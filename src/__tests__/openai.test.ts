@@ -1209,10 +1209,12 @@ describe("buildModelList", () => {
   it("Max subscription gets 1M context for all opus variants, 200k for sonnet", () => {
     const models = buildModelList(true)
     const sonnet = models.find(m => m.id === "claude-sonnet-4-6")!
+    const opus5 = models.find(m => m.id === "claude-opus-5")!
     const opus46 = models.find(m => m.id === "claude-opus-4-6")!
     const opus47 = models.find(m => m.id === "claude-opus-4-7")!
     const opus48 = models.find(m => m.id === "claude-opus-4-8")!
     expect(sonnet.context_window).toBe(200_000)
+    expect(opus5.context_window).toBe(1_000_000)
     expect(opus46.context_window).toBe(1_000_000)
     expect(opus47.context_window).toBe(1_000_000)
     expect(opus48.context_window).toBe(1_000_000)
@@ -1221,10 +1223,12 @@ describe("buildModelList", () => {
   it("non-Max gets 200k context for sonnet and all opus variants", () => {
     const models = buildModelList(false)
     const sonnet = models.find(m => m.id === "claude-sonnet-4-6")!
+    const opus5 = models.find(m => m.id === "claude-opus-5")!
     const opus46 = models.find(m => m.id === "claude-opus-4-6")!
     const opus47 = models.find(m => m.id === "claude-opus-4-7")!
     const opus48 = models.find(m => m.id === "claude-opus-4-8")!
     expect(sonnet.context_window).toBe(200_000)
+    expect(opus5.context_window).toBe(200_000)
     expect(opus46.context_window).toBe(200_000)
     expect(opus47.context_window).toBe(200_000)
     expect(opus48.context_window).toBe(200_000)
