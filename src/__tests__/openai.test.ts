@@ -256,6 +256,47 @@ describe("translateOpenAiToAnthropic", () => {
     }])
   })
 
+  // The Anthropic API accepts only jpeg/png/gif/webp. Forwarding anything else
+  // fails upstream with an opaque error, so an unsupported type is treated the
+  // same as a remote URL: omitted, with the surrounding text preserved.
+  it("omits data URLs whose media type the API does not accept", () => {
+    const result = translateOpenAiToAnthropic({
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "describe this" },
+          { type: "image_url", image_url: { url: "data:image/svg+xml;base64,PHN2Zz4=" } },
+        ],
+      }],
+    })
+
+    expect(result!.messages).toEqual([{
+      role: "user",
+      content: [
+        { type: "text", text: "describe this" },
+        { type: "text", text: "[Unsupported image_url omitted: only data URLs are currently supported]" },
+      ],
+    }])
+  })
+
+  // `image/jpg` is a widespread misspelling in real data URLs; the API knows
+  // only `image/jpeg`, so normalize instead of dropping a valid image.
+  it("normalizes the image/jpg misspelling to image/jpeg", () => {
+    const result = translateOpenAiToAnthropic({
+      messages: [{
+        role: "user",
+        content: [{ type: "image_url", image_url: { url: "data:image/JPG;base64,abc123" } }],
+      }],
+    })
+
+    expect(result!.messages).toEqual([{
+      role: "user",
+      content: [
+        { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "abc123" } },
+      ],
+    }])
+  })
+
   it("sets stream from body", () => {
     const resultStream = translateOpenAiToAnthropic({
       messages: [{ role: "user", content: "Hi" }],
