@@ -85,6 +85,47 @@ describe("translateResponsesToAnthropic", () => {
     ])
   })
 
+  // Both adapters share parseDataUrlImage, so the media-type allowlist and the
+  // image/jpg normalization must be observable from the Responses side too —
+  // this is what keeps them from drifting apart again.
+  it("omits data URLs whose media type the API does not accept", () => {
+    const r = translateResponsesToAnthropic({
+      model: "m",
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [
+            { type: "input_text", text: "look" },
+            { type: "input_image", image_url: "data:image/svg+xml;base64,PHN2Zz4=" },
+          ],
+        },
+      ],
+    })!
+    const content = r.messages[0]!.content as AnthropicContentBlock[]
+    expect(content).toEqual([
+      { type: "text", text: "look" },
+      { type: "text", text: "[Unsupported input_image omitted: only data URLs are currently supported]" },
+    ])
+  })
+
+  it("normalizes the image/jpg misspelling to image/jpeg", () => {
+    const r = translateResponsesToAnthropic({
+      model: "m",
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_image", image_url: "data:image/jpg;base64,abc123" }],
+        },
+      ],
+    })!
+    const content = r.messages[0]!.content as AnthropicContentBlock[]
+    expect(content).toEqual([
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "abc123" } },
+    ])
+  })
+
   it("maps the codex tool round-trip: function_call + function_call_output", () => {
     const r = translateResponsesToAnthropic({
       model: "m",

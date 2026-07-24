@@ -22,9 +22,9 @@ import type {
   AnthropicRequestBody,
   AnthropicMessage,
   AnthropicContentBlock,
-  AnthropicImageBlock,
   AnthropicTool,
 } from "./openai"
+import { parseDataUrlImage } from "./openai"
 
 // ---------------------------------------------------------------------------
 // Responses request types (subset Codex actually sends)
@@ -95,16 +95,6 @@ function partsToText(content: ResponsesContentPart[] | string): string {
     .filter((p) => typeof p.text === "string")
     .map((p) => p.text)
     .join("")
-}
-
-/** Parse a base64 data URL into an Anthropic image block (data URLs only). */
-function parseDataUrlImage(url: string): AnthropicImageBlock | null {
-  const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s.exec(url)
-  if (!match) return null
-  const mediaType = match[1]
-  const data = match[2]
-  if (!mediaType || !data) return null
-  return { type: "image", source: { type: "base64", media_type: mediaType, data } }
 }
 
 /**
