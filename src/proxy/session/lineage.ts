@@ -7,7 +7,6 @@
 
 import { createHash } from "crypto"
 import { normalizeContent } from "../messages"
-import { diagnosticLog } from "../../telemetry"
 
 // --- Types ---
 
@@ -37,15 +36,6 @@ export function normalizeContextUsage(usage: TokenUsage): TokenUsageIteration {
  *  required to classify a mutation as compaction rather than a branch. */
 export const MIN_SUFFIX_FOR_COMPACTION = 2
 
-/** Maximum number of new messages (incoming minus stored) a modified
- *  continuation may append and still resume the stored session. A clean
- *  conversational turn appends at most one exchange: the previous assistant
- *  reply plus the new user message. A larger gap means the stored lineage
- *  missed intervening rounds (client-driven tool loops never persist back
- *  to the store, #689), and resuming would slice those messages out of the
- *  SDK context. */
-export const MAX_CONTINUATION_GAP = 2
-
 export interface SessionState {
   claudeSessionId: string
   lastAccess: number
@@ -71,10 +61,19 @@ export interface SessionState {
  * the information needed to take the correct SDK action.
  */
 export type LineageResult =
-  | { type: "continuation"; session: SessionState }
-  | { type: "compaction";   session: SessionState }
+  | { type: "continuation"; session: SessionState; resumeFrom: number }
+  | { type: "compaction";   session: SessionState; resumeFrom: number; suffixOverlap: number }
   | { type: "undo";         session: SessionState; prefixOverlap: number; rollbackUuid: string | undefined }
-  | { type: "diverged" }
+  | { type: "diverged";     reason: LineageDivergenceReason; prefixOverlap?: number }
+
+export type LineageDivergenceReason =
+  | "unverifiable"
+  | "replayed-request"
+  | "modified-history"
+  | "unrelated-history"
+  | "not-found"
+  | "independent-request"
+  | "missing-session-header"
 
 // --- Hashing ---
 
@@ -205,31 +204,27 @@ function findSuffixAnchorStart(
 
 // --- Lineage verification ---
 
-/** Cache-like interface for verifyLineage — only needs get/set/delete */
-export interface SessionCacheLike {
-  delete(key: string): boolean
-}
-
 /**
  * Verify that incoming messages are a valid continuation of a cached session.
  * Uses per-message hash comparison to deterministically classify mutations.
+ * This function is deliberately side-effect free: it never mutates the cached
+ * state. The caller commits new hashes/counts only after the upstream request
+ * succeeds.
  *
  * Decision matrix:
- *   Full prefix match (fast-path)          → continuation (resume normally)
- *   Suffix overlap >= MIN_SUFFIX           → compaction   (resume normally)
+ *   Full prefix match (fast-path)          → continuation (resume from stored count)
+ *   Suffix overlap >= MIN_SUFFIX           → compaction   (resume after matched suffix)
  *   Prefix overlap > 0, no suffix, shrank  → undo         (fork at rollback point)
- *   Prefix overlap > 0, grew within bound  → continuation (modified continuation)
- *   Anything else                          → diverged     (start fresh)
+ *   Cached prefix changed while growing    → diverged     (fresh full-history replay)
+ *   No overlap                             → diverged     (fresh full-history replay)
  */
 export function verifyLineage(
   cached: SessionState,
-  messages: Array<{ role: string; content: any }>,
-  cacheKey: string,
-  cache: SessionCacheLike
+  messages: Array<{ role: string; content: any }>
 ): LineageResult {
-  // No stored lineage (legacy entry or first request) — allow resume
+  // A legacy entry cannot prove which client history its SDK session contains.
   if (!cached.lineageHash || cached.messageCount === 0) {
-    return { type: "continuation", session: cached }
+    return { type: "diverged", reason: "unverifiable" }
   }
 
   // --- Fast path: aggregate lineage hash ---
@@ -240,17 +235,15 @@ export function verifyLineage(
     // Without this guard, identical requests resume the old SDK session and
     // re-send the last user message, causing ghost context accumulation.
     if (messages.length <= cached.messageCount) {
-      cache.delete(cacheKey)
-      return { type: "diverged" }
+      return { type: "diverged", reason: "replayed-request" }
     }
-    return { type: "continuation", session: cached }
+    return { type: "continuation", session: cached, resumeFrom: cached.messageCount }
   }
 
   // --- Slow path: per-message diff ---
   if (!cached.messageHashes || cached.messageHashes.length === 0) {
     // No per-message hashes stored (legacy session). Can't diff — reject.
-    cache.delete(cacheKey)
-    return { type: "diverged" }
+    return { type: "diverged", reason: "unverifiable" }
   }
 
   const incomingHashes = computeMessageHashes(messages)
@@ -273,19 +266,18 @@ export function verifyLineage(
     cached.messageHashes.length >= MIN_STORED_FOR_COMPACTION &&
     suffixStartInIncoming > 0   // at least one changed message before the preserved suffix
   ) {
-    const compactionMsg = `Compaction detected (key=${cacheKey.slice(0, 8)}…): suffix overlap ${suffixOverlap}/${cached.messageHashes.length}. Allowing resume.`
-    console.error(`[PROXY] ${compactionMsg}`)
-    diagnosticLog.lineage(compactionMsg)
-    cached.lineageHash = computeLineageHash(messages)
-    cached.messageHashes = incomingHashes
-    cached.messageCount = messages.length
-    return { type: "compaction", session: cached }
+    return {
+      type: "compaction",
+      session: cached,
+      resumeFrom: suffixStartInIncoming + suffixOverlap,
+      suffixOverlap,
+    }
   }
 
   // Undo: prefix preserved (beginning intact) but suffix changed,
   // AND the conversation shrank (fewer messages). If the conversation grew
-  // (messages.length > cached.messageCount), the client added new messages
-  // after modifying a previous one — that's a continuation, not an undo.
+  // after a cached message changed, the old SDK session cannot prove it has
+  // the intervening history; that case is handled as divergence below.
   if (prefixOverlap > 0 && suffixOverlap === 0 && messages.length <= cached.messageCount) {
     // Find the SDK UUID at the last matching position.
     let rollbackUuid: string | undefined
@@ -297,41 +289,25 @@ export function verifyLineage(
         }
       }
     }
-    const undoMsg = `Undo detected (key=${cacheKey.slice(0, 8)}…): prefix overlap ${prefixOverlap}/${cached.messageHashes.length}, rollback UUID: ${rollbackUuid || "none (legacy session)"}.`
-    console.error(`[PROXY] ${undoMsg}`)
-    diagnosticLog.lineage(undoMsg)
     return { type: "undo", session: cached, prefixOverlap, rollbackUuid }
   }
 
-  // Modified continuation: the prefix matches except for benign churn on
-  // the last stored slot (e.g., cache_control added) and new messages were
-  // appended. Resume only when the stored lineage is actually current:
-  //   prefixOverlap >= stored - 1   (only the last stored slot may differ)
-  //   gap <= MAX_CONTINUATION_GAP   (at most one new exchange appended)
-  // A stored session further behind is missing intervening messages (#689:
-  // client-driven tool rounds never persist back to the store), and the
-  // resume slice would drop them from the SDK context. Treat that as
-  // diverged instead: a fresh full-history replay is always correct, and
-  // the store re-adopts the full history at end of turn.
+  // A growing history with a changed cached prefix is not proof that the old
+  // SDK session contains the intervening turns. This happens when a request is
+  // routed back to a stale proxy node (#692), and when a client-driven tool
+  // round runs on a throwaway session that never persists back to the store
+  // (#689). Resume would silently skip the missing history, so force a fresh
+  // replay instead.
+  //
+  // This subsumes the MAX_CONTINUATION_GAP bound added in #700: that allowed a
+  // resume when only the last stored slot had churned and at most one exchange
+  // was appended. A changed slot is a changed slot — the SDK session still
+  // holds content the client no longer claims — so the bound is gone and the
+  // whole shape diverges.
   if (prefixOverlap > 0 && messages.length > cached.messageCount) {
-    const gap = messages.length - cached.messageCount
-    if (prefixOverlap >= cached.messageCount - 1 && gap <= MAX_CONTINUATION_GAP) {
-      const modifiedMsg = `Modified continuation (key=${cacheKey.slice(0, 8)}…): prefix overlap ${prefixOverlap}/${cached.messageHashes.length}, incoming ${messages.length} msgs. Allowing resume.`
-      console.error(`[PROXY] ${modifiedMsg}`)
-      diagnosticLog.lineage(modifiedMsg)
-      cached.lineageHash = computeLineageHash(messages.slice(0, messages.length))
-      cached.messageHashes = incomingHashes
-      cached.messageCount = messages.length
-      return { type: "continuation", session: cached }
-    }
-    const staleMsg = `Stale modified continuation (key=${cacheKey.slice(0, 8)}…): prefix overlap ${prefixOverlap}/${cached.messageHashes.length}, incoming ${messages.length} msgs, gap ${gap}. Treating as diverged.`
-    console.error(`[PROXY] ${staleMsg}`)
-    diagnosticLog.lineage(staleMsg)
-    cache.delete(cacheKey)
-    return { type: "diverged" }
+    return { type: "diverged", reason: "modified-history", prefixOverlap }
   }
 
   // No meaningful overlap — completely different conversation.
-  cache.delete(cacheKey)
-  return { type: "diverged" }
+  return { type: "diverged", reason: "unrelated-history", prefixOverlap }
 }
