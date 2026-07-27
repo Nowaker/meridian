@@ -131,6 +131,24 @@ All changes go through this process, no exceptions:
    gh pr merge <PR_NUMBER> --squash --delete-branch
    ```
 
+   Squash is the default because Release Please parses every commit on `main`
+   for the changelog — squashing keeps changelog entries 1:1 with PRs, whereas
+   merge commits leak every intermediate `fix:`/`feat:` commit into the release
+   notes.
+
+   **Exception — external contributions.** When landing someone else's work,
+   preserve their authorship:
+
+   - **Never retype a contributor's change as your own commit.** Cherry-pick it
+     (`git cherry-pick <sha>`), which keeps them as the commit `Author`, and put
+     any of your own changes in a separate commit on top.
+   - Merge with `--merge` so their commit reaches `main` intact, or squash and
+     verify GitHub's auto-generated `Co-authored-by:` trailer survives your edits
+     to the commit message. Both give countable contribution credit; `--merge`
+     keeps them as sole `Author` of their commit.
+   - Accept the extra changelog line that `--merge` may produce — attribution is
+     worth more than a tidy changelog.
+
 6. **Never** run `git push origin main` directly — all code reaches `main` through merged PRs only.
 
 ## Releasing
