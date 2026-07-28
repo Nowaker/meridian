@@ -136,18 +136,35 @@ All changes go through this process, no exceptions:
    merge commits leak every intermediate `fix:`/`feat:` commit into the release
    notes.
 
-   **Exception — external contributions.** When landing someone else's work,
-   preserve their authorship:
+   **Use `--squash` for external contributions too.** `--merge` was tried in
+   #693 and #700 and produced *duplicate* changelog entries, not merely an
+   extra one: GitHub's merge commit carries the branch commit's subject in its
+   body, so Release Please parses both and emits the same line twice.
 
-   - **Never retype a contributor's change as your own commit.** Cherry-pick it
-     (`git cherry-pick <sha>`), which keeps them as the commit `Author`, and put
-     any of your own changes in a separate commit on top.
-   - Merge with `--merge` so their commit reaches `main` intact, or squash and
-     verify GitHub's auto-generated `Co-authored-by:` trailer survives your edits
-     to the commit message. Both give countable contribution credit; `--merge`
-     keeps them as sole `Author` of their commit.
-   - Accept the extra changelog line that `--merge` may produce — attribution is
-     worth more than a tidy changelog.
+   Squash still credits the contributor. GitHub auto-generates a
+   `Co-authored-by:` trailer, which counts toward their contribution graph and
+   renders both avatars on the commit. The only thing lost is sole `Author` on
+   the commit, which is not worth a changelog that repeats itself every release.
+
+   **`main` requires signed commits, so fork PRs can never be merged directly.**
+   An external PR sits at `mergeStateStatus: BLOCKED` with every check green and
+   no indication why — `gh pr view <N> --json mergeStateStatus` is the only
+   signal. This is not something the contributor can fix from their side.
+
+   The path in, for any outside contribution:
+
+   ```bash
+   git checkout -b fix/their-thing-merged origin/main
+   git cherry-pick <their-sha>     # re-signs with your key, keeps them as Author
+   # your own changes go in a separate commit on top
+   gh pr create --base main
+   gh pr merge <N> --squash --delete-branch
+   ```
+
+   - **Never retype a contributor's change as your own commit.** Cherry-pick it;
+     that is what preserves them as `Author` through to the squash trailer.
+   - Close their original PR with a comment explaining the signing constraint,
+     so it does not read as a rejection.
 
 6. **Never** run `git push origin main` directly — all code reaches `main` through merged PRs only.
 
