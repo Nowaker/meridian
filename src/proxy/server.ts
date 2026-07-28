@@ -77,7 +77,7 @@ import { getAdapterTransforms } from "./transforms/registry"
 import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
 import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, getEffectiveProfiles, restoreActiveProfile, type ResolvedProfile } from "./profiles"
-import { getRoutingMode, resolvePriorityOrder, choosePriorityProfile, ProfileExhaustion } from "./routing"
+import { getRoutingMode, resolvePriorityOrder, choosePriorityProfile, ProfileExhaustion, AssignmentStore } from "./routing"
 import { getSetting, setSetting } from "./settings"
 import { filterBetasForProfile, getBetaPolicyFromEnv } from "./betas"
 import { createFileChangeHook, extractFileChangesFromMessages, formatFileChangeSummary, type FileChange } from "./fileChanges"
@@ -93,6 +93,7 @@ import {
   type TokenUsageIteration,
   type TokenUsage,
 } from "./session/lineage"
+import { getPriorityAssignmentKey } from "./session/fingerprint"
 // Re-export for backwards compatibility (existing tests import from here)
 
 import { lookupSession, storeSession, clearSessionCache, getMaxSessionsLimit, evictSession, getSessionByClaudeId } from "./session/cache"
@@ -466,8 +467,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // /v1/chat/completions), so ALL failover logic lives here — no changes to
   // the deep request machinery. State is per proxy instance.
   const priorityExhaustion = new ProfileExhaustion()
-  const priorityAssignments = new Map<string, string>() // sessionKey -> profileId
   const PRIORITY_ASSIGNMENTS_MAX = 5000
+  const priorityAssignments = new AssignmentStore(PRIORITY_ASSIGNMENTS_MAX)
   const PRIORITY_DEFAULT_COOLDOWN_MS = 10 * 60_000
   const PRIORITY_COOLDOWN_CAP_MS = 6 * 60 * 60_000
 
@@ -616,13 +617,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       const inner = await app.fetch(new Request(c.req.url, { method: "POST", headers, body: bodyBuf }))
       const { failed, errorPayload, response } = await sniffQuotaFailure(inner)
       if (!failed) {
-        if (sessionKey) {
-          priorityAssignments.set(sessionKey, candidate)
-          if (priorityAssignments.size > PRIORITY_ASSIGNMENTS_MAX) {
-            const oldest = priorityAssignments.keys().next().value
-            if (oldest !== undefined) priorityAssignments.delete(oldest)
-          }
-        }
+        if (sessionKey) priorityAssignments.set(sessionKey, candidate)
         if (previous) {
           claudeLog("profile.failover", { from: previous, to: candidate, reason: "rate_limit_error", sessionKey })
           plog(`[PROXY] PRIORITY failover ${previous} -> ${candidate}`)
@@ -759,7 +754,22 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           if (effectivePool.length > 1) {
             const { order, unknown } = resolvePriorityOrder(effectivePool.map(p => p.id), priorityProfileOrderSetting())
             if (unknown.length > 0) claudeLog("priority.unknown_order_ids", { unknown })
-            const sessionKey = adapter.getSessionId(c, body) || null
+            // Keyless clients (pylon's main process, OpenCode setups that omit
+            // x-opencode-session) fall back to the conversation fingerprint —
+            // without it they re-pick an account every turn and bounce back to
+            // the preferred profile the moment its cooldown expires, replaying
+            // the whole history against a cold cache.
+            // Deliberately not clientWorkingDirectory (computed below): no
+            // MERIDIAN_WORKDIR/CLAUDE_PROXY_WORKDIR override here — that
+            // override would collapse every client's account key to one
+            // shared value.
+            const assignmentCwd = adapter.extractClientWorkingDirectory?.(body)
+              ?? adapter.extractWorkingDirectory(body)
+            const sessionKey = getPriorityAssignmentKey(
+              adapter.getSessionId(c, body),
+              body.messages,
+              assignmentCwd,
+            )
             const assigned = sessionKey ? priorityAssignments.get(sessionKey) : undefined
             // Assignment affinity: an existing conversation stays on its
             // account while that account is healthy (protects warm prompt
