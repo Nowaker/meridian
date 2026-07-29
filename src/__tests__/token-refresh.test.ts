@@ -1134,3 +1134,55 @@ describe("getAuthRenewalStatus caching", () => {
     expect(reads()).toBe(2)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Warning-window parsing
+//
+// Extracted from the /health handler so it is testable without mocking the
+// whole server, and so server.ts orchestrates rather than computes. `0` is a
+// legitimate setting — warn only once the login has actually lapsed — so a
+// `Number(raw) || DEFAULT` shortcut would silently swallow it.
+// ---------------------------------------------------------------------------
+
+describe("resolveRenewalWarnDays", () => {
+  it("defaults when unset", async () => {
+    const { resolveRenewalWarnDays, DEFAULT_RENEWAL_WARN_DAYS } = await import("../proxy/tokenRefresh")
+    expect(resolveRenewalWarnDays(undefined)).toBe(DEFAULT_RENEWAL_WARN_DAYS)
+    expect(resolveRenewalWarnDays("")).toBe(DEFAULT_RENEWAL_WARN_DAYS)
+  })
+
+  it("accepts 0 rather than swallowing it as falsy", async () => {
+    const { resolveRenewalWarnDays } = await import("../proxy/tokenRefresh")
+    expect(resolveRenewalWarnDays("0")).toBe(0)
+  })
+
+  it("accepts a positive window", async () => {
+    const { resolveRenewalWarnDays } = await import("../proxy/tokenRefresh")
+    expect(resolveRenewalWarnDays("14")).toBe(14)
+    expect(resolveRenewalWarnDays(" 7 ")).toBe(7)
+  })
+
+  it("falls back to the default for a negative or non-numeric value", async () => {
+    const { resolveRenewalWarnDays, DEFAULT_RENEWAL_WARN_DAYS } = await import("../proxy/tokenRefresh")
+    expect(resolveRenewalWarnDays("-1")).toBe(DEFAULT_RENEWAL_WARN_DAYS)
+    expect(resolveRenewalWarnDays("soon")).toBe(DEFAULT_RENEWAL_WARN_DAYS)
+    expect(resolveRenewalWarnDays("NaN")).toBe(DEFAULT_RENEWAL_WARN_DAYS)
+  })
+
+  it("a 0 window means the flag only fires once the login has lapsed", async () => {
+    const { getAuthRenewalStatus, resolveRenewalWarnDays, resetAuthRenewalCache } = await import("../proxy/tokenRefresh")
+    resetAuthRenewalCache()
+    const warnDays = resolveRenewalWarnDays("0")
+
+    const soon = JSON.parse(JSON.stringify(MOCK_CREDENTIALS))
+    soon.claudeAiOauth.refreshTokenExpiresAt = Date.now() + 2 * 86_400_000
+    const stillValid: CredentialStore = { async read() { return soon }, async write() { return true } }
+
+    const lapsed = JSON.parse(JSON.stringify(MOCK_CREDENTIALS))
+    lapsed.claudeAiOauth.refreshTokenExpiresAt = Date.now() - 86_400_000
+    const expired: CredentialStore = { async read() { return lapsed }, async write() { return true } }
+
+    expect((await getAuthRenewalStatus(stillValid, warnDays)).renewalRequiredSoon).toBe(false)
+    expect((await getAuthRenewalStatus(expired, warnDays)).renewalRequiredSoon).toBe(true)
+  })
+})

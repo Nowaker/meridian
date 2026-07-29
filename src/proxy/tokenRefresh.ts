@@ -399,6 +399,21 @@ export async function ensureFreshToken(
  */
 export const DEFAULT_RENEWAL_WARN_DAYS = 3
 
+/**
+ * Parse the MERIDIAN_AUTH_RENEWAL_WARN_DAYS window, falling back to the
+ * default for anything unusable.
+ *
+ * An explicit finite check rather than `Number(raw) || DEFAULT`: `0` is a
+ * legitimate setting — warn only once the login has actually lapsed — and the
+ * shortcut would swallow it as falsy. Negative windows are rejected too; they
+ * would mean "warn only after the login has been dead for N days", which no
+ * monitor wants.
+ */
+export function resolveRenewalWarnDays(raw: string | undefined): number {
+  const parsed = raw ? Number(raw) : NaN
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_RENEWAL_WARN_DAYS
+}
+
 export interface AuthRenewalStatus {
   /** Epoch ms the refresh token stops working, when known. */
   refreshTokenExpiresAt?: number
