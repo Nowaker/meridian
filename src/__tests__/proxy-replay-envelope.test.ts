@@ -114,3 +114,67 @@ describe("fresh-session replay envelope (#619)", () => {
     expect(prompt).toBe("follow up")
   })
 })
+
+/**
+ * #712/#713 — the user's own message must reach the model.
+ *
+ * The lineage tests pin the CLASSIFICATION (compaction that resumes past the
+ * last message is now rejected). This pins the OUTCOME, which is where the bug
+ * actually bit: a wrong verdict made server.ts take its `resumeFrom <
+ * allMessages.length` fallback and send getLastUserMessage() — the LAST
+ * user-role message, which for these clients is a constant injected tail, not
+ * the turn the user just typed. HTTP 200, fluent output, nothing in the logs.
+ *
+ * Stateless chat frontends (SillyTavern and most roleplay UIs) re-send the
+ * whole history every turn and append a constant block after the user's own
+ * message: an injected assistant line plus a prefill sent as a user message.
+ * That block matches the stored tail, so the suffix anchor lands on the final
+ * message. Without a classification test AND this one, a future change to the
+ * fallback could restore the data loss while the lineage tests stayed green.
+ */
+describe("stateless client with a trailing injected block (#712)", () => {
+  const INJECTED_ASSISTANT = { role: "assistant", content: "[post-history instructions]" }
+  const PREFILL = { role: "user", content: "思考已结束。" }
+
+  beforeEach(() => {
+    clearSessionCache()
+    capturedPrompts = []
+  })
+
+  it("delivers the user's message, not the injected prefill", async () => {
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const prior = [
+      { role: "user", content: "turn one" },
+      { role: "assistant", content: "answer one" },
+      { role: "user", content: "turn two" },
+      { role: "assistant", content: "answer two" },
+      { role: "user", content: "turn three" },
+      { role: "assistant", content: "answer three" },
+      INJECTED_ASSISTANT,
+      PREFILL,
+    ]
+    storeSession("sess-712", prior, "sdk-712", "/tmp/test", prior.map(() => null))
+
+    // Next turn: the assistant replied, the user typed something new, and the
+    // client re-appended its constant block.
+    const res = await post(
+      app,
+      [
+        ...prior.slice(0, 6),
+        { role: "assistant", content: "answer three continued" },
+        { role: "user", content: "WHAT THE USER ACTUALLY ASKED" },
+        INJECTED_ASSISTANT,
+        PREFILL,
+      ],
+      { "x-opencode-session": "sess-712" }
+    )
+    expect(res.status).toBe(200)
+
+    const prompt = capturedPrompts[0] as string
+    expect(typeof prompt).toBe("string")
+    // The whole point: the user's turn is in the prompt.
+    expect(prompt).toContain("WHAT THE USER ACTUALLY ASKED")
+    // And it is not merely the injected tail standing in for it.
+    expect(prompt).not.toBe("思考已结束。")
+  })
+})
