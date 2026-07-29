@@ -7,7 +7,7 @@
  * transcript (self-play / confabulated tool output). Resume deltas stay bare.
  */
 
-import { describe, it, expect, mock, beforeEach } from "bun:test"
+import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
 
 let capturedPrompts: any[] = []
 
@@ -176,5 +176,118 @@ describe("stateless client with a trailing injected block (#712)", () => {
     expect(prompt).toContain("WHAT THE USER ACTUALLY ASKED")
     // And it is not merely the injected tail standing in for it.
     expect(prompt).not.toBe("思考已结束。")
+  })
+})
+
+/**
+ * #720 — a user's own <thinking> block must reach the model.
+ *
+ * `thinking` was on the unconditional strip list, and the sanitizer runs on
+ * user-authored text, so a paired <thinking>…</thinking> in a prompt was
+ * deleted before the model saw it — on full replay as well as on resume. Every
+ * unit test asserted the stripping worked; none asserted it should not happen
+ * to user content, which is why this went unnoticed.
+ */
+describe("user-authored <thinking> survives (#720)", () => {
+  beforeEach(() => {
+    clearSessionCache()
+    capturedPrompts = []
+  })
+
+  it("delivers a user's <thinking> block to the model", async () => {
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const res = await post(app, [
+      { role: "user", content: "<thinking>Reason step by step before answering.</thinking>\n\nWhat is 2+2?" },
+    ])
+    expect(res.status).toBe(200)
+
+    const prompt = capturedPrompts[0] as string
+    expect(typeof prompt).toBe("string")
+    expect(prompt).toContain("<thinking>Reason step by step before answering.</thinking>")
+    expect(prompt).toContain("What is 2+2?")
+  })
+
+  it("still strips harness tags from the same message", async () => {
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const res = await post(app, [
+      { role: "user", content: "<env>cwd=/tmp</env><thinking>my reasoning</thinking>the question" },
+    ])
+    expect(res.status).toBe(200)
+
+    const prompt = capturedPrompts[0] as string
+    expect(prompt).toContain("<thinking>my reasoning</thinking>")
+    expect(prompt).not.toContain("<env>")
+    expect(prompt).not.toContain("cwd=/tmp")
+  })
+
+  it("survives on the resume path, not just full replay", async () => {
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const prior = [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "hi there" },
+    ]
+    storeSession("sess-720-resume", prior, "sdk-720-resume", "/tmp/test", [null, "uuid-1"])
+
+    const res = await post(
+      app,
+      [
+        ...prior,
+        { role: "user", content: "<thinking>Reason step by step before answering.</thinking>\n\nWhat is 2+2?" },
+      ],
+      { "x-opencode-session": "sess-720-resume" }
+    )
+    expect(res.status).toBe(200)
+
+    const prompt = capturedPrompts[0] as string
+    expect(prompt).toContain("<thinking>Reason step by step before answering.</thinking>")
+  })
+})
+
+/**
+ * MERIDIAN_STRIP_THINKING — escape hatch for harnesses observed leaking raw
+ * <thinking> tags into user-authored prompts that haven't been surveyed. Off
+ * by default (see the #720 suite above); this suite pins the env-var override.
+ */
+describe("MERIDIAN_STRIP_THINKING env escape hatch", () => {
+  const priorMeridian = process.env.MERIDIAN_STRIP_THINKING
+  const priorClaudeProxy = process.env.CLAUDE_PROXY_STRIP_THINKING
+
+  beforeEach(() => {
+    clearSessionCache()
+    capturedPrompts = []
+  })
+
+  afterEach(() => {
+    if (priorMeridian === undefined) delete process.env.MERIDIAN_STRIP_THINKING
+    else process.env.MERIDIAN_STRIP_THINKING = priorMeridian
+    if (priorClaudeProxy === undefined) delete process.env.CLAUDE_PROXY_STRIP_THINKING
+    else process.env.CLAUDE_PROXY_STRIP_THINKING = priorClaudeProxy
+  })
+
+  it("leaves <thinking> intact when the env var is unset (default)", async () => {
+    delete process.env.MERIDIAN_STRIP_THINKING
+    delete process.env.CLAUDE_PROXY_STRIP_THINKING
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const res = await post(app, [
+      { role: "user", content: "<thinking>my reasoning</thinking>the question" },
+    ])
+    expect(res.status).toBe(200)
+
+    const prompt = capturedPrompts[0] as string
+    expect(prompt).toContain("<thinking>my reasoning</thinking>")
+  })
+
+  it("strips <thinking> through the real HTTP path when MERIDIAN_STRIP_THINKING=1", async () => {
+    process.env.MERIDIAN_STRIP_THINKING = "1"
+    delete process.env.CLAUDE_PROXY_STRIP_THINKING
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const res = await post(app, [
+      { role: "user", content: "<thinking>my reasoning</thinking>the question" },
+    ])
+    expect(res.status).toBe(200)
+
+    const prompt = capturedPrompts[0] as string
+    expect(prompt).not.toContain("<thinking>")
+    expect(prompt).toContain("the question")
   })
 })
