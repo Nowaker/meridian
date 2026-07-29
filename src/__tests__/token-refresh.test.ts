@@ -990,3 +990,147 @@ describe("DEFAULT_RENEWAL_WARN_DAYS", () => {
     expect((await getAuthRenewalStatus(makeStore(inside).store)).renewalRequiredSoon).toBe(true)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Renewal-status caching
+//
+// /health is polled every 10s per open dashboard page (profileBar.ts,
+// landing.ts), by plugin health checks, and by external monitors. On macOS a
+// credential-store read spawns `/usr/bin/security find-generic-password`, so
+// an uncached read here means a subprocess per poll — for a value that moves
+// on a ~30-day cadence. Mirrors the TTL caching getClaudeAuthStatusAsync and
+// fetchOAuthUsage already use.
+// ---------------------------------------------------------------------------
+
+function makeCountingStore(refreshKey: string | undefined, expiresAt: number | undefined) {
+  let reads = 0
+  const seeded = JSON.parse(JSON.stringify(MOCK_CREDENTIALS))
+  if (expiresAt === undefined) delete seeded.claudeAiOauth.refreshTokenExpiresAt
+  else seeded.claudeAiOauth.refreshTokenExpiresAt = expiresAt
+  const store: CredentialStore = {
+    ...(refreshKey ? { refreshKey } : {}),
+    async read() { reads++; return seeded },
+    async write() { return true },
+  }
+  return { store, reads: () => reads }
+}
+
+describe("getAuthRenewalStatus caching", () => {
+  beforeEach(async () => {
+    const { resetAuthRenewalCache } = await import("../proxy/tokenRefresh")
+    resetAuthRenewalCache()
+  })
+
+  it("reads the credential store once for repeated calls on the same refreshKey", async () => {
+    const { getAuthRenewalStatus } = await import("../proxy/tokenRefresh")
+    const { store, reads } = makeCountingStore("file:/tmp/cache-a/.credentials.json", Date.now() + 19 * 86_400_000)
+
+    await getAuthRenewalStatus(store, 3)
+    await getAuthRenewalStatus(store, 3)
+    await getAuthRenewalStatus(store, 3)
+
+    expect(reads()).toBe(1)
+  })
+
+  it("still recomputes the day count and flag from the cached expiry", async () => {
+    const { getAuthRenewalStatus } = await import("../proxy/tokenRefresh")
+    // Only the store READ is cached; warnDays and elapsed time must stay live,
+    // or a monitor changing its threshold would keep seeing the old verdict.
+    const { store } = makeCountingStore("file:/tmp/cache-b/.credentials.json", Date.now() + 5 * 86_400_000)
+
+    const outside = await getAuthRenewalStatus(store, 3)
+    const inside = await getAuthRenewalStatus(store, 7)
+
+    expect(outside.renewalRequiredSoon).toBe(false)
+    expect(inside.renewalRequiredSoon).toBe(true)
+    expect(inside.daysUntilRenewal).toBe(outside.daysUntilRenewal)
+  })
+
+  it("does not cache when the store has no refreshKey", async () => {
+    const { getAuthRenewalStatus } = await import("../proxy/tokenRefresh")
+    // Identity is unknown, so caching could conflate unrelated stores.
+    const { store, reads } = makeCountingStore(undefined, Date.now() + 19 * 86_400_000)
+
+    await getAuthRenewalStatus(store, 3)
+    await getAuthRenewalStatus(store, 3)
+
+    expect(reads()).toBe(2)
+  })
+
+  it("keeps distinct refreshKeys separate", async () => {
+    const { getAuthRenewalStatus } = await import("../proxy/tokenRefresh")
+    const personal = makeCountingStore("file:/tmp/personal/.credentials.json", Date.now() + 19 * 86_400_000)
+    const work = makeCountingStore("file:/tmp/work/.credentials.json", Date.now() + 2 * 86_400_000)
+
+    const p = await getAuthRenewalStatus(personal.store, 3)
+    const w = await getAuthRenewalStatus(work.store, 3)
+
+    expect(p.renewalRequiredSoon).toBe(false)
+    expect(w.renewalRequiredSoon).toBe(true)
+    expect(personal.reads()).toBe(1)
+    expect(work.reads()).toBe(1)
+  })
+
+  it("does not cache a failed read, so a transient blip retries", async () => {
+    const { getAuthRenewalStatus, resetAuthRenewalCache } = await import("../proxy/tokenRefresh")
+    resetAuthRenewalCache()
+    let reads = 0
+    let fail = true
+    const store: CredentialStore = {
+      refreshKey: "file:/tmp/flaky/.credentials.json",
+      async read() {
+        reads++
+        if (fail) throw new Error("keychain unavailable")
+        const seeded = JSON.parse(JSON.stringify(MOCK_CREDENTIALS))
+        seeded.claudeAiOauth.refreshTokenExpiresAt = Date.now() + 19 * 86_400_000
+        return seeded
+      },
+      async write() { return true },
+    }
+
+    const first = await getAuthRenewalStatus(store, 3)
+    expect(first.renewalRequiredSoon).toBe(false)
+    expect(first.refreshTokenExpiresAt).toBeUndefined()
+
+    fail = false
+    const second = await getAuthRenewalStatus(store, 3)
+    expect(reads).toBe(2)
+    expect(second.daysUntilRenewal).toBe(19)
+  })
+
+  it("shares one in-flight read across concurrent callers", async () => {
+    const { getAuthRenewalStatus } = await import("../proxy/tokenRefresh")
+    let reads = 0
+    const store: CredentialStore = {
+      refreshKey: "file:/tmp/concurrent/.credentials.json",
+      async read() {
+        reads++
+        await new Promise((r) => setTimeout(r, 20))
+        const seeded = JSON.parse(JSON.stringify(MOCK_CREDENTIALS))
+        seeded.claudeAiOauth.refreshTokenExpiresAt = Date.now() + 19 * 86_400_000
+        return seeded
+      },
+      async write() { return true },
+    }
+
+    const results = await Promise.all([
+      getAuthRenewalStatus(store, 3),
+      getAuthRenewalStatus(store, 3),
+      getAuthRenewalStatus(store, 3),
+    ])
+
+    expect(reads).toBe(1)
+    expect(results.map((r) => r.daysUntilRenewal)).toEqual([19, 19, 19])
+  })
+
+  it("resetAuthRenewalCache forces the next call to re-read", async () => {
+    const { getAuthRenewalStatus, resetAuthRenewalCache } = await import("../proxy/tokenRefresh")
+    const { store, reads } = makeCountingStore("file:/tmp/cache-c/.credentials.json", Date.now() + 19 * 86_400_000)
+
+    await getAuthRenewalStatus(store, 3)
+    resetAuthRenewalCache()
+    await getAuthRenewalStatus(store, 3)
+
+    expect(reads()).toBe(2)
+  })
+})

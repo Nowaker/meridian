@@ -329,11 +329,12 @@ async function doRefresh(store: CredentialStore): Promise<boolean> {
     (tokenData.expires_in ? now + tokenData.expires_in * 1000 : now + 8 * 60 * 60 * 1000)
 
   // The refresh token is rotated on every refresh, so its expiry may roll
-  // forward too. Anthropic does not currently document returning this, and the
-  // old code dropped it unconditionally — leaving the on-disk value frozen at
-  // login time and any renewal countdown built on it pessimistic. Persist it
-  // when offered; keep the previous value when not, which is the conservative
-  // direction (warn early rather than never).
+  // forward too. Anthropic does not currently document returning this. The
+  // previous code preserved any on-disk value through the spread below but
+  // never parsed a new one from the response, so the stored expiry could only
+  // ever be as old as the last interactive login — leaving any countdown built
+  // on it pessimistic. Persist it when offered; keep the previous value when
+  // not, which is the conservative direction (warn early rather than never).
   const refreshTokenExpiresAtRaw =
     tokenData.refresh_token_expires_at ??
     (tokenData.refresh_token_expires_in ? now + tokenData.refresh_token_expires_in * 1000 : undefined)
@@ -419,19 +420,76 @@ export interface AuthRenewalStatus {
  * field is not evidence of an imminent problem, and alerting on it would fire
  * on every deployment that predates the CLI writing it.
  */
+/**
+ * How long a read of the refresh-token expiry stays fresh.
+ *
+ * `/health` is hot: the dashboard polls it every 10s per open page, plugin
+ * health checks hit it, and external monitors poll it too. On macOS a
+ * credential-store read spawns `/usr/bin/security find-generic-password`, so
+ * reading per request means a subprocess per poll — for a value that moves on
+ * a ~30-day cadence. Five minutes is far shorter than any meaningful change to
+ * the login window and still collapses ~97% of the reads.
+ */
+const RENEWAL_EXPIRY_TTL_MS = 5 * 60_000
+
+const renewalExpiryCache = new Map<string, { value: number | undefined; at: number }>()
+const renewalExpiryInflight = new Map<string, Promise<number | undefined>>()
+
+/** Drop cached refresh-token expiries — for tests, and after a re-login. */
+export function resetAuthRenewalCache(): void {
+  renewalExpiryCache.clear()
+  renewalExpiryInflight.clear()
+}
+
+/**
+ * Read the refresh-token expiry, cached per credential store.
+ *
+ * Keyed on `refreshKey`, which both real stores set (`keychain:` / `file:`).
+ * A store WITHOUT one is not cached at all: its identity is unknown, so
+ * caching could conflate genuinely different accounts — the same reasoning
+ * that makes the key profile-scoped in the first place.
+ *
+ * A failed read is never cached. A keychain blip should retry on the next
+ * poll, not suppress the renewal warning for the whole TTL.
+ */
+async function readRefreshTokenExpiry(s: CredentialStore): Promise<number | undefined> {
+  const key = s.refreshKey
+  if (key) {
+    const cached = renewalExpiryCache.get(key)
+    if (cached && Date.now() - cached.at < RENEWAL_EXPIRY_TTL_MS) return cached.value
+    const inflight = renewalExpiryInflight.get(key)
+    if (inflight) return inflight
+  }
+
+  const read = (async (): Promise<number | undefined> => {
+    let credentials: CredentialsFile | null = null
+    try {
+      credentials = await s.read()
+    } catch {
+      return undefined
+    }
+    const value = credentials?.claudeAiOauth?.refreshTokenExpiresAt
+    if (key) renewalExpiryCache.set(key, { value, at: Date.now() })
+    return value
+  })()
+
+  if (!key) return read
+  renewalExpiryInflight.set(key, read)
+  try {
+    return await read
+  } finally {
+    renewalExpiryInflight.delete(key)
+  }
+}
+
 export async function getAuthRenewalStatus(
   store?: CredentialStore,
   warnDays = DEFAULT_RENEWAL_WARN_DAYS,
 ): Promise<AuthRenewalStatus> {
   const s = store ?? createPlatformCredentialStore()
-  let credentials: CredentialsFile | null = null
-  try {
-    credentials = await s.read()
-  } catch {
-    return { renewalRequiredSoon: false }
-  }
-
-  const refreshTokenExpiresAt = credentials?.claudeAiOauth?.refreshTokenExpiresAt
+  // Only the READ is cached. The day count and the flag are recomputed every
+  // call so elapsed time and a changed warnDays are always reflected.
+  const refreshTokenExpiresAt = await readRefreshTokenExpiry(s)
   if (!refreshTokenExpiresAt) return { renewalRequiredSoon: false }
 
   const msRemaining = refreshTokenExpiresAt - Date.now()
