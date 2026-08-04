@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.61.0](https://github.com/rynfar/meridian/compare/meridian-v1.60.0...meridian-v1.61.0) (2026-08-04)
+
+
+### Features
+
+* Hermes Agent integration example plugin + docs ([#762](https://github.com/rynfar/meridian/issues/762)) ([8b789e4](https://github.com/rynfar/meridian/commit/8b789e4e491c31ec79737cb18dd9c79666496f20))
+
 ## [1.60.0](https://github.com/rynfar/meridian/compare/meridian-v1.59.0...meridian-v1.60.0) (2026-08-04)
 
 > ### ⚠️ Behaviour change: claude.ai connectors are now off by default
