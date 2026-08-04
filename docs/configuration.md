@@ -47,6 +47,37 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 
 †Sonnet 1M requires Extra Usage on all plans including Max ([docs](https://code.claude.com/docs/en/model-config#extended-context)). Opus 1M is included with Max/Team/Enterprise at no extra cost. Fable 1M is also included at no Extra Usage cost, verified live on both Max and Team.
 
+### Subprocess traffic
+
+Meridian runs the Claude Code CLI as a headless subprocess, so it sets these
+on that process by default:
+
+| Variable | Effect |
+|---|---|
+| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | Usage metrics, error reports, feedback uploads, session-quality surveys |
+| `DISABLE_TELEMETRY` | Usage metrics |
+| `DISABLE_ERROR_REPORTING` | Crash reports to the third-party error tracker |
+| `DISABLE_FEEDBACK_COMMAND` | `/feedback`, `/bug`, `/share` uploads |
+| `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY` | Session-quality survey |
+| `DISABLE_AUTOUPDATER` | CLI self-update underneath a running proxy |
+| `CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL` | Plugin marketplace auto-install |
+
+Nobody reads a headless subprocess's usage metrics, its crash reports describe
+a process the operator never launched by hand, and the feedback commands have
+no interactive session to report on. An auto-update mid-run is version skew,
+not a feature.
+
+Any value set in Meridian's own environment wins, including setting one of
+these to `0` to opt back in.
+
+One thing these do not cover: before WebFetch retrieves a URL, the subprocess
+sends the target hostname to `api.anthropic.com` to check it against a safety
+blocklist. That check is deliberately exempt from
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` upstream and is unaffected here.
+It has its own per-adapter switch — see [WebFetch preflight](#webfetch-preflight)
+— though it only reaches the wire on the `cherry` adapter, since no other
+adapter lets the subprocess run the built-in WebFetch at all.
+
 ## Endpoints
 
 | Endpoint | Description |
@@ -150,11 +181,12 @@ hostname to `api.anthropic.com/api/web/domain_info` to check it against a
 safety blocklist. Only the hostname goes — not the path or the page — and the
 result is cached per host for five minutes.
 
-The check is not covered by `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, so
-turning it off here is the only way to keep fetch targets local. With it off,
-WebFetch retrieves any URL without consulting the blocklist; if that matters
-for your deployment, pair it with WebFetch tool permissions on the calling
-agent.
+The check is not covered by `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` — it is
+the one exception to everything under [Subprocess traffic](#subprocess-traffic)
+— so turning it off here is the only way to keep fetch targets local. With it
+off, WebFetch retrieves any URL without consulting the blocklist; if that
+matters for your deployment, pair it with WebFetch tool permissions on the
+calling agent.
 
 **Scope: this only affects the `cherry` adapter.** The preflight runs inside
 the SDK's built-in `WebFetch`, so it only fires when the Meridian-spawned
