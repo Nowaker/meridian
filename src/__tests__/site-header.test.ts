@@ -14,6 +14,7 @@ import { settingsPageHtml } from "../telemetry/settingsPage"
 import { profilePageHtml } from "../telemetry/profilePage"
 import { pluginPageHtml } from "../proxy/plugins/pluginPage"
 import { profileBarHtml, profileBarJs } from "../telemetry/profileBar"
+import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "../telemetry/profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT } from "../telemetry/profileSpent"
 
 const allPages: Array<[string, string]> = [
@@ -96,6 +97,16 @@ describe("landing page layout", () => {
     expect(landingHtml).toContain(`var GENERAL_WINDOW_TYPES=${JSON.stringify(GENERAL_WINDOW_TYPES)}`)
     expect(landingHtml).toContain("--spend-fade")
     expect(landingHtml).toContain("needs login")
+  })
+
+  test("accounts can be re-sorted for viewing without touching the saved order", () => {
+    // The page carries a copy of the comparator, so the modes it offers are
+    // interpolated from the tested module rather than retyped.
+    expect(landingHtml).toContain(`var PROFILE_SORT_MODES=${JSON.stringify(PROFILE_SORT_MODES)}`)
+    expect(landingHtml).toContain(`var viewSort=${JSON.stringify(DEFAULT_PROFILE_SORT)}`)
+    expect(landingHtml).toContain("sort-tab")
+    // View-only: the durable pool order has one writer, and it is not here.
+    expect(landingHtml).not.toContain("/settings/api/routing")
   })
 
   test("account cards come from configured profiles, not synthetic cost buckets", () => {
