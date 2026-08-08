@@ -14,6 +14,7 @@ import { settingsPageHtml } from "../telemetry/settingsPage"
 import { profilePageHtml } from "../telemetry/profilePage"
 import { pluginPageHtml } from "../proxy/plugins/pluginPage"
 import { profileBarHtml, profileBarJs } from "../telemetry/profileBar"
+import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT } from "../telemetry/profileSpent"
 
 const allPages: Array<[string, string]> = [
   ["landing", landingHtml],
@@ -85,6 +86,16 @@ describe("landing page layout", () => {
     expect(landingHtml).not.toContain("Median TTFB")
     // Envelope violations render only when noteworthy
     expect(landingHtml).toContain("envelopeViolationCount>0")
+  })
+
+  test("spent accounts recede and unusable ones are flagged instead", () => {
+    // The page carries a copy of the classifier's arithmetic, so its
+    // thresholds are interpolated from the tested module rather than retyped.
+    expect(landingHtml).toContain(`var FADE_FROM=${FADE_FROM}`)
+    expect(landingHtml).toContain(`var SPENT_AT=${SPENT_AT}`)
+    expect(landingHtml).toContain(`var GENERAL_WINDOW_TYPES=${JSON.stringify(GENERAL_WINDOW_TYPES)}`)
+    expect(landingHtml).toContain("--spend-fade")
+    expect(landingHtml).toContain("needs login")
   })
 
   test("account cards come from configured profiles, not synthetic cost buckets", () => {
