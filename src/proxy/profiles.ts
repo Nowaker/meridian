@@ -8,7 +8,8 @@
  *
  * Profile selection priority:
  *   1. x-meridian-profile request header (per-request override)
- *   2. Active profile (set via POST /profiles/active or UI)
+ *   2. Active profile (set via POST /profiles/active or UI, or taken from
+ *      another instance under MERIDIAN_FOLLOW_ACTIVE — see followActive.ts)
  *   3. First configured profile (or implicit "default" if none configured)
  *
  * This is a leaf module — no imports from server.ts or session/.
@@ -19,6 +20,7 @@ import { join } from "node:path"
 import { configPath, defaultConfigDir } from "../configDir"
 import { setSetting, getSetting } from "./settings"
 import { pickStickyProfile, type RoutingMode } from "./routing"
+import { followedActiveProfile } from "./followActive"
 
 /** Disk profile cache with short TTL so new profiles are picked up quickly */
 const DISK_CACHE_TTL_MS = 5_000
@@ -140,15 +142,55 @@ export function setActiveProfile(profileId: string): void {
 }
 
 /**
- * Get the current active profile ID.
+ * Get the LOCAL active profile ID — this instance's own choice, ignoring
+ * follow mode. Callers that want the profile actually in effect want
+ * `resolveActiveProfileId` instead.
  */
 export function getActiveProfileId(): string | undefined {
   return activeProfileId
 }
 
+/** Last followed value warned about, so the warning is once per value. */
+let warnedUnknownFollowed: string | undefined
+
+/**
+ * The active profile actually in effect: the followed instance's choice under
+ * MERIDIAN_FOLLOW_ACTIVE, otherwise this instance's own.
+ *
+ * This is the ONE input follow mode replaces. Everything around it — the
+ * header override, sticky assignment, the config default, the first-profile
+ * fallback — is unchanged.
+ *
+ * @param availableIds profile IDs this instance actually has, so a followed
+ *   value it cannot serve is rejected here rather than resolving to an
+ *   unrelated account further down `resolveProfile`.
+ */
+export function resolveActiveProfileId(availableIds: readonly string[]): string | undefined {
+  const outcome = followedActiveProfile(availableIds)
+  if (!outcome) return activeProfileId
+  if (outcome.follow) {
+    warnedUnknownFollowed = undefined
+    return outcome.profileId
+  }
+  if (outcome.reason === "unknown-profile" && outcome.followedValue !== warnedUnknownFollowed) {
+    warnedUnknownFollowed = outcome.followedValue
+    console.warn(
+      `[meridian] Followed instance is on profile "${outcome.followedValue}", which is not configured here. ` +
+      `Using this instance's own active profile instead.`
+    )
+  }
+  return activeProfileId
+}
+
+/** The active profile in effect, resolved against the effective profile list. */
+export function getEffectiveActiveProfileId(configProfiles: ProfileConfig[] | undefined): string | undefined {
+  return resolveActiveProfileId(getEffectiveProfiles(configProfiles).map(p => p.id))
+}
+
 /** Reset active profile — for testing only. */
 export function resetActiveProfile(): void {
   activeProfileId = undefined
+  warnedUnknownFollowed = undefined
 }
 
 /**
@@ -243,7 +285,8 @@ export function resolveProfile(
       : undefined
 
   // Priority: header > sticky > active > config default > first profile
-  const resolvedId = requestedId || stickyId || activeProfileId || defaultProfile || effective[0]!.id
+  const activeId = resolveActiveProfileId(effective.map(p => p.id))
+  const resolvedId = requestedId || stickyId || activeId || defaultProfile || effective[0]!.id
   const profile = effective.find(p => p.id === resolvedId)
 
   if (!profile) {
@@ -296,7 +339,7 @@ export function listProfiles(
   const effective = getEffectiveProfiles(profiles)
   if (effective.length === 0) return []
 
-  const currentActive = activeProfileId || defaultProfile || effective[0]!.id
+  const currentActive = resolveActiveProfileId(effective.map(p => p.id)) || defaultProfile || effective[0]!.id
   return effective.map(p => ({
     id: p.id,
     type: p.type ?? "claude-max",
