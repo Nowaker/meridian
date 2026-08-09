@@ -89,6 +89,26 @@ export interface OAuthUsageSnapshot {
   stale?: boolean
 }
 
+/**
+ * Why a usage fetch produced no snapshot.
+ *
+ * Two values, because there are exactly two things to do about it: a missing
+ * token needs a human to run `claude login`, and everything else needs
+ * waiting. Keeping them apart is the whole point of this type — every failure
+ * used to reach callers as a bare `null`, so the quota routes labelled all of
+ * them `no_token`, and a rate-limited read rendered as an account that had
+ * lost its credentials. A 429 and an empty credential file are not the same
+ * news, and only one of them is the user's problem to fix.
+ */
+export type OAuthUsageError = "no_token" | "upstream_error"
+
+/** A usage fetch outcome: the snapshot, or why there isn't one. */
+export interface OAuthUsageResult {
+  snapshot: OAuthUsageSnapshot | null
+  /** Set only when `snapshot` is null. */
+  error: OAuthUsageError | null
+}
+
 const CACHE_TTL_MS_DEFAULT = 30_000
 // A transiently failing fetch serves the last-good snapshot instead of
 // blanking the consumer ("no usage data yet" flapping) — but only within
@@ -97,7 +117,7 @@ const STALE_MAX_MS_DEFAULT = 15 * 60_000
 
 /** Per-profile cache. Key = profileId (or DEFAULT_KEY for the unscoped default). */
 const cacheByProfile = new Map<string, OAuthUsageSnapshot>()
-const inflightByProfile = new Map<string, Promise<OAuthUsageSnapshot | null>>()
+const inflightByProfile = new Map<string, Promise<OAuthUsageResult>>()
 const DEFAULT_KEY = "__default__"
 
 const WINDOW_TYPES: Array<keyof RawOAuthUsageResponse> = [
@@ -252,22 +272,35 @@ export function __setFetchOAuthUsageOverride(
  *                        Defaults to globalThis.fetch.
  */
 export async function fetchOAuthUsage(opts?: FetchOAuthUsageOpts): Promise<OAuthUsageSnapshot | null> {
+  return (await fetchOAuthUsageResult(opts)).snapshot
+}
+
+/**
+ * As `fetchOAuthUsage`, but says why there is no snapshot. Callers that
+ * report a per-profile status to a human want this one; `fetchOAuthUsage`
+ * remains for callers that only act on the numbers.
+ */
+export async function fetchOAuthUsageResult(opts?: FetchOAuthUsageOpts): Promise<OAuthUsageResult> {
   // If the caller injected real test deps, run the real impl. This keeps
   // oauth-usage unit tests isolated from any test-set _testOverride.
   if (_testOverride && !opts?.fetchImpl && !opts?.store) {
-    return _testOverride(opts)
+    const snapshot = await _testOverride(opts)
+    // The override predates the reason and returns a bare snapshot-or-null,
+    // so there is nothing truer to report than the label those callers have
+    // always seen.
+    return { snapshot, error: snapshot ? null : "no_token" }
   }
   return fetchOAuthUsageImpl(opts)
 }
 
-async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<OAuthUsageSnapshot | null> {
+async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<OAuthUsageResult> {
   const ttl = opts?.ttlMs ?? CACHE_TTL_MS_DEFAULT
   const cacheKey = opts?.profileId ?? DEFAULT_KEY
   const fetchImpl = opts?.fetchImpl ?? globalThis.fetch
 
   if (!opts?.force) {
     const cached = cacheByProfile.get(cacheKey)
-    if (cached && Date.now() - cached.fetchedAt < ttl) return cached
+    if (cached && Date.now() - cached.fetchedAt < ttl) return { snapshot: cached, error: null }
   }
   const existing = inflightByProfile.get(cacheKey)
   if (existing) return existing
@@ -278,13 +311,13 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<OAuthUsa
   // On transient failure, serve the last-good snapshot (bounded) instead of
   // null — a credential-read blip or upstream 5xx should not blank the
   // consumer's usage display until the next successful fetch.
-  const staleOr = (reason: string): OAuthUsageSnapshot | null => {
+  const staleOr = (reason: string, error: OAuthUsageError): OAuthUsageResult => {
     const last = cacheByProfile.get(cacheKey)
     if (last && Date.now() - last.fetchedAt < staleMaxMs) {
       claudeLog("oauth_usage.serving_stale", { profile: cacheKey, reason, ageMs: Date.now() - last.fetchedAt })
-      return { ...last, stale: true }
+      return { snapshot: { ...last, stale: true }, error: null }
     }
-    return null
+    return { snapshot: null, error }
   }
 
   const promise = (async () => {
@@ -295,7 +328,7 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<OAuthUsa
         // token-refresh rewrite) was previously silent — log it so flapping
         // usage displays are diagnosable.
         claudeLog("oauth_usage.no_token", { profile: cacheKey })
-        return staleOr("no_token")
+        return staleOr("no_token", "no_token")
       }
 
       let result = await callAnthropic(token, fetchImpl)
@@ -304,23 +337,28 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<OAuthUsa
         const refreshed = await refreshOAuthToken(store)
         if (!refreshed) {
           claudeLog("oauth_usage.refresh_failed", { profile: cacheKey })
-          return staleOr("refresh_failed")
+          // Not `no_token`: the token is present, and a read-only instance
+          // declines to refresh it BY DESIGN (credentialsMode.ts). Reporting
+          // a missing login here would tell the operator to re-authenticate
+          // every account on the box, on the one instance that is forbidden
+          // from touching credentials.
+          return staleOr("refresh_failed", "upstream_error")
         }
         const newToken = await readAccessToken(store)
-        if (!newToken) return staleOr("no_token_after_refresh")
+        if (!newToken) return staleOr("no_token_after_refresh", "no_token")
         result = await callAnthropic(newToken, fetchImpl)
       }
       if ("__status" in result) {
         claudeLog("oauth_usage.upstream_error", { profile: cacheKey, status: result.__status })
-        return staleOr(`upstream_${result.__status}`)
+        return staleOr(`upstream_${result.__status}`, "upstream_error")
       }
 
       const snapshot = buildSnapshot(result)
       cacheByProfile.set(cacheKey, snapshot)
-      return snapshot
+      return { snapshot, error: null }
     } catch (err) {
       claudeLog("oauth_usage.fetch_failed", { profile: cacheKey, error: err instanceof Error ? err.message : String(err) })
-      return staleOr("exception")
+      return staleOr("exception", "upstream_error")
     } finally {
       inflightByProfile.delete(cacheKey)
     }

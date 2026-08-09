@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, test, beforeEach } from "bun:test"
-import { fetchOAuthUsage, resetOAuthUsageCache } from "../proxy/oauthUsage"
+import { fetchOAuthUsage, fetchOAuthUsageResult, resetOAuthUsageCache } from "../proxy/oauthUsage"
 import type { CredentialStore } from "../proxy/tokenRefresh"
 
 const SAMPLE_RESPONSE = {
@@ -279,5 +279,68 @@ describe("oauthUsage", () => {
     const w = result!.windows[0]
     expect(w).toBeDefined()
     expect(w!.resetsAt).toBe(Date.parse(iso))
+  })
+})
+
+/**
+ * The failure REASON, which is what a per-profile status display shows a
+ * human. Every failure used to reach callers as a bare null, so the quota
+ * routes labelled all of them "no_token" and a rate-limited read rendered as
+ * an account that had lost its credentials.
+ */
+describe("fetchOAuthUsageResult", () => {
+  beforeEach(() => {
+    resetOAuthUsageCache()
+  })
+
+  test("reports no_token only when the store holds no token", async () => {
+    const fetchImpl = fixedFetch(() => new Response(JSON.stringify(SAMPLE_RESPONSE), { status: 200 }))
+    const { snapshot, error } = await fetchOAuthUsageResult({
+      force: true, store: makeStore(null), profileId: "reason-empty", fetchImpl,
+    })
+    expect(snapshot).toBeNull()
+    expect(error).toBe("no_token")
+  })
+
+  test("reports upstream_error for a 429 rather than no_token", async () => {
+    const fetchImpl = fixedFetch(() => new Response("rate limited", { status: 429 }))
+    const { snapshot, error } = await fetchOAuthUsageResult({
+      force: true, store: makeStore("t"), profileId: "reason-429", fetchImpl,
+    })
+    expect(snapshot).toBeNull()
+    expect(error).toBe("upstream_error")
+  })
+
+  test("reports upstream_error for a 500", async () => {
+    const fetchImpl = fixedFetch(() => new Response("boom", { status: 500 }))
+    const { error } = await fetchOAuthUsageResult({
+      force: true, store: makeStore("t"), profileId: "reason-500", fetchImpl,
+    })
+    expect(error).toBe("upstream_error")
+  })
+
+  test("reports no error on success", async () => {
+    const fetchImpl = fixedFetch(() => new Response(JSON.stringify(SAMPLE_RESPONSE), { status: 200 }))
+    const { snapshot, error } = await fetchOAuthUsageResult({
+      force: true, store: makeStore("t"), profileId: "reason-ok", fetchImpl,
+    })
+    expect(snapshot).not.toBeNull()
+    expect(error).toBeNull()
+  })
+
+  test("a snapshot served stale after a failure is not an error", async () => {
+    const { fetchImpl } = countingFetch(calls => calls === 1
+      ? new Response(JSON.stringify(SAMPLE_RESPONSE), { status: 200 })
+      : new Response("rate limited", { status: 429 }))
+    const first = await fetchOAuthUsageResult({
+      force: true, store: makeStore("t"), profileId: "reason-stale", fetchImpl,
+    })
+    expect(first.error).toBeNull()
+
+    const second = await fetchOAuthUsageResult({
+      force: true, store: makeStore("t"), profileId: "reason-stale", fetchImpl,
+    })
+    expect(second.snapshot?.stale).toBe(true)
+    expect(second.error).toBeNull()
   })
 })

@@ -9,7 +9,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk"
 import { rateLimitStore } from "./rateLimitStore"
 import { guardUpstreamIdle, UpstreamIdleError } from "./streamIdleGuard"
 import { linkRequestAbort } from "./requestAbort"
-import { fetchOAuthUsage } from "./oauthUsage"
+import { fetchOAuthUsage, fetchOAuthUsageResult } from "./oauthUsage"
 import { resolveSdkWorkingDirectory } from "./cwd"
 import type { Context } from "hono"
 import { DEFAULT_PROXY_CONFIG } from "./types"
@@ -4338,7 +4338,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
     if (profilesList.length === 0) {
       // Single-account mode — just return the default OAuth account's data.
-      const oauth = await fetchOAuthUsage({})
+      const { snapshot: oauth, error } = await fetchOAuthUsageResult({})
       return c.json({
         profiles: [{
           id: "default",
@@ -4346,7 +4346,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           windows: oauth?.windows ?? [],
           extraUsage: oauth?.extraUsage ?? null,
           fetchedAt: oauth?.fetchedAt ?? null,
-          error: oauth ? null : "no_token",
+          error,
         }],
         activeProfile: "default",
         asOf: Date.now(),
@@ -4367,7 +4367,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           error: "not_oauth" as const,
         }
       }
-      const oauth = await fetchOAuthUsage({
+      const { snapshot: oauth, error } = await fetchOAuthUsageResult({
         profileId: p.id,
         claudeConfigDir: p.claudeConfigDir,
       })
@@ -4378,7 +4378,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         windows: oauth?.windows ?? [],
         extraUsage: oauth?.extraUsage ?? null,
         fetchedAt: oauth?.fetchedAt ?? null,
-        error: oauth ? null : "no_token",
+        error,
       }
     }))
 
