@@ -33,6 +33,7 @@ import {
   type CredentialStore,
 } from "../proxy/tokenRefresh"
 import { createFileDesignTokenStore } from "../proxy/design"
+import { fetchOAuthUsageResult, resetOAuthUsageCache } from "../proxy/oauthUsage"
 
 const FLAG = "MERIDIAN_CREDENTIALS_READONLY"
 
@@ -330,3 +331,36 @@ describe("startup banner", () => {
 // `bun test` invocation. It has to: four files in the main run replace
 // ../proxy/models via the globally-scoped mock.module, so the real cache is
 // only observable in an isolated invocation.
+
+/**
+ * A read-only instance declines to refresh BY DESIGN, so a 401 on the usage
+ * endpoint ends in "refresh failed" for a perfectly healthy account. Calling
+ * that a missing token would tell the operator to re-authenticate every
+ * account on the box - from the one instance forbidden to touch credentials.
+ */
+describe("read-only mode does not mislabel a healthy account as logged out", () => {
+  afterEach(() => {
+    delete process.env[FLAG]
+    resetOAuthUsageCache()
+  })
+
+  it("reports upstream_error when a 401 cannot be refreshed", async () => {
+    process.env[FLAG] = "1"
+    const restore = captureConsole()
+    try {
+      const { snapshot, error } = await fetchOAuthUsageResult({
+        force: true,
+        profileId: "readonly-401",
+        store: {
+          async read() { return FAKE_CREDENTIALS as never },
+          async write() { return true },
+        } as CredentialStore,
+        fetchImpl: async () => new Response("unauthorized", { status: 401 }),
+      })
+      expect(snapshot).toBeNull()
+      expect(error).toBe("upstream_error")
+    } finally {
+      restore.restore()
+    }
+  })
+})

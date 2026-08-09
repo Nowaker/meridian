@@ -80,6 +80,7 @@ import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
 import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, restoreActiveProfile, type ResolvedProfile } from "./profiles"
 import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
+import { startFollowUsagePolling, stopFollowUsagePolling } from "./followUsage"
 import { getRoutingMode, resolvePriorityOrder, choosePriorityProfile, ProfileExhaustion, AssignmentStore } from "./routing"
 import { getSetting, setSetting } from "./settings"
 import { filterBetasForProfile, getBetaPolicyFromEnv } from "./betas"
@@ -4660,6 +4661,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
     // Armed here, not before serve(), because the self-follow guard needs the
     // port actually bound — the configured one may be 0.
     startFollowPolling({ host: finalConfig.host, port: info.port })
+    startFollowUsagePolling()
     logFollowBanner(getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing")))
     if (!finalConfig.silent) {
       console.log(`Meridian running at http://${finalConfig.host}:${info.port}`)
@@ -4754,6 +4756,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
       if (profileTokenRefreshInterval) clearInterval(profileTokenRefreshInterval)
       if (authKeepaliveInterval) clearInterval(authKeepaliveInterval)
       stopFollowPolling()
+      stopFollowUsagePolling()
       stopBackgroundRefresh()
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()))

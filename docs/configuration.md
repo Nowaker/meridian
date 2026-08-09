@@ -199,6 +199,18 @@ What it does and does not change:
 - **Following your own address is refused** at startup: the followed value
   could never change and local switching would be refused, freezing the active
   profile permanently.
+- **Usage figures come from the followed instance too**, polled every two
+  minutes from its `/v1/usage/quota/all`. Anthropic's usage endpoint is rate limited per
+  account, and that budget is shared by every process holding the account's
+  credentials: measured on a ten-account box, the second instance got `429`
+  for all ten indefinitely while the first kept fetching normally. Reading the
+  figures the followed instance has already paid for costs it one read per
+  poll regardless of how many accounts exist, and the cadence is deliberately
+  far longer than its 30s usage cache so that following it does not simply
+  drive it into the same limit. A profile the followed
+  instance could not read is skipped rather than imported as a failure, so
+  this instance still tries its own credentials for it; figures older than ten
+  minutes stop being served, and the local path decides again.
 
 The mode is announced at startup and surfaced on `/profiles/list` as a `follow`
 object (`url`, `activeProfile`, `followedValue`, `reason`, `stale`,

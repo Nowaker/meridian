@@ -22,6 +22,7 @@
 
 import { claudeLog } from "../logger"
 import { createPlatformCredentialStore, refreshOAuthToken, type CredentialStore } from "./tokenRefresh"
+import { followedUsageSnapshot } from "./followUsage"
 
 const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 const OAUTH_BETA_HEADER = "oauth-2025-04-20"
@@ -350,6 +351,21 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<OAuthUsa
   }
   const existing = inflightByProfile.get(cacheKey)
   if (existing) return existing
+
+  // A followed instance's figures, when there is one. Taken before the
+  // credential read because the point is to make no upstream call at all:
+  // two instances polling the same account share one rate-limit budget, and
+  // the one that loses it gets 429 for every account it holds. Above the
+  // cooldown for the same reason: these figures arrive over loopback and cost
+  // the rate limit nothing, so a 429 this instance collected earlier has no
+  // business suppressing them — that would blank the follower's dashboard for
+  // the length of the backoff, which is the exact failure this consult exists
+  // to remove.
+  const followed = followedUsageSnapshot(cacheKey)
+  if (followed) {
+    cacheByProfile.set(cacheKey, followed)
+    return { snapshot: followed, error: null }
+  }
 
   // A 429 must throttle forced and normal callers alike. Without a negative
   // cache, every quota poll retries immediately and can keep Anthropic's
