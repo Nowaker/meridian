@@ -61,8 +61,13 @@ describe("profile login routes", () => {
   function stubTokenEndpoint(makeResponse: () => Response) {
     const requests: Array<Record<string, unknown>> = []
     globalThis.fetch = Object.assign(
-      async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-        requests.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>)
+      async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        // Token exchanges only. The login also asks Anthropic for the account
+        // plan, and counting that here would make every "exactly one exchange"
+        // assertion read two while proving nothing about them.
+        if (String(input).includes("/oauth/token")) {
+          requests.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>)
+        }
         return makeResponse()
       },
       { preconnect: originalFetch.preconnect },

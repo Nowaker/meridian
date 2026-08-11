@@ -32,8 +32,13 @@ interface TokenRequest {
 function stubTokenFetch(makeResponse: () => Response) {
   const requests: TokenRequest[] = []
   const fetchFn: typeof fetch = Object.assign(
-    async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-      requests.push(JSON.parse(String(init?.body ?? "{}")) as TokenRequest)
+    async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      // The exchange also asks Anthropic for the account plan, so a stub that
+      // recorded every call would count two per login and break the
+      // "exactly one exchange" assertions while proving nothing about them.
+      if (String(input).includes("/oauth/token")) {
+        requests.push(JSON.parse(String(init?.body ?? "{}")) as TokenRequest)
+      }
       return makeResponse()
     },
     { preconnect: globalThis.fetch.preconnect },
