@@ -76,6 +76,34 @@ export const profilePageHtml = `<!DOCTYPE html>
   }
   .guide .warn strong { color: var(--yellow); }
 
+  /* Browser login — the paste box that replaces a terminal round trip. */
+  .login-btn {
+    padding: 6px 12px; font-size: 12px; font-weight: 500;
+    background: var(--surface2); color: var(--accent); border: 1px solid var(--accent);
+    border-radius: 6px; cursor: pointer; transition: all 0.15s;
+  }
+  .login-btn:hover { background: rgba(88,166,255,0.12); }
+  .login-btn:disabled { opacity: 0.4; cursor: default; }
+  .login-panel {
+    margin-top: 12px; padding: 14px 16px; background: var(--surface2);
+    border: 1px solid var(--border); border-radius: 8px;
+  }
+  .login-panel-title { font-size: 12px; font-weight: 600; margin-bottom: 8px; }
+  .login-steps { font-size: 12px; color: var(--muted); padding-left: 18px; margin-bottom: 10px; }
+  .login-steps li { margin-bottom: 4px; }
+  .login-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .login-input {
+    flex: 1 1 260px; min-width: 0; padding: 7px 10px; border-radius: 6px;
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px;
+  }
+  .login-input:focus { outline: none; border-color: var(--accent); }
+  .login-msg { margin-top: 10px; font-size: 12px; }
+  .login-msg.err { color: var(--red); }
+  .login-msg.busy { color: var(--muted); }
+  .login-reopen { color: var(--accent); font-size: 11px; text-decoration: none; }
+  .login-reopen:hover { text-decoration: underline; }
+
   .mono { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px; }
   .copy-cmd {
     font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px;
@@ -173,10 +201,20 @@ export const profilePageHtml = `<!DOCTYPE html>
       <li><strong>Per-request:</strong> Send <code>x-meridian-profile: &lt;name&gt;</code> header</li>
     </ol>
 
+    <h3 style="margin-top:16px">Re-authenticating a profile</h3>
+    <ol>
+      <li><strong>UI:</strong> Click <strong>Log in from browser</strong> on the profile card, sign in,
+          then paste the code Claude shows you \u2014 the whole callback URL works too</li>
+      <li><strong>CLI:</strong> <code>meridian profile login &lt;name&gt;</code></li>
+    </ol>
+    <p style="font-size:12px;color:var(--muted);margin-top:8px">
+      Claude sends you to a page it hosts rather than back to Meridian, so the code has to
+      make one hop by hand \u2014 Anthropic registers a single redirect URI for this client.
+    </p>
+
     <h3 style="margin-top:16px">Other commands</h3>
     <div style="font-size:13px;margin-top:8px">
       <code>meridian profile list</code> \u2014 show all profiles and auth status<br>
-      <code>meridian profile login &lt;name&gt;</code> \u2014 re-authenticate an expired profile<br>
       <code>meridian profile remove &lt;name&gt;</code> \u2014 remove a profile
     </div>
   </div>
@@ -390,7 +428,14 @@ function render(data, quotaData) {
     html += '<button class="copy-btn" data-cmd="meridian profile login ' + esc(p.id) + '" onclick="copyCmd(this)" title="Copy to clipboard">';
     html += '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25zM5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25z"/></svg>';
     html += '</button>';
+    // Only claude-max profiles have an OAuth flow; api and oauth-token profiles
+    // would only ever get a refusal, so they get no button.
+    if ((p.type || 'claude-max') === 'claude-max') {
+      html += '<button class="login-btn" onclick="startLogin(&quot;'+esc(p.id)+'&quot;)">Log in from browser</button>';
+    }
     html += '</div>';
+
+    html += '<div class="login-slot" id="login-slot-' + esc(p.id) + '"></div>';
 
     html += renderUsageSection(quotaById[p.id]);
 
@@ -438,8 +483,140 @@ async function switchProfile(id) {
   if (data.success) refresh();
 }
 
+// --- Browser login ---
+//
+// The open login is held here rather than in the DOM because render() rebuilds
+// #content wholesale on every poll — a panel written into a card would be
+// destroyed mid-typing. While a login is open the poll is paused, so the panel
+// and whatever is half-pasted into it survive.
+var activeLogin = null;
+
+function loginSlot(id) { return document.getElementById('login-slot-' + id); }
+
+function setLoginMsg(text, kind) {
+  var slot = activeLogin ? loginSlot(activeLogin.profile) : null;
+  if (!slot) return;
+  var msg = slot.querySelector('.login-msg');
+  if (!msg) return;
+  msg.className = 'login-msg' + (kind ? ' ' + kind : '');
+  msg.textContent = text || '';
+}
+
+async function startLogin(id) {
+  if (activeLogin) cancelLogin();
+  var slot = loginSlot(id);
+  if (!slot) return;
+  slot.innerHTML = '<div class="login-panel"><div class="login-msg busy">Starting…</div></div>';
+
+  var res, data;
+  try {
+    res = await fetch('/profiles/login/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile: id })
+    });
+    data = await res.json();
+  } catch (err) {
+    slot.innerHTML = '<div class="login-panel"><div class="login-msg err">Could not reach Meridian.</div></div>';
+    return;
+  }
+
+  if (!res.ok) {
+    slot.innerHTML = '<div class="login-panel"><div class="login-msg err">' + esc(data.error || 'Login unavailable.') + '</div></div>';
+    return;
+  }
+
+  activeLogin = { profile: id, loginId: data.loginId };
+  slot.innerHTML = renderLoginPanel(id, data.authorizeUrl);
+  var input = slot.querySelector('.login-input');
+  if (input) {
+    input.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitLogin(); });
+    input.focus();
+  }
+  window.open(data.authorizeUrl, '_blank', 'noopener');
+}
+
+function renderLoginPanel(id, authorizeUrl) {
+  return '<div class="login-panel">'
+    + '<div class="login-panel-title">Sign in as ' + esc(id) + '</div>'
+    + '<ol class="login-steps">'
+    +   '<li>A Claude sign-in tab just opened — '
+    +     '<a class="login-reopen" href="' + esc(authorizeUrl) + '" target="_blank" rel="noopener">open it again</a>'
+    +     ' if it was blocked.</li>'
+    +   '<li>Make sure you are signed into the right Claude account for this profile.</li>'
+    +   '<li>Paste the code Claude shows you below — or the whole callback URL from the address bar.</li>'
+    + '</ol>'
+    + '<div class="login-row">'
+    +   '<input class="login-input" type="text" autocomplete="off" spellcheck="false" placeholder="code, or https://platform.claude.com/oauth/code/callback?code=…">'
+    +   '<button class="login-btn login-submit" onclick="submitLogin()">Complete login</button>'
+    +   '<button class="switch-btn current login-cancel" style="margin-top:0" onclick="cancelLogin()">Cancel</button>'
+    + '</div>'
+    + '<div class="login-msg"></div>'
+    + '</div>';
+}
+
+async function submitLogin() {
+  if (!activeLogin || activeLogin.spent) return;
+  var slot = loginSlot(activeLogin.profile);
+  var input = slot ? slot.querySelector('.login-input') : null;
+  var value = input ? input.value.trim() : '';
+  if (!value) { setLoginMsg('Paste the code first.', 'err'); return; }
+
+  var buttons = slot ? slot.querySelectorAll('button') : [];
+  for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
+  setLoginMsg('Exchanging…', 'busy');
+
+  var res, data;
+  try {
+    res = await fetch('/profiles/login/complete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ loginId: activeLogin.loginId, code: value })
+    });
+    data = await res.json();
+  } catch (err) {
+    setLoginMsg('Could not reach Meridian.', 'err');
+    for (var j = 0; j < buttons.length; j++) buttons[j].disabled = false;
+    return;
+  }
+
+  if (!res.ok) {
+    setLoginMsg(data.error || 'Login failed.', 'err');
+    var cancelBtn = slot ? slot.querySelector('.login-cancel') : null;
+    if (cancelBtn) cancelBtn.disabled = false;
+    // The server says whether the login survived: it does when the paste was
+    // rejected before any code reached Anthropic. Otherwise the code is spent
+    // and this panel cannot retry it.
+    if (data.retryable) {
+      var submitBtn = slot ? slot.querySelector('.login-submit') : null;
+      if (submitBtn) submitBtn.disabled = false;
+      if (input) input.focus();
+    } else {
+      // Keep the panel — and with it the paused poll — so the reason stays
+      // readable. render() rebuilds #content wholesale, so resuming here would
+      // erase the very message telling the user their code was spent. Cancel
+      // is the way out.
+      activeLogin.spent = true;
+    }
+    return;
+  }
+
+  activeLogin = null;
+  if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
+  refresh();
+}
+
+function cancelLogin() {
+  var previous = activeLogin;
+  activeLogin = null;
+  if (previous) {
+    var slot = loginSlot(previous.profile);
+    if (slot) slot.innerHTML = '';
+  }
+}
+
 refresh();
-setInterval(refresh, 10000);
+setInterval(function () { if (!activeLogin) refresh(); }, 10000);
 ` + profileBarJs + `
 </script>
 </body>

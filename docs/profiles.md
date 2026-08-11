@@ -31,6 +31,37 @@ Open the printed URL in a browser, sign in to the target Claude account, then pa
 meridian profile login work --headless
 ```
 
+#### From the web UI: re-authenticate a profile without a terminal
+
+A profile whose credentials expired can be logged in again from the Profiles page, with no shell on the Meridian host. Click **Log in from browser** on the profile's card:
+
+1. Meridian creates the PKCE login server-side and opens Claude's sign-in in a new tab.
+2. Sign in to that profile's Claude account. Claude shows you a code.
+3. Paste it into the box on the card. Either form works — the **bare code**, or the **whole callback URL** from the address bar (`https://platform.claude.com/oauth/code/callback?code=…&state=…`), which is usually easier to copy.
+
+The same two steps are available for scripting:
+
+```bash
+# → {"loginId":"…","authorizeUrl":"https://claude.com/cai/oauth/authorize?…","expiresAt":…,"profile":"work"}
+curl -X POST http://127.0.0.1:3456/profiles/login/start \
+  -H 'Content-Type: application/json' -d '{"profile":"work"}'
+
+# `code` accepts the bare code or the full callback URL
+curl -X POST http://127.0.0.1:3456/profiles/login/complete \
+  -H 'Content-Type: application/json' -d '{"loginId":"…","code":"…"}'
+```
+
+**Why you paste a code instead of being redirected back.** Claude's OAuth client registers exactly one redirect URI — `https://platform.claude.com/oauth/code/callback`, a page Anthropic hosts. There is no `http://localhost:<port>/callback` variant registered, and a redirect URI belonging to your Meridian instance cannot be added, so an automatic hand-off back into the UI would be rejected at the authorize step. Accepting the callback page's whole URL is as close as this flow gets.
+
+Details worth knowing:
+
+- The PKCE verifier never leaves the server. The browser only ever holds an opaque login id.
+- A login is **single-use** and expires **10 minutes** after it starts. `state` must match the login it was started with, exactly as the CLI requires.
+- Only **claude-max** profiles have this flow. `api` and `oauth-token` profiles are refused with the reason — replace an OAuth token with `meridian profile remove <name> && meridian profile add <name> --oauth-token`.
+- An unknown profile name is refused, not created. `meridian profile add` remains the only way a profile comes into existence.
+- An instance told not to write credential files (`MERIDIAN_CREDENTIALS_READONLY=1` — set on a second instance that shares another's credentials) refuses **before** opening the sign-in tab, and names where the login can be completed instead. Refusing after sign-in would have burned a one-time code for nothing.
+- These routes sit behind `MERIDIAN_API_KEY` like the rest of `/profiles/*` when that key is configured.
+
 #### Headless / CI: register an OAuth token
 
 When a browser isn't available (containers, CI runners, remote shells), generate a long-lived OAuth token with `claude setup-token` and register it as a profile:

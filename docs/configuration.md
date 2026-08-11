@@ -100,6 +100,8 @@ adapter lets the subprocess run the built-in WebFetch at all.
 | `GET /profiles` | Profile management page |
 | `GET /profiles/list` | List profiles with auth status (JSON) |
 | `POST /profiles/active` | Switch the active profile |
+| `POST /profiles/login/start` | Begin an OAuth login for a profile — returns the authorize URL (see [Re-authenticating from the web UI](profiles.md#from-the-web-ui-re-authenticate-a-profile-without-a-terminal)) |
+| `POST /profiles/login/complete` | Finish that login with the code the user pasted back |
 | `GET /v1/usage/quota` | Usage windows for the active profile (JSON) |
 | `GET /v1/usage/quota/all` | Usage windows for every profile (JSON) |
 | `GET /settings` | SDK feature toggles + model pricing UI |
