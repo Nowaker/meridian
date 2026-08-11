@@ -13,14 +13,6 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import { configPath } from "../configDir"
 
-/**
- * Resolve the settings file path.
- *
- * Resolved per call rather than frozen at import time so tests can redirect
- * it via MERIDIAN_CONFIG_DIR (see `src/__tests__/preload.ts`). Without the
- * override the path is exactly what it has always been, so existing installs
- * are unaffected. See configDir.ts for the resolution rule itself.
- */
 function settingsFile(): string {
   return configPath("settings.json")
 }

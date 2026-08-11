@@ -89,10 +89,12 @@ export function loadProfilesFromDisk(): ProfileConfig[] {
       diskProfilesCache = JSON.parse(readFileSync(file, "utf-8"))
     }
     diskProfilesCacheAt = Date.now()
+    diskProfilesCachePath = file
     return diskProfilesCache
   } catch (err) {
     console.warn(`[meridian] Failed to read ${file}: ${err instanceof Error ? err.message : err}`)
     diskProfilesCacheAt = Date.now()
+    diskProfilesCachePath = file
     diskProfilesCache = []
     return []
   }
