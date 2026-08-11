@@ -25,6 +25,18 @@ const OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
 export const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 export const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 export const OAUTH_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
+
+/**
+ * Path Anthropic has registered for this client's loopback redirect.
+ *
+ * `https://claude.ai/oauth/claude-code-client-metadata` declares
+ * `redirect_uris: ["http://localhost/callback", "http://127.0.0.1/callback"]`
+ * — the RFC 8252 §7.3 loopback convention, where the port is not part of the
+ * match but the host and path are. So a redirect back into Meridian has to be
+ * served from `/callback` at the root, on `localhost` or `127.0.0.1`; no other
+ * path will be accepted, which is why the route is not under `/profiles/`.
+ */
+export const OAUTH_LOOPBACK_CALLBACK_PATH = "/callback"
 const OAUTH_SCOPES = [
   "org:create_api_key",
   "user:profile",
@@ -38,8 +50,18 @@ function ensureProfilesDir(): void {
   mkdirSync(PROFILES_DIR, { recursive: true })
 }
 
-function getProfileDir(id: string): string {
+/**
+ * Config directory a browser-login profile gets when it carries no explicit
+ * `claudeConfigDir`. Exported so the web login route resolves the same
+ * directory this CLI would, instead of rebuilding the path a third time
+ * (profiles.ts already builds it for oauth-token isolation).
+ */
+export function profileConfigDirFor(id: string): string {
   return join(PROFILES_DIR, id)
+}
+
+function getProfileDir(id: string): string {
+  return profileConfigDirFor(id)
 }
 
 interface AuthLoginOptions {
@@ -79,21 +101,66 @@ function base64Url(bytes: Buffer): string {
   return bytes.toString("base64url")
 }
 
-export function createManualOAuthSession(scopes?: string[]): ManualOAuthSession {
-  const scopeList = scopes ?? OAUTH_SCOPES
+export interface OAuthPkce {
+  codeVerifier: string
+  codeChallenge: string
+  state: string
+}
+
+export function createOAuthPkce(): OAuthPkce {
   const codeVerifier = base64Url(randomBytes(32))
-  const state = base64Url(randomBytes(32))
-  const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url")
+  return {
+    codeVerifier,
+    codeChallenge: createHash("sha256").update(codeVerifier).digest("base64url"),
+    state: base64Url(randomBytes(32)),
+  }
+}
+
+/**
+ * Build an authorize URL for one PKCE challenge and one redirect_uri.
+ *
+ * Separate from `createOAuthPkce` because a single login needs TWO of these:
+ * one redirecting to a loopback listener, one to Anthropic's code-display
+ * page. Claude Code builds the same pair from one challenge
+ * (`buildAuthUrl({...opts, isManual: true})` and `isManual: false`), opens the
+ * loopback one and prints the manual one, then picks the matching redirect_uri
+ * again at exchange time. Whichever the user completes, the other is simply
+ * never used — so the paste fallback costs nothing and needs no second login.
+ *
+ * `code=true` is set for both. It is NOT what makes Anthropic display the code
+ * rather than redirect: Claude Code appends it unconditionally in both modes,
+ * and the redirect_uri alone decides.
+ */
+export function buildAuthorizeUrl(params: {
+  codeChallenge: string
+  state: string
+  redirectUri: string
+  scopes?: string[]
+}): string {
   const url = new URL(OAUTH_AUTHORIZE_URL)
   url.searchParams.set("code", "true")
   url.searchParams.set("client_id", OAUTH_CLIENT_ID)
   url.searchParams.set("response_type", "code")
-  url.searchParams.set("redirect_uri", OAUTH_REDIRECT_URI)
-  url.searchParams.set("scope", scopeList.join(" "))
-  url.searchParams.set("code_challenge", codeChallenge)
+  url.searchParams.set("redirect_uri", params.redirectUri)
+  url.searchParams.set("scope", (params.scopes ?? OAUTH_SCOPES).join(" "))
+  url.searchParams.set("code_challenge", params.codeChallenge)
   url.searchParams.set("code_challenge_method", "S256")
-  url.searchParams.set("state", state)
-  return { authorizeUrl: url.toString(), codeVerifier, state }
+  url.searchParams.set("state", params.state)
+  return url.toString()
+}
+
+export function createManualOAuthSession(scopes?: string[]): ManualOAuthSession {
+  const pkce = createOAuthPkce()
+  return {
+    authorizeUrl: buildAuthorizeUrl({
+      codeChallenge: pkce.codeChallenge,
+      state: pkce.state,
+      redirectUri: OAUTH_REDIRECT_URI,
+      scopes,
+    }),
+    codeVerifier: pkce.codeVerifier,
+    state: pkce.state,
+  }
 }
 
 export function parseAuthorizationCodeInput(input: string): ParsedAuthorizationCode | null {
@@ -156,6 +223,111 @@ function getAuthStatus(configDir: string): { loggedIn: boolean; email?: string; 
   }
 }
 
+export type OAuthExchangeFailureReason =
+  | "state_mismatch"
+  | "request_failed"
+  | "http_error"
+  | "invalid_response"
+  | "missing_tokens"
+  | "write_failed"
+
+export type OAuthExchangeResult =
+  | { ok: true }
+  | { ok: false; reason: OAuthExchangeFailureReason; status?: number; detail?: string }
+
+export interface OAuthExchangeParams {
+  /** Authorization code parsed out of the user's paste. */
+  code: string
+  /** `state` the paste carried, when it carried one (a pasted URL does). */
+  returnedState?: string
+  /** `state` this login was started with — what `returnedState` must match. */
+  sessionState: string
+  /** PKCE verifier for this login. */
+  codeVerifier: string
+  /** CLAUDE_CONFIG_DIR whose credential store receives the tokens. */
+  claudeConfigDir: string
+  /**
+   * redirect_uri to send with the grant. MUST be the one the authorize step
+   * used — the code is bound to it, and a mismatch is rejected. Defaults to
+   * the code-display page, which is what a pasted code always comes from.
+   */
+  redirectUri?: string
+  /** Scopes recorded when the token response omits `scope`. */
+  scopes?: string[]
+  /** Injectable for tests — defaults to global `fetch`. */
+  fetchFn?: typeof fetch
+}
+
+/**
+ * Validate `state`, exchange an authorization code for OAuth credentials, and
+ * write them to a profile's credential store.
+ *
+ * ONE implementation, two front ends: `meridian profile login --headless`
+ * (which prompts for the paste) and `POST /profiles/login/complete` (which
+ * receives it over HTTP). Both parse the paste with
+ * `parseAuthorizationCodeInput` and hand the result here, so state validation,
+ * the token request and what gets persisted cannot drift between them.
+ *
+ * Returns a reason instead of throwing or printing, because the two callers
+ * present failure differently: the CLI renders reasons as red lines, the HTTP
+ * route maps them to status codes. `detail` carries the token endpoint's error
+ * body (truncated) for the CLI's diagnostics; the route drops it rather than
+ * rendering an upstream error body into a page.
+ */
+export async function exchangeAuthorizationCodeForCredentials(params: OAuthExchangeParams): Promise<OAuthExchangeResult> {
+  if (params.returnedState && params.returnedState !== params.sessionState) {
+    return { ok: false, reason: "state_mismatch" }
+  }
+
+  const fetchFn = params.fetchFn ?? fetch
+  let response: Response
+  try {
+    response = await fetchFn(OAUTH_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "authorization_code",
+        client_id: OAUTH_CLIENT_ID,
+        code: params.code,
+        redirect_uri: params.redirectUri ?? OAUTH_REDIRECT_URI,
+        code_verifier: params.codeVerifier,
+        state: params.returnedState ?? params.sessionState,
+      }),
+      signal: AbortSignal.timeout(30_000),
+    })
+  } catch (err) {
+    return { ok: false, reason: "request_failed", detail: err instanceof Error ? err.message : String(err) }
+  }
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "")
+    return { ok: false, reason: "http_error", status: response.status, detail: body.slice(0, 300) || undefined }
+  }
+
+  let tokenData: OAuthTokenResponse
+  try {
+    tokenData = await response.json() as OAuthTokenResponse
+  } catch (err) {
+    return { ok: false, reason: "invalid_response", detail: err instanceof Error ? err.message : String(err) }
+  }
+
+  if (!tokenData.access_token || !tokenData.refresh_token) {
+    return { ok: false, reason: "missing_tokens" }
+  }
+
+  const expiresAt = tokenData.expires_at ?? Date.now() + (tokenData.expires_in ?? 8 * 60 * 60) * 1000
+  const store = createPlatformCredentialStore({ claudeConfigDir: params.claudeConfigDir })
+  const written = await store.write({
+    claudeAiOauth: {
+      accessToken: tokenData.access_token,
+      refreshToken: tokenData.refresh_token,
+      expiresAt,
+      scopes: tokenData.scope?.split(" ").filter(Boolean) ?? params.scopes ?? OAUTH_SCOPES,
+    },
+  })
+  return written ? { ok: true } : { ok: false, reason: "write_failed" }
+}
+
 async function completeManualOAuthLogin(configDir: string): Promise<boolean> {
   const session = createManualOAuthSession()
   console.log("\x1b[33m⚠ Headless OAuth login: open this URL in a browser:\x1b[0m")
@@ -163,67 +335,45 @@ async function completeManualOAuthLogin(configDir: string): Promise<boolean> {
   console.log(session.authorizeUrl)
   console.log()
   console.log("After sign-in, paste the code shown by Claude below.")
+  console.log("\x1b[90m(the whole callback URL works too)\x1b[0m")
   const input = promptLine("Paste code:")
   const parsed = parseAuthorizationCodeInput(input)
   if (!parsed) {
     console.error("\x1b[31m✗ No authorization code received.\x1b[0m")
     return false
   }
-  if (parsed.state && parsed.state !== session.state) {
-    console.error("\x1b[31m✗ OAuth state mismatch. Please retry the login.\x1b[0m")
-    return false
-  }
 
-  let response: Response
-  try {
-    response = await fetch(OAUTH_TOKEN_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        grant_type: "authorization_code",
-        client_id: OAUTH_CLIENT_ID,
-        code: parsed.code,
-        redirect_uri: OAUTH_REDIRECT_URI,
-        code_verifier: session.codeVerifier,
-        state: parsed.state ?? session.state,
-      }),
-      signal: AbortSignal.timeout(30_000),
-    })
-  } catch (err) {
-    console.error(`\x1b[31m✗ OAuth token exchange failed: ${err instanceof Error ? err.message : err}\x1b[0m`)
-    return false
-  }
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => "")
-    console.error(`\x1b[31m✗ OAuth token exchange failed (${response.status}).\x1b[0m`)
-    if (body) console.error(`  ${body.slice(0, 300)}`)
-    return false
-  }
-
-  let tokenData: OAuthTokenResponse
-  try {
-    tokenData = await response.json() as OAuthTokenResponse
-  } catch (err) {
-    console.error(`\x1b[31m✗ OAuth token response was invalid: ${err instanceof Error ? err.message : err}\x1b[0m`)
-    return false
-  }
-
-  if (!tokenData.access_token || !tokenData.refresh_token) {
-    console.error("\x1b[31m✗ OAuth token response did not include the required tokens.\x1b[0m")
-    return false
-  }
-
-  const expiresAt = tokenData.expires_at ?? Date.now() + (tokenData.expires_in ?? 8 * 60 * 60) * 1000
-  const store = createPlatformCredentialStore({ claudeConfigDir: configDir })
-  return store.write({
-    claudeAiOauth: {
-      accessToken: tokenData.access_token,
-      refreshToken: tokenData.refresh_token,
-      expiresAt,
-      scopes: tokenData.scope?.split(" ").filter(Boolean) ?? OAUTH_SCOPES,
-    },
+  const result = await exchangeAuthorizationCodeForCredentials({
+    code: parsed.code,
+    returnedState: parsed.state,
+    sessionState: session.state,
+    codeVerifier: session.codeVerifier,
+    claudeConfigDir: configDir,
   })
+  if (result.ok) return true
+
+  switch (result.reason) {
+    case "state_mismatch":
+      console.error("\x1b[31m✗ OAuth state mismatch. Please retry the login.\x1b[0m")
+      break
+    case "request_failed":
+      console.error(`\x1b[31m✗ OAuth token exchange failed: ${result.detail}\x1b[0m`)
+      break
+    case "http_error":
+      console.error(`\x1b[31m✗ OAuth token exchange failed (${result.status}).\x1b[0m`)
+      if (result.detail) console.error(`  ${result.detail}`)
+      break
+    case "invalid_response":
+      console.error(`\x1b[31m✗ OAuth token response was invalid: ${result.detail}\x1b[0m`)
+      break
+    case "missing_tokens":
+      console.error("\x1b[31m✗ OAuth token response did not include the required tokens.\x1b[0m")
+      break
+    case "write_failed":
+      console.error("\x1b[31m✗ Could not write credentials for this profile.\x1b[0m")
+      break
+  }
+  return false
 }
 
 export async function profileAdd(id: string, options: AuthLoginOptions = {}): Promise<void> {
