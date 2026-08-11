@@ -16,16 +16,25 @@
 
 import { existsSync, readFileSync } from "node:fs"
 import { join } from "node:path"
-import { homedir } from "node:os"
-import { setSetting, getSetting } from "./settings"
+import { meridianConfigDir, setSetting, getSetting } from "./settings"
 import { pickStickyProfile, type RoutingMode } from "./routing"
 
-const CONFIG_FILE = join(homedir(), ".config", "meridian", "profiles.json")
+/**
+ * Where profiles live on disk. Resolved per call so it tracks
+ * MERIDIAN_CONFIG_DIR — the writer (`profileCli.ts`) resolves the same path
+ * the same way, and a reader and writer that disagree produce a profile that
+ * is written and never seen.
+ */
+function profilesFile(): string {
+  return join(meridianConfigDir(), "profiles.json")
+}
 
 /** Disk profile cache with short TTL so new profiles are picked up quickly */
 const DISK_CACHE_TTL_MS = 5_000
 let diskProfilesCache: ProfileConfig[] = []
 let diskProfilesCacheAt = 0
+/** Path the cache was filled from — a changed override must not serve stale entries. */
+let diskProfilesCachePath = ""
 
 /**
  * Load profiles from ~/.config/meridian/profiles.json.
@@ -33,20 +42,23 @@ let diskProfilesCacheAt = 0
  * while avoiding synchronous disk I/O on every request.
  */
 export function loadProfilesFromDisk(): ProfileConfig[] {
-  if (diskProfilesCacheAt > 0 && Date.now() - diskProfilesCacheAt < DISK_CACHE_TTL_MS) {
+  const file = profilesFile()
+  if (diskProfilesCacheAt > 0 && diskProfilesCachePath === file && Date.now() - diskProfilesCacheAt < DISK_CACHE_TTL_MS) {
     return diskProfilesCache
   }
   try {
-    if (!existsSync(CONFIG_FILE)) {
+    if (!existsSync(file)) {
       diskProfilesCache = []
     } else {
-      diskProfilesCache = JSON.parse(readFileSync(CONFIG_FILE, "utf-8"))
+      diskProfilesCache = JSON.parse(readFileSync(file, "utf-8"))
     }
     diskProfilesCacheAt = Date.now()
+    diskProfilesCachePath = file
     return diskProfilesCache
   } catch (err) {
-    console.warn(`[meridian] Failed to read ${CONFIG_FILE}: ${err instanceof Error ? err.message : err}`)
+    console.warn(`[meridian] Failed to read ${file}: ${err instanceof Error ? err.message : err}`)
     diskProfilesCacheAt = Date.now()
+    diskProfilesCachePath = file
     diskProfilesCache = []
     return []
   }
@@ -221,8 +233,10 @@ function buildResolvedProfile(profile: ProfileConfig): ResolvedProfile {
       // Isolate from host ~/.claude. Without this, the SDK's 401-recovery
       // silently reads host creds from disk and swaps a refreshed token in
       // for our env value, masking token failures. Path must not collapse
-      // to ~/.claude — see query.ts re: upstream claude-code#20553.
-      env.CLAUDE_CONFIG_DIR = join(homedir(), ".config", "meridian", "profiles", profile.id)
+      // to ~/.claude — see query.ts re: upstream claude-code#20553. Built
+      // from meridianConfigDir() so it stays the directory profileCli.ts
+      // creates and profileRemove deletes.
+      env.CLAUDE_CONFIG_DIR = join(meridianConfigDir(), "profiles", profile.id)
     }
     return { id: profile.id, type: "oauth-token", env }
   }
