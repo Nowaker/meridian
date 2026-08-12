@@ -7,8 +7,11 @@
  * already imports tokenRefresh for the credential store, so the refresh path
  * importing back would close a cycle.
  *
- * This is a leaf module — one authenticated GET, no imports.
+ * This is a leaf module — one authenticated GET, and the logger.
  */
+
+import { claudeLog } from "../logger"
+import { authFieldPaths, describeAuthFields } from "./authDiscovery"
 
 /**
  * Where the account's plan comes from — not the token endpoint.
@@ -100,19 +103,36 @@ export async function fetchOAuthPlanFields(
       signal: AbortSignal.timeout(10_000),
     })
   } catch (err) {
+    claudeLog("auth.profile_request_failed", { error: String(err) })
     console.warn(`[meridian] Could not read the account plan: ${err instanceof Error ? err.message : err}`)
     return {}
   }
 
   if (!response.ok) {
+    claudeLog("auth.profile_bad_response", { status: response.status })
     console.warn(`[meridian] Could not read the account plan (${response.status}).`)
     return {}
   }
 
+  let profile: OAuthProfileResponse
   try {
-    return extractPlanFields(await response.json() as OAuthProfileResponse)
+    profile = await response.json() as OAuthProfileResponse
   } catch (err) {
+    claudeLog("auth.profile_parse_failed", { error: String(err) })
     console.warn(`[meridian] Account plan response was not valid JSON: ${err instanceof Error ? err.message : err}`)
     return {}
   }
+
+  const plan = extractPlanFields(profile)
+  // Both halves are logged because they answer different questions. The paths
+  // say what Anthropic sent; the plan says what Meridian kept. A profile that
+  // ends up `unknown` is otherwise indistinguishable between "the field was
+  // never in the response" and "it arrived and we dropped it on the way to
+  // disk", and that distinction is the whole of the diagnosis.
+  claudeLog("auth.profile_discovered", {
+    fields: authFieldPaths(profile),
+    payload: describeAuthFields(profile),
+    plan,
+  })
+  return plan
 }

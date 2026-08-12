@@ -8,6 +8,8 @@ import { fileURLToPath } from "url"
 import { join, dirname } from "path"
 import { promisify } from "util"
 import { env } from "../env"
+import { claudeLog } from "../logger"
+import { authFieldPaths, describeAuthFields } from "./authDiscovery"
 import { isCredentialsReadOnly } from "./credentialsMode"
 import { credentialsFilePathForProfile } from "./tokenRefresh"
 
@@ -390,6 +392,16 @@ export async function getClaudeAuthStatusAsync(profileId?: string, envOverrides?
         ...(envOverrides ? { env: { ...process.env, ...envOverrides } } : {}),
       })
       const parsed = JSON.parse(stdout) as ClaudeAuthStatus
+      // The same payload the CLI path logs, from the reader every HTTP route
+      // goes through. Both are logged because they can disagree: this one is
+      // TTL-cached per profile and falls back to a last-known-good value, so a
+      // field visible here may be minutes old while the CLI reads it live.
+      claudeLog("auth.status_discovered", {
+        source: "cli_async",
+        profile: profileId ?? "default",
+        fields: authFieldPaths(parsed),
+        payload: describeAuthFields(parsed),
+      })
       if (cache) {
         cache.status = parsed; cache.lastKnownGood = parsed
         cache.at = Date.now(); cache.isFailure = false; cache.lastSuccessAt = Date.now()
@@ -400,7 +412,13 @@ export async function getClaudeAuthStatusAsync(profileId?: string, envOverrides?
         cachedAuthStatusCredMtimeMs = credMtime
       }
       return parsed
-    } catch {
+    } catch (err) {
+      claudeLog("auth.status_failed", {
+        source: "cli_async",
+        profile: profileId ?? "default",
+        error: String(err),
+        servingLastKnownGood: Boolean(cache ? cache.lastKnownGood : lastKnownGoodAuthStatus),
+      })
       if (cache) {
         cache.isFailure = true; cache.at = Date.now(); cache.status = null
         cache.credMtimeMs = credMtime

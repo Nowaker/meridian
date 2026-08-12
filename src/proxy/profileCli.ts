@@ -15,6 +15,8 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { configPath } from "../configDir"
+import { claudeLog } from "../logger"
+import { authFieldPaths, describeAuthFields } from "./authDiscovery"
 import { resolveClaudeExecutableSync } from "./models"
 import { fetchOAuthPlanFields, type OAuthPlanFields } from "./oauthPlan"
 import type { ProfileConfig } from "./profiles"
@@ -190,8 +192,19 @@ function getAuthStatus(configDir: string): { loggedIn: boolean; email?: string; 
       env: { ...process.env, CLAUDE_CONFIG_DIR: configDir },
       stdio: ["pipe", "pipe", "pipe"],
     })
-    return JSON.parse(result.toString())
+    const status = JSON.parse(result.toString())
+    // The third payload, and the one every UI actually reads. It is also the
+    // narrowest: it reports the plan family and no tier, so a log that shows
+    // its full key list is what proves the missing field was never offered
+    // here rather than dropped by Meridian.
+    claudeLog("auth.status_discovered", {
+      source: "cli_sync",
+      fields: authFieldPaths(status),
+      payload: describeAuthFields(status),
+    })
+    return status
   } catch (err) {
+    claudeLog("auth.status_failed", { source: "cli_sync", error: String(err) })
     console.warn(`[meridian] Auth check failed for ${configDir}: ${err instanceof Error ? err.message : err}`)
     return { loggedIn: false }
   }
@@ -296,11 +309,13 @@ export async function exchangeAuthorizationCodeForCredentials(params: OAuthExcha
       signal: AbortSignal.timeout(30_000),
     })
   } catch (err) {
+    claudeLog("auth.token_request_failed", { error: String(err) })
     return { ok: false, reason: "request_failed", detail: err instanceof Error ? err.message : String(err) }
   }
 
   if (!response.ok) {
     const body = await response.text().catch(() => "")
+    claudeLog("auth.token_bad_response", { status: response.status, bodyLength: body.length })
     return { ok: false, reason: "http_error", status: response.status, detail: body.slice(0, 300) || undefined }
   }
 
@@ -308,8 +323,17 @@ export async function exchangeAuthorizationCodeForCredentials(params: OAuthExcha
   try {
     tokenData = await response.json() as OAuthTokenResponse
   } catch (err) {
+    claudeLog("auth.token_parse_failed", { error: String(err) })
     return { ok: false, reason: "invalid_response", detail: err instanceof Error ? err.message : String(err) }
   }
+
+  // Logged before the required-token check, so a response that is missing one
+  // of them still says what it did contain — that case is exactly when the
+  // field list is worth having.
+  claudeLog("auth.token_discovered", {
+    fields: authFieldPaths(tokenData),
+    payload: describeAuthFields(tokenData),
+  })
 
   if (!hasRequiredTokens(tokenData)) {
     return { ok: false, reason: "missing_tokens" }
@@ -321,7 +345,14 @@ export async function exchangeAuthorizationCodeForCredentials(params: OAuthExcha
   // them alone would leave the other two writing plan-blind credentials.
   const plan = await fetchOAuthPlanFields(tokenData.access_token, fetchFn)
   const store = createPlatformCredentialStore({ claudeConfigDir: params.claudeConfigDir })
-  const written = await store.write(buildLoginCredentials(tokenData, plan, Date.now(), params.scopes))
+  const credentials = buildLoginCredentials(tokenData, plan, Date.now(), params.scopes)
+  // What ends up on disk, which is not the same question as what arrived: the
+  // two lines together localize a lost field to the response or to this build.
+  claudeLog("auth.credentials_built", {
+    fields: authFieldPaths(credentials.claudeAiOauth),
+    payload: describeAuthFields(credentials.claudeAiOauth),
+  })
+  const written = await store.write(credentials)
   return written ? { ok: true } : { ok: false, reason: "write_failed" }
 }
 
