@@ -42,6 +42,21 @@ export function extendedContextHint(model?: string): string {
   return advise("MERIDIAN_1M_CONTEXT_SUPPORT=0")
 }
 
+/** Phrases that actually indicate a billing or subscription refusal.
+ *
+ *  `\b402\b` excludes a `:digits` suffix so a stack frame like
+ *  `handler.js:402:15` cannot be read as a payment-required status. */
+const BILLING_SIGNALS: readonly RegExp[] = [
+  /\b402\b(?!:\d)/,
+  /billing[_ ](?:error|issue|problem|failure)/,
+  /subscription (?:is |has )?(?:inactive|expired|lapsed|cancell?ed|ended|invalid|not active)/,
+  /(?:expired|inactive|lapsed|invalid|no active|cancell?ed) subscription/,
+  /payment (?:method|required|failed|declined|details|info)/,
+  /update your payment/,
+  /(?:out of|draw from|draws from) extra usage/,
+  /insufficient (?:credit|funds|balance)/,
+]
+
 /** "hit your limit", "hit your session limit", "hit your weekly limit", and any
  *  future single-word qualifier the CLI adopts. Anchored on both sides so it
  *  can't drift into unrelated text that happens to contain "limit". */
@@ -99,8 +114,14 @@ export function classifyError(errMsg: string, model?: string): ClassifiedError {
     }
   }
 
-  // Billing / subscription
-  if (lower.includes("402") || lower.includes("billing") || lower.includes("subscription") || lower.includes("payment")) {
+  // Billing / subscription. Matched on phrases rather than bare tokens: an
+  // error mentioning `subscription.ts`, a path under `src/billing/`, or a URL
+  // containing `/payment/` is not a billing problem, and this branch runs
+  // BEFORE the process-crash and max-turns branches, so it wins on any message
+  // that merely contains the word. That was a wrong status code until
+  // isAccountFailoverError started keying on it (#796) — at which point an
+  // MCP server's stderr could mark every profile in the pool exhausted.
+  if (BILLING_SIGNALS.some(rx => rx.test(lower))) {
     return {
       status: 402,
       type: "billing_error",
@@ -241,6 +262,47 @@ export function isBusySessionError(error: unknown, stderr?: string): boolean {
 export function isRateLimitError(errMsg: string): boolean {
   const lower = errMsg.toLowerCase()
   return lower.includes("429") || lower.includes("rate limit") || lower.includes("too many requests")
+}
+
+/**
+ * Error types that exhaust the CURRENT account while leaving the rest of the
+ * pool viable — priority routing's cue to try the next candidate instead of
+ * handing the failure to the client.
+ *
+ * `rate_limit_error` is a spent quota window; `billing_error` is a lapsed
+ * subscription or a declined payment method. Both are properties of the one
+ * account that raised them and neither can succeed on a retry there, which is
+ * exactly what makes another account worth trying.
+ *
+ * Deliberately absent: `authentication_error`, which the token refresh already
+ * recovers in place, and the account-blind failures (`api_error`,
+ * `overloaded_error`, `timeout_error`) — those say nothing about entitlement,
+ * and failing over on them would spend the whole pool on one upstream hiccup
+ * and leave every account marked exhausted for something none of them did.
+ */
+const ACCOUNT_FAILOVER_ERROR_TYPES: ReadonlySet<string> = new Set([
+  "rate_limit_error",
+  "billing_error",
+])
+
+/**
+ * Whether a classified error type means "this account cannot serve the
+ * request, another one might". Used by priority routing to decide failover.
+ */
+export function isAccountFailoverError(errorType: string | null | undefined): errorType is string {
+  return typeof errorType === "string" && ACCOUNT_FAILOVER_ERROR_TYPES.has(errorType)
+}
+
+/**
+ * Whether the refusal is the quota kind, which names its own reset — the two
+ * cooldown tiers read the account's five-hour window, and only this kind has
+ * anything to look up there. Lives beside the set so the type name stays
+ * owned by one module: a rename that missed a caller in the orchestrator would
+ * not break failover loudly, it would silently downgrade every quota cooldown
+ * to the conservative default.
+ */
+export function isQuotaRefusal(errorType: string | null | undefined): boolean {
+  return errorType === "rate_limit_error"
 }
 
 /**

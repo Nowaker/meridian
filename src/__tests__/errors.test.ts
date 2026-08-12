@@ -2,7 +2,7 @@
  * Unit tests for classifyError — pure function, no mocks needed.
  */
 import { describe, it, expect } from "bun:test"
-import { classifyError, extendedContextHint, isStaleSessionError, isBusySessionError, isExtraUsageRequiredError, extractSdkTermination, formatSdkTermination } from "../proxy/errors"
+import { classifyError, extendedContextHint, isStaleSessionError, isBusySessionError, isExtraUsageRequiredError, extractSdkTermination, formatSdkTermination, isAccountFailoverError, isQuotaRefusal } from "../proxy/errors"
 
 describe("classifyError", () => {
   describe("authentication errors", () => {
@@ -149,6 +149,33 @@ describe("classifyError", () => {
     it("detects 'subscription' keyword", () => {
       const result = classifyError("subscription expired")
       expect(result.status).toBe(402)
+    })
+
+    it("detects a lapsed subscription with a payment-method prompt", () => {
+      const r = classifyError("Claude Code returned an error result: Your Claude Max subscription is inactive — update your payment method to continue.")
+      expect(r.status).toBe(402)
+      expect(r.type).toBe("billing_error")
+    })
+
+    it("detects an exhausted extra-usage refusal", () => {
+      const r = classifyError("API Error: 400 You're out of extra usage. Add more at claude.ai/settings/usage")
+      expect(r.type).toBe("billing_error")
+    })
+
+    // These used to classify as billing because the branch matched bare
+    // substrings anywhere in the text, and it runs before the crash/max-turns
+    // branches so it won. Harmless as a wrong status code; not harmless once
+    // isAccountFailoverError keys on the type (#796), where an incidental
+    // filename could mark every profile in the pool exhausted.
+    it.each([
+      ["a filename", "Claude Code returned an error result: Reached maximum number of turns (3) while editing subscription.ts"],
+      ["a path", "Error: ENOENT: no such file or directory, open '/repo/src/billing/index.ts'"],
+      ["a URL", "fetch failed: https://api.example.com/payment/status returned 500"],
+      ["a stack frame line number", "TypeError: undefined is not a function\n    at handler.js:402:15"],
+    ])("does not read %s as a billing error", (_label, msg) => {
+      const r = classifyError(msg)
+      expect(r.type).not.toBe("billing_error")
+      expect(isAccountFailoverError(r.type)).toBe(false)
     })
   })
 
@@ -525,5 +552,51 @@ describe("classifyError: session/usage limit phrasings (live-observed)", () => {
     const r = classifyError("usage limit reached | resets at 5pm")
     expect(r.type).toBe("rate_limit_error")
     expect(r.status).toBe(429)
+  })
+})
+
+describe("isAccountFailoverError", () => {
+  it("accepts the types that exhaust one account and leave the pool viable", () => {
+    expect(isAccountFailoverError("rate_limit_error")).toBe(true)
+    expect(isAccountFailoverError("billing_error")).toBe(true)
+  })
+
+  it("rejects failures that say nothing about the account", () => {
+    // Failing over on these would spend every account on one upstream hiccup
+    // and mark them all exhausted for something none of them did.
+    expect(isAccountFailoverError("api_error")).toBe(false)
+    expect(isAccountFailoverError("overloaded_error")).toBe(false)
+    expect(isAccountFailoverError("timeout_error")).toBe(false)
+    expect(isAccountFailoverError("upstream_timeout")).toBe(false)
+  })
+
+  it("rejects authentication_error, which the token refresh recovers in place", () => {
+    expect(isAccountFailoverError("authentication_error")).toBe(false)
+  })
+
+  it("rejects a missing or malformed type rather than guessing", () => {
+    expect(isAccountFailoverError(undefined)).toBe(false)
+    expect(isAccountFailoverError(null)).toBe(false)
+    expect(isAccountFailoverError("")).toBe(false)
+  })
+
+  it("agrees with classifyError on a subscription refusal", () => {
+    const classified = classifyError("Your Claude Max subscription is inactive - update your payment method")
+    expect(classified.type).toBe("billing_error")
+    expect(classified.status).toBe(402)
+    expect(isAccountFailoverError(classified.type)).toBe(true)
+  })
+})
+
+describe("isQuotaRefusal", () => {
+  it("separates the refusal that names its own reset from the one that does not", () => {
+    expect(isQuotaRefusal("rate_limit_error")).toBe(true)
+    expect(isQuotaRefusal("billing_error")).toBe(false)
+    expect(isQuotaRefusal(undefined)).toBe(false)
+  })
+
+  it("is a strict subset of the failover set", () => {
+    expect(isAccountFailoverError("rate_limit_error") && isQuotaRefusal("rate_limit_error")).toBe(true)
+    expect(isAccountFailoverError("billing_error") && !isQuotaRefusal("billing_error")).toBe(true)
   })
 })
