@@ -519,7 +519,14 @@ function render(data, quotaData) {
     }
     if (p.subscriptionType) {
       html += '<span class="detail-label">Plan</span>';
-      html += '<span class="detail-value">' + esc(p.subscriptionType) + '</span>';
+      html += '<span class="detail-value">' + esc(p.planLabel || p.subscriptionType) + '</span>';
+    }
+    if (p.allowance) {
+      // The number that says how much work the account can do. The plan alone
+      // does not: Max 5x and Max 20x both report "max" and differ 4x.
+      html += '<span class="detail-label">Allowance</span>';
+      html += '<span class="detail-value" title="' + esc(p.rateLimitTier || '') + '">' + esc(p.allowance)
+        + ' <span style="color:var(--muted);font-weight:400">of a Pro plan\u2019s Claude Code usage</span></span>';
     }
     if (p.lastSuccessAt) {
       html += '<span class="detail-label">Last Verified</span>';
