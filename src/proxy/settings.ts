@@ -17,9 +17,19 @@ function settingsFile(): string {
   return configPath("settings.json")
 }
 
+/**
+ * Whose Claude subscription an account is: the operator's own, or one
+ * borrowed from someone else. Absent means undesignated.
+ */
+export type ProfileOwner = "own" | "loaner"
+
 export interface MeridianSettings {
   /** Last active profile ID — restored on proxy startup */
   activeProfile?: string
+  /** Per-profile ownership, keyed by profile id. Here rather than in
+   *  profiles.json because a profile adopted under MERIDIAN_FOLLOW_ACTIVE has
+   *  no profiles.json entry to carry a field — see profileOwners.ts. */
+  profileOwners?: Record<string, ProfileOwner>
   /** Profile routing mode (#383, priority spec): "active" (default),
    *  "sticky", or "priority". MERIDIAN_ROUTING env var takes precedence. */
   routing?: string

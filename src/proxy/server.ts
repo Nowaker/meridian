@@ -81,6 +81,7 @@ import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
 import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, restoreActiveProfile, shareableCredentialDir, type ResolvedProfile } from "./profiles"
 import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
+import { parseOwnerRequest, profileOwners, setProfileOwner } from "./profileOwners"
 import { startFollowUsagePolling, stopFollowUsagePolling } from "./followUsage"
 import { startProfileLogin, completeProfileLogin } from "./profileLogin"
 import { startProfileAdd, completeProfileAdd } from "./profileAdd"
@@ -3833,6 +3834,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
   app.get("/profiles/list", async (c) => {
     const profiles = listProfiles(finalConfig.profiles, finalConfig.defaultProfile)
+    const owners = profileOwners()
     // Enrich with live auth status
     const enriched = await Promise.all(profiles.map(async (p) => {
       const resolved = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, p.id)
@@ -3863,6 +3865,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // profile cannot be shared (field null). Never a secret — see
         // shareableCredentialDir.
         credentialDir: shareableCredentialDir(resolved),
+        // Present for EVERY profile, null included, for the same reason
+        // credentialDir is: a consumer must be able to tell "designated as
+        // neither" from an instance too old to answer.
+        owner: owners[p.id] ?? null,
       }
     }))
     const routingModeNow = getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing"))
@@ -3944,6 +3950,25 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     })
     plog(`[PROXY] Active profile switched to: ${body.profile} (from ${previousProfile ?? "unset"}, ua: ${(c.req.header("user-agent") || "unknown").slice(0, 60)}) (session + rate-limit caches cleared)`)
     return c.json({ success: true, activeProfile: body.profile })
+  })
+
+  // Deliberately NOT refused under MERIDIAN_FOLLOW_ACTIVE the way
+  // /profiles/active is, and deliberately not routed through
+  // refuseCredentialWrite under MERIDIAN_CREDENTIALS_READONLY. Follow mode
+  // replaces the active profile and the roster, not this instance's opinion of
+  // whose account something is; and a designation is not a credential.
+  app.post("/profiles/owner", async (c) => {
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    const parsed = parseOwnerRequest(body, getEffectiveProfiles(finalConfig.profiles).map(p => p.id))
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400)
+    setProfileOwner(parsed.profile, parsed.owner)
+    plog(`[PROXY] Profile "${parsed.profile}" designated ${parsed.owner ?? "undesignated"}`)
+    return c.json({ success: true, profile: parsed.profile, owner: parsed.owner })
   })
 
   // --- Profile login routes (browser-completable OAuth) ---

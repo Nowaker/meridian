@@ -81,6 +81,15 @@ export const profilePageHtml = `<!DOCTYPE html>
   .switch-btn:disabled { opacity: 0.4; cursor: default; }
   .switch-btn.current { border-color: var(--border); color: var(--muted); cursor: default; }
 
+  .owner-select {
+    background: var(--bg); color: var(--muted); border: 1px solid var(--border);
+    border-radius: 6px; padding: 2px 8px; font-family: inherit; font-size: 12px;
+    cursor: pointer; justify-self: start;
+  }
+  .owner-select:hover { border-color: var(--accent); color: var(--text); }
+  .owner-select:focus { outline: none; border-color: var(--accent); }
+  .owner-select.is-set { color: var(--accent2); }
+
   .empty-state {
     text-align: center; padding: 48px; color: var(--muted);
     background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
@@ -378,6 +387,29 @@ async function refresh() {
 
 function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
+// Display strings, not the stored vocabulary: the server stores own/loaner,
+// which every consuming scheduler already speaks.
+var OWNER_OPTIONS = [['', 'Not set'], ['own', 'Mine'], ['loaner', 'Borrowed']];
+
+function ownerSelect(id, owner) {
+  var current = owner || '';
+  var opts = '';
+  for (var i = 0; i < OWNER_OPTIONS.length; i++) {
+    var o = OWNER_OPTIONS[i];
+    opts += '<option value="' + o[0] + '"' + (o[0] === current ? ' selected' : '') + '>' + o[1] + '</option>';
+  }
+  return '<select class="owner-select' + (current ? ' is-set' : '') + '"'
+    + ' aria-label="Who the ' + esc(id) + ' account belongs to"'
+    + ' onchange="setOwner(&quot;' + esc(id) + '&quot;, this.value)">' + opts + '</select>';
+}
+
+// An open <select> is the focused element, so this needs no state of its own
+// and cannot be left stuck by a change event that never arrives.
+function ownerMenuBusy() {
+  var el = document.activeElement;
+  return !!(el && el.classList && el.classList.contains('owner-select'));
+}
+
 function renderUsageSection(profileQuota) {
   // No quota data for this profile yet (cold start or fetch failed) — hide
   // entirely so we don't render an empty box.
@@ -512,6 +544,9 @@ function render(data, quotaData) {
     html += '<span class="detail-label">Status</span>';
     html += '<span class="detail-value ' + (p.loggedIn ? 'status-ok' : 'status-err') + '">'
       + (p.loggedIn ? '\u2713 Authenticated' : '\u2717 Not logged in') + '</span>';
+
+    html += '<span class="detail-label">Owner</span>';
+    html += ownerSelect(p.id, p.owner);
 
     if (p.email) {
       html += '<span class="detail-label">Email</span>';
@@ -709,6 +744,17 @@ async function switchProfile(id) {
   const data = await res.json();
   if (data.success) refresh();
   else if (data.error) alert(data.error);
+}
+
+async function setOwner(id, value) {
+  var res = await fetch('/profiles/owner', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profile: id, owner: value || null })
+  }).catch(function () { return null; });
+  var data = res ? await res.json().catch(function () { return null; }) : null;
+  if (!res || !res.ok) alert((data && data.error) || 'Could not save the owner.');
+  refresh();
 }
 
 // --- Browser login ---
@@ -1000,7 +1046,7 @@ resetAddForm('');
 // its own state, so each needs its own term - resetAddForm nulls activeAdd,
 // which is the addId the paste is about to be sent with.
 setInterval(function () {
-  if (dragFromIndex === null && !activeLogin && !activeAdd) refresh();
+  if (dragFromIndex === null && !activeLogin && !activeAdd && !ownerMenuBusy()) refresh();
 }, 10000);
 ` + profileBarJs + `
 </script>

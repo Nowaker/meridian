@@ -71,7 +71,13 @@ export const landingHtml = `<!DOCTYPE html>
     color: var(--muted); opacity: 0; transition: opacity 0.15s; }
   .profile-card.switchable:hover .switch-hint { opacity: 1; }
   .profile-cost { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text); }
-  .profile-sub { font-size: 11px; color: var(--muted); text-align: right; margin-bottom: 12px; }
+  .profile-sub { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    font-size: 11px; color: var(--muted); margin-bottom: 12px; }
+  .owner-select { background: var(--bg); color: var(--muted); border: 1px solid var(--border);
+    border-radius: 6px; padding: 2px 6px; font-family: inherit; font-size: 11px; cursor: pointer; }
+  .owner-select:hover { border-color: var(--accent); color: var(--text); }
+  .owner-select:focus { outline: none; border-color: var(--accent); }
+  .owner-select.is-set { color: var(--accent2); }
   .usage-row { display: flex; align-items: center; gap: 10px; font-size: 12px; padding: 4px 0; }
   .usage-row .w-label { color: var(--muted); width: 64px; flex-shrink: 0; }
   .usage-row .w-bar { flex: 1; height: 6px; background: var(--surface2); border-radius: 3px; overflow: hidden; }
@@ -262,7 +268,7 @@ function profileSection(q,s,pl,h){
     // Real profiles exist: show exactly those. Traffic that predates
     // per-profile attribution (the synthetic "default" bucket) still
     // counts in the totals strip but doesn't render as a fake account.
-    for(var i=0;i<configured.length;i++){var p=configured[i];profs.push({id:p.id,label:p.id,type:p.type,isActive:!!p.isActive,loggedIn:p.loggedIn,configured:true,allowance:p.allowance,planLabel:p.planLabel,rateLimitTier:p.rateLimitTier});seen[p.id]=1}
+    for(var i=0;i<configured.length;i++){var p=configured[i];profs.push({id:p.id,label:p.id,type:p.type,isActive:!!p.isActive,loggedIn:p.loggedIn,configured:true,allowance:p.allowance,planLabel:p.planLabel,rateLimitTier:p.rateLimitTier,owner:p.owner});seen[p.id]=1}
   }else{
     // Single-account setup: one card, labeled with the logged-in email.
     var email=(h&&h.auth&&h.auth.loggedIn&&h.auth.email)||'';
@@ -328,12 +334,39 @@ function profileSection(q,s,pl,h){
     cards+='<div class="profile-card'+(p.isActive?' active':'')+(switchable?' switchable':'')+spendClass+'"'+spendStyle+spendTip+(switchable?' data-profile="'+esc(p.id)+'" role="button" tabindex="0"':'')+'>'
       +'<div class="profile-head"><span class="profile-name"><span class="prof-dot"></span>'+esc(p.label||p.id)+' '+badge+'</span>'
       +'<span class="profile-cost">'+usd(cost?cost.estimatedUsd:0)+'</span></div>'
-      +'<div class="profile-sub">'+(cost?cost.requests+' request'+(cost.requests===1?'':'s')+' · est. API value · 24h':'no traffic · 24h')+'</div>'
+      +'<div class="profile-sub">'+(p.configured?ownerSelect(p.id,p.owner):'<span></span>')
+      +'<span>'+(cost?cost.requests+' request'+(cost.requests===1?'':'s')+' · est. API value · 24h':'no traffic · 24h')+'</span></div>'
       +rows+'</div>';
   }
   if(!cards)return '';
   return '<div class="section"><div class="section-head"><div class="section-title">'+(profs.length===1?'Account':'Accounts')+'</div>'+sortTabs(profs.length)+'</div>'
     +'<div class="profile-grid">'+cards+'</div></div>';
+}
+
+// Display strings, not the stored vocabulary: the server stores own/loaner,
+// which every consuming scheduler already speaks.
+var OWNER_OPTIONS=[['','Not set'],['own','Mine'],['loaner','Borrowed']];
+function ownerSelect(id,owner){
+  var current=owner||'';
+  var opts='';
+  for(var i=0;i<OWNER_OPTIONS.length;i++){
+    var o=OWNER_OPTIONS[i];
+    opts+='<option value="'+o[0]+'"'+(o[0]===current?' selected':'')+'>'+o[1]+'</option>';
+  }
+  return '<select class="owner-select'+(current?' is-set':'')+'" data-owner-for="'+esc(id)+'"'
+    +' aria-label="Who the '+esc(id)+' account belongs to">'+opts+'</select>';
+}
+// An open <select> is the focused element, so this needs no state of its own
+// and cannot be left stuck by a change event that never arrives.
+function ownerMenuBusy(){
+  var el=document.activeElement;
+  return !!(el&&el.classList&&el.classList.contains('owner-select'));
+}
+function setOwner(id,value){
+  fetch('/profiles/owner',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile:id,owner:value||null})})
+    .then(function(r){return r.json().then(function(d){return {ok:r.ok,data:d}})})
+    .then(function(res){if(!res.ok&&res.data&&res.data.error)alert(res.data.error);refresh()})
+    .catch(function(){});
 }
 
 function strip(items){
@@ -392,7 +425,14 @@ function switchProfile(id){
     .then(function(data){if(data.success){refresh();if(window.meridianHeaderRefresh)window.meridianHeaderRefresh()}else if(data.error)alert(data.error)})
     .catch(function(){});
 }
+document.getElementById('content').addEventListener('change',function(e){
+  var sel=e.target.closest('.owner-select');
+  if(sel)setOwner(sel.dataset.ownerFor,sel.value);
+});
 document.getElementById('content').addEventListener('click',function(e){
+  // The card is itself a switch button, so a control inside one has to opt out
+  // of it or picking an owner would also move all traffic to that account.
+  if(e.target.closest('.owner-select'))return;
   var tab=e.target.closest('.sort-tab');
   if(tab&&tab.dataset.sort){setViewSort(tab.dataset.sort);return}
   var card=e.target.closest('.profile-card.switchable');
@@ -400,11 +440,12 @@ document.getElementById('content').addEventListener('click',function(e){
 });
 document.getElementById('content').addEventListener('keydown',function(e){
   if(e.key!=='Enter'&&e.key!==' ')return;
+  if(e.target.closest('.owner-select'))return;
   var card=e.target.closest('.profile-card.switchable');
   if(card&&card.dataset.profile){e.preventDefault();switchProfile(card.dataset.profile)}
 });
 viewSort=readStoredSort()||viewSort;
-refresh();setInterval(refresh,10000);
+refresh();setInterval(function(){if(!ownerMenuBusy())refresh()},10000);
 ` + profileBarJs + `
 </script>
 </body>
