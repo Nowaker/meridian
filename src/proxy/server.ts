@@ -79,7 +79,7 @@ import { runTransformHook, buildPipeline, createRequestContext } from "./transfo
 import { getAdapterTransforms } from "./transforms/registry"
 import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
-import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, restoreActiveProfile, type ResolvedProfile } from "./profiles"
+import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, restoreActiveProfile, shareableCredentialDir, type ResolvedProfile } from "./profiles"
 import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
 import { startFollowUsagePolling, stopFollowUsagePolling } from "./followUsage"
 import { startProfileLogin, completeProfileLogin } from "./profileLogin"
@@ -3858,6 +3858,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         loggedIn: auth?.loggedIn ?? false,
         lastCheckedAt: cacheInfo.lastCheckedAt || null,
         lastSuccessAt: cacheInfo.lastSuccessAt || null,
+        // Present for EVERY profile, null included, so a follower can tell an
+        // instance too old to answer (field absent) from one saying this
+        // profile cannot be shared (field null). Never a secret — see
+        // shareableCredentialDir.
+        credentialDir: shareableCredentialDir(resolved),
       }
     }))
     const routingModeNow = getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing"))
