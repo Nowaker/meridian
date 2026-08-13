@@ -51,6 +51,37 @@ describe("planAllowance", () => {
       .toBe("5x")
   })
 
+  it("never calls a Team seat Personal, however its tier is spelled", () => {
+    // Measured on a ten-account host: two Team profiles report
+    // `subscriptionType: "team"` with `rateLimitTier: "default_claude_max_5x"`.
+    // The size is genuinely 5x; the name "Personal Max" is not, and a reader
+    // deciding whose allotment to spend acts on the name.
+    expect(planAllowance({ rateLimitTier: "default_claude_max_5x", subscriptionType: "team" }))
+      .toEqual({ multiplier: "5x", weight: 5, label: "Team" })
+    expect(planAllowance({ rateLimitTier: "default_claude_max_20x", subscriptionType: "team" }))
+      .toEqual({ multiplier: "20x", weight: 20, label: "Team" })
+    expect(planAllowance({ rateLimitTier: "team_standard", subscriptionType: "max" }))
+      .toEqual({ multiplier: "1x", weight: 1, label: "Personal" })
+    expect(planAllowance({ rateLimitTier: "default_claude_max_5x", subscriptionType: "enterprise" }))
+      .toEqual({ multiplier: "5x", weight: 5, label: "Enterprise" })
+  })
+
+  it("keeps the tier's own label when the two agree", () => {
+    expect(planAllowance({ rateLimitTier: "default_claude_max_20x", subscriptionType: "max" }).label)
+      .toBe("Personal Max")
+    expect(planAllowance({ rateLimitTier: "team_tier_1", subscriptionType: "team" }).label)
+      .toBe("Team Premium")
+    expect(planAllowance({ rateLimitTier: "default_claude_pro", subscriptionType: "pro" }).label)
+      .toBe("Personal Pro")
+  })
+
+  it("keeps the tier's label when the subscription type says nothing usable", () => {
+    expect(planAllowance({ rateLimitTier: "default_claude_max_5x", subscriptionType: "something_new" }).label)
+      .toBe("Personal Max")
+    expect(planAllowance({ rateLimitTier: "default_claude_max_5x", subscriptionType: "  " }).label)
+      .toBe("Personal Max")
+  })
+
   it("reports max and team as unknown when only the subscription type is known", () => {
     expect(planAllowance({ subscriptionType: "max" })).toEqual({ multiplier: null, weight: null, label: null })
     expect(planAllowance({ subscriptionType: "team" })).toEqual({ multiplier: null, weight: null, label: null })
