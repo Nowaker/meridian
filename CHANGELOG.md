@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.62.0](https://github.com/rynfar/meridian/compare/meridian-v1.61.0...meridian-v1.62.0) (2026-08-15)
+
+
+### Features
+
+* **adapters:** add Prime Agent adapter ([#808](https://github.com/rynfar/meridian/issues/808)) ([377a79b](https://github.com/rynfar/meridian/commit/377a79bd305fccf57ce15a2d0c84893b3c8115c9))
+
+
+### Bug Fixes
+
+* **replay:** restore tool-call attribution for pi, bash, and code tools ([#802](https://github.com/rynfar/meridian/issues/802)) ([87e60f8](https://github.com/rynfar/meridian/commit/87e60f8d475dbc3a7b8fb90430c684f36cc03c77))
+* **routing:** fail over when an account's subscription is refused ([#800](https://github.com/rynfar/meridian/issues/800)) ([1635f3e](https://github.com/rynfar/meridian/commit/1635f3e742eccfeb1a8f6e45f77d4e543f1469e3))
+* **session:** say which message broke the lineage, not just how many matched ([#797](https://github.com/rynfar/meridian/issues/797)) ([87f78f8](https://github.com/rynfar/meridian/commit/87f78f8c4e1989c5afacbe532f3fc1aaaf7e888b))
+
 ## [1.61.0](https://github.com/rynfar/meridian/compare/meridian-v1.60.0...meridian-v1.61.0) (2026-08-11)
 
 
