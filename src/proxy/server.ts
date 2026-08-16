@@ -50,7 +50,7 @@ import { LRUMap } from "../utils/lruMap"
 import { telemetryStore, diagnosticLog, createTelemetryRoutes, landingHtml, renderPrometheusMetrics } from "../telemetry"
 import type { RequestMetric } from "../telemetry"
 import { classifyError, extractSdkTermination, formatSdkTermination, isStaleSessionError, isBusySessionError, isRateLimitError, isExtraUsageRequiredError, isExpiredTokenError } from "./errors"
-import { refreshOAuthToken, ensureFreshToken, startBackgroundRefresh, stopBackgroundRefresh, createPlatformCredentialStore, getAuthRenewalStatus, getStoredPlanFields, resolveRenewalWarnDays, type CredentialStore, type StoredPlanFields } from "./tokenRefresh"
+import { refreshOAuthToken, ensureFreshToken, startBackgroundRefresh, stopBackgroundRefresh, createPlatformCredentialStore, readStoredCredentialPresence, getAuthRenewalStatus, getStoredPlanFields, resolveRenewalWarnDays, type CredentialStore, type StoredPlanFields } from "./tokenRefresh"
 import { planAllowance } from "./planAllowance"
 import { isCredentialsReadOnly, logCredentialsModeBanner } from "./credentialsMode"
 import {
@@ -3847,8 +3847,22 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // The tier that sizes the plan is never in `claude auth status` — only
       // the family (`max`), which covers both 5x and 20x. It is on disk, in
       // the profile's own credential file.
-      const plan = await getStoredPlanFields(credentialStoreForProfile(resolved)).catch((): StoredPlanFields => ({}))
+      const credentialStore = credentialStoreForProfile(resolved)
+      const plan = await getStoredPlanFields(credentialStore).catch((): StoredPlanFields => ({}))
       const allowance = planAllowance({ ...plan, subscriptionType: auth?.subscriptionType })
+      // `claude auth status` answers from its own view of the account and was
+      // measured saying `loggedIn: true` for a credential whose accessToken is
+      // the empty string - three accounts on one fleet read as fine here while
+      // every request they served came back 401, so the page offered no way to
+      // tell them from an account that was merely idle. The credential is what
+      // a request actually presents, so an access token that is not there
+      // outranks a cheerful probe. Only `absent` demotes: see
+      // `readStoredCredentialPresence` for why `unknown` must not, and note
+      // that a profile authenticated some other way has no OAuth store at all,
+      // which is likewise no evidence about it.
+      const presence = credentialStore
+        ? await readStoredCredentialPresence(credentialStore)
+        : "unknown"
       return {
         ...p,
         email: auth?.email || null,
@@ -3857,7 +3871,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         allowance: allowance.multiplier,
         allowanceWeight: allowance.weight,
         planLabel: allowance.label,
-        loggedIn: auth?.loggedIn ?? false,
+        loggedIn: presence === "absent" ? false : (auth?.loggedIn ?? false),
         lastCheckedAt: cacheInfo.lastCheckedAt || null,
         lastSuccessAt: cacheInfo.lastSuccessAt || null,
         // Present for EVERY profile, null included, so a follower can tell an
