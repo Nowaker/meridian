@@ -9,6 +9,7 @@
  */
 
 import { profileBarCss, profileBarHtml, profileBarJs, themeCss } from "./profileBar"
+import { profileFactsJs } from "./profileFacts"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "./profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT } from "./profileSpent"
 
@@ -71,6 +72,33 @@ export const landingHtml = `<!DOCTYPE html>
     color: var(--muted); opacity: 0; transition: opacity 0.15s; }
   .profile-card.switchable:hover .switch-hint { opacity: 1; }
   .profile-cost { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text); }
+
+
+  /* Account details on hover. Drawn rather than a title attribute: the native
+     tooltip cannot show a label/value list, and this one has to match the grid
+     on /profiles row for row. */
+  .prof-info { position: relative; display: inline-flex; }
+  .prof-info-dot { width: 14px; height: 14px; flex-shrink: 0; border-radius: 50%;
+    border: 1px solid var(--border); background: var(--surface2); color: var(--muted);
+    font-family: Georgia, 'Times New Roman', serif; font-style: italic; font-size: 10px;
+    font-weight: 700; line-height: 12px; text-align: center; cursor: help; }
+  .prof-info:hover .prof-info-dot, .prof-info:focus-within .prof-info-dot {
+    border-color: var(--accent); color: var(--accent); }
+  .prof-info-dot:focus-visible { outline: none; border-color: var(--accent); color: var(--accent); }
+  .prof-pop { position: absolute; top: calc(100% + 8px); left: -8px; z-index: 20;
+    min-width: 256px; padding: 12px 14px; background: var(--surface2);
+    border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    opacity: 0; visibility: hidden; transition: opacity 0.12s;
+    text-align: left; font-weight: 400; letter-spacing: 0; text-transform: none; cursor: default; }
+  .prof-info:hover .prof-pop, .prof-info:focus-within .prof-pop { opacity: 1; visibility: visible; }
+  .prof-pop-type { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--accent2); margin-bottom: 8px; }
+  .prof-pop-grid { display: grid; grid-template-columns: auto 1fr; gap: 5px 14px; font-size: 11px; }
+  .prof-pop-label { color: var(--muted); white-space: nowrap; }
+  .prof-pop-value { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; word-break: break-word; }
+  .prof-pop-value.status-ok { color: var(--green); }
+  .prof-pop-value.status-err { color: var(--red); }
   .profile-sub { display: flex; align-items: center; justify-content: space-between; gap: 8px;
     font-size: 11px; color: var(--muted); margin-bottom: 12px; }
   .owner-select { background: var(--bg); color: var(--muted); border: 1px solid var(--border);
@@ -135,6 +163,7 @@ export const landingHtml = `<!DOCTYPE html>
   <div id="content"><div style="color:var(--muted);padding:40px;text-align:center">Loading…</div></div>
 </div>
 <script>
+` + profileFactsJs + `
 function ms(v){if(v==null||v===0)return '—';return v<1000?v+'ms':(v/1000).toFixed(1)+'s'}
 function esc(s){return String(s).replace(/[&<>"']/g,function(ch){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]})}
 function usd(v){if(v==null)return '—';if(v>0&&v<0.01)return '$'+v.toFixed(4);if(v<100)return '$'+v.toFixed(2);return '$'+Math.round(v).toLocaleString()}
@@ -257,6 +286,31 @@ function introSection(h){
     +'</div>';
 }
 
+function infoIcon(entry,type){
+  var facts=profileFacts(entry);
+  var rows='';
+  for(var i=0;i<facts.length;i++){
+    var f=facts[i];
+    var tone=f.tone==='ok'?' status-ok':f.tone==='err'?' status-err':'';
+    var hint=f.hint?' title="'+esc(f.hint)+'"':'';
+    var note=f.note?' <span style="color:var(--muted)">'+esc(f.note)+'</span>':'';
+    rows+='<span class="prof-pop-label">'+esc(f.label)+'</span>'
+      +'<span class="prof-pop-value'+tone+'"'+hint+'>'+esc(f.value)+note+'</span>';
+  }
+  return '<span class="prof-info">'
+    +'<span class="prof-info-dot" tabindex="0" role="button" aria-label="Details for '+esc(entry.id)+'">i</span>'
+    +'<span class="prof-pop" role="tooltip">'
+    +'<span class="prof-pop-type">'+esc(type||'claude-max')+'</span>'
+    +'<span class="prof-pop-grid">'+rows+'</span>'
+    +'</span></span>';
+}
+
+// An open overlay is the hovered or focused element, so this needs no state of
+// its own and cannot be left stuck by an event that never arrives.
+function infoPopOpen(){
+  return !!document.querySelector('.prof-info:hover, .prof-info:focus-within');
+}
+
 function profileSection(q,s,pl,h){
   var byProfile=(s&&s.costEstimate&&s.costEstimate.byProfile)||{};
   var quotaByProfile={};
@@ -268,7 +322,9 @@ function profileSection(q,s,pl,h){
     // Real profiles exist: show exactly those. Traffic that predates
     // per-profile attribution (the synthetic "default" bucket) still
     // counts in the totals strip but doesn't render as a fake account.
-    for(var i=0;i<configured.length;i++){var p=configured[i];profs.push({id:p.id,label:p.id,type:p.type,isActive:!!p.isActive,loggedIn:p.loggedIn,configured:true,allowance:p.allowance,planLabel:p.planLabel,rateLimitTier:p.rateLimitTier,owner:p.owner});seen[p.id]=1}
+    // The whole entry rides along so the details overlay reads it directly —
+    // a copied field list here would have to grow every time profileFacts does.
+    for(var i=0;i<configured.length;i++){var p=configured[i];profs.push({id:p.id,label:p.id,type:p.type,isActive:!!p.isActive,loggedIn:p.loggedIn,configured:true,allowance:p.allowance,planLabel:p.planLabel,rateLimitTier:p.rateLimitTier,owner:p.owner,entry:p});seen[p.id]=1}
   }else{
     // Single-account setup: one card, labeled with the logged-in email.
     var email=(h&&h.auth&&h.auth.loggedIn&&h.auth.email)||'';
@@ -332,7 +388,7 @@ function profileSection(q,s,pl,h){
     var spendTip=spend.reason==='unusable'?' title="Cannot serve requests \u2014 run: meridian profile login '+esc(p.id)+'"'
       :spend.fraction!=null&&spend.fade>0?' title="'+Math.round(spend.fraction*100)+'% of this account\u2019s 5h / 7d allowance is used"':'';
     cards+='<div class="profile-card'+(p.isActive?' active':'')+(switchable?' switchable':'')+spendClass+'"'+spendStyle+spendTip+(switchable?' data-profile="'+esc(p.id)+'" role="button" tabindex="0"':'')+'>'
-      +'<div class="profile-head"><span class="profile-name"><span class="prof-dot"></span>'+esc(p.label||p.id)+' '+badge+'</span>'
+      +'<div class="profile-head"><span class="profile-name"><span class="prof-dot"></span>'+(p.entry?infoIcon(p.entry,p.type):'')+esc(p.label||p.id)+' '+badge+'</span>'
       +'<span class="profile-cost">'+usd(cost?cost.estimatedUsd:0)+'</span></div>'
       +'<div class="profile-sub">'+(p.configured?ownerSelect(p.id,p.owner):'<span></span>')
       +'<span>'+(cost?cost.requests+' request'+(cost.requests===1?'':'s')+' · est. API value · 24h':'no traffic · 24h')+'</span></div>'
@@ -343,9 +399,6 @@ function profileSection(q,s,pl,h){
     +'<div class="profile-grid">'+cards+'</div></div>';
 }
 
-// Display strings, not the stored vocabulary: the server stores own/loaner,
-// which every consuming scheduler already speaks.
-var OWNER_OPTIONS=[['','Not set'],['own','Mine'],['loaner','Borrowed']];
 function ownerSelect(id,owner){
   var current=owner||'';
   var opts='';
@@ -431,8 +484,10 @@ document.getElementById('content').addEventListener('change',function(e){
 });
 document.getElementById('content').addEventListener('click',function(e){
   // The card is itself a switch button, so a control inside one has to opt out
-  // of it or picking an owner would also move all traffic to that account.
+  // of it or picking an owner (or reading the details) would also move all
+  // traffic to that account.
   if(e.target.closest('.owner-select'))return;
+  if(e.target.closest('.prof-info'))return;
   var tab=e.target.closest('.sort-tab');
   if(tab&&tab.dataset.sort){setViewSort(tab.dataset.sort);return}
   var card=e.target.closest('.profile-card.switchable');
@@ -441,11 +496,12 @@ document.getElementById('content').addEventListener('click',function(e){
 document.getElementById('content').addEventListener('keydown',function(e){
   if(e.key!=='Enter'&&e.key!==' ')return;
   if(e.target.closest('.owner-select'))return;
+  if(e.target.closest('.prof-info'))return;
   var card=e.target.closest('.profile-card.switchable');
   if(card&&card.dataset.profile){e.preventDefault();switchProfile(card.dataset.profile)}
 });
 viewSort=readStoredSort()||viewSort;
-refresh();setInterval(function(){if(!ownerMenuBusy())refresh()},10000);
+refresh();setInterval(function(){if(!ownerMenuBusy()&&!infoPopOpen())refresh()},10000);
 ` + profileBarJs + `
 </script>
 </body>

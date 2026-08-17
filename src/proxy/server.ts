@@ -83,6 +83,7 @@ import type { LoadedPlugin } from "./plugins/types"
 import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, restoreActiveProfile, shareableCredentialDir, type ResolvedProfile } from "./profiles"
 import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
 import { parseOwnerRequest, profileOwners, setProfileOwner } from "./profileOwners"
+import { organizationNames, organizationNeedsRefresh, refreshOrganizationNameSoon } from "./organizationName"
 import { startFollowUsagePolling, stopFollowUsagePolling } from "./followUsage"
 import { startProfileLogin, completeProfileLogin } from "./profileLogin"
 import { startProfileAdd, completeProfileAdd } from "./profileAdd"
@@ -3863,6 +3864,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   app.get("/profiles/list", async (c) => {
     const profiles = listProfiles(finalConfig.profiles, finalConfig.defaultProfile)
     const owners = profileOwners()
+    const organizations = organizationNames()
     // Enrich with live auth status
     const enriched = await Promise.all(profiles.map(async (p) => {
       const resolved = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, p.id)
@@ -3891,6 +3893,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       const presence = credentialStore
         ? await readStoredCredentialPresence(credentialStore)
         : "unknown"
+      const organization = organizations[p.id]
+      // Only claude-max profiles have an OAuth account to ask about, and only
+      // their credentials are a directory this can name — an API-key profile
+      // would otherwise be looked up against the host's own ~/.claude and
+      // labelled with an unrelated organization.
+      if (resolved.type === "claude-max" && organizationNeedsRefresh(organization, Date.now())) {
+        refreshOrganizationNameSoon(p.id, { claudeConfigDir: resolved.env.CLAUDE_CONFIG_DIR })
+      }
       return {
         ...p,
         email: auth?.email || null,
@@ -3899,6 +3909,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         allowance: allowance.multiplier,
         allowanceWeight: allowance.weight,
         planLabel: allowance.label,
+        organizationName: organization?.name ?? null,
         loggedIn: presence === "absent" ? false : (auth?.loggedIn ?? false),
         lastCheckedAt: cacheInfo.lastCheckedAt || null,
         lastSuccessAt: cacheInfo.lastSuccessAt || null,

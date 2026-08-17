@@ -4,6 +4,7 @@
  */
 
 import { profileBarCss, profileBarHtml, profileBarJs, themeCss } from "./profileBar"
+import { profileFactsJs } from "./profileFacts"
 import { WINDOW_LABELS } from "./profileUsage"
 
 export const profilePageHtml = `<!DOCTYPE html>
@@ -274,6 +275,7 @@ export const profilePageHtml = `<!DOCTYPE html>
 </div>
 
 <script>
+` + profileFactsJs + `
 // Inlined from src/telemetry/profileUsage.ts. The TS source is unit-tested
 // (see profile-usage.test.ts) and the labels object is interpolated here so
 // the browser script and TS module share their data.
@@ -387,10 +389,6 @@ async function refresh() {
 
 function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
-// Display strings, not the stored vocabulary: the server stores own/loaner,
-// which every consuming scheduler already speaks.
-var OWNER_OPTIONS = [['', 'Not set'], ['own', 'Mine'], ['loaner', 'Borrowed']];
-
 function ownerSelect(id, owner) {
   var current = owner || '';
   var opts = '';
@@ -408,6 +406,21 @@ function ownerSelect(id, owner) {
 function ownerMenuBusy() {
   var el = document.activeElement;
   return !!(el && el.classList && el.classList.contains('owner-select'));
+}
+
+// Owner is the one fact that is editable here, so its value cell is the live
+// control rather than the text the landing overlay shows for the same row.
+function factRows(facts, p) {
+  return facts.map(function (f) {
+    if (f.label === 'Owner') {
+      return '<span class="detail-label">Owner</span>' + ownerSelect(p.id, p.owner);
+    }
+    var tone = f.tone === 'ok' ? ' status-ok' : f.tone === 'err' ? ' status-err' : '';
+    var hint = f.hint ? ' title="' + esc(f.hint) + '"' : '';
+    var note = f.note ? ' <span style="color:var(--muted);font-weight:400">' + esc(f.note) + '</span>' : '';
+    return '<span class="detail-label">' + esc(f.label) + '</span>'
+      + '<span class="detail-value' + tone + '"' + hint + '>' + esc(f.value) + note + '</span>';
+  }).join('');
 }
 
 function renderUsageSection(profileQuota) {
@@ -540,38 +553,7 @@ function render(data, quotaData) {
     html += '<span class="profile-badge badge-type">' + esc(p.type || 'claude-max') + '</span>';
     html += '</div>';
 
-    html += '<div class="profile-details">';
-    html += '<span class="detail-label">Status</span>';
-    html += '<span class="detail-value ' + (p.loggedIn ? 'status-ok' : 'status-err') + '">'
-      + (p.loggedIn ? '\u2713 Authenticated' : '\u2717 Not logged in') + '</span>';
-
-    html += '<span class="detail-label">Owner</span>';
-    html += ownerSelect(p.id, p.owner);
-
-    if (p.email) {
-      html += '<span class="detail-label">Email</span>';
-      html += '<span class="detail-value">' + esc(p.email) + '</span>';
-    }
-    if (p.subscriptionType) {
-      html += '<span class="detail-label">Plan</span>';
-      html += '<span class="detail-value">' + esc(p.planLabel || p.subscriptionType) + '</span>';
-    }
-    if (p.allowance) {
-      // The number that says how much work the account can do. The plan alone
-      // does not: Max 5x and Max 20x both report "max" and differ 4x.
-      html += '<span class="detail-label">Allowance</span>';
-      html += '<span class="detail-value" title="' + esc(p.rateLimitTier || '') + '">' + esc(p.allowance)
-        + ' <span style="color:var(--muted);font-weight:400">of a Pro plan\u2019s Claude Code usage</span></span>';
-    }
-    if (p.lastSuccessAt) {
-      html += '<span class="detail-label">Last Verified</span>';
-      html += '<span class="detail-value" style="color:var(--green)">' + timeAgo(p.lastSuccessAt) + '</span>';
-    }
-    if (p.lastCheckedAt && (!p.lastSuccessAt || p.lastCheckedAt !== p.lastSuccessAt)) {
-      html += '<span class="detail-label">Last Checked</span>';
-      html += '<span class="detail-value">' + timeAgo(p.lastCheckedAt) + '</span>';
-    }
-    html += '</div>';
+    html += '<div class="profile-details">' + factRows(profileFacts(p), p) + '</div>';
 
     if (!p.loggedIn) {
       html += '<div style="margin-top:12px;padding:10px 14px;background:rgba(210,153,34,0.1);border:1px solid rgba(210,153,34,0.3);border-radius:8px;font-size:12px">';
@@ -714,15 +696,6 @@ content.addEventListener('keydown', function (e) {
   saveOrder(moveInOrder(order, from, to), order[from] + ' moved to position ' + (to + 1) + ' of ' + order.length + '.');
 });
 
-function timeAgo(ts) {
-  if (!ts) return '\u2014';
-  var s = Math.floor((Date.now() - ts) / 1000);
-  if (s < 5) return 'just now';
-  if (s < 60) return s + 's ago';
-  if (s < 3600) return Math.floor(s/60) + 'm ago';
-  if (s < 86400) return Math.floor(s/3600) + 'h ago';
-  return new Date(ts).toLocaleString();
-}
 
 function copyCmd(btn) {
   var cmd = btn.getAttribute('data-cmd');
