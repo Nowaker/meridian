@@ -121,3 +121,38 @@ describe("computeProfileSpend", () => {
     expect(s.fraction).toBe(0.97)
   })
 })
+
+describe("computeProfileSpend with a refusal", () => {
+  // The measured case this input exists for: corp4 rendered 5h 67% / 7d 7%
+  // while Anthropic refused every request through it. Judging it by the
+  // percentages alone makes "least spent" recommend the one account that
+  // could not serve.
+  const healthyLooking = [win("five_hour", 0.67), win("seven_day", 0.07)]
+
+  it("calls a refusing account spent however comfortable its last read looks", () => {
+    const s = computeProfileSpend({ windows: healthyLooking, refused: true })
+    expect(s.state).toBe("spent")
+    expect(s.reason).toBe("refused")
+    expect(s.fade).toBe(1)
+  })
+
+  it("sorts a refusing account as most spent, ahead of a genuinely busier one", () => {
+    const refusing = computeProfileSpend({ windows: healthyLooking, refused: true })
+    const busy = computeProfileSpend({ windows: [win("five_hour", 0.9)] })
+    expect(refusing.fraction).not.toBeNull()
+    expect(refusing.fraction!).toBeGreaterThan(busy.fraction!)
+  })
+
+  it("leaves the same account alone once the refusal is gone", () => {
+    const s = computeProfileSpend({ windows: healthyLooking, refused: false })
+    expect(s.state).toBe("available")
+    expect(s.reason).toBeNull()
+    expect(s.fraction).toBe(0.67)
+  })
+
+  it("still asks for a human first: a refusal does not mask a missing login", () => {
+    const s = computeProfileSpend({ windows: healthyLooking, refused: true, loggedIn: false })
+    expect(s.reason).toBe("unusable")
+    expect(s.fade).toBe(0)
+  })
+})

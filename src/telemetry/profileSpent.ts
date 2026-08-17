@@ -36,6 +36,13 @@ export interface SpendInput {
   error?: string | null
   /** `loggedIn` for this profile from /profiles/list. */
   loggedIn?: boolean | null
+  /**
+   * Set when Anthropic has refused this account since its last usage read.
+   * Outranks the percentages: they are the last SUCCESSFUL read, and an
+   * account measured at 5h 67% was refusing every request at the time, so
+   * judging it by them alone recommends the one account that cannot serve.
+   */
+  refused?: boolean | null
 }
 
 export type SpendState = "unknown" | "available" | "fading" | "spent"
@@ -51,8 +58,10 @@ export interface ProfileSpend {
    * Callers give `reason: "unusable"` its own, louder treatment.
    */
   fade: number
-  /** Why it is spent. "unusable" needs a human; "usage" only needs time. */
-  reason: "usage" | "unusable" | null
+  /** Why it is spent. "unusable" needs a human; "usage" and "refused" only
+   *  need time, and differ in who says so: our own reading of the windows,
+   *  or Anthropic refusing a request outright. */
+  reason: "usage" | "unusable" | "refused" | null
 }
 
 /**
@@ -89,6 +98,9 @@ export function generalUtilization(windows: readonly SpendWindow[] | null | unde
 export function computeProfileSpend(input: SpendInput): ProfileSpend {
   if (isUnusable(input)) {
     return { fraction: 1, state: "spent", fade: 0, reason: "unusable" }
+  }
+  if (input.refused) {
+    return { fraction: 1, state: "spent", fade: 1, reason: "refused" }
   }
   const fraction = generalUtilization(input.windows)
   if (fraction == null) {

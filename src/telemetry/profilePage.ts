@@ -66,6 +66,10 @@ export const profilePageHtml = `<!DOCTYPE html>
   }
   .badge-active { background: rgba(88,166,255,0.15); color: var(--accent); }
   .badge-type { background: var(--bg); color: var(--muted); border: 1px solid var(--border); }
+  .badge-refusing { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.35); }
+  .refusal-note { margin-top: 10px; padding: 10px 14px; border-radius: 8px; font-size: 12px; line-height: 1.5;
+    background: rgba(248,81,73,0.08); border: 1px solid rgba(248,81,73,0.3); color: var(--text); }
+  .refusal-note .refusal-why { color: var(--muted); }
   .profile-details {
     display: grid; grid-template-columns: 120px 1fr; gap: 6px 16px; font-size: 13px;
   }
@@ -439,6 +443,45 @@ function factRows(facts, p) {
   }).join('');
 }
 
+// A refusal and the cached percentages are different kinds of fact, so they
+// are rendered as different things: the badge states what the API is doing
+// now, the bars below stay as the last successful read. Measured: an account
+// showed 5h 67% / 7d 7% while every request through it was refused.
+function refusalSummary(refusal) {
+  if (!refusal) return null;
+  var bucket = refusal.diagnosis && refusal.diagnosis.bucket
+    ? labelForWindow(refusal.diagnosis.bucket)
+    : 'unknown limit';
+  var reported = !!(refusal.diagnosis && refusal.diagnosis.reported);
+  var reset = formatResetCountdown(refusal.until);
+  return {
+    bucket: bucket,
+    reported: reported,
+    label: bucket + (reported ? '' : ' (guess)'),
+    reset: reset,
+    why: (refusal.diagnosis && refusal.diagnosis.rationale) || '',
+    at: refusal.at,
+  };
+}
+
+function renderRefusalBadge(refusal) {
+  var s = refusalSummary(refusal);
+  if (!s) return '';
+  return '<span class="profile-badge badge-refusing" title="' + esc(s.why) + '">out of ' + esc(s.label) + '</span>';
+}
+
+function renderRefusalNote(refusal) {
+  var s = refusalSummary(refusal);
+  if (!s) return '';
+  return '<div class="refusal-note">'
+    + '<strong style="color:var(--red)">\u26a0 Anthropic is refusing this account</strong> - '
+    + 'out of <strong>' + esc(s.label) + '</strong>'
+    + (s.reset ? ', expected back ' + esc(s.reset) : '')
+    + '. Refused ' + esc(timeAgo(s.at)) + '.'
+    + '<div class="refusal-why">' + esc(s.why) + '. The percentages below are the last successful read, not live.</div>'
+    + '</div>';
+}
+
 function renderUsageSection(profileQuota) {
   // No quota data for this profile yet (cold start or fetch failed) — hide
   // entirely so we don't render an empty box.
@@ -567,7 +610,9 @@ function render(data, quotaData) {
     html += '<span class="profile-name">' + esc(p.id) + '</span>';
     if (isActive) html += '<span class="profile-badge badge-active">active</span>';
     html += '<span class="profile-badge badge-type">' + esc(p.type || 'claude-max') + '</span>';
+    html += renderRefusalBadge((quotaById[p.id] || {}).refusal);
     html += '</div>';
+    html += renderRefusalNote((quotaById[p.id] || {}).refusal);
 
     html += '<div class="profile-details">' + factRows(profileFacts(p), p) + '</div>';
 

@@ -118,6 +118,10 @@ export const landingHtml = `<!DOCTYPE html>
   .pool-chip.exhausted { color: var(--red); background: rgba(248,81,73,0.12); }
   .plan-chip { font-size: 10px; padding: 2px 8px; border-radius: 10px; background: var(--surface2);
     color: var(--accent2); margin-left: 6px; vertical-align: middle; font-variant-numeric: tabular-nums; }
+  .refusal-banner { font-size: 12px; line-height: 1.45; color: var(--text); margin-bottom: 10px;
+    padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(248,81,73,0.35); background: rgba(248,81,73,0.1); }
+  .refusal-banner strong { color: var(--red); }
+  .refusal-banner-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .usage-row .w-pct { width: 38px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
   .usage-row .w-reset { color: var(--muted); font-size: 11px; width: 76px; text-align: right; }
   .no-usage { font-size: 12px; color: var(--muted); padding: 4px 0; }
@@ -215,6 +219,7 @@ function generalUtilization(windows){
 }
 function computeProfileSpend(p){
   if(isUnusable(p))return {fraction:1,state:'spent',fade:0,reason:'unusable'};
+  if(p.refused)return {fraction:1,state:'spent',fade:1,reason:'refused'};
   var f=generalUtilization(p.windows);
   if(f==null)return {fraction:null,state:'unknown',fade:0,reason:null};
   if(f>=SPENT_AT)return {fraction:f,state:'spent',fade:1,reason:'usage'};
@@ -334,7 +339,7 @@ function profileSection(q,s,pl,h){
   if(profs.length===0)return '';
   function spentOf(p){
     var quota=quotaByProfile[p.id]||{};
-    return computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn}).fraction;
+    return computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn,refused:!!quota.refusal}).fraction;
   }
   profs=sortProfilesForView(profs,viewSort,spentOf);
   var cards='';
@@ -342,7 +347,7 @@ function profileSection(q,s,pl,h){
     var p=profs[i];var cost=byProfile[p.id];
     var quota=quotaByProfile[p.id]||{};
     var wins=(quota.windows||[]).filter(function(w){return w.utilization!=null});
-    var spend=computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn});
+    var spend=computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn,refused:!!quota.refusal});
     if(!p.configured&&wins.length===0&&!cost)continue;
     var rows='';
     for(var j=0;j<wins.length;j++){
@@ -368,6 +373,9 @@ function profileSection(q,s,pl,h){
     }
     if(!rows)rows='<div class="no-usage">no usage data yet</div>';
     var isPriority=pl&&pl.routing==='priority';
+    // active+priority keeps the active profile meaningful - switching it is how
+    // you move traffic, so the card stays clickable, unlike in pure priority.
+    var isActivePriority=pl&&pl.routing==='active+priority';
     var follow=pl&&pl.follow;
     var switchable=multi&&p.configured&&!p.isActive&&!isPriority&&!follow;
     var badge=isPriority?'':p.isActive?'<span class="active-pill">Active</span>':switchable?'<span class="switch-hint">Click to activate</span>':'';
@@ -375,24 +383,46 @@ function profileSection(q,s,pl,h){
     // Sits beside the name because it qualifies the percentages below it: 70%
     // of a 20x account is several times the work left in 70% of a 5x one.
     if(p.allowance)badge+='<span class="plan-chip" title="'+esc((p.planLabel||'')+(p.rateLimitTier?' · '+p.rateLimitTier:''))+'">'+esc(p.allowance)+'</span>';
-    if(isPriority){
+    if(isPriority||isActivePriority){
       var orderIdx=(pl.profileOrder||[]).indexOf(p.id);
-      if(orderIdx>=0)badge+='<span class="pool-chip">#'+(orderIdx+1)+' in pool</span>';
+      if(orderIdx>=0)badge+='<span class="pool-chip">'+(isActivePriority?'#'+(orderIdx+1)+' fallback':'#'+(orderIdx+1)+' in pool')+'</span>';
       var exh=(pl.exhausted||[]).filter(function(e){return e.id===p.id})[0];
-      if(exh)badge+=' <span class="pool-chip exhausted">exhausted · resets '+resetIn(exh.until)+'</span>';
+      // Suppressed when a refusal is being reported below: both say the same
+      // thing, and the banner says it better.
+      if(exh&&!quota.refusal)badge+=' <span class="pool-chip exhausted">exhausted · resets '+resetIn(exh.until)+'</span>';
+    }
+    var sp=quota.refusal;
+    var refusalBanner='';
+    if(sp){
+      var spBucket=(sp.diagnosis&&sp.diagnosis.bucket)?winLabel(sp.diagnosis.bucket):'its limit';
+      var spGuess=(sp.diagnosis&&sp.diagnosis.reported)?'':' (guess)';
+      badge+=' <span class="pool-chip exhausted">out of '+esc(spBucket+spGuess)+'</span>';
+      // A full-width line immediately above the usage bars, not a chip beside
+      // the name: measured in review, a 10px chip wraps to four lines in a
+      // narrow card and loses to the large "67%" rendered right below it -
+      // which is the exact misreading this whole feature exists to stop.
+      refusalBanner='<div class="refusal-banner" title="'+esc((sp.diagnosis&&sp.diagnosis.rationale)||'')+'">'
+        +'<strong>⚠ Anthropic is refusing this account</strong> - out of '+esc(spBucket+spGuess)
+        +(sp.until?', back '+resetIn(sp.until):'')
+        +'<div class="refusal-banner-sub">figures below are the last successful read, not live</div></div>';
     }
     if(spend.reason==='unusable')badge+=' <span class="spend-pill needs-login">needs login</span>';
-    else if(spend.state==='spent')badge+=' <span class="spend-pill">spent</span>';
+    // A refusal already carries its own chip and banner, which name the window
+    // and the way back. The generic pill and the "N% used" tooltip would only
+    // restate it less precisely, and the tooltip would quote the fraction of 1
+    // this branch assumes rather than the last read the card actually shows.
+    else if(spend.state==='spent'&&spend.reason!=='refused')badge+=' <span class="spend-pill">spent</span>';
     var spendClass=spend.reason==='unusable'?' needs-login':spend.fade>0?' spend-'+spend.state:'';
     var spendStyle=spend.fade>0?' style="--spend-fade:'+spend.fade.toFixed(2)+'"':'';
     var spendTip=spend.reason==='unusable'?' title="Cannot serve requests \u2014 run: meridian profile login '+esc(p.id)+'"'
+      :spend.reason==='refused'?''
       :spend.fraction!=null&&spend.fade>0?' title="'+Math.round(spend.fraction*100)+'% of this account\u2019s 5h / 7d allowance is used"':'';
     cards+='<div class="profile-card'+(p.isActive?' active':'')+(switchable?' switchable':'')+spendClass+'"'+spendStyle+spendTip+(switchable?' data-profile="'+esc(p.id)+'" role="button" tabindex="0"':'')+'>'
       +'<div class="profile-head"><span class="profile-name"><span class="prof-dot"></span>'+(p.entry?infoIcon(p.entry,p.type):'')+esc(p.label||p.id)+' '+badge+'</span>'
       +'<span class="profile-cost">'+usd(cost?cost.estimatedUsd:0)+'</span></div>'
       +'<div class="profile-sub">'+(p.configured?ownerSelect(p.id,p.owner):'<span></span>')
       +'<span>'+(cost?cost.requests+' request'+(cost.requests===1?'':'s')+' · est. API value · 24h':'no traffic · 24h')+'</span></div>'
-      +rows+'</div>';
+      +refusalBanner+rows+'</div>';
   }
   if(!cards)return '';
   return '<div class="section"><div class="section-head"><div class="section-title">'+(profs.length===1?'Account':'Accounts')+'</div>'+sortTabs(profs.length)+'</div>'
