@@ -27,6 +27,18 @@ const OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
 export const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 export const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 export const OAUTH_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
+
+/**
+ * Path Anthropic has registered for this client's loopback redirect.
+ *
+ * `https://claude.ai/oauth/claude-code-client-metadata` declares
+ * `redirect_uris: ["http://localhost/callback", "http://127.0.0.1/callback"]`
+ * — the RFC 8252 §7.3 loopback convention, where the port is not part of the
+ * match but the host and path are. So a redirect back into Meridian has to be
+ * served from `/callback` at the root, on `localhost` or `127.0.0.1`; no other
+ * path will be accepted, which is why the route is not under `/profiles/`.
+ */
+export const OAUTH_LOOPBACK_CALLBACK_PATH = "/callback"
 const OAUTH_SCOPES = [
   "org:create_api_key",
   "user:profile",
@@ -110,21 +122,66 @@ function base64Url(bytes: Buffer): string {
   return bytes.toString("base64url")
 }
 
-export function createManualOAuthSession(scopes?: string[]): ManualOAuthSession {
-  const scopeList = scopes ?? OAUTH_SCOPES
+export interface OAuthPkce {
+  codeVerifier: string
+  codeChallenge: string
+  state: string
+}
+
+export function createOAuthPkce(): OAuthPkce {
   const codeVerifier = base64Url(randomBytes(32))
-  const state = base64Url(randomBytes(32))
-  const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url")
+  return {
+    codeVerifier,
+    codeChallenge: createHash("sha256").update(codeVerifier).digest("base64url"),
+    state: base64Url(randomBytes(32)),
+  }
+}
+
+/**
+ * Build an authorize URL for one PKCE challenge and one redirect_uri.
+ *
+ * Separate from `createOAuthPkce` because a single login needs TWO of these:
+ * one redirecting to a loopback listener, one to Anthropic's code-display
+ * page. Claude Code builds the same pair from one challenge
+ * (`buildAuthUrl({...opts, isManual: true})` and `isManual: false`), opens the
+ * loopback one and prints the manual one, then picks the matching redirect_uri
+ * again at exchange time. Whichever the user completes, the other is simply
+ * never used — so the paste fallback costs nothing and needs no second login.
+ *
+ * `code=true` is set for both. It is NOT what makes Anthropic display the code
+ * rather than redirect: Claude Code appends it unconditionally in both modes,
+ * and the redirect_uri alone decides.
+ */
+export function buildAuthorizeUrl(params: {
+  codeChallenge: string
+  state: string
+  redirectUri: string
+  scopes?: string[]
+}): string {
   const url = new URL(OAUTH_AUTHORIZE_URL)
   url.searchParams.set("code", "true")
   url.searchParams.set("client_id", OAUTH_CLIENT_ID)
   url.searchParams.set("response_type", "code")
-  url.searchParams.set("redirect_uri", OAUTH_REDIRECT_URI)
-  url.searchParams.set("scope", scopeList.join(" "))
-  url.searchParams.set("code_challenge", codeChallenge)
+  url.searchParams.set("redirect_uri", params.redirectUri)
+  url.searchParams.set("scope", (params.scopes ?? OAUTH_SCOPES).join(" "))
+  url.searchParams.set("code_challenge", params.codeChallenge)
   url.searchParams.set("code_challenge_method", "S256")
-  url.searchParams.set("state", state)
-  return { authorizeUrl: url.toString(), codeVerifier, state }
+  url.searchParams.set("state", params.state)
+  return url.toString()
+}
+
+export function createManualOAuthSession(scopes?: string[]): ManualOAuthSession {
+  const pkce = createOAuthPkce()
+  return {
+    authorizeUrl: buildAuthorizeUrl({
+      codeChallenge: pkce.codeChallenge,
+      state: pkce.state,
+      redirectUri: OAUTH_REDIRECT_URI,
+      scopes,
+    }),
+    codeVerifier: pkce.codeVerifier,
+    state: pkce.state,
+  }
 }
 
 export function parseAuthorizationCodeInput(input: string): ParsedAuthorizationCode | null {
@@ -265,6 +322,12 @@ export interface OAuthExchangeParams {
   codeVerifier: string
   /** CLAUDE_CONFIG_DIR whose credential store receives the tokens. */
   claudeConfigDir: string
+  /**
+   * redirect_uri to send with the grant. MUST be the one the authorize step
+   * used — the code is bound to it, and a mismatch is rejected. Defaults to
+   * the code-display page, which is what a pasted code always comes from.
+   */
+  redirectUri?: string
   /** Scopes recorded when the token response omits `scope`. */
   scopes?: string[]
   /** Injectable for tests — defaults to global `fetch`. */
@@ -302,7 +365,7 @@ export async function exchangeAuthorizationCodeForCredentials(params: OAuthExcha
         grant_type: "authorization_code",
         client_id: OAUTH_CLIENT_ID,
         code: params.code,
-        redirect_uri: OAUTH_REDIRECT_URI,
+        redirect_uri: params.redirectUri ?? OAUTH_REDIRECT_URI,
         code_verifier: params.codeVerifier,
         state: params.returnedState ?? params.sessionState,
       }),

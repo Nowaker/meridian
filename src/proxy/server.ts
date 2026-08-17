@@ -85,7 +85,7 @@ import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, F
 import { parseOwnerRequest, profileOwners, setProfileOwner } from "./profileOwners"
 import { organizationNames, organizationNeedsRefresh, refreshOrganizationNameSoon } from "./organizationName"
 import { startFollowUsagePolling, stopFollowUsagePolling } from "./followUsage"
-import { startProfileLogin, completeProfileLogin } from "./profileLogin"
+import { startProfileLogin, completeProfileLogin, completeProfileLoginFromCallback, getProfileLoginStatus } from "./profileLogin"
 import { startProfileAdd, completeProfileAdd } from "./profileAdd"
 import { getRoutingMode, resolvePriorityOrder, choosePriorityProfile, ProfileExhaustion, AssignmentStore } from "./routing"
 import { getSetting, setSetting } from "./settings"
@@ -4026,10 +4026,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
   // --- Profile login routes (browser-completable OAuth) ---
   //
-  // Two steps because Anthropic's client id registers exactly one redirect URI,
-  // a page Anthropic hosts — nothing can redirect back into Meridian. /start
-  // hands the browser an opaque login id and the authorize URL; the user signs
-  // in and brings the code back to /complete. Decisions live in profileLogin.ts.
+  // /start mints one PKCE challenge and hands the browser an opaque login id
+  // plus an authorize URL. A browser on this host gets one that redirects to
+  // GET /callback below, and the login finishes on its own; a browser anywhere
+  // else gets the code-display page and finishes via /complete with a paste.
+  // /status is how the page learns which happened. Decisions live in
+  // profileLogin.ts.
 
   app.post("/profiles/login/start", async (c) => {
     let body: { profile?: string }
@@ -4038,7 +4040,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     } catch {
       return c.json({ error: "Invalid JSON in request body" }, 400)
     }
-    const result = startProfileLogin({ profiles: finalConfig.profiles, profileId: body.profile ?? "" })
+    const result = startProfileLogin({
+      profiles: finalConfig.profiles,
+      profileId: body.profile ?? "",
+      hostHeader: c.req.header("host"),
+    })
     if (!result.ok) {
       claudeLog("profile.login_refused", {
         profile: body.profile ?? null,
@@ -4047,13 +4053,30 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       })
       return c.json({ error: result.message, code: result.code }, result.status as 400)
     }
-    plog(`[PROXY] Profile login started for "${result.profileId}" (expires in ${Math.round((result.expiresAt - Date.now()) / 1000)}s)`)
+    plog(`[PROXY] Profile login started for "${result.profileId}" (mode=${result.mode}, expires in ${Math.round((result.expiresAt - Date.now()) / 1000)}s)`)
     return c.json({
       loginId: result.loginId,
+      mode: result.mode,
       authorizeUrl: result.authorizeUrl,
+      pasteAuthorizeUrl: result.pasteAuthorizeUrl,
       expiresAt: result.expiresAt,
       profile: result.profileId,
     })
+  })
+
+  app.get("/profiles/login/status", (c) => {
+    const loginId = c.req.query("loginId")
+    if (!loginId) {
+      return c.json({ error: "Missing 'loginId' query parameter", code: "invalid_request" }, 400)
+    }
+    const status = getProfileLoginStatus(loginId)
+    if (!status) {
+      return c.json({
+        error: "This login is no longer open — it expired, or it was already completed. Start it again.",
+        code: "expired_login",
+      }, 410)
+    }
+    return c.json(status)
   })
 
   app.post("/profiles/login/complete", async (c) => {
@@ -4150,6 +4173,34 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     })
     plog(`[PROXY] Profile "${result.profileId}" created from the web UI`)
     return c.json({ success: true, profile: result.profileId })
+  })
+
+  // PUBLIC — no requireAuth. Anthropic redirects the user's browser here and
+  // that redirect carries no API key, so gating it would break the flow for
+  // every instance running with MERIDIAN_API_KEY set. The path and root
+  // placement are Anthropic's, not ours: the client's registered loopback
+  // redirect URIs are `http://localhost/callback` and
+  // `http://127.0.0.1/callback`. Its security review is in
+  // proxy-settings-auth.test.ts beside the allowlist entry.
+  app.get("/callback", async (c) => {
+    const { renderLoginCallbackPage } = await import("../telemetry/loginCallbackPage")
+    const result = await completeProfileLoginFromCallback({
+      state: c.req.query("state"),
+      code: c.req.query("code"),
+      error: c.req.query("error"),
+      errorDescription: c.req.query("error_description"),
+    })
+    if (!result.ok) {
+      // Neither the code nor the state is logged — both are one-time
+      // credentials for this login.
+      claudeLog("profile.login_failed", { reason: result.code, via: "callback" })
+      plog(`[PROXY] Profile login callback failed: ${result.code}`)
+      return c.html(renderLoginCallbackPage({ ok: false, message: result.message }), result.status as 400)
+    }
+    expireAuthStatusCache()
+    claudeLog("profile.login_completed", { profile: result.profileId, via: "callback" })
+    plog(`[PROXY] Profile login completed for "${result.profileId}" (browser redirect)`)
+    return c.html(renderLoginCallbackPage({ ok: true, profileId: result.profileId }))
   })
 
   // --- Plugin management routes ---

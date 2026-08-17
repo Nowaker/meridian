@@ -16,6 +16,7 @@ import { pluginPageHtml } from "../proxy/plugins/pluginPage"
 import { profileBarHtml, profileBarJs } from "../telemetry/profileBar"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "../telemetry/profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT } from "../telemetry/profileSpent"
+import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
 
 const allPages: Array<[string, string]> = [
   ["landing", landingHtml],
@@ -55,6 +56,16 @@ describe("shared site header", () => {
       const count = html.split("meridian-header").length - 1
       expect(count, `${name} page should embed the header once`).toBeGreaterThanOrEqual(1)
     }
+  })
+
+  test("the OAuth callback page is the deliberate exception", () => {
+    // /callback is reachable WITHOUT the API key — Anthropic's redirect carries
+    // none — while the header polls /health and /profiles/list, which are gated.
+    // Embedding it would render broken "offline" chrome on the one page a user
+    // sees mid-login. This pins that exception so it is not "fixed" by hand.
+    const html = renderLoginCallbackPage({ ok: true, profileId: "personal" })
+    expect(html).not.toContain("meridian-header")
+    expect(html).toContain("href=\"/profiles\"")
   })
 })
 
@@ -123,6 +134,7 @@ describe("design-system conformance (DESIGN.md)", () => {
     "src/telemetry/dashboard.ts",
     "src/telemetry/settingsPage.ts",
     "src/telemetry/profilePage.ts",
+    "src/telemetry/loginCallbackPage.ts",
     "src/proxy/plugins/pluginPage.ts",
   ]
 

@@ -4,13 +4,17 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:f
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
+  LOGIN_RESULT_TTL_MS,
   LOGIN_TTL_MS,
   completeProfileLogin,
+  completeProfileLoginFromCallback,
+  getProfileLoginStatus,
   pendingLoginCount,
   resetPendingLogins,
+  resolveLoopbackRedirectUri,
   startProfileLogin,
 } from "../proxy/profileLogin"
-import type { ProfileConfig } from "../proxy/profiles"
+import { resetDiskProfileDiscovery, type ProfileConfig } from "../proxy/profiles"
 
 const TOKEN_RESPONSE = {
   access_token: "web-login-access-token",
@@ -77,6 +81,11 @@ describe("profileLogin", () => {
       { id: "direct", type: "api", apiKey: "sk-ant-api-test" },
     ]
     resetPendingLogins()
+    // These cases pass an explicit profile list, so disk discovery must be off
+    // — otherwise a file that ran earlier in the same process (proxy-async-ops
+    // imports bin/cli.ts) has turned it on, and the host's real profiles.json
+    // merges into every assertion.
+    resetDiskProfileDiscovery()
     delete process.env.MERIDIAN_CREDENTIALS_READONLY
     delete process.env.CLAUDE_PROXY_CREDENTIALS_READONLY
   })
@@ -394,6 +403,244 @@ describe("profileLogin", () => {
       expect(workResult).toMatchObject({ ok: true, profileId: "work" })
       expect(credentialsAt(join(tempDir, "personal")).accessToken).toBe("personal-token")
       expect(credentialsAt(join(tempDir, "work")).accessToken).toBe("work-token")
+    })
+  })
+
+  describe("resolveLoopbackRedirectUri", () => {
+    it("builds a callback URL for the two hosts Anthropic registered", () => {
+      expect(resolveLoopbackRedirectUri("localhost:3457")).toBe("http://localhost:3457/callback")
+      expect(resolveLoopbackRedirectUri("127.0.0.1:3457")).toBe("http://127.0.0.1:3457/callback")
+      // Port 80 — the registered URI verbatim.
+      expect(resolveLoopbackRedirectUri("localhost")).toBe("http://localhost/callback")
+    })
+
+    it("declines every origin a redirect could not come back from", () => {
+      expect(resolveLoopbackRedirectUri("meridian.example.com")).toBeUndefined()
+      expect(resolveLoopbackRedirectUri("meridian-dev.desktop.ts.nowaker.net")).toBeUndefined()
+      expect(resolveLoopbackRedirectUri("192.168.1.5:3457")).toBeUndefined()
+      expect(resolveLoopbackRedirectUri(undefined)).toBeUndefined()
+      expect(resolveLoopbackRedirectUri("")).toBeUndefined()
+      expect(resolveLoopbackRedirectUri("not a host")).toBeUndefined()
+      expect(resolveLoopbackRedirectUri("localhost:999999")).toBeUndefined()
+    })
+
+    it("declines IPv6 loopback, which is not among the registered URIs", () => {
+      expect(resolveLoopbackRedirectUri("[::1]:3457")).toBeUndefined()
+    })
+
+    it("rebuilds the URL instead of echoing the header", () => {
+      // Host is client-supplied; anything past the authority is discarded
+      // rather than trusted into the redirect target.
+      expect(resolveLoopbackRedirectUri("localhost:3457/evil?x=1")).toBe("http://localhost:3457/callback")
+      expect(resolveLoopbackRedirectUri("LOCALHOST:3457")).toBe("http://localhost:3457/callback")
+    })
+  })
+
+  describe("startProfileLogin — redirect vs paste", () => {
+    it("offers a loopback redirect when the browser is on this host", () => {
+      const result = startProfileLogin({ profiles, profileId: "personal", hostHeader: "127.0.0.1:3457" })
+      if (!result.ok) throw new Error(`expected success, got ${result.code}`)
+
+      expect(result.mode).toBe("redirect")
+      expect(new URL(result.authorizeUrl).searchParams.get("redirect_uri"))
+        .toBe("http://127.0.0.1:3457/callback")
+      expect(new URL(result.pasteAuthorizeUrl).searchParams.get("redirect_uri"))
+        .toBe("https://platform.claude.com/oauth/code/callback")
+    })
+
+    it("mints both authorize URLs from ONE challenge, so either may be completed", () => {
+      const result = startProfileLogin({ profiles, profileId: "personal", hostHeader: "localhost:3457" })
+      if (!result.ok) throw new Error("expected success")
+
+      const redirect = new URL(result.authorizeUrl).searchParams
+      const paste = new URL(result.pasteAuthorizeUrl).searchParams
+      expect(redirect.get("state")).toBe(paste.get("state"))
+      expect(redirect.get("code_challenge")).toBe(paste.get("code_challenge"))
+      // One login, not two.
+      expect(pendingLoginCount()).toBe(1)
+    })
+
+    it("falls back to paste for a browser that cannot be redirected back", () => {
+      const result = startProfileLogin({ profiles, profileId: "personal", hostHeader: "meridian.example.com" })
+      if (!result.ok) throw new Error("expected success")
+
+      expect(result.mode).toBe("paste")
+      expect(result.authorizeUrl).toBe(result.pasteAuthorizeUrl)
+      expect(new URL(result.authorizeUrl).searchParams.get("redirect_uri"))
+        .toBe("https://platform.claude.com/oauth/code/callback")
+    })
+
+    it.skipIf(skipOnDarwin)("still exchanges a PASTED code against the code-display redirect_uri", async () => {
+      // Started in redirect mode, finished by paste: the code came from the
+      // other URL, so the grant must name that one or Anthropic rejects it.
+      const started = startProfileLogin({ profiles, profileId: "personal", hostHeader: "127.0.0.1:3457" })
+      if (!started.ok) throw new Error("expected success")
+
+      const { fetchFn, requests } = okTokenFetch()
+      expect(await completeProfileLogin({ loginId: started.loginId, input: "pasted-code", fetchFn }))
+        .toMatchObject({ ok: true })
+      expect(requests[0]?.redirect_uri).toBe("https://platform.claude.com/oauth/code/callback")
+    })
+  })
+
+  describe("completeProfileLoginFromCallback", () => {
+    it.skipIf(skipOnDarwin)("exchanges against the loopback redirect_uri and writes the credentials", async () => {
+      const started = startProfileLogin({ profiles, profileId: "personal", hostHeader: "127.0.0.1:3457" })
+      if (!started.ok) throw new Error("expected success")
+      const state = new URL(started.authorizeUrl).searchParams.get("state") ?? ""
+
+      const { fetchFn, requests } = okTokenFetch()
+      const result = await completeProfileLoginFromCallback({ state, code: "redirect-code", fetchFn })
+
+      expect(result).toMatchObject({ ok: true, profileId: "personal" })
+      expect(requests[0]).toMatchObject({
+        code: "redirect-code",
+        redirect_uri: "http://127.0.0.1:3457/callback",
+        grant_type: "authorization_code",
+      })
+      expect(credentialsAt(join(tempDir, "personal")).accessToken).toBe("web-login-access-token")
+      expect(pendingLoginCount()).toBe(0)
+    })
+
+    it("refuses a state no login is waiting for, without sending anything", async () => {
+      startProfileLogin({ profiles, profileId: "personal", hostHeader: "127.0.0.1:3457" })
+
+      const { fetchFn, requests } = okTokenFetch()
+      const result = await completeProfileLoginFromCallback({ state: "not-a-real-state", code: "x", fetchFn })
+
+      expect(result).toMatchObject({ ok: false, code: "expired_login", status: 410 })
+      expect(requests).toHaveLength(0)
+      // The open login is untouched — a wrong state reaches nothing.
+      expect(pendingLoginCount()).toBe(1)
+    })
+
+    it("reports a refusal from Claude without exchanging anything", async () => {
+      const started = startProfileLogin({ profiles, profileId: "personal", hostHeader: "127.0.0.1:3457" })
+      if (!started.ok) throw new Error("expected success")
+      const state = new URL(started.authorizeUrl).searchParams.get("state") ?? ""
+
+      const { fetchFn, requests } = okTokenFetch()
+      const result = await completeProfileLoginFromCallback({
+        state,
+        error: "access_denied",
+        errorDescription: "user refused",
+        fetchFn,
+      })
+
+      expect(result).toMatchObject({ ok: false, code: "login_denied", status: 400 })
+      if (result.ok) throw new Error("expected refusal")
+      expect(result.message).toContain("access_denied")
+      expect(requests).toHaveLength(0)
+      expect(pendingLoginCount()).toBe(0)
+    })
+
+    it("refuses a callback for a login that never issued a loopback URL", async () => {
+      const started = startProfileLogin({ profiles, profileId: "personal", hostHeader: "meridian.example.com" })
+      if (!started.ok) throw new Error("expected success")
+      const state = new URL(started.authorizeUrl).searchParams.get("state") ?? ""
+
+      const { fetchFn, requests } = okTokenFetch()
+      const result = await completeProfileLoginFromCallback({ state, code: "abc", fetchFn })
+
+      expect(result).toMatchObject({ ok: false, code: "no_code" })
+      expect(requests).toHaveLength(0)
+    })
+
+    it.skipIf(skipOnDarwin)("is single-use — the same redirect replayed finds nothing", async () => {
+      const started = startProfileLogin({ profiles, profileId: "personal", hostHeader: "127.0.0.1:3457" })
+      if (!started.ok) throw new Error("expected success")
+      const state = new URL(started.authorizeUrl).searchParams.get("state") ?? ""
+
+      const { fetchFn, requests } = okTokenFetch()
+      expect(await completeProfileLoginFromCallback({ state, code: "abc", fetchFn })).toMatchObject({ ok: true })
+      expect(await completeProfileLoginFromCallback({ state, code: "abc", fetchFn }))
+        .toMatchObject({ ok: false, code: "expired_login", status: 410 })
+      expect(requests).toHaveLength(1)
+    })
+
+    it("refuses a callback for an expired login", async () => {
+      const started = startProfileLogin({ profiles, profileId: "personal", hostHeader: "127.0.0.1:3457" })
+      if (!started.ok) throw new Error("expected success")
+      const state = new URL(started.authorizeUrl).searchParams.get("state") ?? ""
+
+      const { fetchFn, requests } = okTokenFetch()
+      const result = await completeProfileLoginFromCallback({
+        state,
+        code: "abc",
+        now: Date.now() + LOGIN_TTL_MS + 1,
+        fetchFn,
+      })
+      expect(result).toMatchObject({ ok: false, code: "expired_login", status: 410 })
+      expect(requests).toHaveLength(0)
+    })
+
+    it.skipIf(skipOnDarwin)("keeps two concurrent logins apart by state", async () => {
+      const first = startProfileLogin({ profiles, profileId: "personal", hostHeader: "127.0.0.1:3457" })
+      const second = startProfileLogin({ profiles, profileId: "work", hostHeader: "127.0.0.1:3457" })
+      if (!first.ok || !second.ok) throw new Error("expected both to start")
+      const secondState = new URL(second.authorizeUrl).searchParams.get("state") ?? ""
+
+      const { fetchFn } = stubTokenFetch(() => new Response(
+        JSON.stringify({ ...TOKEN_RESPONSE, access_token: "work-token" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ))
+      expect(await completeProfileLoginFromCallback({ state: secondState, code: "abc", fetchFn }))
+        .toMatchObject({ ok: true, profileId: "work" })
+
+      expect(credentialsAt(join(tempDir, "work")).accessToken).toBe("work-token")
+      expect(existsSync(join(tempDir, "personal", ".credentials.json"))).toBe(false)
+      expect(pendingLoginCount()).toBe(1)
+    })
+  })
+
+  describe("getProfileLoginStatus", () => {
+    it("reports waiting while the user is still signing in", () => {
+      const started = startProfileLogin({ profiles, profileId: "personal", hostHeader: "127.0.0.1:3457" })
+      if (!started.ok) throw new Error("expected success")
+      expect(getProfileLoginStatus(started.loginId)).toEqual({ status: "waiting", profileId: "personal" })
+    })
+
+    it.skipIf(skipOnDarwin)("reports completed once the redirect finished the login", async () => {
+      const started = startProfileLogin({ profiles, profileId: "personal", hostHeader: "127.0.0.1:3457" })
+      if (!started.ok) throw new Error("expected success")
+      const state = new URL(started.authorizeUrl).searchParams.get("state") ?? ""
+
+      const { fetchFn } = okTokenFetch()
+      await completeProfileLoginFromCallback({ state, code: "abc", fetchFn })
+      expect(getProfileLoginStatus(started.loginId)).toEqual({ status: "completed", profileId: "personal" })
+    })
+
+    it("reports the reason a login failed, so the page can show it", async () => {
+      const started = startProfileLogin({ profiles, profileId: "personal", hostHeader: "127.0.0.1:3457" })
+      if (!started.ok) throw new Error("expected success")
+      const state = new URL(started.authorizeUrl).searchParams.get("state") ?? ""
+
+      const { fetchFn } = stubTokenFetch(() => new Response(
+        JSON.stringify({ error: "invalid_grant" }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      ))
+      await completeProfileLoginFromCallback({ state, code: "stale", fetchFn })
+
+      const status = getProfileLoginStatus(started.loginId)
+      expect(status).toMatchObject({ status: "failed", profileId: "personal", code: "exchange_failed" })
+      expect(status?.error).toContain("400")
+      // The token endpoint's body never reaches a surface the user can read.
+      expect(status?.error).not.toContain("invalid_grant")
+    })
+
+    it("knows nothing about an id it never issued", () => {
+      expect(getProfileLoginStatus("never-issued")).toBeNull()
+    })
+
+    it.skipIf(skipOnDarwin)("forgets an outcome once its retention window passes", async () => {
+      const started = startProfileLogin({ profiles, profileId: "personal", hostHeader: "127.0.0.1:3457" })
+      if (!started.ok) throw new Error("expected success")
+      const state = new URL(started.authorizeUrl).searchParams.get("state") ?? ""
+
+      const { fetchFn } = okTokenFetch()
+      await completeProfileLoginFromCallback({ state, code: "abc", fetchFn })
+      expect(getProfileLoginStatus(started.loginId)).toMatchObject({ status: "completed" })
+      expect(getProfileLoginStatus(started.loginId, Date.now() + LOGIN_RESULT_TTL_MS + 1)).toBeNull()
     })
   })
 })

@@ -39,34 +39,42 @@ Every login also records the account's plan (`subscriptionType`, `rateLimitTier`
 
 #### From the web UI: re-authenticate a profile without a terminal
 
-A profile whose credentials expired can be logged in again from the Profiles page, with no shell on the Meridian host. Click **Log in from browser** on the profile's card:
+A profile whose credentials expired can be logged in again from the Profiles page, with no shell on the Meridian host. Click **Log in from browser** on the profile's card, sign in to that profile's Claude account, and you are done — Claude sends you back to Meridian, which finishes the login and updates the card. There is nothing to copy and paste.
 
-1. Meridian creates the PKCE login server-side and opens Claude's sign-in in a new tab.
-2. Sign in to that profile's Claude account. Claude shows you a code.
-3. Paste it into the box on the card. Either form works — the **bare code**, or the **whole callback URL** from the address bar (`https://platform.claude.com/oauth/code/callback?code=…&state=…`), which is usually easier to copy.
+That works when the browser is on the machine Meridian runs on (including through an SSH port-forward, since the forwarded address is still loopback to the browser). A browser anywhere else — Meridian published on a LAN or tailnet hostname — cannot be redirected back, so the panel asks for the code instead. Either form is accepted: the **bare code** Claude shows you, or the **whole callback URL** from the address bar (`https://platform.claude.com/oauth/code/callback?code=…&state=…`), which is usually easier to copy. The redirect flow also offers **Paste a code instead** as a manual fallback, which does not restart anything — both sign-in URLs belong to the same login.
 
-The same two steps are available for scripting:
+**Why the browser sometimes has to be on the same host.** Anthropic publishes the Claude Code client's registration at [`https://claude.ai/oauth/claude-code-client-metadata`](https://claude.ai/oauth/claude-code-client-metadata), and it declares exactly three ways back:
+
+```json
+"redirect_uris": ["http://localhost/callback", "http://127.0.0.1/callback"]
+```
+
+plus the hosted code-display page, `https://platform.claude.com/oauth/code/callback`. The loopback pair is the [RFC 8252 §7.3](https://datatracker.ietf.org/doc/html/rfc8252#section-7.3) convention, where the port is not part of the match — which is why Meridian can use whichever port you reached it on. A redirect URI belonging to *your* hostname cannot be added to Anthropic's registration, so it would be rejected at the authorize step; the paste flow is what remains for that case.
+
+For scripting, the same login is three routes:
 
 ```bash
-# → {"loginId":"…","authorizeUrl":"https://claude.com/cai/oauth/authorize?…","expiresAt":…,"profile":"work"}
+# mode is "redirect" when the Host you call with is a loopback address, else "paste"
+# → {"loginId":"…","mode":"redirect","authorizeUrl":"…","pasteAuthorizeUrl":"…","expiresAt":…,"profile":"work"}
 curl -X POST http://127.0.0.1:3456/profiles/login/start \
   -H 'Content-Type: application/json' -d '{"profile":"work"}'
 
-# `code` accepts the bare code or the full callback URL
+# → {"status":"waiting"|"completed"|"failed", "profileId":"work", …}
+curl 'http://127.0.0.1:3456/profiles/login/status?loginId=…'
+
+# only needed for the paste path; `code` accepts the bare code or the full callback URL
 curl -X POST http://127.0.0.1:3456/profiles/login/complete \
   -H 'Content-Type: application/json' -d '{"loginId":"…","code":"…"}'
 ```
 
-**Why you paste a code instead of being redirected back.** Claude's OAuth client registers exactly one redirect URI — `https://platform.claude.com/oauth/code/callback`, a page Anthropic hosts. There is no `http://localhost:<port>/callback` variant registered, and a redirect URI belonging to your Meridian instance cannot be added, so an automatic hand-off back into the UI would be rejected at the authorize step. Accepting the callback page's whole URL is as close as this flow gets.
-
 Details worth knowing:
 
 - The PKCE verifier never leaves the server. The browser only ever holds an opaque login id.
-- A login is **single-use** and expires **10 minutes** after it starts. `state` must match the login it was started with, exactly as the CLI requires.
+- A login is **single-use** and expires **10 minutes** after it starts. `state` must match the login it was started with, exactly as the CLI requires; on the redirect path that `state` is what identifies the login at all.
+- `GET /callback` is deliberately **not** behind `MERIDIAN_API_KEY` — Anthropic's redirect carries no key. It acts only on an unguessable, single-use `state` minted by `/profiles/login/start`, which *is* gated, and answers 410 to anything else.
 - Only **claude-max** profiles have this flow. `api` and `oauth-token` profiles are refused with the reason — replace an OAuth token with `meridian profile remove <name> && meridian profile add <name> --oauth-token`.
 - An unknown profile name is refused here rather than created — a typo in a re-authentication must not quietly produce a second account slot. Creating one is a separate, explicit act: see [Add a profile from the web UI](#from-the-web-ui-add-a-profile) below.
 - An instance told not to write credential files (`MERIDIAN_CREDENTIALS_READONLY=1` — set on a second instance that shares another's credentials) refuses **before** opening the sign-in tab, and names where the login can be completed instead. Refusing after sign-in would have burned a one-time code for nothing.
-- These routes sit behind `MERIDIAN_API_KEY` like the rest of `/profiles/*` when that key is configured.
 
 #### From the web UI: add a profile
 

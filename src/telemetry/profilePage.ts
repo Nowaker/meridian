@@ -127,6 +127,10 @@ export const profilePageHtml = `<!DOCTYPE html>
     border: 1px solid var(--border); border-radius: 8px;
   }
   .login-panel-title { font-size: 12px; font-weight: 600; margin-bottom: 8px; }
+  .login-note {
+    font-size: 12px; color: var(--muted); margin-bottom: 8px; padding: 8px 10px;
+    background: rgba(210,153,34,0.1); border: 1px solid rgba(210,153,34,0.3); border-radius: 6px;
+  }
   .login-steps { font-size: 12px; color: var(--muted); padding-left: 18px; margin-bottom: 10px; }
   .login-steps li { margin-bottom: 4px; }
   .login-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
@@ -256,13 +260,14 @@ export const profilePageHtml = `<!DOCTYPE html>
 
     <h3 style="margin-top:16px">Re-authenticating a profile</h3>
     <ol>
-      <li><strong>UI:</strong> Click <strong>Log in from browser</strong> on the profile card, sign in,
-          then paste the code Claude shows you \u2014 the whole callback URL works too</li>
+      <li><strong>UI:</strong> Click <strong>Log in from browser</strong> on the profile card and sign in.
+          Claude sends you back here and the login finishes itself.</li>
       <li><strong>CLI:</strong> <code>meridian profile login &lt;name&gt;</code></li>
     </ol>
     <p style="font-size:12px;color:var(--muted);margin-top:8px">
-      Claude sends you to a page it hosts rather than back to Meridian, so the code has to
-      make one hop by hand \u2014 Anthropic registers a single redirect URI for this client.
+      Claude will only redirect back to <code>localhost</code> or <code>127.0.0.1</code> \u2014 those are the
+      addresses registered for this client. Browsing Meridian on any other hostname, the panel
+      asks for the code instead; the bare code or the whole callback URL both work.
     </p>
 
     <h3 style="margin-top:16px">Other commands</h3>
@@ -734,9 +739,10 @@ async function setOwner(id, value) {
 //
 // The open login is held here rather than in the DOM because render() rebuilds
 // #content wholesale on every poll — a panel written into a card would be
-// destroyed mid-typing. While a login is open the poll is paused, so the panel
-// and whatever is half-pasted into it survive.
+// destroyed mid-typing. While a login is open the card poll is paused, so the
+// panel and whatever is half-pasted into it survive.
 var activeLogin = null;
+var loginPollTimer = null;
 
 function loginSlot(id) { return document.getElementById('login-slot-' + id); }
 
@@ -776,22 +782,51 @@ async function startLogin(id) {
     return;
   }
 
-  activeLogin = { profile: id, loginId: data.loginId };
-  slot.innerHTML = renderLoginPanel(id, data.authorizeUrl);
-  var input = slot.querySelector('.login-input');
-  if (input) {
-    input.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitLogin(); });
-    input.focus();
+  activeLogin = { profile: id, loginId: data.loginId, pasteUrl: data.pasteAuthorizeUrl };
+
+  if (data.mode === 'redirect') {
+    slot.innerHTML = renderWaitingPanel(id, data.authorizeUrl);
+    // The server finishes this one on its own when Claude redirects back, so
+    // all the page does is watch for it.
+    scheduleLoginPoll();
+  } else {
+    slot.innerHTML = renderPastePanel(id, data.authorizeUrl,
+      'This browser is not on the machine Meridian runs on, so Claude cannot redirect back to it. Paste the code instead.');
+    bindPasteInput(slot);
+    // Poll anyway: the same login can still be finished from a browser on the
+    // Meridian host, and then this panel should get out of the way.
+    scheduleLoginPoll();
   }
   window.open(data.authorizeUrl, '_blank', 'noopener');
 }
 
-// One panel for both flows. Signing a profile in and creating one differ in
-// their wording and their handlers, not in their shape — two copies of this
+// The redirect flow's panel. It has no paste box on purpose — Claude comes
+// back to Meridian by itself — so it does not share renderOauthPanel's shape.
+function renderWaitingPanel(id, authorizeUrl) {
+  return '<div class="login-panel">'
+    + '<div class="login-panel-title">Sign in as ' + esc(id) + '</div>'
+    + '<ol class="login-steps">'
+    +   '<li>A Claude sign-in tab just opened — '
+    +     '<a class="login-reopen" href="' + esc(authorizeUrl) + '" target="_blank" rel="noopener">open it again</a>'
+    +     ' if it was blocked.</li>'
+    +   '<li>Make sure you are signed into the right Claude account for this profile.</li>'
+    +   '<li>That is all — Claude sends you back here and this page finishes the login itself.</li>'
+    + '</ol>'
+    + '<div class="login-row">'
+    +   '<button class="switch-btn current login-cancel" style="margin-top:0" onclick="cancelLogin()">Cancel</button>'
+    +   '<a class="login-reopen" href="#" onclick="switchToPaste();return false;">Paste a code instead</a>'
+    + '</div>'
+    + '<div class="login-msg busy">Waiting for you to finish signing in\\u2026</div>'
+    + '</div>';
+}
+
+// One panel for both paste flows. Signing a profile in and creating one differ
+// in their wording and their handlers, not in their shape — two copies of this
 // markup would drift the moment either is touched.
 function renderOauthPanel(o) {
   return '<div class="login-panel">'
     + '<div class="login-panel-title">' + o.title + '</div>'
+    + (o.note ? '<div class="login-note">' + esc(o.note) + '</div>' : '')
     + '<ol class="login-steps">'
     +   '<li>A Claude sign-in tab just opened — '
     +     '<a class="login-reopen" href="' + esc(o.authorizeUrl) + '" target="_blank" rel="noopener">open it again</a>'
@@ -808,15 +843,77 @@ function renderOauthPanel(o) {
     + '</div>';
 }
 
-function renderLoginPanel(id, authorizeUrl) {
+function renderPastePanel(id, authorizeUrl, note) {
   return renderOauthPanel({
     title: 'Sign in as ' + esc(id),
     authorizeUrl: authorizeUrl,
+    note: note,
     accountStep: 'Make sure you are signed into the right Claude account for this profile.',
     submitLabel: 'Complete login',
     onSubmit: 'submitLogin()',
     onCancel: 'cancelLogin()',
   });
+}
+
+function bindPasteInput(slot) {
+  var input = slot.querySelector('.login-input');
+  if (!input) return;
+  input.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitLogin(); });
+  input.focus();
+}
+
+// Falls back WITHOUT restarting the login: both authorize URLs were minted from
+// the same challenge, so the one that shows a code completes the login already
+// in progress.
+function switchToPaste() {
+  if (!activeLogin) return;
+  var slot = loginSlot(activeLogin.profile);
+  if (!slot || !activeLogin.pasteUrl) return;
+  slot.innerHTML = renderPastePanel(activeLogin.profile, activeLogin.pasteUrl,
+    'Opened a second sign-in that ends on a page showing the code.');
+  bindPasteInput(slot);
+  window.open(activeLogin.pasteUrl, '_blank', 'noopener');
+}
+
+function scheduleLoginPoll() {
+  stopLoginPoll();
+  loginPollTimer = setTimeout(checkLoginStatus, 1500);
+}
+
+function stopLoginPoll() {
+  if (loginPollTimer) clearTimeout(loginPollTimer);
+  loginPollTimer = null;
+}
+
+async function checkLoginStatus() {
+  if (!activeLogin || activeLogin.spent) return;
+  var loginId = activeLogin.loginId;
+
+  var res, data;
+  try {
+    res = await fetch('/profiles/login/status?loginId=' + encodeURIComponent(loginId));
+    data = await res.json();
+  } catch (err) {
+    scheduleLoginPoll();
+    return;
+  }
+
+  // The login may have been cancelled or replaced while this was in flight.
+  if (!activeLogin || activeLogin.loginId !== loginId) return;
+
+  if (res.ok && data.status === 'waiting') { scheduleLoginPoll(); return; }
+  if (res.ok && data.status === 'completed') { finishLogin(); return; }
+
+  setLoginMsg(data.error || 'Login failed.', 'err');
+  activeLogin.spent = true;
+  stopLoginPoll();
+}
+
+function finishLogin() {
+  stopLoginPoll();
+  activeLogin = null;
+  if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
+  refresh();
 }
 
 async function submitLogin() {
@@ -865,13 +962,12 @@ async function submitLogin() {
     return;
   }
 
-  activeLogin = null;
-  if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
-  refresh();
+  finishLogin();
 }
 
 function cancelLogin() {
   var previous = activeLogin;
+  stopLoginPoll();
   activeLogin = null;
   if (previous) {
     var slot = loginSlot(previous.profile);

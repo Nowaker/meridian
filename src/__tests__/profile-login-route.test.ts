@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:f
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { resetPendingLogins } from "../proxy/profileLogin"
+import { resetDiskProfileDiscovery } from "../proxy/profiles"
 import { createProxyServer } from "../proxy/server"
 import { stopBackgroundRefresh } from "../proxy/tokenRefresh"
 
@@ -29,11 +30,19 @@ describe("profile login routes", () => {
     }))
   }
 
+  function get(path: string, headers: Record<string, string> = {}) {
+    return app.fetch(new Request(`http://localhost${path}`, { headers }))
+  }
+
   beforeEach(() => {
     originalFetch = globalThis.fetch
     tempDir = mkdtempSync(join(tmpdir(), "meridian-login-route-"))
     mkdirSync(join(tempDir, "personal"), { recursive: true })
     resetPendingLogins()
+    // The server is built with an explicit profile list; keep disk discovery
+    // out of it so an earlier file in the same process cannot merge the host's
+    // real profiles.json into these assertions.
+    resetDiskProfileDiscovery()
     delete process.env.MERIDIAN_CREDENTIALS_READONLY
     delete process.env.MERIDIAN_API_KEY
 
@@ -224,15 +233,101 @@ describe("profile login routes", () => {
     expect(raw).not.toContain("already redeemed")
   })
 
-  // Both routes sit under the /profiles/* prefix, so they inherit requireAuth
-  // rather than needing their own registration — asserted rather than assumed.
-  it("requires the API key on both routes when one is configured", async () => {
+  // The three /profiles/* routes inherit requireAuth from the prefix rather
+  // than registering it themselves — asserted rather than assumed. /callback
+  // deliberately does not; see the next test.
+  it("requires the API key on the profile-scoped routes when one is configured", async () => {
     process.env.MERIDIAN_API_KEY = "secret-key"
 
     expect((await post("/profiles/login/start", { profile: "personal" })).status).toBe(401)
     expect((await post("/profiles/login/complete", { loginId: "x", code: "y" })).status).toBe(401)
+    expect((await get("/profiles/login/status?loginId=x")).status).toBe(401)
 
     const authorized = await post("/profiles/login/start", { profile: "personal" }, { "x-api-key": "secret-key" })
     expect(authorized.status).toBe(200)
+  })
+
+  it("leaves /callback reachable without the API key, because Anthropic's redirect carries none", async () => {
+    process.env.MERIDIAN_API_KEY = "secret-key"
+
+    const res = await get("/callback?state=nothing-is-waiting&code=x")
+    // Refused on its merits (no such login), NOT on auth.
+    expect(res.status).toBe(410)
+    expect(res.headers.get("content-type")).toContain("text/html")
+  })
+
+  describe("browser redirect flow", () => {
+    it("offers a loopback redirect to a browser on this host, and a paste to any other", async () => {
+      const local = await post("/profiles/login/start", { profile: "personal" }, { host: "127.0.0.1:3457" })
+      const localBody = await local.json() as { mode: string; authorizeUrl: string; pasteAuthorizeUrl: string }
+      expect(localBody.mode).toBe("redirect")
+      expect(new URL(localBody.authorizeUrl).searchParams.get("redirect_uri")).toBe("http://127.0.0.1:3457/callback")
+      expect(new URL(localBody.pasteAuthorizeUrl).searchParams.get("redirect_uri"))
+        .toBe("https://platform.claude.com/oauth/code/callback")
+
+      const remote = await post("/profiles/login/start", { profile: "personal" }, { host: "meridian.example.com" })
+      const remoteBody = await remote.json() as { mode: string; authorizeUrl: string; pasteAuthorizeUrl: string }
+      expect(remoteBody.mode).toBe("paste")
+      expect(remoteBody.authorizeUrl).toBe(remoteBody.pasteAuthorizeUrl)
+    })
+
+    it.skipIf(skipOnDarwin)("completes the login when Claude redirects back, and says so on the page", async () => {
+      const started = await post("/profiles/login/start", { profile: "personal" }, { host: "127.0.0.1:3457" })
+      const { loginId, authorizeUrl } = await started.json() as { loginId: string; authorizeUrl: string }
+      const state = new URL(authorizeUrl).searchParams.get("state") ?? ""
+
+      const requests = stubTokenEndpoint(() => new Response(JSON.stringify(TOKEN_RESPONSE), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }))
+
+      const res = await get(`/callback?code=redirect-code&state=${encodeURIComponent(state)}`)
+      expect(res.status).toBe(200)
+      const html = await res.text()
+      expect(html).toContain("Signed in")
+      expect(html).toContain("personal")
+      // The one-time code must not survive into the rendered page.
+      expect(html).not.toContain("redirect-code")
+
+      expect(requests[0]).toMatchObject({ redirect_uri: "http://127.0.0.1:3457/callback" })
+      expect(JSON.parse(readFileSync(join(tempDir, "personal", ".credentials.json"), "utf-8")).claudeAiOauth.accessToken)
+        .toBe("route-access-token")
+
+      const status = await get(`/profiles/login/status?loginId=${encodeURIComponent(loginId)}`)
+      expect(status.status).toBe(200)
+      expect(await status.json()).toEqual({ status: "completed", profileId: "personal" })
+    })
+
+    it("renders an error page, not a success one, when the redirect brings a refusal", async () => {
+      const started = await post("/profiles/login/start", { profile: "personal" }, { host: "127.0.0.1:3457" })
+      const { loginId, authorizeUrl } = await started.json() as { loginId: string; authorizeUrl: string }
+      const state = new URL(authorizeUrl).searchParams.get("state") ?? ""
+
+      const requests = stubTokenEndpoint(() => new Response("{}", { status: 200 }))
+      const res = await get(`/callback?error=access_denied&state=${encodeURIComponent(state)}`)
+
+      expect(res.status).toBe(400)
+      expect(await res.text()).toContain("Login failed")
+      expect(requests).toHaveLength(0)
+
+      const status = await get(`/profiles/login/status?loginId=${encodeURIComponent(loginId)}`)
+      expect(await status.json()).toMatchObject({ status: "failed", code: "login_denied" })
+    })
+
+    it("reports a login still waiting, and 410s a status nobody is holding", async () => {
+      const started = await post("/profiles/login/start", { profile: "personal" }, { host: "127.0.0.1:3457" })
+      const { loginId } = await started.json() as { loginId: string }
+
+      const waiting = await get(`/profiles/login/status?loginId=${encodeURIComponent(loginId)}`)
+      expect(await waiting.json()).toEqual({ status: "waiting", profileId: "personal" })
+
+      const unknown = await get("/profiles/login/status?loginId=made-up")
+      expect(unknown.status).toBe(410)
+      expect((await unknown.json() as { code: string }).code).toBe("expired_login")
+
+      const missingParam = await get("/profiles/login/status")
+      expect(missingParam.status).toBe(400)
+      expect((await missingParam.json() as { code: string }).code).toBe("invalid_request")
+    })
   })
 })
