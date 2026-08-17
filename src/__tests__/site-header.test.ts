@@ -14,6 +14,7 @@ import { settingsPageHtml } from "../telemetry/settingsPage"
 import { profilePageHtml } from "../telemetry/profilePage"
 import { pluginPageHtml } from "../proxy/plugins/pluginPage"
 import { profileBarHtml, profileBarJs } from "../telemetry/profileBar"
+import { reorderClientJs } from "../telemetry/profileOrder"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "../telemetry/profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT } from "../telemetry/profileSpent"
 import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
@@ -116,8 +117,17 @@ describe("landing page layout", () => {
     expect(landingHtml).toContain(`var PROFILE_SORT_MODES=${JSON.stringify(PROFILE_SORT_MODES)}`)
     expect(landingHtml).toContain(`var viewSort=${JSON.stringify(DEFAULT_PROFILE_SORT)}`)
     expect(landingHtml).toContain("sort-tab")
-    // View-only: the durable pool order has one writer, and it is not here.
-    expect(landingHtml).not.toContain("/settings/api/routing")
+    // The choice itself is never persisted server-side: it lives in
+    // localStorage and re-renders from the last payload.
+    expect(landingHtml).toContain("localStorage.setItem(SORT_STORAGE_KEY,mode)")
+    // The durable pool order still has exactly one writer, and it is the
+    // shared reorder gesture — the page's own code only ever reads it.
+    expect(landingHtml.split(reorderClientJs).join("")).not.toContain("PUT")
+    // ...and the gesture is offered only while the cards are in the persisted
+    // order. A drag saves whatever sequence is on screen, so under a spent
+    // ranking it would write that ranking into the routing pool — an order
+    // nobody chose and the page gives no sign of having chosen.
+    expect(landingHtml).toContain("viewSort==='configured'")
   })
 
   test("the fade never reaches the card itself, so the active ring survives it", () => {

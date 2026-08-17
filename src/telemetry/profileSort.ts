@@ -18,7 +18,7 @@ export const DEFAULT_PROFILE_SORT: ProfileSortMode = "configured"
 
 /** Rendered as the control, in this order. `id` is what the comparator takes. */
 export const PROFILE_SORT_MODES: ReadonlyArray<{ id: ProfileSortMode; label: string; title: string }> = [
-  { id: "configured", label: "Order", title: "The order profiles are configured in" },
+  { id: "configured", label: "Order", title: "The saved pool order — drag a card to change it" },
   { id: "spent-desc", label: "Most spent", title: "Closest to running out first" },
   { id: "spent-asc", label: "Least spent", title: "Most capacity left first" },
 ]
@@ -35,8 +35,8 @@ export function parseProfileSortMode(raw: string | null | undefined): ProfileSor
  * of evidence, not a low number — sorting it to the front of "least spent"
  * would recommend the one account we cannot vouch for.
  *
- * Ties and the "configured" mode keep the incoming order, which is the
- * order the profiles are configured in.
+ * Ties and the "configured" mode keep the incoming order, which the caller
+ * has already put in the saved pool order.
  */
 export function sortProfilesForView<T>(
   items: readonly T[],

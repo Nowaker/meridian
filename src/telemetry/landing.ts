@@ -10,6 +10,7 @@
 
 import { profileBarCss, profileBarHtml, profileBarJs, themeCss } from "./profileBar"
 import { profileFactsJs } from "./profileFacts"
+import { reorderClientJs, reorderCss, reorderLiveRegionHtml } from "./profileOrder"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "./profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT } from "./profileSpent"
 
@@ -71,6 +72,7 @@ export const landingHtml = `<!DOCTYPE html>
     border-radius: 10px; padding: 1px 8px; }
   .spend-pill.needs-login { color: var(--red); background: rgba(248,81,73,0.12);
     border-color: rgba(248,81,73,0.35); }
+  ${reorderCss}
   .profile-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 4px; }
   .profile-name { font-size: 13px; font-weight: 600; letter-spacing: 0.5px; display: flex; align-items: center; gap: 8px; }
   .profile-name .prof-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
@@ -175,6 +177,7 @@ export const landingHtml = `<!DOCTYPE html>
 ` + profileBarHtml + `
 <div class="container">
   <div id="content"><div style="color:var(--muted);padding:40px;text-align:center">Loading…</div></div>
+  ${reorderLiveRegionHtml}
 </div>
 <script>
 ` + profileFactsJs + `
@@ -289,6 +292,8 @@ function setViewSort(mode){
   if(refocus){var el=document.querySelector('.sort-tab[data-sort="'+mode+'"]');if(el)el.focus()}
 }
 
+${reorderClientJs}
+
 function introSection(h){
   var meta=[];
   if(h.auth&&h.auth.loggedIn)meta.push(esc(h.auth.email||'')+(h.auth.subscriptionType?' ('+esc(h.auth.subscriptionType)+')':''));
@@ -351,8 +356,19 @@ function profileSection(q,s,pl,h){
     var quota=quotaByProfile[p.id]||{};
     return computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn,refused:!!quota.refusal}).fraction;
   }
-  profs=sortProfilesForView(profs,viewSort,spentOf);
+  // The persisted order is the base order everywhere. /profiles writes it;
+  // this page read config order instead, so the two disagreed after a drag.
+  // The view sort ranks on top of that base, so "configured" shows the pool
+  // order rather than whatever sequence /profiles/list happened to return.
+  profs=sortProfilesForView(meridianReorder.sortProfiles(profs),viewSort,spentOf);
+  // A drag persists whatever sequence the cards are currently in, so it is
+  // offered only while that sequence is the persisted one. Under a spent
+  // ranking a drag would write the ranking into the routing pool order - an
+  // order nobody chose, and which the page gives no sign of having chosen.
+  var envPinned=meridianReorder.envPinned();
+  var reorderable=multi&&!envPinned&&viewSort==='configured';
   var cards='';
+  var pos=0;
   for(var i=0;i<profs.length;i++){
     var p=profs[i];var cost=byProfile[p.id];
     var quota=quotaByProfile[p.id]||{};
@@ -427,15 +443,20 @@ function profileSection(q,s,pl,h){
     var spendTip=spend.reason==='unusable'?' title="Cannot serve requests \u2014 run: meridian profile login '+esc(p.id)+'"'
       :spend.reason==='refused'?''
       :spend.fraction!=null&&spend.fade>0?' title="'+Math.round(spend.fraction*100)+'% of this account\u2019s 5h / 7d allowance is used"':'';
-    cards+='<div class="profile-card'+(p.isActive?' active':'')+(switchable?' switchable':'')+spendClass+'"'+spendStyle+spendTip+(switchable?' data-profile="'+esc(p.id)+'" role="button" tabindex="0"':'')+'>'
-      +'<div class="profile-head"><span class="profile-name"><span class="prof-dot"></span>'+(p.entry?infoIcon(p.entry,p.type):'')+esc(p.label||p.id)+' '+badge+'</span>'
+    var draggable=reorderable&&p.configured;
+    cards+='<div class="profile-card'+(p.isActive?' active':'')+(switchable?' switchable':'')+spendClass+'"'+spendStyle+spendTip
+      +(p.configured?' data-id="'+esc(p.id)+'" data-index="'+pos+'"':'')
+      +(switchable?' data-profile="'+esc(p.id)+'" role="button" tabindex="0"':'')+'>'
+      +'<div class="profile-head"><span class="profile-name">'+(draggable?meridianReorder.handleHtml(p.id,pos,profs.length):'')+'<span class="prof-dot"></span>'+(p.entry?infoIcon(p.entry,p.type):'')+esc(p.label||p.id)+' '+badge+'</span>'
       +'<span class="profile-cost">'+usd(cost?cost.estimatedUsd:0)+'</span></div>'
       +'<div class="profile-sub">'+(p.configured?ownerSelect(p.id,p.owner):'<span></span>')
       +'<span>'+(cost?cost.requests+' request'+(cost.requests===1?'':'s')+' · est. API value · 24h':'no traffic · 24h')+'</span></div>'
       +refusalBanner+rows+'</div>';
+    if(p.configured)pos++;
   }
   if(!cards)return '';
   return '<div class="section"><div class="section-head"><div class="section-title">'+(profs.length===1?'Account':'Accounts')+'</div>'+sortTabs(profs.length)+'</div>'
+    +(multi?meridianReorder.noteHtml(reorderable,envPinned?'env':'view-sort'):'')
     +'<div class="profile-grid">'+cards+'</div></div>';
 }
 
@@ -472,12 +493,14 @@ function strip(items){
 
 async function refresh(){
   try{
-    const [health,stats,quota,profiles]=await Promise.all([
+    const [health,stats,quota,profiles,routing]=await Promise.all([
       fetch('/health').then(r=>r.json()),
       fetch('/telemetry/summary?window=86400000').then(r=>r.json()),
       fetch('/v1/usage/quota/all').then(r=>r.json()).catch(function(){return null}),
-      fetch('/profiles/list').then(r=>r.json()).catch(function(){return null})
+      fetch('/profiles/list').then(r=>r.json()).catch(function(){return null}),
+      fetch('/settings/api/routing').then(r=>r.json()).catch(function(){return null})
     ]);
+    meridianReorder.adopt(routing);
     render(health,stats,quota,profiles);
   }catch(e){document.getElementById('content').innerHTML='<div style="color:var(--red);padding:40px;text-align:center">Could not connect</div>'}
 }
@@ -486,6 +509,7 @@ function tokens(v){if(v==null)return '—';if(v>=1e6)return (v/1e6).toFixed(1)+'
 
 function render(h,s,q,pl){
   lastData=[h,s,q,pl];
+  var refocusId=meridianReorder.focusAnchor();
   let o='';
   o+=introSection(h);
 
@@ -510,6 +534,7 @@ function render(h,s,q,pl){
 
   o+='<div class="footer">Meridian · <a href="https://github.com/rynfar/meridian">GitHub</a> · Built on the <a href="https://github.com/anthropics/claude-agent-sdk-typescript">Claude Agent SDK</a></div>';
   document.getElementById('content').innerHTML=o;
+  meridianReorder.restoreFocus(refocusId);
 }
 
 function switchProfile(id){
@@ -522,12 +547,16 @@ document.getElementById('content').addEventListener('change',function(e){
   var sel=e.target.closest('.owner-select');
   if(sel)setOwner(sel.dataset.ownerFor,sel.value);
 });
+// The handle sits inside a card that is itself a switch button, so without
+// this every grab of the handle would also change the active account.
+function onHandle(e){return !!(e.target.closest&&e.target.closest('.drag-handle'))}
 document.getElementById('content').addEventListener('click',function(e){
   // The card is itself a switch button, so a control inside one has to opt out
   // of it or picking an owner (or reading the details) would also move all
   // traffic to that account.
   if(e.target.closest('.owner-select'))return;
   if(e.target.closest('.prof-info'))return;
+  if(onHandle(e))return;
   var tab=e.target.closest('.sort-tab');
   if(tab&&tab.dataset.sort){setViewSort(tab.dataset.sort);return}
   var card=e.target.closest('.profile-card.switchable');
@@ -537,11 +566,14 @@ document.getElementById('content').addEventListener('keydown',function(e){
   if(e.key!=='Enter'&&e.key!==' ')return;
   if(e.target.closest('.owner-select'))return;
   if(e.target.closest('.prof-info'))return;
+  if(onHandle(e))return;
   var card=e.target.closest('.profile-card.switchable');
   if(card&&card.dataset.profile){e.preventDefault();switchProfile(card.dataset.profile)}
 });
 viewSort=readStoredSort()||viewSort;
-refresh();setInterval(function(){if(!ownerMenuBusy()&&!infoPopOpen())refresh()},10000);
+meridianReorder.init({onSaved:refresh});
+refresh();
+setInterval(function(){if(!meridianReorder.dragging()&&!ownerMenuBusy()&&!infoPopOpen())refresh()},10000);
 ` + profileBarJs + `
 </script>
 </body>
