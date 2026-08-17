@@ -147,6 +147,12 @@ export const profilePageHtml = `<!DOCTYPE html>
   .login-reopen:hover { text-decoration: underline; }
   .add-intro { font-size: 13px; color: var(--muted); margin-bottom: 10px; }
   .add-note { font-size: 11px; color: var(--muted); margin-top: 8px; }
+  /* Deliberately lighter than .profile-card: it now sits above the account
+     list, where a card's weight would read as the page's headline. */
+  .add-card {
+    padding: 14px 16px; background: var(--surface2);
+    border: 1px solid var(--border); border-radius: 8px;
+  }
 
   .mono { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px; }
   .copy-cmd {
@@ -212,15 +218,15 @@ export const profilePageHtml = `<!DOCTYPE html>
 <h1>Profiles</h1>
 <div class="subtitle">Manage Claude account profiles</div>
 
-<div id="content"><div style="color:var(--muted);padding:40px;text-align:center">Loading\u2026</div></div>
-<div id="orderStatus" class="sr-only" role="status" aria-live="polite"></div>
-
 <!-- Outside #content on purpose: render() rebuilds that element wholesale on
      every poll, which would destroy a half-typed name or a pasted code. -->
 <div class="section">
   <div class="section-title">Add a profile</div>
-  <div class="profile-card"><div id="add-slot"></div></div>
+  <div class="add-card"><div id="add-slot"></div></div>
 </div>
+
+<div id="content"><div style="color:var(--muted);padding:40px;text-align:center">Loading\u2026</div></div>
+<div id="orderStatus" class="sr-only" role="status" aria-live="polite"></div>
 
 <div class="section" style="margin-top:32px">
   <div class="section-title">Setup Guide</div>
