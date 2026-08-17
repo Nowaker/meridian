@@ -153,6 +153,21 @@ export interface StartLoginSuccess {
    * challenge and `state`, and whichever is completed first wins.
    */
   pasteAuthorizeUrl: string
+  /**
+   * Authorize URL that redirects to this instance on loopback, when one can be
+   * built at all. In `redirect` mode this is `authorizeUrl`; in `paste` mode it
+   * is the upgrade the page may take if `loopbackProbeUrl` answers.
+   */
+  loopbackAuthorizeUrl?: string
+  /**
+   * Status URL for THIS login on the loopback origin, for the page to probe.
+   *
+   * Deliberately the status route rather than something like `/health`: a 200
+   * from it proves the browser can reach loopback AND that what answers there
+   * is the same instance holding this login. Anything else on that port
+   * answers 410 and the page keeps the paste flow.
+   */
+  loopbackProbeUrl?: string
   expiresAt: number
 }
 
@@ -169,6 +184,9 @@ export interface StartLoginParams {
    * which decides whether a loopback redirect can reach this instance.
    */
   hostHeader?: string
+  /** Port this instance listens on, used to offer a loopback candidate when
+   *  `hostHeader` is some other name. */
+  serverPort?: number
   now?: number
 }
 
@@ -263,6 +281,28 @@ export function resolveLoopbackRedirectUri(hostHeader: string | undefined): stri
 }
 
 /**
+ * A loopback redirect this instance MIGHT be reachable at, for a browser that
+ * reached it under some other name.
+ *
+ * `Host` proves a loopback redirect will work; its absence proves nothing. A
+ * user browsing `https://meridian.example.net` from the very machine Meridian
+ * runs on can still be redirected to `http://127.0.0.1:<port>/callback` — the
+ * browser is on that host, it simply did not say so. Measured in Chromium: a
+ * page on an HTTPS origin may both `fetch` and be navigated to loopback, since
+ * `127.0.0.1` is a potentially-trustworthy origin and so is exempt from
+ * mixed-content blocking.
+ *
+ * So this returns a CANDIDATE, offered alongside the paste URL rather than
+ * used in its place. The page probes it (see `loopbackProbeUrl`) and upgrades
+ * only when the probe answers; a browser on another machine never reaches it,
+ * the probe fails, and the paste flow stands.
+ */
+export function loopbackRedirectUriForPort(port: number | undefined): string | undefined {
+  if (!port || !Number.isInteger(port) || port <= 0 || port > 65535) return undefined
+  return `http://127.0.0.1:${port}${OAUTH_LOOPBACK_CALLBACK_PATH}`
+}
+
+/**
  * Refuse when this instance must not write credential files.
  *
  * `MERIDIAN_CREDENTIALS_READONLY=1` marks an instance that shares another
@@ -334,19 +374,25 @@ export function startProfileLogin(params: StartLoginParams): StartLoginSuccess |
   }
 
   const pkce = createOAuthPkce()
-  const loopbackRedirectUri = resolveLoopbackRedirectUri(params.hostHeader)
+  // Two questions, not one: whether a loopback redirect is CERTAIN (the browser
+  // said it reached us on loopback) and whether one is POSSIBLE (it may be on
+  // this host under another name). The first picks the mode; the second is
+  // offered for the page to probe.
+  const certainLoopbackUri = resolveLoopbackRedirectUri(params.hostHeader)
+  const loopbackRedirectUri = certainLoopbackUri ?? loopbackRedirectUriForPort(params.serverPort)
   const pasteAuthorizeUrl = buildAuthorizeUrl({
     codeChallenge: pkce.codeChallenge,
     state: pkce.state,
     redirectUri: OAUTH_REDIRECT_URI,
   })
-  const authorizeUrl = loopbackRedirectUri
+  const loopbackAuthorizeUrl = loopbackRedirectUri
     ? buildAuthorizeUrl({
         codeChallenge: pkce.codeChallenge,
         state: pkce.state,
         redirectUri: loopbackRedirectUri,
       })
-    : pasteAuthorizeUrl
+    : undefined
+  const authorizeUrl = certainLoopbackUri ? loopbackAuthorizeUrl! : pasteAuthorizeUrl
 
   const loginId = randomBytes(16).toString("base64url")
   const expiresAt = now + LOGIN_TTL_MS
@@ -364,9 +410,13 @@ export function startProfileLogin(params: StartLoginParams): StartLoginSuccess |
     ok: true,
     profileId,
     loginId,
-    mode: loopbackRedirectUri ? "redirect" : "paste",
+    mode: certainLoopbackUri ? "redirect" : "paste",
     authorizeUrl,
     pasteAuthorizeUrl,
+    ...(loopbackAuthorizeUrl ? { loopbackAuthorizeUrl } : {}),
+    ...(loopbackRedirectUri
+      ? { loopbackProbeUrl: `${new URL(loopbackRedirectUri).origin}/profiles/login/status?loginId=${encodeURIComponent(loginId)}` }
+      : {}),
     expiresAt,
   }
 }

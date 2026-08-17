@@ -155,6 +155,47 @@ describe("design-system conformance (DESIGN.md)", () => {
   })
 })
 
+describe("profiles page — the sign-in control is a real link", () => {
+  // Someone signed into several Claude accounts needs the browser's own
+  // context menu — "Open Link in Incognito Window", "Copy Link Address" — to
+  // choose which session answers the sign-in. Chrome and Firefox offer that
+  // for an anchor with an href and for nothing else, so these assertions are
+  // the feature, not decoration.
+  test("renders an anchor with an href, not a button", () => {
+    expect(profilePageHtml).toContain('<a class="login-btn login-link"')
+    expect(profilePageHtml).toContain("loginHrefFor(p.id)")
+    expect(profilePageHtml).toContain('rel="noopener noreferrer"')
+    expect(profilePageHtml).not.toContain('<button class="login-btn" onclick="startLogin')
+  })
+
+  test("nothing in the login flow opens a window from script", () => {
+    // A scripted window.open is exactly what denies the context menu, and it
+    // also ignores ctrl-click and middle-click. Scoped to the login section so
+    // this says something precise about THIS flow rather than policing every
+    // other feature on the page.
+    const start = profilePageHtml.indexOf("// --- Browser login ---")
+    expect(start).toBeGreaterThan(-1)
+    const next = profilePageHtml.indexOf("// --- ", start + 24)
+    const loginSection = next === -1 ? profilePageHtml.slice(start) : profilePageHtml.slice(start, next)
+    expect(loginSection).not.toContain("window.open(")
+  })
+
+  test("the fallback to pasting a code is also a real link", () => {
+    expect(profilePageHtml).toContain('onclick="switchToPaste();return true;"')
+    expect(profilePageHtml).not.toContain('href="#" onclick="switchToPaste()')
+  })
+
+  test("hrefs survive a re-render and are refreshed before they expire", () => {
+    expect(profilePageHtml).toContain("applyLoginHrefs()")
+    expect(profilePageHtml).toContain("ensureLoginLinks(profiles)")
+  })
+
+  test("no PKCE material is ever put in a link", () => {
+    expect(profilePageHtml).not.toContain("codeVerifier")
+    expect(profilePageHtml).not.toContain("code_verifier")
+  })
+})
+
 describe("per-page titles do not repeat the brand", () => {
   test("dashboard h1 is the page name, not the brand", () => {
     expect(dashboardHtml).not.toContain("<h1>Meridian</h1>")

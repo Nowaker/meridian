@@ -11,6 +11,7 @@ import {
   getProfileLoginStatus,
   pendingLoginCount,
   resetPendingLogins,
+  loopbackRedirectUriForPort,
   resolveLoopbackRedirectUri,
   startProfileLogin,
 } from "../proxy/profileLogin"
@@ -436,6 +437,23 @@ describe("profileLogin", () => {
     })
   })
 
+  describe("loopbackRedirectUriForPort", () => {
+    it("builds the candidate on the registered loopback host", () => {
+      expect(loopbackRedirectUriForPort(3457)).toBe("http://127.0.0.1:3457/callback")
+      expect(loopbackRedirectUriForPort(1)).toBe("http://127.0.0.1:1/callback")
+      expect(loopbackRedirectUriForPort(65535)).toBe("http://127.0.0.1:65535/callback")
+    })
+
+    it("has nothing to offer without a real port", () => {
+      expect(loopbackRedirectUriForPort(undefined)).toBeUndefined()
+      expect(loopbackRedirectUriForPort(0)).toBeUndefined()
+      expect(loopbackRedirectUriForPort(-1)).toBeUndefined()
+      expect(loopbackRedirectUriForPort(65536)).toBeUndefined()
+      expect(loopbackRedirectUriForPort(3457.5)).toBeUndefined()
+      expect(loopbackRedirectUriForPort(Number.NaN)).toBeUndefined()
+    })
+  })
+
   describe("startProfileLogin — redirect vs paste", () => {
     it("offers a loopback redirect when the browser is on this host", () => {
       const result = startProfileLogin({ profiles, profileId: "personal", hostHeader: "127.0.0.1:3457" })
@@ -468,6 +486,67 @@ describe("profileLogin", () => {
       expect(result.authorizeUrl).toBe(result.pasteAuthorizeUrl)
       expect(new URL(result.authorizeUrl).searchParams.get("redirect_uri"))
         .toBe("https://platform.claude.com/oauth/code/callback")
+    })
+
+    it("offers a loopback CANDIDATE to a browser that reached us under another name", () => {
+      const result = startProfileLogin({
+        profiles,
+        profileId: "personal",
+        hostHeader: "meridian-dev.desktop.ts.nowaker.net",
+        serverPort: 3457,
+      })
+      if (!result.ok) throw new Error("expected success")
+
+      // Still paste by default — being on the Meridian host is not proven yet.
+      expect(result.mode).toBe("paste")
+      expect(result.authorizeUrl).toBe(result.pasteAuthorizeUrl)
+
+      // …but the upgrade is offered, for the page to probe.
+      expect(new URL(result.loopbackAuthorizeUrl ?? "").searchParams.get("redirect_uri"))
+        .toBe("http://127.0.0.1:3457/callback")
+      expect(result.loopbackProbeUrl)
+        .toBe(`http://127.0.0.1:3457/profiles/login/status?loginId=${encodeURIComponent(result.loginId)}`)
+    })
+
+    it("offers no candidate when it cannot name a port", () => {
+      const result = startProfileLogin({ profiles, profileId: "personal", hostHeader: "meridian.example.com" })
+      if (!result.ok) throw new Error("expected success")
+      expect(result.loopbackAuthorizeUrl).toBeUndefined()
+      expect(result.loopbackProbeUrl).toBeUndefined()
+    })
+
+    it("does not need the probe when Host already proved loopback", () => {
+      const result = startProfileLogin({
+        profiles,
+        profileId: "personal",
+        hostHeader: "localhost:3457",
+        serverPort: 3457,
+      })
+      if (!result.ok) throw new Error("expected success")
+      expect(result.mode).toBe("redirect")
+      // Host wins over the port-derived guess: it is the address the browser
+      // actually used, so it is the one that will come back.
+      expect(result.authorizeUrl).toBe(result.loopbackAuthorizeUrl ?? "")
+      expect(new URL(result.authorizeUrl).searchParams.get("redirect_uri"))
+        .toBe("http://localhost:3457/callback")
+    })
+
+    it.skipIf(skipOnDarwin)("exchanges an UPGRADED login against the loopback redirect_uri", async () => {
+      // The page probed loopback, took the upgrade and signed in there, so the
+      // grant must name the loopback URI even though `mode` said paste.
+      const started = startProfileLogin({
+        profiles,
+        profileId: "personal",
+        hostHeader: "meridian-dev.desktop.ts.nowaker.net",
+        serverPort: 3457,
+      })
+      if (!started.ok) throw new Error("expected success")
+      const state = new URL(started.loopbackAuthorizeUrl ?? "").searchParams.get("state") ?? ""
+
+      const { fetchFn, requests } = okTokenFetch()
+      expect(await completeProfileLoginFromCallback({ state, code: "redirected-code", fetchFn }))
+        .toMatchObject({ ok: true, profileId: "personal" })
+      expect(requests[0]?.redirect_uri).toBe("http://127.0.0.1:3457/callback")
     })
 
     it.skipIf(skipOnDarwin)("still exchanges a PASTED code against the code-display redirect_uri", async () => {

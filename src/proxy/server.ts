@@ -4044,6 +4044,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       profiles: finalConfig.profiles,
       profileId: body.profile ?? "",
       hostHeader: c.req.header("host"),
+      serverPort: finalConfig.port,
     })
     if (!result.ok) {
       claudeLog("profile.login_refused", {
@@ -4059,6 +4060,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       mode: result.mode,
       authorizeUrl: result.authorizeUrl,
       pasteAuthorizeUrl: result.pasteAuthorizeUrl,
+      ...(result.loopbackAuthorizeUrl ? { loopbackAuthorizeUrl: result.loopbackAuthorizeUrl } : {}),
+      ...(result.loopbackProbeUrl ? { loopbackProbeUrl: result.loopbackProbeUrl } : {}),
       expiresAt: result.expiresAt,
       profile: result.profileId,
     })

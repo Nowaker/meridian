@@ -271,6 +271,76 @@ describe("profile login routes", () => {
       expect(remoteBody.authorizeUrl).toBe(remoteBody.pasteAuthorizeUrl)
     })
 
+    it.skipIf(skipOnDarwin)("completes a login presented by a client that never initiated it", async () => {
+      // The point of putting a real URL in an href: the sign-in can be finished
+      // in an incognito window, or another browser entirely, which shares no
+      // cookies, no storage and no script with the page that started it. That
+      // works only because the verifier and `state` are held server-side and
+      // keyed by `state` alone — so this pins it.
+      const started = await post("/profiles/login/start", { profile: "personal" }, {
+        host: "127.0.0.1:3457",
+        cookie: "meridian-ui=originating-browser",
+        "user-agent": "OriginatingBrowser/1.0",
+      })
+      const { loginId, loopbackAuthorizeUrl } = await started.json() as {
+        loginId: string
+        loopbackAuthorizeUrl: string
+      }
+      const state = new URL(loopbackAuthorizeUrl).searchParams.get("state") ?? ""
+
+      const requests = stubTokenEndpoint(() => new Response(JSON.stringify(TOKEN_RESPONSE), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }))
+
+      const res = await app.fetch(new Request(`http://localhost/callback?state=${state}&code=from-another-browser`, {
+        headers: { "user-agent": "PrivateWindow/2.0", host: "127.0.0.1:3457" },
+      }))
+      expect(res.status).toBe(200)
+      expect(requests).toHaveLength(1)
+      expect(JSON.parse(readFileSync(join(tempDir, "personal", ".credentials.json"), "utf-8")).claudeAiOauth.accessToken)
+        .toBe(TOKEN_RESPONSE.access_token)
+
+      // …and the page that started it learns the outcome, having done nothing.
+      const status = await get(`/profiles/login/status?loginId=${loginId}`)
+      expect(await status.json()).toMatchObject({ status: "completed", profileId: "personal" })
+    })
+
+    it("hands a browser under another name the loopback candidate and a probe for it", async () => {
+      // A configured port is what makes the candidate expressible; the other
+      // tests run on port 0, where there is no address to offer.
+      const ported = createProxyServer({
+        port: 3999,
+        host: "127.0.0.1",
+        profiles: [{ id: "personal", claudeConfigDir: join(tempDir, "personal") }],
+        defaultProfile: "personal",
+        silent: true,
+      }).app
+
+      const res = await ported.fetch(new Request("http://localhost/profiles/login/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", host: "meridian-dev.desktop.ts.nowaker.net" },
+        body: JSON.stringify({ profile: "personal" }),
+      }))
+      const body = await res.json() as {
+        mode: string
+        loginId: string
+        authorizeUrl: string
+        pasteAuthorizeUrl: string
+        loopbackAuthorizeUrl?: string
+        loopbackProbeUrl?: string
+      }
+
+      expect(body.mode).toBe("paste")
+      expect(body.authorizeUrl).toBe(body.pasteAuthorizeUrl)
+      expect(new URL(body.loopbackAuthorizeUrl ?? "").searchParams.get("redirect_uri"))
+        .toBe("http://127.0.0.1:3999/callback")
+      // The probe is this login's own status URL on the loopback origin, so a
+      // 200 from it proves the responder is this very instance.
+      expect(body.loopbackProbeUrl)
+        .toBe(`http://127.0.0.1:3999/profiles/login/status?loginId=${encodeURIComponent(body.loginId)}`)
+    })
+
     it.skipIf(skipOnDarwin)("completes the login when Claude redirects back, and says so on the page", async () => {
       const started = await post("/profiles/login/start", { profile: "personal" }, { host: "127.0.0.1:3457" })
       const { loginId, authorizeUrl } = await started.json() as { loginId: string; authorizeUrl: string }
