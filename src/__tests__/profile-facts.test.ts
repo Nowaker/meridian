@@ -138,6 +138,49 @@ describe("ownership and allowance", () => {
   })
 })
 
+describe("the account family and the plan within it", () => {
+  test("they are two rows, because two fields answer them", () => {
+    const p = { accountType: "Team", planName: "Premium seat" }
+    expect(valueOf(p, "Account")).toBe("Team")
+    expect(valueOf(p, "Plan")).toBe("Premium seat")
+  })
+
+  test("a known family with an unknowable plan still states the family", () => {
+    expect(labels({ accountType: "Team" })).toEqual(["Status", "Owner", "Account"])
+  })
+
+  test("the seat outranks every coarser name for the same account", () => {
+    expect(valueOf({
+      accountType: "Team",
+      planName: "Standard seat",
+      planLabel: "Team",
+      subscriptionType: "team",
+    }, "Plan")).toBe("Standard seat")
+  })
+
+  test("the plan's hint is the field that sized it", () => {
+    // A Team seat is sized by `seat_tier`, so showing `rate_limit_tier` there
+    // would name the field that cannot tell Premium from Standard - measured,
+    // both of this fleet's seat kinds disagree with it.
+    const seat = profileFacts({ planName: "Premium seat", seatTier: "team_tier_1", rateLimitTier: "default_claude_max_5x" })
+      .find(f => f.label === "Plan")!
+    expect(seat.hint).toBe("team_tier_1")
+    const personal = profileFacts({ planName: "Max 20x", rateLimitTier: "default_claude_max_20x" })
+      .find(f => f.label === "Plan")!
+    expect(personal.hint).toBe("default_claude_max_20x")
+  })
+
+  test("the account sits between the organization and the plan", () => {
+    expect(labels({
+      email: "a@b.c",
+      organizationName: "Acme Inc",
+      accountType: "Team",
+      planName: "Premium seat",
+      allowance: "6.25x",
+    })).toEqual(["Status", "Owner", "Email", "Organization", "Account", "Plan", "Allowance"])
+  })
+})
+
 describe("timeAgo", () => {
   test("an absent timestamp reads as a dash", () => {
     expect(timeAgo(null)).toBe("—")

@@ -3830,7 +3830,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // that sizes it, so the 5x-vs-20x distinction can only come off disk.
       // Same store, same cached read as the renewal window above.
       const plan = await getStoredPlanFields(healthStore).catch((): StoredPlanFields => ({}))
-      const allowance = planAllowance({ ...plan, subscriptionType: auth.subscriptionType })
+      // Spread the live status only WHEN IT HAS ONE. `subscriptionType:
+      // undefined` overwrites the value read off disk, so an account whose
+      // `claude auth status` omits the field lost its stored plan entirely -
+      // which is why a personal Max rendered no Plan row at all.
+      const allowance = planAllowance({
+        ...plan,
+        ...(auth.subscriptionType ? { subscriptionType: auth.subscriptionType } : {}),
+      })
 
       return c.json({
         status: "healthy",
@@ -3840,9 +3847,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           email: auth.email,
           subscriptionType: auth.subscriptionType,
           rateLimitTier: plan.rateLimitTier ?? null,
+          seatTier: plan.seatTier ?? null,
           allowance: allowance.multiplier,
           allowanceWeight: allowance.weight,
           planLabel: allowance.label,
+          accountType: allowance.accountType,
+          planName: allowance.planName,
           ...renewal,
         },
         mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
@@ -3879,7 +3889,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // the profile's own credential file.
       const credentialStore = credentialStoreForProfile(resolved)
       const plan = await getStoredPlanFields(credentialStore).catch((): StoredPlanFields => ({}))
-      const allowance = planAllowance({ ...plan, subscriptionType: auth?.subscriptionType })
+      // Spread the live status only WHEN IT HAS ONE. `subscriptionType:
+      // undefined` overwrites the value read off disk, so an account whose
+      // `claude auth status` omits the field lost its stored plan entirely -
+      // which is why a personal Max rendered no Plan row at all.
+      const allowance = planAllowance({
+        ...plan,
+        ...(auth?.subscriptionType ? { subscriptionType: auth.subscriptionType } : {}),
+      })
       // `claude auth status` answers from its own view of the account and was
       // measured saying `loggedIn: true` for a credential whose accessToken is
       // the empty string - three accounts on one fleet read as fine here while
@@ -3906,10 +3923,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         email: auth?.email || null,
         subscriptionType: auth?.subscriptionType || null,
         rateLimitTier: plan.rateLimitTier ?? null,
+        seatTier: plan.seatTier ?? null,
         allowance: allowance.multiplier,
         allowanceWeight: allowance.weight,
         planLabel: allowance.label,
         organizationName: organization?.name ?? null,
+        accountType: allowance.accountType,
+        planName: allowance.planName,
         loggedIn: presence === "absent" ? false : (auth?.loggedIn ?? false),
         lastCheckedAt: cacheInfo.lastCheckedAt || null,
         lastSuccessAt: cacheInfo.lastSuccessAt || null,

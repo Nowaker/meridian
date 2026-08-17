@@ -47,7 +47,14 @@ function profileFacts(p) {
   facts.push({ label: 'Owner', value: ownerLabel(p.owner), tone: '' });
   if (p.email) facts.push({ label: 'Email', value: p.email, tone: '' });
   if (p.organizationName) facts.push({ label: 'Organization', value: p.organizationName, tone: '' });
-  if (p.subscriptionType) facts.push({ label: 'Plan', value: p.planLabel || p.subscriptionType, tone: '' });
+  // Two rows, because two fields answer two questions and either can be known
+  // without the other: a Team seat whose seat_tier is missing has a
+  // trustworthy family and an unknowable plan.
+  if (p.accountType) facts.push({ label: 'Account', value: p.accountType, tone: '' });
+  var planName = p.planName || p.planLabel || p.subscriptionType;
+  if (planName) {
+    facts.push({ label: 'Plan', value: planName, tone: '', hint: p.seatTier || p.rateLimitTier || '' });
+  }
   if (p.allowance) {
     // The number that says how much work the account can do. The plan alone
     // does not: Max 5x and Max 20x both report "max" and differ 4x.

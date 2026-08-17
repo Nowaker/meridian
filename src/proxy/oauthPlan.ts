@@ -30,12 +30,23 @@ interface OAuthProfileResponse {
   organization?: {
     organization_type?: string | null
     rate_limit_tier?: string | null
+    seat_tier?: string | null
   } | null
 }
 
 export interface OAuthPlanFields {
   subscriptionType?: string
   rateLimitTier?: string
+  /**
+   * Which seat a Team member holds, and the ONLY field that separates a
+   * Premium seat from a Standard one. Measured across twelve live accounts:
+   * every Premium seat reports `rate_limit_tier: "default_claude_max_5x"` —
+   * byte-identical to what a personal Max 5x reports — and a Standard seat
+   * reports `default_raven`, a codename naming no published allotment. So the
+   * rate-limit tier can size neither kind of Team seat: one because it lies
+   * and one because it says nothing. Null on every personal account.
+   */
+  seatTier?: string
 }
 
 /**
@@ -64,9 +75,11 @@ export function subscriptionTypeFromOrganizationType(
 export function extractPlanFields(profile: OAuthProfileResponse | null | undefined): OAuthPlanFields {
   const subscriptionType = subscriptionTypeFromOrganizationType(profile?.organization?.organization_type)
   const rateLimitTier = profile?.organization?.rate_limit_tier
+  const seatTier = profile?.organization?.seat_tier
   return {
     ...(subscriptionType ? { subscriptionType } : {}),
     ...(rateLimitTier ? { rateLimitTier } : {}),
+    ...(seatTier ? { seatTier } : {}),
   }
 }
 
@@ -80,7 +93,15 @@ export function extractPlanFields(profile: OAuthProfileResponse | null | undefin
  * completed.
  */
 export function planFieldsMissing(fields: OAuthPlanFields | null | undefined): boolean {
-  return !fields?.subscriptionType || !fields?.rateLimitTier
+  if (!fields?.subscriptionType || !fields.rateLimitTier) return true
+  // A Team account is not described until its SEAT is known, and it is the one
+  // family where the two fields already present cannot finish the job: every
+  // Team seat reports `team` here, and `rate_limit_tier` reads
+  // `default_claude_max_5x` on a Premium seat and `default_raven` on a
+  // Standard one. Without this clause a credential written before seat_tier
+  // was captured looks complete for ever and is never backfilled - which is
+  // exactly the state four Premium seats on this fleet were in.
+  return fields.subscriptionType === "team" && !fields.seatTier
 }
 
 /**
