@@ -7,12 +7,12 @@
  * `Plan: max` can differ by 4x in capacity, so a page that shows only the plan
  * cannot tell the user which account has room left.
  *
- * The multiplier is derived from `rateLimitTier` — the raw string the profile
- * endpoint returns, e.g. `default_claude_max_20x` — rather than from
- * `subscriptionType`, because that field is too coarse: it collapses Max 5x
- * and Max 20x into the single word `max`, and Team Standard and Team Premium
- * into `team`. `subscriptionType` is used only as a fallback for the tiers it
- * does identify unambiguously.
+ * The multiplier is derived from the raw strings the profile endpoint returns
+ * — `seatTier` for a Team account, `rateLimitTier` otherwise — rather than
+ * from `subscriptionType`, because that field is too coarse: it collapses Max
+ * 5x and Max 20x into the single word `max`, and Team Standard and Team
+ * Premium into `team`. `subscriptionType` names the family and is used for the
+ * size only as a fallback for the one tier it pins unambiguously.
  *
  * An unrecognized tier yields null rather than a default, which is the whole
  * point of the field: rendering `1x` for an account that is really 20x is
@@ -31,9 +31,33 @@ export interface PlanAllowance {
   weight: number | null
   /** Tier label, e.g. `"Personal Max"`. Null when the tier is unknown. */
   label: string | null
+  /**
+   * Which side of Anthropic's pricing the account sits on — `"Personal"`,
+   * `"Team"` or `"Enterprise"`. Separate from `planName` because the two are
+   * answered by different fields and either can be known without the other: an
+   * account whose family is declared but whose tier is unrecognized still has
+   * a trustworthy family.
+   */
+  accountType: string | null
+  /**
+   * The plan WITHIN that family, in the vocabulary of Anthropic's own pricing
+   * page: `"Max 20x"`, `"Max 5x"`, `"Pro"`, `"Free"` for personal accounts and
+   * `"Premium seat"` / `"Standard seat"` for Team ones.
+   *
+   * Null when the family is known but the plan is not — which is the common
+   * case for a Team seat with no `seat_tier`, since its `rate_limit_tier`
+   * reports the underlying bucket rather than the seat.
+   */
+  planName: string | null
 }
 
-const UNKNOWN: PlanAllowance = { multiplier: null, weight: null, label: null }
+const UNKNOWN: PlanAllowance = {
+  multiplier: null,
+  weight: null,
+  label: null,
+  accountType: null,
+  planName: null,
+}
 
 /**
  * Which side of Anthropic's pricing an account sits on. Tracked separately
@@ -47,6 +71,8 @@ type PlanFamily = "personal" | "team" | "enterprise"
 interface TierProfile {
   label: string
   family: PlanFamily
+  /** The plan's own name within its family, as Anthropic's pricing page words it. */
+  planName: string
   multiplier: string
   weight: number
 }
@@ -82,12 +108,35 @@ export function normalizeRateLimitTier(raw: string | null | undefined): string |
  * at random.
  */
 const TIERS: Record<string, TierProfile> = {
-  "max 20x": { label: "Personal Max", family: "personal", multiplier: "20x", weight: 20 },
-  "max 5x": { label: "Personal Max", family: "personal", multiplier: "5x", weight: 5 },
-  "pro": { label: "Personal Pro", family: "personal", multiplier: "1x", weight: 1 },
-  "team premium": { label: "Team Premium", family: "team", multiplier: "6.25x", weight: 6.25 },
-  "team tier 1": { label: "Team Premium", family: "team", multiplier: "6.25x", weight: 6.25 },
-  "team standard": { label: "Team Standard", family: "team", multiplier: "1x", weight: 1 },
+  "max 20x": { label: "Personal Max", family: "personal", planName: "Max 20x", multiplier: "20x", weight: 20 },
+  "max 5x": { label: "Personal Max", family: "personal", planName: "Max 5x", multiplier: "5x", weight: 5 },
+  "pro": { label: "Personal Pro", family: "personal", planName: "Pro", multiplier: "1x", weight: 1 },
+  "team premium": { label: "Team Premium", family: "team", planName: "Premium seat", multiplier: "6.25x", weight: 6.25 },
+  "team tier 1": { label: "Team Premium", family: "team", planName: "Premium seat", multiplier: "6.25x", weight: 6.25 },
+  "team standard": { label: "Team Standard", family: "team", planName: "Standard seat", multiplier: "1x", weight: 1 },
+}
+
+/**
+ * A Team seat's size comes from `seat_tier`, NOT from `rate_limit_tier`.
+ *
+ * Measured across eleven live accounts: every Team seat reports
+ * `rate_limit_tier: "default_claude_max_5x"` — byte-identical to what a
+ * personal Max 5x reports — while `seat_tier` carries `"team_tier_1"`, which
+ * DreamHost's usage tracker canonicalizes to Team Premium at 6.25x. Sizing a
+ * Team seat off the rate-limit tier therefore understates it by 25% and names
+ * it after the wrong product.
+ *
+ * The field is null on every personal account, so its mere presence is also
+ * evidence of the family.
+ *
+ * The bare spellings are tried with a `team ` prefix because `seat_tier` is
+ * already scoped to a team — a value of `standard` there means the same thing
+ * `team_standard` means in `rate_limit_tier`.
+ */
+function tierFromSeat(seatTier: string | null | undefined): TierProfile | undefined {
+  const normalized = normalizeRateLimitTier(seatTier)
+  if (!normalized) return undefined
+  return TIERS[normalized] ?? TIERS[`team ${normalized}`]
 }
 
 /** Which family each `subscriptionType` names, for the reconciliation below. */
@@ -128,17 +177,26 @@ const SUBSCRIPTION_FALLBACK: Record<string, string> = {
  */
 export function planAllowance(fields: {
   rateLimitTier?: string | null
+  seatTier?: string | null
   subscriptionType?: string | null
 } | null | undefined): PlanAllowance {
   const subscription = fields?.subscriptionType?.trim().toLowerCase()
   const declaredFamily = subscription ? SUBSCRIPTION_FAMILY[subscription] : undefined
+
+  const fromSeat = tierFromSeat(fields?.seatTier)
+  if (fromSeat) return reconcile(fromSeat, declaredFamily)
 
   const fromTier = TIERS[normalizeRateLimitTier(fields?.rateLimitTier) ?? ""]
   if (fromTier) return reconcile(fromTier, declaredFamily)
 
   const key = subscription ? SUBSCRIPTION_FALLBACK[subscription] : undefined
   const fromSubscription = key ? TIERS[key] : undefined
-  return fromSubscription ? reconcile(fromSubscription, declaredFamily) : { ...UNKNOWN }
+  if (fromSubscription) return reconcile(fromSubscription, declaredFamily)
+
+  return {
+    ...UNKNOWN,
+    accountType: declaredFamily ? FAMILY_LABEL[declaredFamily] : null,
+  }
 }
 
 /**
@@ -151,8 +209,12 @@ export function planAllowance(fields: {
  * the tier's, because the tier is what Anthropic sizes the allotment by.
  */
 function reconcile(tier: TierProfile, declaredFamily: PlanFamily | undefined): PlanAllowance {
-  const label = declaredFamily && declaredFamily !== tier.family
-    ? FAMILY_LABEL[declaredFamily]
-    : tier.label
-  return { multiplier: tier.multiplier, weight: tier.weight, label }
+  const contradicted = Boolean(declaredFamily && declaredFamily !== tier.family)
+  return {
+    multiplier: tier.multiplier,
+    weight: tier.weight,
+    label: contradicted ? FAMILY_LABEL[declaredFamily!] : tier.label,
+    accountType: FAMILY_LABEL[declaredFamily ?? tier.family],
+    planName: contradicted ? null : tier.planName,
+  }
 }

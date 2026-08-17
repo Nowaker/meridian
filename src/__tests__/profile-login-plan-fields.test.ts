@@ -80,6 +80,41 @@ describe("extractPlanFields", () => {
       .toEqual({ subscriptionType: "team" })
   })
 
+  // Both Team seats this fleet holds, measured through the live endpoint. They
+  // are `claude_team` with a differing `seat_tier`, and their `rate_limit_tier`
+  // can size neither: the Premium seat's is what a personal Max 5x reports, and
+  // the Standard seat's is an Anthropic codename naming no published allotment.
+  it("keeps the seat tier, the only field that sizes a Team seat", () => {
+    expect(extractPlanFields({
+      organization: {
+        organization_type: "claude_team",
+        rate_limit_tier: "default_claude_max_5x",
+        seat_tier: "team_tier_1",
+      },
+    })).toEqual({
+      subscriptionType: "team",
+      rateLimitTier: "default_claude_max_5x",
+      seatTier: "team_tier_1",
+    })
+    expect(extractPlanFields({
+      organization: {
+        organization_type: "claude_team",
+        rate_limit_tier: "default_raven",
+        seat_tier: "team_standard",
+      },
+    })).toEqual({
+      subscriptionType: "team",
+      rateLimitTier: "default_raven",
+      seatTier: "team_standard",
+    })
+  })
+
+  it("omits the seat tier a personal account does not have", () => {
+    expect(extractPlanFields(MAX_PROFILE)).not.toHaveProperty("seatTier")
+    expect(extractPlanFields({ organization: { organization_type: "claude_max", seat_tier: null } }))
+      .toEqual({ subscriptionType: "max" })
+  })
+
   it("keeps the tier when only the plan is unrecognized", () => {
     expect(extractPlanFields({ organization: { organization_type: "claude_future", rate_limit_tier: "some_tier" } }))
       .toEqual({ rateLimitTier: "some_tier" })

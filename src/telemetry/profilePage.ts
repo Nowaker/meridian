@@ -373,9 +373,18 @@ function render(data, quotaData) {
       html += '<span class="detail-label">Email</span>';
       html += '<span class="detail-value">' + esc(p.email) + '</span>';
     }
-    if (p.subscriptionType) {
+    // Two rows, because two different fields answer two different questions
+    // and either can be known without the other: a Team seat whose seat_tier
+    // is missing has a trustworthy family and an unknowable plan.
+    if (p.accountType) {
+      html += '<span class="detail-label">Account</span>';
+      html += '<span class="detail-value">' + esc(p.accountType) + '</span>';
+    }
+    var planName = p.planName || p.planLabel || p.subscriptionType;
+    if (planName) {
       html += '<span class="detail-label">Plan</span>';
-      html += '<span class="detail-value">' + esc(p.planLabel || p.subscriptionType) + '</span>';
+      html += '<span class="detail-value" title="' + esc(p.seatTier || p.rateLimitTier || '') + '">'
+        + esc(planName) + '</span>';
     }
     if (p.allowance) {
       // The number that says how much work the account can do. The plan alone

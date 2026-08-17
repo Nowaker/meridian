@@ -68,6 +68,14 @@ export interface OAuthCredentials {
   scopes?: string[]
   subscriptionType?: string
   rateLimitTier?: string
+  /**
+   * Which seat a Team member holds. The only field that separates a Premium
+   * seat from a Standard one: measured across twelve live accounts, every
+   * Premium seat reports `rate_limit_tier: "default_claude_max_5x"` — what a
+   * personal Max 5x reports — and a Standard seat reports `default_raven`,
+   * which names no published allotment at all.
+   */
+  seatTier?: string
 }
 
 export interface CredentialsFile {
@@ -458,6 +466,7 @@ interface StoredCredentialFacts {
   refreshTokenExpiresAt?: number
   subscriptionType?: string
   rateLimitTier?: string
+  seatTier?: string
 }
 
 const credentialFactsCache = new Map<string, { value: StoredCredentialFacts; at: number }>()
@@ -501,6 +510,7 @@ async function readCredentialFacts(s: CredentialStore): Promise<StoredCredential
       refreshTokenExpiresAt: oauth?.refreshTokenExpiresAt,
       subscriptionType: oauth?.subscriptionType,
       rateLimitTier: oauth?.rateLimitTier,
+      seatTier: oauth?.seatTier,
     }
     if (key) credentialFactsCache.set(key, { value, at: Date.now() })
     return value
@@ -527,16 +537,18 @@ async function readCredentialFacts(s: CredentialStore): Promise<StoredCredential
 export interface StoredPlanFields {
   subscriptionType?: string
   rateLimitTier?: string
+  seatTier?: string
 }
 
 export async function getStoredPlanFields(
   store?: CredentialStore,
 ): Promise<StoredPlanFields> {
   const s = store ?? createPlatformCredentialStore()
-  const { subscriptionType, rateLimitTier } = await readCredentialFacts(s)
+  const { subscriptionType, rateLimitTier, seatTier } = await readCredentialFacts(s)
   return {
     ...(subscriptionType ? { subscriptionType } : {}),
     ...(rateLimitTier ? { rateLimitTier } : {}),
+    ...(seatTier ? { seatTier } : {}),
   }
 }
 
