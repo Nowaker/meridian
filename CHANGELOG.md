@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.62.4](https://github.com/rynfar/meridian/compare/meridian-v1.62.3...meridian-v1.62.4) (2026-08-17)
+
+
+### Bug Fixes
+
+* preserve passthrough session cache lineage ([#837](https://github.com/rynfar/meridian/issues/837)) ([a8a3d11](https://github.com/rynfar/meridian/commit/a8a3d11c50868a157cd1997a3b0f3b7d913fb0cc))
+
 ## [1.62.3](https://github.com/rynfar/meridian/compare/meridian-v1.62.2...meridian-v1.62.3) (2026-08-17)
 
 
