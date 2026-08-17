@@ -1022,12 +1022,23 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           profile.id !== "default" ? profile.id : undefined,
           Object.keys(profile.env).length > 0 ? profile.env : undefined
         )
-        const agentMode = c.req.header("x-opencode-agent-mode") ?? null
         // Opaque tag clients can send to distinguish concurrent request flows
         // from the same conversation (e.g., pylon's main chat vs. memory-extract fork vs. subagent).
         // Logged for observability; fork-*/subagent-* values also skip fingerprint cache (see below).
         // Examples: "main", "fork-memory-extract", "subagent-scout".
         const requestSource = c.req.header("x-meridian-source")?.slice(0, 64) || undefined
+        // NOTE: OpenCode-specific legacy fallback. Older integrations sent
+        // this header even when another adapter was selected; preserve that
+        // behavior while adapters migrate to the normalized extension point.
+        const declaredAgentMode =
+          adapter.getAgentMode?.(c, body) ?? c.req.header("x-opencode-agent-mode") ?? null
+        // A generic subagent source and an adapter-specific mode declaration
+        // describe the same semantic fact. Treat either as authoritative so a
+        // client cannot accidentally get cache isolation without the base model
+        // tier (or the base tier without safe headerless cache isolation).
+        const isSubagentRequest =
+          declaredAgentMode === "subagent" || requestSource?.startsWith("subagent-") === true
+        const agentMode = isSubagentRequest ? "subagent" : declaredAgentMode
         const requestedModel = typeof body.model === "string" ? body.model : "sonnet"
         let model = mapModelToClaudeModel(requestedModel, authStatus?.subscriptionType, agentMode)
         // Explicitly versioned ids override their tier's canonical pin for
@@ -1251,12 +1262,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // each flow writes different message hashes to the shared key.
         //
         // When x-meridian-source marks a request as an independent fork or
-        // subagent, skip fingerprint lookup (no reclassification) and skip the
-        // write at end of turn (no cache pollution). The main conversation
-        // keeps its cache entry intact across forks.
+        // either supported signal marks it as a subagent, skip fingerprint
+        // lookup (no reclassification) and skip the write at end of turn (no
+        // cache pollution). The main conversation keeps its cache entry intact.
         //
-        // Opt-in via header value: clients that don't set the header are
-        // unaffected — behavior is byte-identical to today.
+        // Clients that declare neither an independent source nor a subagent
+        // mode retain the normal fingerprint-cache behavior.
         // Client-driven passthrough loop: the last message is a tool_result,
         // i.e. the client executed a forwarded tool and is sending the result
         // back to continue its own loop. These requests are self-contained
@@ -1278,14 +1289,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // as unrelated headerless workflow requests.
         const isClientDrivenLoop = adapterBase !== "claude-code" && !agentSessionId && lastIsToolResult
         // The fork/subagent independence guard protects HEADERLESS flows from
-        // colliding on the shared (firstUserMessage, cwd) fingerprint. An
+        // colliding on the shared (firstUserMessage, cwd) fingerprint. Adapter
+        // mode and generic source declarations share the subagent behavior. An
         // explicit session key can't collide — distinct flows carry distinct
         // keys — so keyed requests resume normally even when marked as a
         // fork/subagent source. Without this, pylon's long-lived subagent
         // workers fresh-replayed every turn: prompt-cache hits decayed to the
         // static-prefix floor and turn latency grew with conversation length.
         const isIndependentSession =
-          (!agentSessionId && (requestSource?.startsWith("fork-") || requestSource?.startsWith("subagent-"))) ||
+          (!agentSessionId && (requestSource?.startsWith("fork-") || isSubagentRequest)) ||
           isClientDrivenLoop || false
         let lineageResult: LineageResult = isIndependentSession
           ? { type: "diverged", reason: "independent-request" }
@@ -1299,13 +1311,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         if (lineageResult.type === "undo" && adapterBase === "opencode" && !agentSessionId) {
           lineageResult = { type: "diverged", reason: "missing-session-header" }
         }
-        // Clients that declare a concurrent flow (x-meridian-source fork-/
-        // subagent-) knowingly run parallel turns under one session key — see
+        // Clients that declare a concurrent flow (a fork source or either
+        // subagent signal) knowingly run parallel turns under one session key — see
         // the keyed fork/subagent note above. Serializing them is still worth
         // doing, but a reclassification is their normal cost; refusing them
         // would break flows that worked before turn coordination existed.
         const declaresConcurrentFlow =
-          requestSource?.startsWith("fork-") === true || requestSource?.startsWith("subagent-") === true
+          requestSource?.startsWith("fork-") === true || isSubagentRequest
         if (
           profileSessionId &&
           !declaresConcurrentFlow &&
