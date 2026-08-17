@@ -9,7 +9,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk"
 import { rateLimitStore } from "./rateLimitStore"
 import { guardUpstreamIdle, UpstreamIdleError } from "./streamIdleGuard"
 import { linkRequestAbort } from "./requestAbort"
-import { fetchOAuthUsage, fetchOAuthUsageResult, peekOAuthUsage } from "./oauthUsage"
+import { fetchOAuthUsage, fetchOAuthUsageResult, peekOAuthUsage, toUsageEntry } from "./oauthUsage"
 import { resolveSdkWorkingDirectory } from "./cwd"
 import type { Context } from "hono"
 import { DEFAULT_PROXY_CONFIG } from "./types"
@@ -4864,21 +4864,24 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // came to be labelled `no_token`. Older consumers that only switch on
   // `no_token` fall through to their default branch, which is why these are new
   // values rather than reuses.
+  //
+  // When the check that just ran produced nothing, `windows`/`extraUsage` are
+  // the last successful reading rather than empty, marked `stale: true` with
+  // `fetchedAt` saying when it was taken, and `failure` saying why the newer
+  // check didn't land and how many have failed in a row. `error` keeps its old
+  // meaning exactly — set when there was nothing fresh AND no recent-enough
+  // reading to stand in — so a consumer ignoring the new fields is unaffected.
   app.get("/v1/usage/quota/all", async (c) => {
     const profilesList = getEffectiveProfiles(finalConfig.profiles)
     const activeId = resolveActiveProfileId(profilesList.map(p => p.id)) || finalConfig.defaultProfile || profilesList[0]?.id || null
 
     if (profilesList.length === 0) {
       // Single-account mode — just return the default OAuth account's data.
-      const { snapshot: oauth, error } = await fetchOAuthUsageResult({})
       return c.json({
         profiles: [{
           id: "default",
           isActive: true,
-          windows: oauth?.windows ?? [],
-          extraUsage: oauth?.extraUsage ?? null,
-          fetchedAt: oauth?.fetchedAt ?? null,
-          error,
+          ...toUsageEntry(await fetchOAuthUsageResult({})),
           refusal: refusalStore.get("default") ?? null,
         }],
         activeProfile: "default",
@@ -4897,22 +4900,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           windows: [] as any[],
           extraUsage: null,
           fetchedAt: null,
+          stale: false,
           error: "not_oauth" as const,
+          failure: null,
           refusal: refusalStore.get(p.id) ?? null,
         }
       }
-      const { snapshot: oauth, error } = await fetchOAuthUsageResult({
-        profileId: p.id,
-        claudeConfigDir: p.claudeConfigDir,
-      })
       return {
         id: p.id,
         isActive: p.id === activeId,
         type,
-        windows: oauth?.windows ?? [],
-        extraUsage: oauth?.extraUsage ?? null,
-        fetchedAt: oauth?.fetchedAt ?? null,
-        error,
+        ...toUsageEntry(await fetchOAuthUsageResult({
+          profileId: p.id,
+          claudeConfigDir: p.claudeConfigDir,
+        })),
         // Separate from `windows` on purpose: those are what we last READ, this
         // is what the API is doing right now. An account can be refusing while
         // its last read still says 67%, so one must never overwrite the other.
