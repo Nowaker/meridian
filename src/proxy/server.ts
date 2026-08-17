@@ -81,7 +81,7 @@ import { getAdapterTransforms } from "./transforms/registry"
 import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
 import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, getEffectiveProfiles, restoreActiveProfile, type ResolvedProfile } from "./profiles"
-import { getRoutingMode, resolvePriorityOrder, choosePriorityProfile, chooseActivePriorityCandidates, isPoolRouting, ACTIVE_PRIORITY, ROUTING_MODES, ProfileExhaustion, AssignmentStore, resolveCooldownUntil, cooldownCapMs, type RoutingMode } from "./routing"
+import { getRoutingMode, classifyRouteKind, resolvePriorityOrder, choosePriorityProfile, chooseActivePriorityCandidates, isPoolRouting, ACTIVE_PRIORITY, ROUTING_MODES, ProfileExhaustion, AssignmentStore, resolveCooldownUntil, cooldownCapMs, type RoutingMode } from "./routing"
 import { diagnoseLimit, type LimitDiagnosis } from "./limitDetection"
 import { SpentStore, FailoverEventLog } from "./profileHealth"
 import { getSetting, setSetting } from "./settings"
@@ -163,6 +163,13 @@ interface RequestMeta {
    */
   ttfbMs?: number
   sessionTurnLease?: SessionTurnLease
+  /**
+   * Which attempt of a priority failover this is, 1-based, and set only on
+   * one. `forkAttemptMeta` carries `requestId` across every attempt, so that
+   * id is what groups the hops back together on the read path - this says
+   * where in the chain a hop sits, and that it is one at all.
+   */
+  routeAttempt?: number
 }
 
 interface HandleMessagesOptions {
@@ -921,7 +928,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     let previous: string | null = null
     let previousReason = "rate_limit_error"
     for (const [attempt, candidate] of orderedCandidateIds.entries()) {
-      const inner = await handleMessages(c, forkAttemptMeta(requestMeta, attempt), { body, forcedProfileId: candidate })
+      // Each hop writes its own telemetry row. `routeAttempt` is what marks a
+      // row as a hop and orders it, and the `requestId` forkAttemptMeta keeps
+      // across attempts is what groups them - so the read path can stitch a
+      // failover back into one row with its account chain
+      // (telemetry/routeChain.ts). Nothing is correlated here.
+      const attemptMeta = { ...forkAttemptMeta(requestMeta, attempt), routeAttempt: attempt + 1 }
+      const inner = await handleMessages(c, attemptMeta, { body, forcedProfileId: candidate })
       const sniffed = await sniffAccountFailure(inner)
       if (!sniffed.failed) {
         if (sessionKey) priorityAssignments.set(sessionKey, candidate)
@@ -1020,10 +1033,23 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return withClaudeLogContext({ requestId: requestMeta.requestId, endpoint: requestMeta.endpoint }, async () => {
       // Hoist adapter detection before try so it's available in the catch block for telemetry
       const adapter = detectAdapter(c)
-      // Same reason, for the profile: the outer catch is where a non-stream
-      // refusal lands, and a refusal nobody can attribute to an account is not
-      // worth recording. It also left those telemetry rows with no profileId.
-      let resolvedProfileId: string | null = null
+      // Set by dispatchPriority on each internal hop. Hoisted for the same
+      // reason as the adapter: a hop that fails records from the catch block,
+      // and it is precisely the failed hops that a route chain is made of.
+      const routeAttempt = requestMeta.routeAttempt
+      const routeGroupId = routeAttempt === undefined ? undefined : requestMeta.requestId
+      // Which account to blame, for the outer catch's two consumers: the
+      // refusal bookkeeping and the telemetry row. Seeded from the forced pin
+      // rather than left null until resolveProfile, because a hop that fails
+      // EARLY is still a hop that refused - unattributed, it books no refusal
+      // at all and renders as a chain of "default ✗ -> default ✗", which
+      // defeats the point of both. Upgraded to the resolved id below.
+      let attributedProfileId = options.forcedProfileId || c.req.header("x-meridian-profile") || undefined
+      // Captured rather than re-read in the catch: the mode is already resolved
+      // once per request below, and both consumers there want the mode that was
+      // in effect WHEN the request ran, not whatever /settings holds by the time
+      // it failed.
+      let attributedRoutingMode: RoutingMode | undefined
       try {
         const body = options.body
 
@@ -1074,6 +1100,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // Meridian already uses for session tracking is the assignment key,
         // so a session and its subagent/fork requests land on one account.
         const routingMode = getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing"))
+        attributedRoutingMode = routingMode
         // Priority mode (opt-in): unpinned requests are dispatched across the
         // ordered pool with per-request failover. Pinned requests (explicit
         // x-meridian-profile — including our own internal hops) bypass the
@@ -1135,7 +1162,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             ? { routingMode, stickySessionKey: adapter.getSessionId(c, body) }
             : undefined
         )
-        resolvedProfileId = profile.id
+        attributedProfileId = profile.id
+
+        // Attribution for /telemetry: how this account was chosen. One header
+        // read, one flag and a pure call — the chain itself is assembled on
+        // the read path, never here.
+        const routeKind = classifyRouteKind({
+          pinnedProfileHeader: c.req.header("x-meridian-profile"),
+          priorityHop: routeAttempt !== undefined,
+          routingMode,
+        })
 
         const authStatus = await getClaudeAuthStatusAsync(
           profile.id !== "default" ? profile.id : undefined,
@@ -2763,6 +2799,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             timestamp: Date.now(),
             adapter: adapter.name,
             profileId: profile.id,
+            routeKind,
+            routeGroupId,
+            routeAttempt,
             requestSource,
             model,
             requestModel: body.model || undefined,
@@ -4080,6 +4119,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   adapter: adapter.name,
             profileId: profile.id,
             requestSource,
+                  routeKind,
+                  routeGroupId,
+                  routeAttempt,
                   model,
                   requestModel: body.model || undefined,
                   mode: "stream",
@@ -4206,15 +4248,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               // `event: error` frame in the body - invisible to anything
               // inspecting status codes, which is why an exhausted account went
               // on reporting healthy percentages until now.
-              if (streamErr.type === "rate_limit_error") {
-                recordProfileRefusal({
-                  profileId: profile.id,
-                  message: errMsg,
-                  routing: routingMode,
-                  internalHop: Boolean(options.forcedProfileId),
-                  sessionKey: adapter.getSessionId(c, body),
-                })
-              }
+              const refusal = streamErr.type === "rate_limit_error"
+                ? recordProfileRefusal({
+                    profileId: profile.id,
+                    message: errMsg,
+                    routing: routingMode,
+                    internalHop: Boolean(options.forcedProfileId),
+                    sessionKey: adapter.getSessionId(c, body),
+                  })
+                : null
 
               // Surface the SDK termination reason (max_turns / process_exit / aborted)
               // and stderr tail to /telemetry/logs?category=error so failures are
@@ -4315,6 +4357,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   timestamp: Date.now(),
                   adapter: adapter.name,
                   profileId: profile.id,
+                  routeKind,
+                  routeGroupId,
+                  routeAttempt,
                   requestSource,
                   model,
                   requestModel: body.model || undefined,
@@ -4369,6 +4414,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 timestamp: Date.now(),
                 adapter: adapter.name,
                 profileId: profile.id,
+                routeKind,
+                routeGroupId,
+                routeAttempt,
+                routeRefusedBucket: refusal?.bucket ?? undefined,
                 requestSource,
                 model,
                 requestModel: body.model || undefined,
@@ -4506,14 +4555,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
         claudeLog("proxy.error", { error: errMsg, classified: classified.type })
 
-        if (classified.type === "rate_limit_error") {
-          recordProfileRefusal({
-            profileId: resolvedProfileId,
-            message: errMsg,
-            routing: getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing")),
-            internalHop: Boolean(options.forcedProfileId),
-          })
-        }
+        const refusal = classified.type === "rate_limit_error"
+          ? recordProfileRefusal({
+              profileId: attributedProfileId ?? null,
+              message: errMsg,
+              routing: attributedRoutingMode ?? getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing")),
+              internalHop: Boolean(options.forcedProfileId),
+            })
+          : null
 
         // Surface the SDK termination reason. Outer-catch context is limited —
         // model/isResume/etc. may not be assigned yet if the error fired early —
@@ -4532,7 +4581,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           requestId: requestMeta.requestId,
           timestamp: Date.now(),
           adapter: adapter.name,
-          profileId: resolvedProfileId ?? undefined,
+          profileId: attributedProfileId,
+          routeKind: classifyRouteKind({
+            pinnedProfileHeader: c.req.header("x-meridian-profile"),
+            priorityHop: routeAttempt !== undefined,
+            routingMode: attributedRoutingMode,
+          }),
+          routeGroupId,
+          routeAttempt,
+          routeRefusedBucket: refusal?.bucket ?? undefined,
           model: "unknown",
           requestModel: undefined,
           mode: "non-stream",
