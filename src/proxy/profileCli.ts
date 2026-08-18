@@ -11,17 +11,25 @@
 
 import { execFileSync, spawnSync } from "node:child_process"
 import { createHash, randomBytes } from "node:crypto"
-import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs"
+import { mkdirSync, rmSync, existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { configPath } from "../configDir"
+import { envBool } from "../env"
 import { claudeLog } from "../logger"
 import { authFieldPaths, describeAuthFields } from "./authDiscovery"
 import { resolveClaudeExecutableSync } from "./models"
 import { fetchOAuthPlanFields, type OAuthPlanFields } from "./oauthPlan"
 import type { ProfileConfig } from "./profiles"
-import { setSetting } from "./settings"
+import {
+  applyProfileRename,
+  loadProfileConfigFrom,
+  reclaimAlias,
+  saveProfileConfigTo,
+} from "./profileRename"
+import { getSetting, setSetting } from "./settings"
 import { createPlatformCredentialStore, type CredentialsFile } from "./tokenRefresh"
+
 
 const OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
 export const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
@@ -204,14 +212,10 @@ export function parseAuthorizationCodeInput(input: string): ParsedAuthorizationC
 }
 
 function loadProfileConfig(): ProfileConfig[] {
-  const file = profilesConfigFile()
-  if (!existsSync(file)) return []
-  try {
-    return JSON.parse(readFileSync(file, "utf-8"))
-  } catch (err) {
-    console.warn(`[meridian] Failed to read ${file}: ${err instanceof Error ? err.message : err}`)
-    return []
-  }
+  // Resolved per call, never frozen into a module const: MERIDIAN_CONFIG_DIR
+  // relocates this file, and the rename planner has to read the same one this
+  // process is writing.
+  return loadProfileConfigFrom(profilesConfigFile())
 }
 
 /**
@@ -227,7 +231,7 @@ export function loadProfileIds(): string[] {
 
 function saveProfileConfig(profiles: ProfileConfig[]): void {
   ensureProfilesDir()
-  writeFileSync(profilesConfigFile(), `${JSON.stringify(profiles, null, 2)}\n`, { mode: 0o600 })
+  saveProfileConfigTo(profilesConfigFile(), profiles)
 }
 
 function getAuthStatus(configDir: string): { loggedIn: boolean; email?: string; subscriptionType?: string } {
@@ -539,12 +543,13 @@ export async function profileAdd(id: string, options: AuthLoginOptions = {}): Pr
 
   // Checked here as well as inside createProfileSlot: this one fails before a
   // browser login the user would otherwise complete for nothing.
-  const profiles = loadProfileConfig()
+  let profiles = loadProfileConfig()
   if (profiles.find(p => p.id === id)) {
     console.error(`\x1b[31m✗ Profile "${id}" already exists.\x1b[0m`)
     console.error(`  Run: meridian profile list`)
     process.exit(1)
   }
+  profiles = reclaimAlias(profiles, id)
 
   // Offer to import existing ~/.claude credentials if this is the first profile
   // and the default config dir has valid, active auth
@@ -643,12 +648,13 @@ export async function profileAddOauthToken(id: string, tokenArg: string | undefi
     process.exit(1)
   }
 
-  const profiles = loadProfileConfig()
+  let profiles = loadProfileConfig()
   if (profiles.find(p => p.id === id)) {
     console.error(`\x1b[31m✗ Profile "${id}" already exists.\x1b[0m`)
     console.error(`  Run: meridian profile list`)
     process.exit(1)
   }
+  profiles = reclaimAlias(profiles, id)
 
   let token = tokenArg?.trim() ?? ""
   if (!token) {
@@ -679,15 +685,19 @@ export function profileList(): void {
 
   console.log("Profiles:\n")
   for (const p of profiles) {
+    let status: string
     if (p.oauthToken || p.type === "oauth-token") {
-      console.log(`  ${p.id.padEnd(20)} \x1b[32m✓ OAuth token\x1b[0m`)
-      continue
+      status = "\x1b[32m✓ OAuth token\x1b[0m"
+    } else {
+      const auth = getAuthStatus(p.claudeConfigDir ?? "")
+      status = auth.loggedIn
+        ? `\x1b[32m✓ ${auth.email} (${auth.subscriptionType || "unknown"})\x1b[0m`
+        : "\x1b[31m✗ not logged in\x1b[0m"
     }
-    const auth = getAuthStatus(p.claudeConfigDir ?? "")
-    const status = auth.loggedIn
-      ? `\x1b[32m✓ ${auth.email} (${auth.subscriptionType || "unknown"})\x1b[0m`
-      : "\x1b[31m✗ not logged in\x1b[0m"
     console.log(`  ${p.id.padEnd(20)} ${status}`)
+    if (p.aliases && p.aliases.length > 0) {
+      console.log(`  ${"".padEnd(20)} \x1b[90malso answers to: ${p.aliases.join(", ")}\x1b[0m`)
+    }
   }
   console.log()
   printEnvHint(profiles)
@@ -739,6 +749,33 @@ export function profileRemove(id: string): void {
   if (profiles.length > 0) {
     printEnvHint(profiles)
   }
+}
+
+export function profileRename(from: string, to: string): void {
+  if (envBool("CREDENTIALS_READONLY")) {
+    console.error("\x1b[31m✗ MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials.\x1b[0m")
+    console.error("  Rename the profile from the instance that owns them.")
+    process.exit(1)
+  }
+
+  const wasActive = getSetting("activeProfile") === from
+  // `profileRename`'s own defaults hardcode ~/.config/meridian and cannot see
+  // MERIDIAN_CONFIG_DIR, so a dev instance would rename inside the directory it
+  // is not using. These are this process's real paths.
+  const result = applyProfileRename(from, to, {
+    profilesDir: configPath("profiles"),
+    configFile: profilesConfigFile(),
+  })
+  if (!result.ok) {
+    console.error(`\x1b[31m✗ ${result.error}\x1b[0m`)
+    if (result.hint) console.error(`  ${result.hint}`)
+    process.exit(1)
+  }
+
+  console.log(`\x1b[32m✓ Profile "${from}" renamed to "${to}".\x1b[0m`)
+  console.log(`  Requests naming ${result.aliases.map(a => `"${a}"`).join(", ")} are served by "${to}" until the name is added again.`)
+  if (wasActive) console.log(`  Active profile is now "${to}".`)
+  printEnvHint(result.profiles)
 }
 
 export async function profileSwitch(id: string): Promise<void> {
@@ -925,6 +962,7 @@ Commands:
   meridian profile add <name> --oauth-token [TOKEN] Add a profile from a \`claude setup-token\` value
                                                     (if TOKEN is omitted, you will be prompted; input is hidden)
   meridian profile list                             List profiles and auth status
+  meridian profile rename <old> <new>               Rename a profile; <old> keeps routing to it until reused
   meridian profile remove <name>                    Remove a profile
   meridian profile switch <name>                    Switch the active profile (requires running proxy)
   meridian profile login <name> [--headless]        Re-authenticate a profile, adding it first if it does not
@@ -939,5 +977,6 @@ Examples:
                                                     # Add headless CI profile (token from CLI argument)
   meridian profile login work --headless            # Re-authenticate via OAuth URL/code prompt
   meridian profile switch work                      # Switch to work account
+  meridian profile rename work employer             # Rename; "work" still routes to it
   meridian profile list                             # Show all profiles`)
 }

@@ -80,7 +80,7 @@ import { runTransformHook, buildPipeline, createRequestContext } from "./transfo
 import { getAdapterTransforms } from "./transforms/registry"
 import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
-import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, restoreActiveProfile, shareableCredentialDir, type ResolvedProfile } from "./profiles"
+import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, restoreActiveProfile, invalidateDiskProfileCache, shareableCredentialDir, type ResolvedProfile } from "./profiles"
 import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
 import { parseOwnerRequest, profileOwners, setProfileOwner } from "./profileOwners"
 import { organizationNames, organizationNeedsRefresh, refreshOrganizationNameSoon } from "./organizationName"
@@ -4388,6 +4388,41 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     claudeLog("profile.login_completed", { profile: result.profileId, via: "callback" })
     plog(`[PROXY] Profile login completed for "${result.profileId}" (browser redirect)`)
     return c.html(renderLoginCallbackPage({ ok: true, profileId: result.profileId }))
+  })
+
+  app.post("/profiles/rename", async (c) => {
+    let body: { from?: string; to?: string }
+    try {
+      body = await c.req.json() as { from?: string; to?: string }
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    if (!body.from || !body.to) {
+      return c.json({ error: "Missing 'from' or 'to' in request body" }, 400)
+    }
+    if (envBool("CREDENTIALS_READONLY")) {
+      return c.json({ error: "MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials." }, 403)
+    }
+    const { applyProfileRename } = await import("./profileRename")
+    const result = applyProfileRename(body.from, body.to)
+    if (!result.ok) {
+      return c.json({ error: result.hint ? `${result.error} ${result.hint}` : result.error }, 400)
+    }
+    // The renamed profile is on disk now; drop the TTL cache so this caller's
+    // very next /profiles/list shows the new name instead of its own stale one.
+    invalidateDiskProfileCache()
+    // applyProfileRename moved the persisted pointer; this process holds its
+    // own copy in memory and has to be told as well.
+    if (getActiveProfileId() === body.from) setActiveProfile(body.to)
+    claudeLog("profile.renamed", {
+      from: result.from,
+      to: result.to,
+      aliases: result.aliases,
+      userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+      origin: c.req.header("origin") ?? c.req.header("referer")?.slice(0, 120) ?? null,
+    })
+    plog(`[PROXY] Profile renamed: ${result.from} -> ${result.to} (still answers to: ${result.aliases.join(", ")})`)
+    return c.json({ success: true, from: result.from, to: result.to, aliases: result.aliases })
   })
 
   // --- Plugin management routes ---

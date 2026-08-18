@@ -66,6 +66,17 @@ function profileFacts(p) {
       hint: p.rateLimitTier || ''
     });
   }
+  // Here rather than on the /profiles card alone: a name that still routes is
+  // a fact about the account, so the landing page's overlay has to state it
+  // too - somebody reading a card is entitled to know it answers to more names.
+  if (p.aliases && p.aliases.length > 0) {
+    facts.push({
+      label: 'Former names',
+      value: p.aliases.join(', '),
+      tone: '',
+      hint: 'Requests naming these are served by this profile, until the name is added again'
+    });
+  }
   if (p.lastSuccessAt) facts.push({ label: 'Last Verified', value: timeAgo(p.lastSuccessAt), tone: 'ok' });
   if (p.lastCheckedAt && p.lastCheckedAt !== p.lastSuccessAt) {
     facts.push({ label: 'Last Checked', value: timeAgo(p.lastCheckedAt), tone: '' });
