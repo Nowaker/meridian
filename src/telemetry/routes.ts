@@ -69,6 +69,12 @@ export function createTelemetryRoutes() {
     return c.json({ windowMs, ...summarizeRoutes(collapseRouteChains(metrics)) })
   })
 
+  // What the store holds and for how long, so the page can say which of its
+  // offered windows it can actually cover.
+  routes.get("/retention", (c) => {
+    return c.json({ ...telemetryStore.describe(), asOf: Date.now() })
+  })
+
   // Aggregate summary
   routes.get("/summary", (c) => {
     const windowMs = Number.parseInt(c.req.query("window") || "3600000", 10) // default 1 hour
