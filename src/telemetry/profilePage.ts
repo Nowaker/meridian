@@ -64,6 +64,8 @@ export const profilePageHtml = `<!DOCTYPE html>
   }
   .detail-label { color: var(--muted); }
   .detail-value { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px; }
+  .cached-tag { color: var(--muted); font-size: 10px; font-style: italic; margin-left: 6px; white-space: nowrap; }
+  .detail-unknown { color: var(--muted); font-style: italic; }
   .status-ok { color: var(--green); }
   .status-err { color: var(--red); }
   .switch-btn {
@@ -464,8 +466,18 @@ function factRows(facts, p) {
     var tone = f.tone === 'ok' ? ' status-ok' : f.tone === 'err' ? ' status-err' : '';
     var hint = f.hint ? ' title="' + esc(f.hint) + '"' : '';
     var note = f.note ? ' <span style="color:var(--muted);font-weight:400">' + esc(f.note) + '</span>' : '';
-    return '<span class="detail-label">' + esc(f.label) + '</span>'
-      + '<span class="detail-value' + tone + '"' + hint + '>' + esc(f.value) + note + '</span>';
+    var provenance = factProvenance(f.value, !!f.stale);
+    // A fact absent from a check that SUCCEEDED is not applicable to this
+    // account rather than unread - an API-key profile has no plan - so its row
+    // goes entirely, which is what profileFacts already does by not pushing it.
+    if (provenance === 'never' && !f.stale) return '';
+    var label = '<span class="detail-label">' + esc(f.label) + '</span>';
+    if (provenance === 'never') {
+      return label + '<span class="detail-value detail-unknown">never read</span>';
+    }
+    return label
+      + '<span class="detail-value' + tone + '"' + hint + '>'
+      + esc(f.value) + note + cachedTag(provenance) + '</span>';
   }).join('');
 }
 
@@ -535,6 +547,7 @@ function renderUsageSection(profileQuota) {
   var extra = formatExtraUsage(profileQuota.extraUsage);
 
   var failedRun = describeFailedRun(profileQuota.failure);
+  var usageTag = cachedTag(profileQuota.stale ? 'cached' : 'live');
 
   // No figures at all means this profile has never been read successfully —
   // the route serves the last good reading at any age, so an empty windows
@@ -583,7 +596,7 @@ function renderUsageSection(profileQuota) {
     return '<div class="usage-card status-' + esc(status) + '" title="' + esc(tip) + '">'
       + '<div class="usage-row">'
       +   '<span class="usage-label">' + esc(label) + '</span>'
-      +   '<span class="usage-pct">' + pctRound + '%</span>'
+      +   '<span class="usage-pct">' + pctRound + '%' + usageTag + '</span>'
       + '</div>'
       + '<div class="usage-bar"><div class="usage-fill" style="width:' + (pct * 100).toFixed(1) + '%"></div></div>'
       + (reset ? '<div class="usage-reset">' + esc(reset) + '</div>' : '')
@@ -595,7 +608,7 @@ function renderUsageSection(profileQuota) {
     extraBlock = '<div class="usage-extra status-' + esc(extra.status) + '">'
       +   '<div class="usage-extra-row">'
       +     '<span class="usage-label">Extra usage</span>'
-      +     '<span class="usage-pct">' + extra.utilizationPct + '%</span>'
+      +     '<span class="usage-pct">' + extra.utilizationPct + '%' + usageTag + '</span>'
       +   '</div>'
       +   '<div class="usage-bar"><div class="usage-fill" style="width:' + extra.utilizationPct + '%"></div></div>'
       +   '<div class="usage-extra-row" style="margin-top:4px">'

@@ -111,6 +111,8 @@ export const landingHtml = `<!DOCTYPE html>
   .prof-pop-value { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; word-break: break-word; }
   .prof-pop-value.status-ok { color: var(--green); }
   .prof-pop-value.status-err { color: var(--red); }
+  .cached-tag { color: var(--muted); font-size: 10px; font-style: italic; margin-left: 6px; white-space: nowrap; }
+  .detail-unknown { color: var(--muted); font-style: italic; }
   .profile-sub { display: flex; align-items: center; justify-content: space-between; gap: 8px;
     font-size: 11px; color: var(--muted); margin-bottom: 12px; }
   .owner-select { background: var(--bg); color: var(--muted); border: 1px solid var(--border);
@@ -314,8 +316,12 @@ function infoIcon(entry,type){
     var tone=f.tone==='ok'?' status-ok':f.tone==='err'?' status-err':'';
     var hint=f.hint?' title="'+esc(f.hint)+'"':'';
     var note=f.note?' <span style="color:var(--muted)">'+esc(f.note)+'</span>':'';
-    rows+='<span class="prof-pop-label">'+esc(f.label)+'</span>'
-      +'<span class="prof-pop-value'+tone+'"'+hint+'>'+esc(f.value)+note+'</span>';
+    var prov=factProvenance(f.value,!!f.stale);
+    if(prov==='never'&&!f.stale)continue;
+    var cell=prov==='never'
+      ?'<span class="prof-pop-value detail-unknown">never read</span>'
+      :'<span class="prof-pop-value'+tone+'"'+hint+'>'+esc(f.value)+note+cachedTag(prov)+'</span>';
+    rows+='<span class="prof-pop-label">'+esc(f.label)+'</span>'+cell;
   }
   return '<span class="prof-info">'
     +'<span class="prof-info-dot" tabindex="0" role="button" aria-label="Details for '+esc(entry.id)+'">i</span>'

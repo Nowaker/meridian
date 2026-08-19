@@ -27,6 +27,19 @@ function ownerLabel(owner) {
   return 'Not set';
 }
 
+// Mirrors src/telemetry/cachedFacts.ts, which is where these are unit-tested.
+// Here rather than in either page because BOTH render the same fact list, and a
+// marker that existed on only one of them would say a value is remembered on
+// /profiles and current in the landing overlay.
+function factProvenance(value, stale) {
+  if (value == null || value === '') return 'never';
+  return stale ? 'cached' : 'live';
+}
+
+function cachedTag(provenance) {
+  return provenance === 'cached' ? '<span class="cached-tag">(cached)</span>' : '';
+}
+
 function timeAgo(ts) {
   if (!ts) return '\u2014';
   var s = Math.floor((Date.now() - ts) / 1000);
@@ -39,13 +52,22 @@ function timeAgo(ts) {
 
 function profileFacts(p) {
   var facts = [];
+  // Status, Email and Plan are the three the auth check produces, so ONE failed
+  // check makes all three remembered at once - which is why the provenance is
+  // read off the profile rather than carried per fact. Everything below it
+  // comes from elsewhere and is unaffected.
+  var authProvenance = p.authProvenance || 'live';
+  var authStale = authProvenance !== 'live';
   facts.push({
     label: 'Status',
-    value: p.loggedIn ? '\u2713 Authenticated' : '\u2717 Not logged in',
-    tone: p.loggedIn ? 'ok' : 'err'
+    value: authProvenance === 'never'
+      ? null
+      : (p.loggedIn ? '\u2713 Authenticated' : '\u2717 Not logged in'),
+    tone: p.loggedIn ? 'ok' : 'err',
+    stale: authStale
   });
   facts.push({ label: 'Owner', value: ownerLabel(p.owner), tone: '' });
-  if (p.email) facts.push({ label: 'Email', value: p.email, tone: '' });
+  if (p.email) facts.push({ label: 'Email', value: p.email, tone: '', stale: authStale });
   if (p.organizationName) facts.push({ label: 'Organization', value: p.organizationName, tone: '' });
   // Two rows, because two fields answer two questions and either can be known
   // without the other: a Team seat whose seat_tier is missing has a
@@ -53,7 +75,13 @@ function profileFacts(p) {
   if (p.accountType) facts.push({ label: 'Account', value: p.accountType, tone: '' });
   var planName = p.planName || p.planLabel || p.subscriptionType;
   if (planName) {
-    facts.push({ label: 'Plan', value: planName, tone: '', hint: p.seatTier || p.rateLimitTier || '' });
+    facts.push({
+      label: 'Plan',
+      value: planName,
+      tone: '',
+      hint: p.seatTier || p.rateLimitTier || '',
+      stale: authStale
+    });
   }
   if (p.allowance) {
     // The number that says how much work the account can do. The plan alone
