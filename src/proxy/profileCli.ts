@@ -11,7 +11,7 @@
 
 import { execFileSync, spawnSync } from "node:child_process"
 import { createHash, randomBytes } from "node:crypto"
-import { mkdirSync, rmSync, existsSync } from "node:fs"
+import { mkdirSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { configPath } from "../configDir"
@@ -21,6 +21,7 @@ import { authFieldPaths, describeAuthFields } from "./authDiscovery"
 import { resolveClaudeExecutableSync } from "./models"
 import { fetchOAuthPlanFields, type OAuthPlanFields } from "./oauthPlan"
 import type { ProfileConfig } from "./profiles"
+import { applyProfileRemove } from "./profileRemove"
 import {
   applyProfileRename,
   loadProfileConfigFrom,
@@ -703,51 +704,34 @@ export function profileList(): void {
   printEnvHint(profiles)
 }
 
-/**
- * Pure: resolve which on-disk directories should be removed when this profile
- * is deleted. Browser-login profiles drop their explicit `claudeConfigDir`
- * (provided it lives under `profilesDir`); oauth-token profiles drop the
- * pinned isolation dir at `profilesDir/<id>` (created by the SDK during use,
- * not stored on the profile itself).
- *
- * Caller is responsible for the actual `rmSync` — this returns paths only.
- */
-export function dirsToRemoveOnProfileRemove(profile: ProfileConfig, profilesDir: string): string[] {
-  const dirs: string[] = []
-  if (profile.claudeConfigDir?.startsWith(profilesDir)) {
-    dirs.push(profile.claudeConfigDir)
-  }
-  if (profile.oauthToken || profile.type === "oauth-token") {
-    const isolationDir = join(profilesDir, profile.id)
-    if (!dirs.includes(isolationDir)) dirs.push(isolationDir)
-  }
-  return dirs
-}
-
 export function profileRemove(id: string): void {
-  const profiles = loadProfileConfig()
-  const idx = profiles.findIndex(p => p.id === id)
-  if (idx === -1) {
-    console.error(`\x1b[31m✗ Profile "${id}" not found.\x1b[0m`)
+  if (envBool("CREDENTIALS_READONLY")) {
+    console.error("\x1b[31m✗ MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials.\x1b[0m")
+    console.error("  Remove the profile from the instance that owns them.")
     process.exit(1)
   }
 
-  const removed = profiles[idx]
-  if (!removed) {
-    console.error(`\x1b[31m✗ Profile "${id}" not found.\x1b[0m`)
+  // `applyProfileRemove`'s own defaults hardcode ~/.config/meridian and cannot
+  // see MERIDIAN_CONFIG_DIR, so a dev instance would delete inside the
+  // directory it is not using. These are this process's real paths.
+  const result = applyProfileRemove(id, {
+    profilesDir: configPath("profiles"),
+    configFile: profilesConfigFile(),
+  })
+  if (!result.ok) {
+    console.error(`\x1b[31m✗ ${result.error}\x1b[0m`)
+    if (result.hint) console.error(`  ${result.hint}`)
     process.exit(1)
   }
-  const dirsToRemove = dirsToRemoveOnProfileRemove(removed, configPath("profiles"))
-  profiles.splice(idx, 1)
-  saveProfileConfig(profiles)
 
-  for (const dir of dirsToRemove) {
-    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
-  }
+  if (getSetting("activeProfile") === id) setSetting("activeProfile", "")
 
   console.log(`\x1b[32m✓ Profile "${id}" removed.\x1b[0m`)
-  if (profiles.length > 0) {
-    printEnvHint(profiles)
+  for (const orphan of result.dirsOrphaned) {
+    console.error(`\x1b[33m⚠ Left behind ${orphan.dir}: ${orphan.reason}\x1b[0m`)
+  }
+  if (result.profiles.length > 0) {
+    printEnvHint(result.profiles)
   }
 }
 

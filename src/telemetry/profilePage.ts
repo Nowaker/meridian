@@ -41,6 +41,21 @@ export const profilePageHtml = `<!DOCTYPE html>
     align-items: center; transition: all 0.15s;
   }
   .icon-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .icon-btn.danger:hover { border-color: var(--red); color: var(--red); }
+  .remove-confirm {
+    margin-bottom: 12px; padding: 12px 14px; border-radius: 8px;
+    background: rgba(248,81,73,0.08); border: 1px solid rgba(248,81,73,0.35);
+  }
+  .remove-confirm-text { font-size: 12px; color: var(--text); }
+  .remove-confirm-actions { margin-top: 10px; display: flex; gap: 8px; }
+  .confirm-btn {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer;
+    transition: all 0.15s;
+  }
+  .confirm-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .confirm-btn.danger { color: var(--red); border-color: rgba(248,81,73,0.5); }
+  .confirm-btn.danger:hover { background: var(--red); color: var(--bg); border-color: var(--red); }
   .rename-input {
     background: var(--surface2); color: var(--text); border: 1px solid var(--accent);
     border-radius: 6px; padding: 4px 8px; font-size: 14px; font-weight: 600;
@@ -356,10 +371,17 @@ var lastProfiles = null;
 // innerHTML, which would blank the input mid-keystroke.
 var editingProfile = null;
 var renameError = null;
+// Profile awaiting a remove confirmation, and the error from the last rejected
+// attempt. The poll is suspended while one is pending for the same reason a
+// rename suspends it: a redraw mid-decision would take the confirmation away
+// and leave the click that follows landing on whatever moved into its place.
+var removingProfile = null;
+var removeError = null;
 
 var ICON_PENCIL = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M11.013 1.427a1.75 1.75 0 012.474 0l1.086 1.086a1.75 1.75 0 010 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 01-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61zm1.414 1.06a.25.25 0 00-.354 0L10.811 3.75l1.439 1.44 1.263-1.263a.25.25 0 000-.354l-1.086-1.086zM11.189 6.25L9.75 4.81l-6.286 6.287a.25.25 0 00-.064.108l-.558 1.953 1.953-.558a.249.249 0 00.108-.064l6.286-6.286z"/></svg>';
 var ICON_CHECK = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/></svg>';
 var ICON_X = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M3.72 3.72a.75.75 0 011.06 0L8 6.94l3.22-3.22a.75.75 0 111.06 1.06L9.06 8l3.22 3.22a.75.75 0 11-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 01-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 010-1.06z"/></svg>';
+var ICON_TRASH = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M11 1.75V3h2.25a.75.75 0 010 1.5H2.75a.75.75 0 010-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75zM6.5 1.75V3h3V1.75a.25.25 0 00-.25-.25h-2.5a.25.25 0 00-.25.25z"/><path d="M4.997 6.178a.75.75 0 10-1.494.144L4.462 16.5h7.076l.959-10.178a.75.75 0 00-1.494-.144l-.888 9.322H5.885l-.888-9.322z"/></svg>';
 
 function focusRenameInput() {
   var el = document.getElementById('rename-input');
@@ -411,8 +433,43 @@ async function commitRename(from) {
   focusRenameInput();
 }
 
+function startRemove(id) {
+  removingProfile = id;
+  removeError = null;
+  redraw();
+}
+
+function cancelRemove() {
+  removingProfile = null;
+  removeError = null;
+  redraw();
+}
+
+async function commitRemove(id) {
+  var data;
+  try {
+    var res = await fetch('/profiles/remove', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile: id })
+    });
+    data = await res.json();
+  } catch (err) {
+    data = { error: 'Could not reach Meridian.' };
+  }
+  if (data && data.success) {
+    removingProfile = null;
+    removeError = null;
+    await refresh();
+    if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
+    return;
+  }
+  removeError = (data && data.error) || 'Remove failed.';
+  redraw();
+}
+
 async function refresh() {
-  if (editingProfile) return;
+  if (editingProfile || removingProfile) return;
   try {
     var [profilesRes, quotaRes, routingRes] = await Promise.all([
       fetch('/profiles/list'),
@@ -678,6 +735,7 @@ function render(data, quotaData) {
       html += renderRefusalBadge((quotaById[p.id] || {}).refusal);
       html += '<span class="profile-card-actions">';
       html += '<button class="icon-btn" title="Rename profile" onclick="startRename(&quot;'+esc(p.id)+'&quot;)">' + ICON_PENCIL + '</button>';
+      html += '<button class="icon-btn danger" title="Remove profile" onclick="startRemove(&quot;'+esc(p.id)+'&quot;)">' + ICON_TRASH + '</button>';
       html += '</span>';
     }
     html += '</div>';
@@ -685,6 +743,16 @@ function render(data, quotaData) {
 
     if (editingProfile === p.id && renameError) {
       html += '<div class="rename-error">' + esc(renameError) + '</div>';
+    }
+
+    if (removingProfile === p.id) {
+      html += '<div class="remove-confirm">';
+      html += '<div class="remove-confirm-text">Remove <strong>' + esc(p.id) + '</strong>? Its stored credentials are deleted with it, so putting it back means logging in again.</div>';
+      if (removeError) html += '<div class="rename-error">' + esc(removeError) + '</div>';
+      html += '<div class="remove-confirm-actions">';
+      html += '<button class="confirm-btn danger" onclick="commitRemove(&quot;'+esc(p.id)+'&quot;)">Remove</button>';
+      html += '<button class="confirm-btn" onclick="cancelRemove()">Cancel</button>';
+      html += '</div></div>';
     }
 
     html += '<div class="profile-details">' + factRows(profileFacts(p), p) + '</div>';

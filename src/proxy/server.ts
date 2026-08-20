@@ -4431,6 +4431,53 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return c.json({ success: true, from: result.from, to: result.to, aliases: result.aliases })
   })
 
+  app.post("/profiles/remove", async (c) => {
+    let body: { profile?: string }
+    try {
+      body = await c.req.json() as { profile?: string }
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    if (!body.profile) {
+      return c.json({ error: "Missing 'profile' in request body" }, 400)
+    }
+    if (envBool("CREDENTIALS_READONLY")) {
+      return c.json({ error: "MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials." }, 403)
+    }
+    const removedId = body.profile
+    const { applyProfileRemove } = await import("./profileRemove")
+    const result = applyProfileRemove(removedId)
+    if (!result.ok) {
+      return c.json({ error: result.hint ? `${result.error} ${result.hint}` : result.error }, 400)
+    }
+    // The profile is off disk now; drop the TTL cache so this caller's very
+    // next /profiles/list is not answered from a copy that still lists it.
+    invalidateDiskProfileCache()
+    // Removing the ACTIVE profile leaves the pointer naming nothing, and
+    // resolveProfile then falls back to the first profile while warning on
+    // every single request. Naming the fallback explicitly is the same account
+    // without the noise, and it is what the UI shows as active.
+    if (getActiveProfileId() === removedId) {
+      setActiveProfile(getEffectiveProfiles(finalConfig.profiles)[0]?.id ?? "")
+    }
+    claudeLog("profile.removed", {
+      profile: result.id,
+      dirsRemoved: result.dirsRemoved.length,
+      dirsOrphaned: result.dirsOrphaned,
+      remaining: result.profiles.length,
+      userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+      origin: c.req.header("origin") ?? c.req.header("referer")?.slice(0, 120) ?? null,
+    })
+    plog(`[PROXY] Profile removed: ${result.id} (${result.profiles.length} remaining)`)
+    return c.json({
+      success: true,
+      profile: result.id,
+      dirsRemoved: result.dirsRemoved,
+      dirsOrphaned: result.dirsOrphaned,
+      remaining: result.profiles.map(p => p.id),
+    })
+  })
+
   // --- Plugin management routes ---
 
   app.get("/plugins/list", async (c) => {
