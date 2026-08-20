@@ -105,6 +105,54 @@ export function planFieldsMissing(fields: OAuthPlanFields | null | undefined): b
 }
 
 /**
+ * How long a plan reading is trusted before Anthropic is asked again.
+ *
+ * A plan is not immutable, and nothing in the lifecycle used to notice: an
+ * account upgraded from Max 5x to Max 20x keeps the same credential file, the
+ * only writer was gated on the field being ABSENT, and one account on this
+ * fleet was reported 5x for days after it had been upgraded. So the reading
+ * expires. Six hours is under the ~8h access-token lifetime, which makes this
+ * one extra GET per token refresh in practice, while still bounding the rate
+ * when a burst of 401s drives several refreshes inside one day.
+ */
+export const PLAN_RECHECK_MS = 6 * 60 * 60_000
+
+export interface StoredPlanState extends OAuthPlanFields {
+  /**
+   * When the plan was last read from Anthropic. Absent on a credential written
+   * before readings were dated, which reads as due — that is what makes an
+   * existing fleet pick its upgrades up rather than only new logins.
+   */
+  planCheckedAt?: number
+}
+
+export function planNeedsCheck(
+  fields: StoredPlanState | null | undefined,
+  now = Date.now(),
+): boolean {
+  if (planFieldsMissing(fields)) return true
+  const checkedAt = fields?.planCheckedAt
+  if (typeof checkedAt !== "number" || !Number.isFinite(checkedAt)) return true
+  return now - checkedAt >= PLAN_RECHECK_MS
+}
+
+/**
+ * Which plan fields a fresh reading disagrees with the stored one about.
+ *
+ * Only keys the reading actually CARRIES are compared: `extractPlanFields`
+ * omits whatever Anthropic did not send, and an absent key means "not
+ * reported" rather than "no longer set" — so counting it as a change would
+ * erase a good stored value every time a response came back partial.
+ */
+export function changedPlanFields(
+  stored: OAuthPlanFields | null | undefined,
+  fetched: OAuthPlanFields,
+): (keyof OAuthPlanFields)[] {
+  const keys: (keyof OAuthPlanFields)[] = ["subscriptionType", "rateLimitTier", "seatTier"]
+  return keys.filter((key) => fetched[key] !== undefined && stored?.[key] !== fetched[key])
+}
+
+/**
  * Best-effort plan lookup for a valid access token. Never throws and never
  * fails its caller: a profile whose plan is unknown is strictly better than no
  * profile at all, and every consumer already treats it as optional.

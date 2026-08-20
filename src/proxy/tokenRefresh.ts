@@ -22,7 +22,7 @@ import { dirname, join, resolve } from "node:path"
 import { promisify } from "node:util"
 import { claudeLog } from "../logger"
 import { isCredentialsReadOnly, refuseCredentialWrite } from "./credentialsMode"
-import { fetchOAuthPlanFields, planFieldsMissing } from "./oauthPlan"
+import { changedPlanFields, fetchOAuthPlanFields, planNeedsCheck } from "./oauthPlan"
 
 const execFile = promisify(execFileCb)
 
@@ -78,6 +78,12 @@ export interface OAuthCredentials {
    * which names no published allotment at all.
    */
   seatTier?: string
+  /**
+   * When the three fields above were last read from Anthropic, so a plan that
+   * CHANGES is noticed. Absent on a credential written before readings were
+   * dated, which reads as due rather than as fresh.
+   */
+  planCheckedAt?: number
 }
 
 export interface CredentialsFile {
@@ -437,20 +443,39 @@ async function doRefresh(store: CredentialStore): Promise<boolean> {
   // access token, which is what the profile endpoint requires, so it is the
   // only place a backfill can happen without forcing an interactive re-login.
   //
-  // Gated on the fields being absent, so this costs one extra GET once per
-  // profile rather than on every ~8h refresh: the next refresh reads the value
-  // this one wrote and skips. Merged before the write so the whole thing is
-  // still a single store write, and spread UNDER the existing fields so a
-  // value already on disk always wins over a freshly fetched one.
-  const backfilled = planFieldsMissing(credentials.claudeAiOauth)
+  // Read on a SCHEDULE rather than only when a field is missing, because a plan
+  // is not immutable: an account upgraded from Max 5x to Max 20x keeps the same
+  // credential file, so an absent-only gate re-reads the value it wrote itself
+  // and reports the superseded plan for the life of the login.
+  const planFields = planNeedsCheck(credentials.claudeAiOauth)
     ? await fetchOAuthPlanFields(tokenData.access_token)
     : {}
-  if (backfilled.subscriptionType || backfilled.rateLimitTier) {
-    credentials.claudeAiOauth = { ...backfilled, ...credentials.claudeAiOauth }
+  // A fresh reading WINS over the stored one - that is the whole of noticing a
+  // change - but only for the keys it actually carries, since extractPlanFields
+  // omits whatever Anthropic did not send. The date is stamped only on a reading
+  // that produced something, so a failing endpoint is retried next refresh
+  // instead of suppressing the check for a whole window. Merged before the
+  // write, so a refresh stays one credential-store write.
+  const planChanges = changedPlanFields(credentials.claudeAiOauth, planFields)
+  const planRead = Object.keys(planFields).length > 0
+  if (planRead) {
+    credentials.claudeAiOauth = {
+      ...credentials.claudeAiOauth,
+      ...planFields,
+      planCheckedAt: Date.now(),
+    }
   }
 
   const written = await store.write(credentials)
   if (!written) return false
+
+  // A changed plan invalidates the cached credential facts /profiles/list and
+  // /health are answered from, which would otherwise keep reporting the old
+  // allowance for the rest of their TTL.
+  if (planChanges.length > 0) {
+    resetAuthRenewalCache()
+    claudeLog("auth.plan_changed", { changed: planChanges, plan: planFields })
+  }
 
   // Logged so it is observable whether Anthropic ever rolls the refresh-token
   // window — undefined here means the renewal countdown stays anchored to the
@@ -458,7 +483,8 @@ async function doRefresh(store: CredentialStore): Promise<boolean> {
   claudeLog("token_refresh.success", {
     expiresAt,
     refreshTokenExpiresAt,
-    backfilledPlan: Object.keys(backfilled),
+    planChecked: planRead,
+    planChanged: planChanges,
   })
   return true
 }

@@ -6,11 +6,17 @@
  * refresh is the only other moment holding a valid access token, so it is the
  * only place the gap can be closed without an interactive re-login.
  *
+ * The reading also EXPIRES, because a plan is not immutable: an account
+ * upgraded from Max 5x to Max 20x keeps the same credential file, so a gate
+ * that only fired on an absent field reported the superseded plan for the life
+ * of the login. So a fresh reading outranks the stored one, and the date of the
+ * last reading is what decides whether one is taken at all.
+ *
  * Both endpoints are reached through `globalThis.fetch`, so the mock dispatches
  * on URL: the token endpoint returns rotated tokens, the profile endpoint
  * returns the plan. Profile-endpoint calls are counted, because "does not ask
- * when it already knows" is the assertion that keeps this one GET per profile
- * rather than one per refresh.
+ * while the reading is still fresh" is the assertion that bounds this to one
+ * GET per recheck window rather than one per refresh attempt.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test"
@@ -69,7 +75,7 @@ function stubEndpoints(profileResponse: () => Response | null) {
 }
 
 /** A store seeded with tokens plus whatever plan fields the case is about. */
-function makeStore(plan: { subscriptionType?: string; rateLimitTier?: string }) {
+function makeStore(plan: Record<string, unknown>) {
   let stored: Record<string, unknown> = {
     claudeAiOauth: {
       accessToken: "old-access-token",
@@ -153,25 +159,78 @@ describe("a token refresh backfills a plan-blind credential", () => {
     expect(stub.profileAuthorization()).toBe("Bearer rotated-access-token")
   })
 
-  it("does not ask again once both fields are known", async () => {
+  it("does not ask again while the last reading is still fresh", async () => {
     const { refreshOAuthToken } = await import("../proxy/tokenRefresh")
-    const { store } = makeStore({ subscriptionType: "max", rateLimitTier: "default_claude_max_20x" })
+    const { store } = makeStore({
+      subscriptionType: "max",
+      rateLimitTier: "default_claude_max_20x",
+      planCheckedAt: Date.now(),
+    })
     const stub = stubEndpoints(() => jsonResponse(MAX_20X_PROFILE))
 
     expect(await refreshOAuthToken(store)).toBe(true)
     expect(stub.profileCalls()).toBe(0)
   })
 
-  it("keeps the stored value when the endpoint reports a different one", async () => {
+  it("asks again once the reading has aged out", async () => {
     const { refreshOAuthToken } = await import("../proxy/tokenRefresh")
-    // Only the missing half is being filled in; a plan already on disk was
-    // written by a login and is not up for revision by a backfill.
-    const { store, oauth } = makeStore({ subscriptionType: "team" })
+    const { PLAN_RECHECK_MS } = await import("../proxy/oauthPlan")
+    const { store } = makeStore({
+      subscriptionType: "max",
+      rateLimitTier: "default_claude_max_20x",
+      planCheckedAt: Date.now() - PLAN_RECHECK_MS - 1,
+    })
+    const stub = stubEndpoints(() => jsonResponse(MAX_20X_PROFILE))
+
+    expect(await refreshOAuthToken(store)).toBe(true)
+    expect(stub.profileCalls()).toBe(1)
+  })
+
+  it("asks about a complete credential that was never dated", async () => {
+    const { refreshOAuthToken } = await import("../proxy/tokenRefresh")
+    // Every credential on a fleet that predates the date is in this state, so
+    // this is what decides whether an upgrade is noticed on an account that is
+    // already logged in and wants nothing else from a human.
+    const { store } = makeStore({ subscriptionType: "max", rateLimitTier: "default_claude_max_5x" })
+    const stub = stubEndpoints(() => jsonResponse(MAX_20X_PROFILE))
+
+    expect(await refreshOAuthToken(store)).toBe(true)
+    expect(stub.profileCalls()).toBe(1)
+  })
+
+  it("takes an upgrade over the plan already on disk", async () => {
+    const { refreshOAuthToken } = await import("../proxy/tokenRefresh")
+    // The measured case: an account added as Max 5x, upgraded to Max 20x, and
+    // still reported 5x days later because nothing ever read it a second time.
+    const { store, oauth } = makeStore({ subscriptionType: "max", rateLimitTier: "default_claude_max_5x" })
     stubEndpoints(() => jsonResponse(MAX_20X_PROFILE))
 
     expect(await refreshOAuthToken(store)).toBe(true)
-    expect(oauth().subscriptionType).toBe("team")
     expect(oauth().rateLimitTier).toBe("default_claude_max_20x")
+    expect(typeof oauth().planCheckedAt).toBe("number")
+  })
+
+  it("leaves a field the reading did not carry alone", async () => {
+    const { refreshOAuthToken } = await import("../proxy/tokenRefresh")
+    // A partial response must not erase disk: an absent key means "not
+    // reported", never "no longer set".
+    const { store, oauth } = makeStore({ subscriptionType: "team", seatTier: "default_raven" })
+    stubEndpoints(() => jsonResponse({ organization: { rate_limit_tier: "default_claude_max_5x" } }))
+
+    expect(await refreshOAuthToken(store)).toBe(true)
+    expect(oauth().subscriptionType).toBe("team")
+    expect(oauth().seatTier).toBe("default_raven")
+    expect(oauth().rateLimitTier).toBe("default_claude_max_5x")
+  })
+
+  it("does not date a reading that failed, so the next refresh retries", async () => {
+    const { refreshOAuthToken } = await import("../proxy/tokenRefresh")
+    const { store, oauth } = makeStore({ subscriptionType: "max", rateLimitTier: "default_claude_max_5x" })
+    stubEndpoints(() => null)
+
+    expect(await refreshOAuthToken(store)).toBe(true)
+    expect(oauth().rateLimitTier).toBe("default_claude_max_5x")
+    expect("planCheckedAt" in oauth()).toBe(false)
   })
 
   it("still refreshes the token when the plan lookup fails", async () => {
