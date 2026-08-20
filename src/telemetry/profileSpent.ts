@@ -20,9 +20,18 @@
 export const GENERAL_WINDOW_TYPES: readonly string[] = ["five_hour", "seven_day"]
 
 /** Where the gradient starts — below this a profile reads as untouched. */
-export const FADE_FROM = 0.85
-/** At or above this a profile is spent, whatever the exact number. */
-export const SPENT_AT = 0.95
+export const FADE_FROM = 0.95
+/**
+ * At or above this a profile is spent, whatever the exact number.
+ *
+ * One, not a margin below it, because "spent" is read as "cannot serve" and
+ * anything short of an exhausted window still can. The account that forced
+ * this apart sat at 0.96 seven_day with a five_hour window at 0 — a full
+ * fresh window of work available, greyed out and pilled "spent" because the
+ * worse of the two general windows crossed a 0.95 line. Anthropic reports
+ * exactly 1 for a window that is genuinely finished, so that is the number.
+ */
+export const SPENT_AT = 1
 
 export interface SpendWindow {
   type: string
