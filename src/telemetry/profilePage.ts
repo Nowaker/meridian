@@ -6,6 +6,7 @@
 import { profileBarCss, profileBarHtml, profileBarJs, themeCss } from "./profileBar"
 import { profileFactsJs } from "./profileFacts"
 import { reorderClientJs, reorderCss, reorderLiveRegionHtml } from "./profileOrder"
+import { selectionHoldJs } from "./selectionHold"
 import { WINDOW_LABELS } from "./profileUsage"
 
 export const profilePageHtml = `<!DOCTYPE html>
@@ -360,6 +361,7 @@ function formatExtraUsage(eu) {
 }
 
 ${reorderClientJs}
+${selectionHoldJs}
 
 // Cache the last seen quota response so the /profiles/list refresh can
 // keep showing usage even if a single /v1/usage/quota/all call fails.
@@ -1337,12 +1339,14 @@ meridianReorder.init({ onSaved: refresh });
 refresh();
 resetAddForm('');
 // A poll re-renders every card, so it must not land while one is being
-// operated on: mid-drag it replaces the cards being dragged, and mid-login or
-// mid-add it wipes the panel the code is being pasted into. Each panel keeps
-// its own state, so each needs its own term - resetAddForm nulls activeAdd,
-// which is the addId the paste is about to be sent with.
+// operated on: mid-drag it replaces the cards being dragged, mid-login or
+// mid-add it wipes the panel the code is being pasted into, and mid-copy it
+// takes the selected text away with the nodes that carried it. Each panel
+// keeps its own state, so each needs its own term - resetAddForm nulls
+// activeAdd, which is the addId the paste is about to be sent with.
 setInterval(function () {
-  if (!meridianReorder.dragging() && !activeLogin && !activeAdd && !ownerMenuBusy()) refresh();
+  if (!meridianReorder.dragging() && !activeLogin && !activeAdd && !ownerMenuBusy()
+    && !meridianSelection.holdsRedraw()) refresh();
 }, 10000);
 ` + profileBarJs + `
 </script>

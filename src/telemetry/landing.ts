@@ -11,6 +11,7 @@
 import { profileBarCss, profileBarHtml, profileBarJs, themeCss } from "./profileBar"
 import { profileFactsJs } from "./profileFacts"
 import { reorderClientJs, reorderCss, reorderLiveRegionHtml } from "./profileOrder"
+import { selectionHoldJs } from "./selectionHold"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "./profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT } from "./profileSpent"
 
@@ -295,6 +296,7 @@ function setViewSort(mode){
 }
 
 ${reorderClientJs}
+${selectionHoldJs}
 
 function introSection(h){
   var meta=[];
@@ -560,6 +562,12 @@ document.getElementById('content').addEventListener('click',function(e){
   // The card is itself a switch button, so a control inside one has to opt out
   // of it or picking an owner (or reading the details) would also move all
   // traffic to that account.
+  //
+  // Releasing a drag-select dispatches a click too, and that one is the end of
+  // a copy rather than a request to switch account. A plain click has already
+  // collapsed whatever was selected by the time it fires, so this refuses only
+  // the gesture that really was a selection.
+  if(meridianSelection.live())return;
   if(e.target.closest('.owner-select'))return;
   if(e.target.closest('.prof-info'))return;
   if(onHandle(e))return;
@@ -579,7 +587,7 @@ document.getElementById('content').addEventListener('keydown',function(e){
 viewSort=readStoredSort()||viewSort;
 meridianReorder.init({onSaved:refresh});
 refresh();
-setInterval(function(){if(!meridianReorder.dragging()&&!ownerMenuBusy()&&!infoPopOpen())refresh()},10000);
+setInterval(function(){if(!meridianReorder.dragging()&&!ownerMenuBusy()&&!infoPopOpen()&&!meridianSelection.holdsRedraw())refresh()},10000);
 ` + profileBarJs + `
 </script>
 </body>
