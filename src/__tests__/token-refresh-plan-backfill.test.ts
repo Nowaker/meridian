@@ -53,11 +53,15 @@ const MAX_20X_PROFILE = {
  * the case that must leave the refresh itself successful.
  */
 function stubEndpoints(profileResponse: () => Response | null) {
+  let tokenCalls = 0
   let profileCalls = 0
   let profileAuthorization: string | undefined
   globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
     const href = String(url)
-    if (href === TOKEN_URL) return jsonResponse(ROTATED_TOKENS)
+    if (href === TOKEN_URL) {
+      tokenCalls++
+      return jsonResponse(ROTATED_TOKENS)
+    }
     if (href === PROFILE_URL) {
       profileCalls++
       profileAuthorization = (init?.headers as Record<string, string> | undefined)?.Authorization
@@ -69,6 +73,7 @@ function stubEndpoints(profileResponse: () => Response | null) {
   }) as typeof fetch
 
   return {
+    tokenCalls: () => tokenCalls,
     profileCalls: () => profileCalls,
     profileAuthorization: () => profileAuthorization,
   }
@@ -208,6 +213,23 @@ describe("a token refresh backfills a plan-blind credential", () => {
     expect(await refreshOAuthToken(store)).toBe(true)
     expect(oauth().rateLimitTier).toBe("default_claude_max_20x")
     expect(typeof oauth().planCheckedAt).toBe("number")
+  })
+
+  it("takes a due plan upgrade without rotating a still-valid access token", async () => {
+    const { ensureFreshToken } = await import("../proxy/tokenRefresh")
+    const { PLAN_RECHECK_MS } = await import("../proxy/oauthPlan")
+    const { store, oauth } = makeStore({
+      subscriptionType: "max",
+      rateLimitTier: "default_claude_max_5x",
+      planCheckedAt: Date.now() - PLAN_RECHECK_MS - 1,
+      expiresAt: Date.now() + 4 * 60 * 60_000,
+    })
+    const stub = stubEndpoints(() => jsonResponse(MAX_20X_PROFILE))
+
+    expect(await ensureFreshToken(store)).toBe(true)
+    expect(stub.tokenCalls()).toBe(0)
+    expect(stub.profileCalls()).toBe(1)
+    expect(oauth().rateLimitTier).toBe("default_claude_max_20x")
   })
 
   it("leaves a field the reading did not carry alone", async () => {

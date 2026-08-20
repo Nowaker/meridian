@@ -27,6 +27,7 @@ const MOCK_CREDENTIALS = {
     scopes: ["openid", "profile"],
     subscriptionType: "max",
     rateLimitTier: "standard",
+    planCheckedAt: Date.now(),
   },
   extraField: "keep-me",
 }
@@ -315,7 +316,14 @@ describe("ensureFreshToken", () => {
     const { ensureFreshToken } = await import("../proxy/tokenRefresh")
     const fetchSpy = mock(() => Promise.reject(new Error("fetch should not be called")))
     mockFetch(fetchSpy)
-    const { store, writes } = makeStoreWithExpiry(Date.now() + 60 * 60 * 1000) // +1h, well outside default 5min buffer
+    const { store, writes } = makeStore({
+      ...MOCK_CREDENTIALS,
+      claudeAiOauth: {
+        ...MOCK_CREDENTIALS.claudeAiOauth,
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        planCheckedAt: Date.now(),
+      },
+    })
 
     const ok = await ensureFreshToken(store)
     expect(ok).toBe(true)

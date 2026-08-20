@@ -152,6 +152,30 @@ export function changedPlanFields(
   return keys.filter((key) => fetched[key] !== undefined && stored?.[key] !== fetched[key])
 }
 
+export interface OAuthPlanUpdate<T extends StoredPlanState> {
+  readonly fields: OAuthPlanFields
+  readonly changed: (keyof OAuthPlanFields)[]
+  readonly state: T & { readonly planCheckedAt: number }
+}
+
+export async function readOAuthPlanUpdate<T extends StoredPlanState>(
+  state: T,
+  accessToken: string,
+): Promise<OAuthPlanUpdate<T> | null> {
+  if (!planNeedsCheck(state)) return null
+  const fields = await fetchOAuthPlanFields(accessToken)
+  if (Object.keys(fields).length === 0) return null
+  return {
+    fields,
+    changed: changedPlanFields(state, fields),
+    state: {
+      ...state,
+      ...fields,
+      planCheckedAt: Date.now(),
+    },
+  }
+}
+
 /**
  * Best-effort plan lookup for a valid access token. Never throws and never
  * fails its caller: a profile whose plan is unknown is strictly better than no
