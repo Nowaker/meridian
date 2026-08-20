@@ -711,13 +711,7 @@ export function profileRemove(id: string): void {
     process.exit(1)
   }
 
-  // `applyProfileRemove`'s own defaults hardcode ~/.config/meridian and cannot
-  // see MERIDIAN_CONFIG_DIR, so a dev instance would delete inside the
-  // directory it is not using. These are this process's real paths.
-  const result = applyProfileRemove(id, {
-    profilesDir: configPath("profiles"),
-    configFile: profilesConfigFile(),
-  })
+  const result = applyProfileRemove(id)
   if (!result.ok) {
     console.error(`\x1b[31m✗ ${result.error}\x1b[0m`)
     if (result.hint) console.error(`  ${result.hint}`)
@@ -743,13 +737,7 @@ export function profileRename(from: string, to: string): void {
   }
 
   const wasActive = getSetting("activeProfile") === from
-  // `profileRename`'s own defaults hardcode ~/.config/meridian and cannot see
-  // MERIDIAN_CONFIG_DIR, so a dev instance would rename inside the directory it
-  // is not using. These are this process's real paths.
-  const result = applyProfileRename(from, to, {
-    profilesDir: configPath("profiles"),
-    configFile: profilesConfigFile(),
-  })
+  const result = applyProfileRename(from, to)
   if (!result.ok) {
     console.error(`\x1b[31m✗ ${result.error}\x1b[0m`)
     if (result.hint) console.error(`  ${result.hint}`)

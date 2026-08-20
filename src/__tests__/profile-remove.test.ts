@@ -60,15 +60,20 @@ describe("applyProfileRemove", () => {
   let root: string
   let profilesDir: string
   let configFile: string
+  let savedConfigDir: string | undefined
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "meridian-remove-"))
     profilesDir = join(root, "profiles")
     configFile = join(root, "profiles.json")
     mkdirSync(profilesDir, { recursive: true })
+    savedConfigDir = process.env.MERIDIAN_CONFIG_DIR
+    process.env.MERIDIAN_CONFIG_DIR = root
   })
 
   afterEach(() => {
+    if (savedConfigDir !== undefined) process.env.MERIDIAN_CONFIG_DIR = savedConfigDir
+    else delete process.env.MERIDIAN_CONFIG_DIR
     chmodSync(profilesDir, 0o700)
     rmSync(root, { recursive: true, force: true })
   })
@@ -156,6 +161,24 @@ describe("applyProfileRemove", () => {
     expect(result.ok).toBe(false)
     expect(existsSync(join(workDir, ".credentials.json"))).toBe(true)
     expect(readConfig()[0]!.id).toBe("work")
+  })
+
+  test("named no paths, it works on the config directory this instance uses", () => {
+    // The web route passes no options, so this is the call it makes. While the
+    // defaults hardcoded ~/.config/meridian, the instance that owns the
+    // credentials searched the OTHER instance's profiles.json - answering
+    // "not found" for a profile the page had just listed, and, for any id the
+    // two files shared, queueing the wrong account's credentials for deletion.
+    const workDir = seedProfileDir("work")
+    seed([{ id: "work", claudeConfigDir: workDir }, { id: "personal" }])
+
+    const result = applyProfileRemove("work")
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.dirsRemoved).toEqual([workDir])
+    expect(existsSync(workDir)).toBe(false)
+    expect(readConfig().map(p => p.id)).toEqual(["personal"])
   })
 
   test("refuses an unknown profile without touching the file", () => {

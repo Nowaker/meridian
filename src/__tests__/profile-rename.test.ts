@@ -6,10 +6,12 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test"
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import {
   applyProfileRename,
+  defaultProfilesConfigFile,
+  defaultProfilesDir,
   isValidProfileId,
   planProfileRename,
   reclaimAlias,
@@ -40,6 +42,31 @@ describe("isValidProfileId", () => {
     for (const id of ["", "with space", "dot.name", "slash/name", "..", "emoji🙂", "quote\"name"]) {
       expect(isValidProfileId(id)).toBe(false)
     }
+  })
+})
+
+describe("default profile paths", () => {
+  let savedConfigDir: string | undefined
+
+  beforeEach(() => { savedConfigDir = process.env.MERIDIAN_CONFIG_DIR })
+  afterEach(() => {
+    if (savedConfigDir !== undefined) process.env.MERIDIAN_CONFIG_DIR = savedConfigDir
+    else delete process.env.MERIDIAN_CONFIG_DIR
+  })
+
+  test("follow MERIDIAN_CONFIG_DIR, and re-read it on every call", () => {
+    process.env.MERIDIAN_CONFIG_DIR = "/cfg/primary"
+    expect(defaultProfilesDir()).toBe("/cfg/primary/profiles")
+    expect(defaultProfilesConfigFile()).toBe("/cfg/primary/profiles.json")
+
+    // Not frozen at import: the variable is read after the CLI has started.
+    process.env.MERIDIAN_CONFIG_DIR = "/cfg/standby"
+    expect(defaultProfilesConfigFile()).toBe("/cfg/standby/profiles.json")
+  })
+
+  test("fall back to ~/.config/meridian when it is unset", () => {
+    delete process.env.MERIDIAN_CONFIG_DIR
+    expect(defaultProfilesConfigFile()).toBe(join(homedir(), ".config", "meridian", "profiles.json"))
   })
 })
 
@@ -287,6 +314,19 @@ describe("applyProfileRename", () => {
     expect(saved[0]!.id).toBe("employer")
     expect(saved[0]!.claudeConfigDir).toBe(join(profilesDir, "employer"))
     expect(saved[0]!.aliases).toEqual(["work"])
+  })
+
+  test("named no paths, it works on the config directory this instance uses", () => {
+    const workDir = join(profilesDir, "work")
+    mkdirSync(workDir)
+    writeFileSync(join(workDir, ".credentials.json"), "{}")
+    seed([{ id: "work", claudeConfigDir: workDir }])
+
+    const result = applyProfileRename("work", "employer")
+
+    expect(result.ok).toBe(true)
+    expect(existsSync(join(profilesDir, "employer", ".credentials.json"))).toBe(true)
+    expect(readConfig()[0]!.id).toBe("employer")
   })
 
   test("refuses when the destination directory is already occupied", () => {
