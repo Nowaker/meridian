@@ -671,7 +671,10 @@ function render(data, quotaData) {
     } else {
       html += '<span class="profile-name">' + esc(p.id) + '</span>';
       if (isActive) html += '<span class="profile-badge badge-active">active</span>';
-      html += '<span class="profile-badge badge-type">' + esc(p.type || 'claude-max') + '</span>';
+      const planTitle = [p.planLabel, p.rateLimitTier].filter(Boolean).join(' · ');
+      html += p.allowance
+        ? '<span class="profile-badge badge-type" title="' + esc(planTitle) + '">' + esc(p.allowance) + '</span>'
+        : '<span class="profile-badge badge-type">' + esc(p.type || 'claude-max') + '</span>';
       html += renderRefusalBadge((quotaById[p.id] || {}).refusal);
       html += '<span class="profile-card-actions">';
       html += '<button class="icon-btn" title="Rename profile" onclick="startRename(&quot;'+esc(p.id)+'&quot;)">' + ICON_PENCIL + '</button>';
