@@ -205,6 +205,11 @@ export function getEffectiveActiveProfileId(configProfiles: ProfileConfig[] | un
   return resolveActiveProfileId(getEffectiveProfiles(configProfiles).map(p => p.id))
 }
 
+export function clearActiveProfile(): void {
+  activeProfileId = undefined
+  setSetting("activeProfile", undefined)
+}
+
 /** Reset active profile — for testing only. */
 export function resetActiveProfile(): void {
   activeProfileId = undefined
@@ -325,7 +330,15 @@ export function resolveProfile(
   requestedId?: string,
   options?: ResolveProfileOptions
 ): ResolvedProfile {
-  const effective = getEffectiveProfiles(profiles)
+  return resolveProfileFromPool(getEffectiveProfiles(profiles), defaultProfile, requestedId, options)
+}
+
+export function resolveProfileFromPool(
+  effective: readonly ProfileConfig[],
+  defaultProfile: string | undefined,
+  requestedId?: string,
+  options?: ResolveProfileOptions
+): ResolvedProfile {
 
   // No profiles configured — return empty env (standard single-account mode)
   if (effective.length === 0) {
