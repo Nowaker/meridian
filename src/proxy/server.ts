@@ -80,7 +80,7 @@ import { runTransformHook, buildPipeline, createRequestContext } from "./transfo
 import { getAdapterTransforms } from "./transforms/registry"
 import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
-import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, restoreActiveProfile, invalidateDiskProfileCache, shareableCredentialDir, type ResolvedProfile } from "./profiles"
+import { resolveProfile, resolveProfileFromPool, listProfiles, setActiveProfile, clearActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, restoreActiveProfile, invalidateDiskProfileCache, shareableCredentialDir, type ProfileConfig, type ResolvedProfile } from "./profiles"
 import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
 import { parseOwnerRequest, profileOwners, setProfileOwner } from "./profileOwners"
 import { organizationNames, organizationNeedsRefresh, refreshOrganizationNameSoon } from "./organizationName"
@@ -88,9 +88,12 @@ import { startFollowUsagePolling, stopFollowUsagePolling } from "./followUsage"
 import { startProfileLogin, completeProfileLogin, completeProfileLoginFromCallback, getProfileLoginStatus } from "./profileLogin"
 import { startProfileAdd, completeProfileAdd } from "./profileAdd"
 import { getRoutingMode, resolvePriorityOrder, choosePriorityProfile, chooseActivePriorityCandidates, isPoolRouting, ACTIVE_PRIORITY, ROUTING_MODES, ProfileExhaustion, AssignmentStore, type RoutingMode } from "./routing"
+import { filterEligibleProfileIds, mergeRoutingExcludedProfiles, parseRoutingExcludedProfiles } from "./routingExclusions"
+import { canonicalRoutingExcludedProfileIds, evaluateRoutingProfileAccess, noEligibleProfilesResponse, profileExcludedResponse, replacementForExcludedActive } from "./routingExclusionRuntime"
+import { activateProfile } from "./profileActivation"
 import { diagnoseLimit, type LimitDiagnosis } from "./limitDetection"
 import { RefusalStore, FailoverEventLog } from "./profileHealth"
-import { getSetting, setSetting } from "./settings"
+import { getSetting, saveSettings, setSetting, type MeridianSettings } from "./settings"
 import { filterBetasForProfile, getBetaPolicyFromEnv } from "./betas"
 import { createFileChangeHook, extractFileChangesFromMessages, formatFileChangeSummary, type FileChange } from "./fileChanges"
 import { detectTokenAnomalies, formatAnomalyAlerts, type TokenSnapshot } from "./tokenHealth"
@@ -476,6 +479,76 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   app.use("/settings/*", requireAuth)
   app.use("/settings", requireAuth)
   app.use("/design-login", requireAuth)
+
+  const internalHopToken = randomUUID()
+  const configuredRoutingExcludedProfileIds = () => mergeRoutingExcludedProfiles(
+      parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles")),
+      parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")),
+    )
+  const routingExcludedProfileIdsFor = (profiles: readonly ProfileConfig[]) => canonicalRoutingExcludedProfileIds(
+    profiles,
+    configuredRoutingExcludedProfileIds(),
+  )
+  const routingExcludedProfileIds = () => routingExcludedProfileIdsFor(getEffectiveProfiles(finalConfig.profiles))
+
+  const applyActiveProfile = (
+    profileId: string | undefined,
+    attribution: { readonly source: string; readonly userAgent?: string | null; readonly origin?: string | null },
+  ): void => activateProfile(profileId, attribution, {
+    getActiveProfileId,
+    setActiveProfile,
+    clearActiveProfile,
+    clearSessionCache,
+    logEvent: claudeLog,
+    logLine: plog,
+  })
+
+  function reconcileActiveProfileWithExclusions(): void {
+    const profiles = getEffectiveProfiles(finalConfig.profiles)
+    const replacement = replacementForExcludedActive({
+      profiles,
+      defaultProfile: finalConfig.defaultProfile,
+      activeProfile: getActiveProfileId(),
+      excludedProfileIds: routingExcludedProfileIds(),
+    })
+    if (!replacement.change) return
+    applyActiveProfile(replacement.profileId, { source: "routing-exclusions" })
+  }
+
+  reconcileActiveProfileWithExclusions()
+
+  type ErrorShape = "anthropic" | "openai"
+  const errorEnvelope = (shape: ErrorShape, type: string, message: string) =>
+    shape === "anthropic"
+      ? { type: "error", error: { type, message } }
+      : { error: { type, message, code: null } }
+
+  async function relayInnerError(internalResponse: Response, shape: ErrorShape): Promise<Response> {
+    const rawBody = await internalResponse.text()
+    let errorType: string | undefined
+    let errorMessage: string | undefined
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(rawBody)
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error
+    }
+    if (parsed && typeof parsed === "object" && "error" in parsed) {
+      const error = parsed.error
+      if (error && typeof error === "object") {
+        if ("type" in error && typeof error.type === "string") errorType = error.type
+        if ("message" in error && typeof error.message === "string") errorMessage = error.message
+      }
+    }
+    return new Response(JSON.stringify(errorEnvelope(
+      shape,
+      errorType ?? "upstream_error",
+      errorMessage ?? rawBody,
+    )), {
+      status: internalResponse.status,
+      headers: { "Content-Type": "application/json" },
+    })
+  }
 
   // --- Priority routing (opt-in, routing="priority") ---
   // Ordered account pool with per-request failover. The /v1/messages handler
@@ -876,6 +949,31 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // Meridian already uses for session tracking is the assignment key,
         // so a session and its subagent/fork requests land on one account.
         const routingMode = getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing"))
+        const warmProfileId = c.req.header("x-meridian-internal-hop") === internalHopToken
+          && c.req.header("x-meridian-routing-purpose") === "warm"
+          ? c.req.header("x-meridian-profile")
+          : undefined
+        const requestedProfileId = warmProfileId ?? c.req.header("x-meridian-profile") ?? undefined
+        const routingAccess = evaluateRoutingProfileAccess({
+          profiles: getEffectiveProfiles(finalConfig.profiles),
+          defaultProfile: finalConfig.defaultProfile,
+          purpose: warmProfileId ? "warm" : "work",
+          explicitProfileId: requestedProfileId,
+          excludedProfileIds: routingExcludedProfileIds(),
+        })
+        switch (routingAccess.access.kind) {
+          case "explicit_excluded":
+            return profileExcludedResponse(routingAccess.access.profileId)
+          case "no_eligible_profiles":
+            return noEligibleProfilesResponse()
+          case "allowed":
+            break
+          default: {
+            const exhaustive: never = routingAccess.access
+            return exhaustive
+          }
+        }
+        const eligibleProfiles = routingAccess.profiles
         // Priority mode (opt-in): unpinned requests are dispatched across the
         // ordered pool with per-request failover. Pinned requests (explicit
         // x-meridian-profile — including our own internal hops) bypass the
@@ -883,8 +981,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         if (isPoolRouting(routingMode) && !c.req.header("x-meridian-profile")) {
           const effectivePool = getEffectiveProfiles(finalConfig.profiles)
           if (effectivePool.length > 1) {
-            const { order, unknown } = resolvePriorityOrder(effectivePool.map(p => p.id), priorityProfileOrderSetting())
+            const { order: fullOrder, unknown } = resolvePriorityOrder(effectivePool.map(p => p.id), priorityProfileOrderSetting())
             if (unknown.length > 0) claudeLog("priority.unknown_order_ids", { unknown })
+            const order = filterEligibleProfileIds(fullOrder, routingAccess.excludedProfileIds)
             // Keyless clients (pylon's main process, OpenCode setups that omit
             // x-opencode-session) fall back to the conversation fingerprint —
             // without it they re-pick an account every turn and bounce back to
@@ -906,7 +1005,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             if (routingMode === ACTIVE_PRIORITY) {
               // No header and no options: this is the "active" chain verbatim,
               // so the pool head is whatever the UI/CLI last selected.
-              const activeId = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile).id
+              const activeId = resolveProfileFromPool(eligibleProfiles, routingAccess.defaultProfile).id
               candidates = chooseActivePriorityCandidates(
                 activeId,
                 order,
@@ -929,10 +1028,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             return dispatchPriority(c, candidates, sessionKey, body.stream === true, routingMode)
           }
         }
-        const profile = resolveProfile(
-          finalConfig.profiles,
-          finalConfig.defaultProfile,
-          c.req.header("x-meridian-profile") || undefined,
+        const profile = resolveProfileFromPool(
+          eligibleProfiles,
+          routingAccess.defaultProfile,
+          requestedProfileId,
           routingMode === "sticky"
             ? { routingMode, stickySessionKey: adapter.getSessionId(c, body) }
             : undefined
@@ -1198,6 +1297,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // workers fresh-replayed every turn: prompt-cache hits decayed to the
         // static-prefix floor and turn latency grew with conversation length.
         const isIndependentSession =
+          warmProfileId !== undefined ||
           (!agentSessionId && (requestSource?.startsWith("fork-") || requestSource?.startsWith("subagent-"))) ||
           isClientDrivenLoop || false
         // If the previous turn's background drain is still persisting this
@@ -3830,6 +3930,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       routing: getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing")),
       modes: ROUTING_MODES,
       profileOrder: resolvePriorityOrder(profiles.map(p => p.id), priorityProfileOrderSetting()).order,
+      routingExcludedProfiles: parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles")),
+      routingManagedExcludedProfiles: parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")),
       profiles: profiles.map(p => p.id),
       envOverride: {
         routing: Boolean(process.env.MERIDIAN_ROUTING),
@@ -3838,13 +3940,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     })
   })
   app.put("/settings/api/routing", async (c) => {
-    let body: { routing?: unknown; profileOrder?: unknown }
+    let body: {
+      routing?: unknown
+      profileOrder?: unknown
+      routingExcludedProfiles?: unknown
+      routingManagedExcludedProfiles?: unknown
+    }
     try { body = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
+    const updates: Partial<MeridianSettings> = {}
     if (body.routing !== undefined) {
       if (typeof body.routing !== "string" || !ROUTING_MODES.includes(body.routing as RoutingMode)) {
         return c.json({ error: `routing must be one of: ${ROUTING_MODES.join(", ")}` }, 400)
       }
-      setSetting("routing", body.routing)
+      updates.routing = body.routing
     }
     if (body.profileOrder !== undefined) {
       if (!Array.isArray(body.profileOrder) || body.profileOrder.some(x => typeof x !== "string")) {
@@ -3853,7 +3961,23 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       const known = new Set(listProfiles(finalConfig.profiles, finalConfig.defaultProfile).map(p => p.id))
       const unknown = (body.profileOrder as string[]).filter(id => !known.has(id))
       if (unknown.length > 0) return c.json({ error: `Unknown profiles: ${unknown.join(", ")}` }, 400)
-      setSetting("profileOrder", body.profileOrder as string[])
+      updates.profileOrder = body.profileOrder as string[]
+    }
+    if (body.routingExcludedProfiles !== undefined) {
+      if (!Array.isArray(body.routingExcludedProfiles) || body.routingExcludedProfiles.some(profileId => typeof profileId !== "string")) {
+        return c.json({ error: "routingExcludedProfiles must be an array of profile ids" }, 400)
+      }
+      updates.routingExcludedProfiles = parseRoutingExcludedProfiles(body.routingExcludedProfiles)
+    }
+    if (body.routingManagedExcludedProfiles !== undefined) {
+      if (!Array.isArray(body.routingManagedExcludedProfiles) || body.routingManagedExcludedProfiles.some(profileId => typeof profileId !== "string")) {
+        return c.json({ error: "routingManagedExcludedProfiles must be an array of profile ids" }, 400)
+      }
+      updates.routingManagedExcludedProfiles = parseRoutingExcludedProfiles(body.routingManagedExcludedProfiles)
+    }
+    if (Object.keys(updates).length > 0) saveSettings(updates)
+    if (body.routingExcludedProfiles !== undefined || body.routingManagedExcludedProfiles !== undefined) {
+      reconcileActiveProfileWithExclusions()
     }
     plog(`[PROXY] Routing settings updated: routing=${getSetting("routing") ?? "active"} order=${(getSetting("profileOrder") ?? []).join(",") || "(config order)"}`)
     return c.json({ success: true })
@@ -4015,7 +4139,28 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // --- Profile management routes ---
 
   app.get("/profiles/list", async (c) => {
-    const profiles = listProfiles(finalConfig.profiles, finalConfig.defaultProfile)
+    const listedProfiles = listProfiles(finalConfig.profiles, finalConfig.defaultProfile)
+    const availableProfileIds = listedProfiles.length > 0
+      ? listedProfiles.map(profile => profile.id)
+      : ["default"]
+    const excludedProfileIds = routingExcludedProfileIdsFor(
+      listedProfiles.length > 0 ? getEffectiveProfiles(finalConfig.profiles) : [],
+    )
+    const eligibleProfileIds = filterEligibleProfileIds(
+      availableProfileIds,
+      excludedProfileIds,
+    )
+    const resolvedActiveProfile = resolveActiveProfileId(eligibleProfileIds)
+    const activeProfile = (resolvedActiveProfile && eligibleProfileIds.includes(resolvedActiveProfile)
+      ? resolvedActiveProfile
+      : undefined)
+      ?? (eligibleProfileIds.includes(finalConfig.defaultProfile ?? "") ? finalConfig.defaultProfile : undefined)
+      ?? eligibleProfileIds[0]
+      ?? null
+    const profiles = listedProfiles.map(profile => ({
+      ...profile,
+      isActive: profile.id === activeProfile,
+    }))
     const owners = profileOwners()
     const organizations = organizationNames()
     // Enrich with live auth status
@@ -4107,7 +4252,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     const follow = followStatus(profiles.map(p => p.id))
     return c.json({
       profiles: enriched,
-      activeProfile: resolveActiveProfileId(profiles.map(p => p.id)) || finalConfig.defaultProfile || profiles[0]?.id || "default",
+      activeProfile,
       // Additive (#383): current routing mode so UIs can surface it.
       routing: routingModeNow,
       // Reported in every mode, unlike `exhausted` above: an account that is
@@ -4173,26 +4318,49 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     if (!effective.find(p => p.id === body.profile)) {
       return c.json({ error: `Unknown profile: ${body.profile}. Available: ${effective.map(p => p.id).join(", ")}` }, 400)
     }
-    const previousProfile = getActiveProfileId() ?? null
-    setActiveProfile(body.profile!)
-    // Evict all cached SDK sessions — they were started under the old profile's
-    // credentials and cannot be reused with different auth. The rate-limit
-    // store is NOT cleared: entries are profile-scoped, so the new profile
-    // can no longer read the old one's quotas, and other profiles' snapshots
-    // stay valid (consumers judge staleness from `observedAt`).
-    clearSessionCache()
-    // Attribute the switch: multiple surfaces can POST here (the meridian UI,
-    // the CLI, pylon's provider switcher, the iOS companion) and the active
-    // profile is GLOBAL state — an unexplained flip should be answerable from
-    // the logs, not an investigation.
-    claudeLog("profile.switched", {
-      from: previousProfile,
-      to: body.profile,
+    if (routingExcludedProfileIds().includes(body.profile)) {
+      return profileExcludedResponse(body.profile)
+    }
+    applyActiveProfile(body.profile, {
+      source: "profiles-api",
       userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
       origin: c.req.header("origin") ?? c.req.header("referer")?.slice(0, 120) ?? null,
     })
-    plog(`[PROXY] Active profile switched to: ${body.profile} (from ${previousProfile ?? "unset"}, ua: ${(c.req.header("user-agent") || "unknown").slice(0, 60)}) (session + rate-limit caches cleared)`)
     return c.json({ success: true, activeProfile: body.profile })
+  })
+
+  app.post("/profiles/:id/warm", (c) => {
+    const profileId = c.req.param("id")
+    const profiles = getEffectiveProfiles(finalConfig.profiles)
+    const availableProfileIds = profiles.length > 0 ? profiles.map(profile => profile.id) : ["default"]
+    if (!availableProfileIds.includes(profileId)) {
+      return c.json({
+        type: "error",
+        error: { type: "not_found", message: `Unknown profile: ${profileId}` },
+      }, 404)
+    }
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "x-meridian-agent": "openai",
+      "x-meridian-profile": profileId,
+      "x-meridian-internal-hop": internalHopToken,
+      "x-meridian-routing-purpose": "warm",
+    }
+    const apiKey = c.req.header("x-api-key")
+    if (apiKey) headers["x-api-key"] = apiKey
+    const authorization = c.req.header("authorization")
+    if (authorization) headers.authorization = authorization
+    return app.fetch(new Request("http://internal/v1/messages", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 8,
+        stream: false,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+      signal: c.req.raw.signal,
+    }))
   })
 
   // Deliberately NOT refused under MERIDIAN_FOLLOW_ACTIVE the way
@@ -4418,8 +4586,21 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     // very next /profiles/list shows the new name instead of its own stale one.
     invalidateDiskProfileCache()
     // applyProfileRename moved the persisted pointer; this process holds its
-    // own copy in memory and has to be told as well.
-    if (getActiveProfileId() === body.from) setActiveProfile(body.to)
+    // own copy in memory and has to be told as well. A former-name exclusion
+    // follows the alias onto the renamed profile, so choose another eligible
+    // account rather than activating a work-ineligible one.
+    if (getActiveProfileId() === body.from) {
+      const excludedProfileIds = routingExcludedProfileIdsFor(result.profiles)
+      const renamedProfileId = result.to
+      const nextProfileId = excludedProfileIds.includes(renamedProfileId)
+        ? filterEligibleProfileIds(result.profiles.map(profile => profile.id), excludedProfileIds)[0]
+        : renamedProfileId
+      applyActiveProfile(nextProfileId, {
+        source: "profile-rename",
+        userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+        origin: c.req.header("origin") ?? c.req.header("referer")?.slice(0, 120) ?? null,
+      })
+    }
     claudeLog("profile.renamed", {
       from: result.from,
       to: result.to,
@@ -4453,12 +4634,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     // The profile is off disk now; drop the TTL cache so this caller's very
     // next /profiles/list is not answered from a copy that still lists it.
     invalidateDiskProfileCache()
-    // Removing the ACTIVE profile leaves the pointer naming nothing, and
-    // resolveProfile then falls back to the first profile while warning on
-    // every single request. Naming the fallback explicitly is the same account
-    // without the noise, and it is what the UI shows as active.
+    // Removing the ACTIVE profile leaves the pointer naming nothing. Choose the
+    // first remaining work-eligible profile, or clear the pointer when none is
+    // eligible, so neither requests nor the UI fall onto an excluded account.
     if (getActiveProfileId() === removedId) {
-      setActiveProfile(getEffectiveProfiles(finalConfig.profiles)[0]?.id ?? "")
+      const excludedProfileIds = routingExcludedProfileIdsFor(result.profiles)
+      const nextProfileId = filterEligibleProfileIds(
+        result.profiles.map(profile => profile.id),
+        excludedProfileIds,
+      )[0]
+      applyActiveProfile(nextProfileId, {
+        source: "profile-remove",
+        userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+        origin: c.req.header("origin") ?? c.req.header("referer")?.slice(0, 120) ?? null,
+      })
     }
     claudeLog("profile.removed", {
       profile: result.id,
@@ -4593,13 +4782,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     })
     const internalRes = await app.fetch(internalReq)
 
-    if (!internalRes.ok) {
-      const errBody = await internalRes.text()
-      return c.json(
-        { type: "error", error: { type: "upstream_error", message: errBody } },
-        internalRes.status as 400 | 401 | 429 | 500
-      )
-    }
+    if (!internalRes.ok) return relayInnerError(internalRes, "anthropic")
 
     const completionId = `chatcmpl-${randomUUID()}`
     const created = Math.floor(Date.now() / 1000)
@@ -4731,13 +4914,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     })
     const internalRes = await app.fetch(internalReq)
 
-    if (!internalRes.ok) {
-      const errBody = await internalRes.text()
-      return c.json(
-        { error: { type: "upstream_error", message: errBody, code: null } },
-        internalRes.status as 400 | 401 | 429 | 500
-      )
-    }
+    if (!internalRes.ok) return relayInnerError(internalRes, "openai")
 
     const responseId = `resp_${randomUUID().replace(/-/g, "")}`
     const created = Math.floor(Date.now() / 1000)
@@ -5117,10 +5294,30 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // auth resolved by the design module (design token first, then profile
   // credentials).
   app.post("/v1/design/*", async (c) => {
-    const profile = resolveProfile(
-      finalConfig.profiles,
-      finalConfig.defaultProfile,
-      c.req.header("x-meridian-profile") || undefined
+    const requestedProfileId = c.req.header("x-meridian-profile") || undefined
+    const routingAccess = evaluateRoutingProfileAccess({
+      profiles: getEffectiveProfiles(finalConfig.profiles),
+      defaultProfile: finalConfig.defaultProfile,
+      purpose: "work",
+      explicitProfileId: requestedProfileId,
+      excludedProfileIds: routingExcludedProfileIds(),
+    })
+    switch (routingAccess.access.kind) {
+      case "explicit_excluded":
+        return profileExcludedResponse(routingAccess.access.profileId)
+      case "no_eligible_profiles":
+        return noEligibleProfilesResponse()
+      case "allowed":
+        break
+      default: {
+        const exhaustive: never = routingAccess.access
+        return exhaustive
+      }
+    }
+    const profile = resolveProfileFromPool(
+      routingAccess.profiles,
+      routingAccess.defaultProfile,
+      requestedProfileId,
     )
     const url = new URL(c.req.url)
     const upstreamUrl = `${DESIGN_UPSTREAM_ORIGIN}${url.pathname}${url.search}`

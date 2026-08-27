@@ -11,6 +11,11 @@ const profiles = [
   { id: "reserved", env: {} },
 ]
 
+const renamedProfiles = [
+  { id: "employer", aliases: ["work"], env: {} },
+  { id: "personal", env: {} },
+]
+
 describe("routing exclusion runtime", () => {
   it("returns only work-eligible profiles and an eligible default", () => {
     const result = evaluateRoutingProfileAccess({
@@ -44,6 +49,48 @@ describe("routing exclusion runtime", () => {
       activeProfile: "reserved",
       excludedProfileIds: ["reserved"],
     })).toEqual({ change: true, profileId: "primary" })
+  })
+
+  it("canonicalizes alias exclusions before filtering automatic work", () => {
+    const result = evaluateRoutingProfileAccess({
+      profiles: renamedProfiles,
+      defaultProfile: "employer",
+      purpose: "work",
+      excludedProfileIds: ["work"],
+    })
+
+    expect(result.profiles.map(profile => profile.id)).toEqual(["personal"])
+    expect(result.excludedProfileIds).toEqual(["employer"])
+  })
+
+  it("rejects an excluded canonical profile requested through an alias", () => {
+    const result = evaluateRoutingProfileAccess({
+      profiles: renamedProfiles,
+      purpose: "work",
+      explicitProfileId: "work",
+      excludedProfileIds: ["employer"],
+    })
+
+    expect(result.access).toEqual({ kind: "explicit_excluded", profileId: "employer" })
+  })
+
+  it("preserves an eligible default expressed through an alias", () => {
+    const result = evaluateRoutingProfileAccess({
+      profiles: renamedProfiles,
+      defaultProfile: "work",
+      purpose: "work",
+      excludedProfileIds: [],
+    })
+
+    expect(result.defaultProfile).toBe("employer")
+  })
+
+  it("moves an active canonical profile excluded through an alias", () => {
+    expect(replacementForExcludedActive({
+      profiles: renamedProfiles,
+      activeProfile: "employer",
+      excludedProfileIds: ["work"],
+    })).toEqual({ change: true, profileId: "personal" })
   })
 
   it("returns stable error envelopes", async () => {

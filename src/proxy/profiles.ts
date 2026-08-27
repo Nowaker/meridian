@@ -371,7 +371,7 @@ export function resolveProfileFromPool(
  * shadow a live account that has since taken the name.
  */
 export function findProfileByIdOrAlias(
-  profiles: ProfileConfig[],
+  profiles: readonly ProfileConfig[],
   id: string
 ): ProfileConfig | undefined {
   return profiles.find(p => p.id === id) ?? profiles.find(p => p.aliases?.includes(id))
