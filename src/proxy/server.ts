@@ -106,7 +106,7 @@ import {
   retryAfterBodyFields,
   OVERLOADED_RETRY_AFTER_SECONDS,
 } from "./retryAfter"
-import { getSetting, setSetting } from "./settings"
+import { getSetting, setSetting, readIntegrationSettings, isIntegrationKey, setIntegrationSetting } from "./settings"
 import { filterBetasForProfile, getBetaPolicyFromEnv } from "./betas"
 import { createFileChangeHook, extractFileChangesFromMessages, formatFileChangeSummary, type FileChange } from "./fileChanges"
 import { detectTokenAnomalies, formatAnomalyAlerts, type TokenSnapshot } from "./tokenHealth"
@@ -6729,6 +6729,29 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     }
     plog(`[PROXY] Routing settings updated: routing=${getSetting("routing") ?? "active"} order=${(getSetting("profileOrder") ?? []).join(",") || "(config order)"}`)
     return c.json({ success: true })
+  })
+
+  app.get("/settings/api/integrations", (c) => {
+    return c.json({ integrations: readIntegrationSettings() })
+  })
+  app.put("/settings/api/integrations", async (c) => {
+    let body: Record<string, unknown>
+    try { body = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      return c.json({ error: "Body must be an object of integration flags" }, 400)
+    }
+    // Validated in full before anything is written: a body with one good flag
+    // and one typo would otherwise half-apply, leaving the operator with a
+    // setting they did not ask for and an error saying it failed.
+    for (const [key, value] of Object.entries(body)) {
+      if (!isIntegrationKey(key)) return c.json({ error: `Unknown integration: ${key}` }, 400)
+      if (typeof value !== "boolean") return c.json({ error: `${key} must be true or false` }, 400)
+    }
+    for (const [key, value] of Object.entries(body)) {
+      if (isIntegrationKey(key) && typeof value === "boolean") setIntegrationSetting(key, value)
+    }
+    plog(`[PROXY] Integration settings updated: ${Object.entries(readIntegrationSettings()).map(([k, v]) => `${k}=${v ? "on" : "off"}`).join(" ")}`)
+    return c.json({ success: true, integrations: readIntegrationSettings() })
   })
 
   app.get("/settings/api/pricing", (c) => {

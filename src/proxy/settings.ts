@@ -103,9 +103,28 @@ export function isCodexUsageEnabled(settings: MeridianSettings): boolean {
   return settings.integrations?.codexUsage ?? true
 }
 
-export function setCodexUsageEnabled(enabled: boolean): void {
+/**
+ * Every integration the operator can switch, with its default already applied.
+ *
+ * This is the list the settings API and UI enumerate, so a second integration
+ * is one entry here plus one descriptor in the settings page.
+ */
+export function readIntegrationSettings(): Record<string, boolean> {
+  const settings = loadSettings()
+  return { codexUsage: isCodexUsageEnabled(settings) }
+}
+
+export function isIntegrationKey(key: string): key is keyof MeridianIntegrationSettings {
+  return Object.prototype.hasOwnProperty.call(readIntegrationSettings(), key)
+}
+
+export function setIntegrationSetting(key: keyof MeridianIntegrationSettings, enabled: boolean): void {
   // saveSettings merges only at the top level, so the existing block has to be
   // re-spread or sibling integrations would be dropped.
   const current = loadSettings().integrations ?? {}
-  saveSettings({ integrations: { ...current, codexUsage: enabled } })
+  saveSettings({ integrations: { ...current, [key]: enabled } })
+}
+
+export function setCodexUsageEnabled(enabled: boolean): void {
+  setIntegrationSetting("codexUsage", enabled)
 }

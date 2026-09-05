@@ -142,6 +142,16 @@ ${profileBarHtml}
     <div id="routing-body">Loading…</div>
   </div>
 
+  <h1 style="margin-top:40px">Integrations</h1>
+  <p class="subtitle" style="max-width:720px;line-height:1.6">
+    Optional connections to tools outside Meridian. These add information to the dashboard and nothing
+    else — no integration can route a request. Turning one off stops Meridian looking at all: no file is
+    read and no request is made. An integration whose tool is not installed shows nothing either way.
+  </p>
+  <div class="adapter-card">
+    <div id="integrations-body">Loading…</div>
+  </div>
+
   <h1 style="margin-top:40px">Model Pricing</h1>
   <p class="subtitle" style="max-width:720px;line-height:1.6">
     Rates used by the telemetry cost estimate, in USD per million tokens. Edit a value to override the
@@ -467,9 +477,49 @@ async function loadRouting() {
   }));
 }
 
+// One descriptor per integration. The section is rendered from this list, so a
+// second integration is an entry here and an entry in readIntegrationSettings().
+const INTEGRATIONS = [
+  { key: 'codexUsage', label: 'ChatGPT Account Usage',
+    desc: 'Show ChatGPT (Codex) accounts from the oc-codex-multi-auth pool on the dashboard: plan, remaining allowance, and redeemable usage resets. Strictly read-only — Meridian never writes the pool and never refreshes a ChatGPT token' },
+];
+
+async function loadIntegrations() {
+  const res = await fetch('/settings/api/integrations');
+  const cfg = await res.json();
+  const grid = document.createElement('div');
+  grid.className = 'feature-grid';
+  for (const integration of INTEGRATIONS) {
+    const row = document.createElement('div');
+    row.className = 'feature-row';
+    const checked = cfg.integrations[integration.key] ? 'checked' : '';
+    row.innerHTML = '<div class="feature-info"><span class="feature-label">' + integration.label +
+      '</span><span class="feature-desc">' + integration.desc + '</span></div>' +
+      '<label class="toggle"><input type="checkbox" ' + checked +
+      ' onchange="saveIntegration(\\''+integration.key+'\\', this.checked)">' +
+      '<span class="toggle-track"></span></label>';
+    grid.appendChild(row);
+  }
+  const el = document.getElementById('integrations-body');
+  el.innerHTML = '';
+  el.appendChild(grid);
+}
+
+async function saveIntegration(key, enabled) {
+  const patch = {};
+  patch[key] = enabled;
+  await fetch('/settings/api/integrations', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  showSaved();
+}
+
 loadConfig();
 loadPricing();
 loadRouting();
+loadIntegrations();
 ${profileBarJs}
 </script>
 </body>
