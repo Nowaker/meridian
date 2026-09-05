@@ -53,6 +53,7 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_BUILD_SOURCE` | — | *(derived from the install path)* | Overrides the `build.source` reported by `/health`: `npm`, `local`, or `dev`. Normally set by [`bin/meridian-launchd.sh`](#running-as-a-service-without-drift), not by hand. |
 | `MERIDIAN_BUILD_SHA`, `MERIDIAN_BUILD_BRANCH`, `MERIDIAN_BUILD_DIRTY` | — | unset | Optional commit stamps surfaced in `/health` `build`. Absent unless something sets them at launch. |
 | `MERIDIAN_DEBUG` | `CLAUDE_PROXY_DEBUG` | unset | Set to `1` for verbose request/session logging |
+| `MERIDIAN_MOCK` | — | unset | Set to `1` to answer every request locally with the payload Meridian would have sent upstream, instead of calling Anthropic. See [Mock mode](#mock-mode). |
 | `MERIDIAN_SILENT` | `CLAUDE_PROXY_SILENT` | unset | Set to `1` to suppress startup output (used by embedding plugins) |
 | `MERIDIAN_PLUGIN_DIR` | — | `~/.config/meridian/plugins` | Plugin auto-discovery directory |
 | `MERIDIAN_PLUGIN_CONFIG` | — | `~/.config/meridian/plugins.json` | Plugin manifest path |
@@ -89,6 +90,57 @@ blocklist. That check is deliberately exempt from
 It has its own per-adapter switch — see [WebFetch preflight](#webfetch-preflight)
 — though it only reaches the wire on the `cherry` adapter, since no other
 adapter lets the subprocess run the built-in WebFetch at all.
+
+## Mock mode
+
+Mock mode answers a request locally and returns, as the assistant's text, the
+exact payload Meridian would have passed to the Agent SDK. Nothing is sent to
+Anthropic and no tokens are spent.
+
+It exists because Meridian rewrites a request substantially on its way
+upstream — adapter transforms, plugin transforms, system-prompt injection,
+working-directory notes, tool translation, profile and routing resolution —
+and none of that is observable from the outside. Without it, debugging an
+injected note or a misbehaving plugin means spending real tokens and inferring
+the input from the output.
+
+Turn it on per request, which needs no restart:
+
+```bash
+curl -s http://127.0.0.1:3456/v1/messages \
+  -H 'content-type: application/json' -H 'x-api-key: x' \
+  -H 'x-meridian-mock: 1' \
+  -d '{"model":"claude-sonnet-4-5","max_tokens":1024,
+       "messages":[{"role":"user","content":"hi"}]}' | jq -r '.content[1].text'
+```
+
+or for every request on an instance with `MERIDIAN_MOCK=1`. The header wins
+over the env var in both directions, so `x-meridian-mock: 0` takes one request
+back to the real path on an otherwise-mocked instance.
+
+The response is a normal Anthropic message with two blocks: a `thinking` block
+saying the proxy is mocking, and a `text` block holding the payload. Streaming
+and non-streaming both work and render the same payload. Usage is reported as
+zero, so mock traffic does not pollute cost or quota telemetry.
+
+Details worth knowing:
+
+- **Not credentialed.** The payload is built before any upstream call, so mock
+  mode answers on an instance with no profile and no login at all. That makes
+  it usable for inspecting adapter and plugin behaviour on a throwaway
+  instance.
+- **Readable, not strict JSON.** Newlines inside string values are emitted as
+  real newlines rather than `\n` escapes — a flattened prompt is tens of
+  kilobytes and is unusable in a terminal as one escaped line. Functions are
+  rendered as `[Function: name]`, so you can see whether a hook is wired up.
+- **Credentials are redacted.** Values under credential-shaped keys (`*TOKEN`,
+  `*SECRET`, `*PASSWORD`, `*API_KEY`, …) are replaced with a marker. Key names
+  are kept: knowing which variable carries the token is the debugging signal.
+  Nothing else is hidden.
+- **Captured at the SDK boundary.** The payload is taken at the single choke
+  point every SDK path funnels through, so it reflects every transform. The one
+  field it does not show is `spawnClaudeCodeProcess`, which the process gate
+  attaches immediately afterwards and which carries no model-visible content.
 
 ## Endpoints
 

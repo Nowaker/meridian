@@ -80,6 +80,7 @@ import { extractAdvisorModel, extractSystemText, getLastUserMessage, stripAdviso
 import { requireAuth, authEnabled } from "./auth"
 import { detectAdapter } from "./adapters/detect"
 import { buildQueryOptions, resolveQueryConfigDir, singleTurnCapLiftRaisesBudget, type QueryContext } from "./query"
+import { isMockRequested, mockSdkMessages, MOCK_HEADER } from "./mock"
 import { normalizeEffort } from "./effort"
 import { parseOutputFormat, structuredOutputText } from "./structuredOutput"
 import { runTransformHook, buildPipeline, createRequestContext } from "./transform"
@@ -279,6 +280,14 @@ interface RequestMeta {
    * teardown that trips both paths propagates once.
    */
   cascadeSubtreeCancel?: (source: string) => void
+  /**
+   * Answer locally instead of calling the SDK, returning the payload that
+   * would have gone upstream. Resolved once per request from the
+   * `x-meridian-mock` header (falling back to `MERIDIAN_MOCK`) and carried
+   * here because `runSdkQueryAttempt` — the choke point that acts on it — is a
+   * server-level closure with no access to the Hono context.
+   */
+  mock?: boolean
 }
 
 interface PriorityAttemptExposure {
@@ -815,6 +824,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     mode: string,
     activeLocators: readonly TranscriptLocator[],
   ) {
+    // Mock mode answers from the params themselves. Returning before the
+    // semaphore, the transcript leases and the process gate is what lets it
+    // run with no profile, no credentials and no subprocess — there is no
+    // upstream call to serialize, and no transcript for a query that never
+    // happens. The `mode` strings are this function's own callers' (see the
+    // eight call sites below); only the non-stream ones want an `assistant`
+    // message rather than `stream_event` envelopes.
+    if (requestMeta.mock) {
+      yield* mockSdkMessages(params, !mode.startsWith("non_stream"))
+      return
+    }
     // Measured around the wait itself, not read from the granted lease: an
     // aborted wait never produces a lease, and crediting queue time only on
     // success dumped the entire wait of every cancelled request into
@@ -6890,6 +6910,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         routingTurnIdentity,
         retainSessionTurnFence: () => { retainSessionTurnFence = true },
         cascadeSubtreeCancel,
+        mock: isMockRequested(c.req.header(MOCK_HEADER)),
       }
       const response = await handleMessages(c, requestMeta, {
         body,
@@ -7368,6 +7389,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     if (xApiKey) internalHeaders["x-api-key"] = xApiKey
     const authz = c.req.header("authorization")
     if (authz) internalHeaders["authorization"] = authz
+    const mockHeader = c.req.header(MOCK_HEADER)
+    if (mockHeader) internalHeaders[MOCK_HEADER] = mockHeader
     internalHeaders["x-meridian-internal-hop"] = internalHopToken
     const internalReq = new Request("http://internal/v1/messages", {
       method: "POST",
@@ -7511,6 +7534,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     if (authz) internalHeaders["authorization"] = authz
     const xProfile = c.req.header("x-meridian-profile")
     if (xProfile) internalHeaders["x-meridian-profile"] = xProfile
+    const xMock = c.req.header(MOCK_HEADER)
+    if (xMock) internalHeaders[MOCK_HEADER] = xMock
 
     internalHeaders["x-meridian-internal-hop"] = internalHopToken
     const internalReq = new Request("http://internal/v1/messages", {
