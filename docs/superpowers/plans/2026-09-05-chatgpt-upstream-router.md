@@ -125,7 +125,7 @@ Verified empirically: a Meridian started with `MERIDIAN_CONFIG_DIR` pointed at a
 - Meridian MUST NOT write `~/.opencode/oc-codex-multi-auth-accounts.json`, and MUST NOT refresh a token read from it. The read-only guarantee in `src/proxy/codex/pool.ts` and `src/__tests__/codex-no-write.test.ts` stays intact and unmodified.
 - Provider MUST be resolved from the requested model BEFORE profile resolution, routing, session lookup or transcript work.
 - A ChatGPT request MUST NEVER reach the Claude Agent SDK path, Claude env construction (`profiles.ts:216-242`), or Claude token refresh (`tokenRefresh.ts`).
-- An OpenAI profile MUST NEVER reach ANY Anthropic credential path. This is not only the `/auth/refresh` route (`server.ts:7215`): the background loop `ensureFreshTokenForProfiles` (`server.ts:340`) walks EVERY profile into `ensureFreshToken`, gated by no route and no header, and would send a single-use ChatGPT refresh token to the Anthropic token endpoint on its own schedule. Every all-profiles loop MUST be provider-filtered - see the table in Task 3.
+- An OpenAI profile MUST NEVER reach ANY Anthropic credential path. This is not only the `/auth/refresh` route (`server.ts:7215`): the background loop `ensureFreshTokenForProfiles` (`server.ts:340`) walks EVERY profile into `ensureFreshToken`, gated by no route and no header, and would send a single-use ChatGPT refresh token to the Anthropic token endpoint on its own schedule. Every all-profiles loop MUST be provider-filtered BEFORE it calls `resolveProfile` - see the table in Task 3.
 - A missing or provider-mismatched profile MUST error. It MUST NOT fall through to the "Unknown profile ... Using first configured profile" path at `profiles.ts:202-208`.
 - Account identity is `accountUserId`. `accountId` alone is forbidden as a key anywhere in rotation, caching, cooldown or storage.
 - Every upstream response MUST be validated to name the account it was requested for before its contents are used or cached.
@@ -197,7 +197,18 @@ Option (c), a Meridian refresh SERVICE that hands tokens to a slimmed plugin, is
 
 `choosePriorityProfile()` and `ProfileExhaustion` (`src/proxy/routing.ts:139-187`) operate on opaque string ids and absolute `until` timestamps. They need NO algorithmic change.
 
-What is Anthropic-coupled is the INPUT: `CooldownWindowType = "five_hour" | "seven_day"` and `COOLDOWN_WINDOWS` (`routing.ts:250-269`), fed by SDK `rate_limit_info`. ChatGPT reports window WIDTH in seconds, and the widths observed live are 18000 (5h), 604800 (weekly) and **2592000 (30d, free tier)**. Window layout also varies by tier: Pro and Business Premium report the weekly limit as `primary_window` with `secondary_window` null, while Business Standard still uses the older 5h-primary / weekly-secondary shape. Reading "primary" as "the 5h window" is wrong on four of the six live accounts.
+What is Anthropic-coupled is the INPUT: `CooldownWindowType = "five_hour" | "seven_day"` and `COOLDOWN_WINDOWS` (`routing.ts:250-269`), fed by SDK `rate_limit_info`. ChatGPT reports window WIDTH in seconds, and the widths observed live are 18000 (5h), 604800 (weekly) and **2592000 (30d, free tier)**.
+
+**Confirmed empirically 2026-09-05**, against all six of the operator's real accounts and independently re-captured by the integrator an hour later. Windows live under `usage.rate_limit.primary_window` / `.secondary_window`, NOT at the top level of the payload:
+
+| Plan slug | `primary_window` width | `secondary_window` |
+|---|---|---|
+| `pro` | 604800 (weekly) | null |
+| `self_serve_business_prolite` | 604800 (weekly) | null |
+| `team` | 18000 (5h) | 604800 (weekly) |
+| `free` | 2592000 (30d) | null |
+
+Three of the four observed shapes put the WEEKLY window in `primary_window`, so reading position as width is wrong on four of the six live accounts. Every window MUST be labelled from `limit_window_seconds` and NEVER from which key it arrived under. The 30d free-tier width also rules out the reference implementation's rule of treating anything at or above six days as "weekly", which understates that allowance more than fourfold.
 
 **Decision:** keep one profile catalog for the UI, but partition pools and state by provider. Resolve model -> provider first, then derive that provider's candidate order, active profile, assignment store and exhaustion tracker. A GPT request with no OpenAI account FAILS; it does not borrow an Anthropic one. Provider-specific code converts each vendor's window vocabulary into an absolute `until` before calling `mark()`.
 
@@ -297,7 +308,9 @@ Claude's durable transcript assignment exists to own SDK session generations, fo
 | 7858 | audit | no | `credentialStore: credentialStoreForProfile(profile)` at `:7870` | Anthropic credential store built for an OpenAI profile |
 | 8082 | auth keepalive, every 45s | YES | `Object.keys(resolved.env).length` | THROWS every 45s inside a background timer |
 
-`ResolvedOpenAI` deliberately has NO `env` field (D2). That is what makes the credential leak structurally impossible, and it is exactly why the three `Object.keys(...env)` sites throw rather than quietly misbehave. Provider-filter each loop BEFORE it reads `env` or builds a credential store; do not "fix" this by giving the OpenAI arm an empty `env`.
+`ResolvedOpenAI` deliberately has NO `env` field (D2). That is what makes the credential leak structurally impossible, and it is exactly why the three `Object.keys(...env)` sites throw rather than quietly misbehave. Do not "fix" this by giving the OpenAI arm an empty `env`.
+
+**Filter BEFORE you resolve.** In each all-profiles loop the provider filter must sit ahead of the `resolveProfile` call itself, not between that call and the `env` read. Step 2 requires a provider-mismatched resolution to THROW, so a loop that resolves first and filters afterwards is filtering after the exception has already been raised. This is an ordering requirement, not a stylistic one.
 
 **Interfaces:**
 - Produces: `type PersistedProfile = LegacyAnthropicProfile | OpenAIProfile` (legacy arm: `provider?: "anthropic"`)
@@ -309,7 +322,7 @@ Claude's durable transcript assignment exists to own SDK session generations, fo
 - [ ] **Step 3:** Failing test: `buildResolvedProfile` cannot be reached with an OpenAI profile - assert at the type level and with a runtime guard test that no `CLAUDE_CONFIG_DIR` / `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` is ever produced for `provider: "openai"`.
 - [ ] **Step 4:** Failing test: `POST /auth/refresh` with `x-meridian-profile` naming an OpenAI profile returns 4xx and makes NO outbound request. Today that path would POST a ChatGPT refresh token to `https://platform.claude.com/v1/oauth/token`.
 - [ ] **Step 5:** Failing test for the four unrouted loops - the one that catches `:340`. Put an OpenAI profile in `profiles.json` beside an Anthropic one, spy on the outbound Anthropic token endpoint, then assert ALL of: `GET /health` returns 200 carrying literal `"status":"healthy"`; `GET /profiles/list` returns 200 and lists BOTH profiles; one `ensureFreshTokenForProfiles` pass and one 45s keepalive tick each complete without throwing; and the spy recorded ZERO requests for the OpenAI profile. This must fail against today's code before it passes.
-- [ ] **Step 6:** Implement. Provider-filter every all-profiles loop (`:340`, `:7092`, `:8082`) before it reads `env` or builds a credential store, and give `/health` (`:7016`) an OpenAI-safe path. Audit `:7548` and `:7858` for the same hazard.
+- [ ] **Step 6:** Implement. In every all-profiles loop (`:340`, `:7092`, `:8082`) the provider filter MUST precede the `resolveProfile` call, not merely precede the `env` read or the credential-store construction - Step 2 makes a mismatched resolution throw, so filtering after the call is filtering after the exception. Give `/health` (`:7016`) an OpenAI-safe path. Audit `:7548` and `:7858` for the same hazard.
 
 ---
 
