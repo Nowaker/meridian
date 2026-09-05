@@ -13,6 +13,7 @@ import { processSessionTree, truncateSessionKey, type SessionTreeRegistration } 
 import { AbortableSemaphore, getProcessSdkSemaphore, type SemaphoreLease } from "./concurrency"
 import { closeServerWithGracePeriod, trackServerConnections } from "./shutdown"
 import { fetchOAuthUsage, fetchOAuthUsageResult } from "./oauthUsage"
+import { getCodexUsage } from "./codex/service"
 import { resolveSdkWorkingDirectory } from "./cwd"
 import type { Context } from "hono"
 import { DEFAULT_PROXY_CONFIG } from "./types"
@@ -7520,6 +7521,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       activeProfile: activeId,
       asOf: Date.now(),
     })
+  })
+
+  // Read-only ChatGPT (Codex) account usage, sourced from the oc-codex-multi-auth
+  // pool. Separate from /v1/usage/quota/all because these are not Meridian
+  // profiles: Meridian shows them, it does not route to them. The service owns
+  // the setting gate, the pool read and the fan-out; this route only serves it.
+  app.get("/v1/usage/codex", async (c) => {
+    return c.json(await getCodexUsage())
   })
 
   // Returns the last observed token usage for a session, looked up by the Claude
