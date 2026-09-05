@@ -15,7 +15,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test"
 import { mkdirSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { loadCodexPool, codexAccountIdentity, codexPoolPath } from "../proxy/codex/pool"
+import { loadCodexPool, readCodexPool, codexAccountIdentity, codexPoolPath } from "../proxy/codex/pool"
 
 const tempDir = join(tmpdir(), `meridian-codex-pool-${process.pid}`)
 const poolFile = join(tempDir, "oc-codex-multi-auth-accounts.json")
@@ -134,6 +134,26 @@ describe("codex pool reader", () => {
   test("honours an explicit enabled:false", () => {
     writePool({ version: 3, accounts: [account({ enabled: false })], activeIndex: 0 })
     expect(loadCodexPool()?.accounts[0]?.enabled).toBe(false)
+  })
+
+  test("distinguishes an absent pool from a broken one", () => {
+    expect(readCodexPool()).toEqual({ pool: null, error: "not_configured" })
+
+    writePool("{ not json")
+    expect(readCodexPool()).toEqual({ pool: null, error: "pool_unreadable" })
+
+    writePool({ version: 2, accounts: [account()], activeIndex: 0 })
+    expect(readCodexPool()).toEqual({ pool: null, error: "invalid_pool" })
+
+    writePool({ version: 3, accounts: {}, activeIndex: 0 })
+    expect(readCodexPool()).toEqual({ pool: null, error: "invalid_pool" })
+  })
+
+  test("reports no error when the pool reads cleanly", () => {
+    writePool({ version: 3, accounts: [account()], activeIndex: 0 })
+    const result = readCodexPool()
+    expect(result.error).toBeNull()
+    expect(result.pool?.accounts).toHaveLength(1)
   })
 })
 

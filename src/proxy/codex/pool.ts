@@ -27,6 +27,7 @@
 import { existsSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
+import type { CodexPoolError } from "./types"
 
 const POOL_FILE_NAME = "oc-codex-multi-auth-accounts.json"
 const SUPPORTED_VERSION = 3
@@ -68,28 +69,51 @@ export function codexPoolPath(): string {
   return override ? override : join(homedir(), ".opencode", POOL_FILE_NAME)
 }
 
-/** Read the pool. Returns null when it is absent or unreadable — never throws. */
-export function loadCodexPool(): CodexPool | null {
+export interface CodexPoolResult {
+  pool: CodexPool | null
+  error: CodexPoolError | null
+}
+
+/**
+ * Read the pool, saying which way it failed. Never throws.
+ *
+ * The distinction is what lets the dashboard stay silent when oc-codex simply
+ * is not installed while still reporting a pool that is present and broken.
+ */
+export function readCodexPool(): CodexPoolResult {
   const path = codexPoolPath()
+
+  let raw: string
+  try {
+    if (!existsSync(path)) return { pool: null, error: "not_configured" }
+    raw = readFileSync(path, "utf-8")
+  } catch {
+    return { pool: null, error: "pool_unreadable" }
+  }
+
   let parsed: unknown
   try {
-    if (!existsSync(path)) return null
-    parsed = JSON.parse(readFileSync(path, "utf-8"))
+    parsed = JSON.parse(raw)
   } catch {
-    return null
+    return { pool: null, error: "pool_unreadable" }
   }
 
   const root = asRecord(parsed)
-  if (!root) return null
-  if (root.version !== SUPPORTED_VERSION) return null
-  if (!Array.isArray(root.accounts)) return null
+  if (!root) return { pool: null, error: "invalid_pool" }
+  if (root.version !== SUPPORTED_VERSION) return { pool: null, error: "invalid_pool" }
+  if (!Array.isArray(root.accounts)) return { pool: null, error: "invalid_pool" }
 
   const accounts: CodexPoolAccount[] = []
   for (const entry of root.accounts) {
     const account = toAccount(entry)
     if (account) accounts.push(account)
   }
-  return { path, accounts }
+  return { pool: { path, accounts }, error: null }
+}
+
+/** Read the pool. Returns null when it is absent or unreadable — never throws. */
+export function loadCodexPool(): CodexPool | null {
+  return readCodexPool().pool
 }
 
 /**

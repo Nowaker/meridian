@@ -16,16 +16,26 @@
  * because Codex must not depend on the Claude-specific usage module.
  */
 
+/**
+ * Why the pool yielded no accounts.
+ *
+ * `not_configured` is the quiet one: oc-codex-multi-auth is simply not
+ * installed, which is not a fault and must not be reported as one. The other
+ * two say the pool is there and wrong, which is worth telling the operator.
+ */
+export type CodexPoolError =
+  /** No pool file. oc-codex-multi-auth is simply not installed here. */
+  | "not_configured"
+  /** The pool exists but its bytes could not be read or parsed. */
+  | "pool_unreadable"
+  /** The pool parsed but is not a schema this build understands. */
+  | "invalid_pool"
+
 /** Why the integration as a whole produced nothing. */
 export type CodexIntegrationError =
   /** The operator turned the integration off. Nothing was read or fetched. */
   | "disabled"
-  /** No pool file. oc-codex-multi-auth is simply not installed here. */
-  | "not_configured"
-  /** The pool exists but could not be read. */
-  | "pool_unreadable"
-  /** The pool was read but is not a schema this build understands. */
-  | "invalid_pool"
+  | CodexPoolError
 
 /** Why a single upstream request failed. */
 export type CodexRemoteError =
