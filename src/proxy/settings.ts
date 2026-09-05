@@ -32,6 +32,18 @@ function settingsFile(): string {
     : join(homedir(), ".config", "meridian", "settings.json")
 }
 
+/**
+ * Optional third-party integrations.
+ *
+ * Declared as a type alias rather than an interface so it carries an implicit
+ * index signature: settings written by a newer build must survive a round-trip
+ * through an older one rather than being dropped.
+ */
+export type MeridianIntegrationSettings = {
+  /** Read-only ChatGPT (Codex) account cards sourced from the oc-codex pool. */
+  codexUsage?: boolean
+}
+
 export interface MeridianSettings {
   /** Last active profile ID — restored on proxy startup */
   activeProfile?: string
@@ -42,6 +54,7 @@ export interface MeridianSettings {
    *  profiles.json order. MERIDIAN_PROFILE_ORDER env var takes precedence. */
   profileOrder?: string[]
   priorityFailback?: PriorityFailbackPolicy
+  integrations?: MeridianIntegrationSettings
 }
 
 /** Read settings from disk. Returns empty object if file doesn't exist or is invalid. */
@@ -76,4 +89,23 @@ export function getSetting<K extends keyof MeridianSettings>(key: K): MeridianSe
 /** Set a single setting value and persist */
 export function setSetting<K extends keyof MeridianSettings>(key: K, value: MeridianSettings[K]): void {
   saveSettings({ [key]: value })
+}
+
+/**
+ * Whether to surface read-only ChatGPT (Codex) account cards.
+ *
+ * The default lives here and nowhere else, so it is one line to change and
+ * cannot drift between the service and the settings UI. On means Meridian looks
+ * for the oc-codex pool and stays silent if it is absent; off means it does not
+ * look at all.
+ */
+export function isCodexUsageEnabled(settings: MeridianSettings): boolean {
+  return settings.integrations?.codexUsage ?? true
+}
+
+export function setCodexUsageEnabled(enabled: boolean): void {
+  // saveSettings merges only at the top level, so the existing block has to be
+  // re-spread or sibling integrations would be dropped.
+  const current = loadSettings().integrations ?? {}
+  saveSettings({ integrations: { ...current, codexUsage: enabled } })
 }

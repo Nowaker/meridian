@@ -10,7 +10,14 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test"
 import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { loadSettings, saveSettings, getSetting, setSetting } from "../proxy/settings"
+import {
+  loadSettings,
+  saveSettings,
+  getSetting,
+  setSetting,
+  isCodexUsageEnabled,
+  setCodexUsageEnabled,
+} from "../proxy/settings"
 
 describe("settings module", () => {
   const tempDir = join(tmpdir(), `meridian-settings-unit-${process.pid}`)
@@ -106,5 +113,42 @@ describe("settings module", () => {
 
     process.env.MERIDIAN_CONFIG_DIR = otherDir
     expect(loadSettings().routing).toBe("priority")
+  })
+
+  describe("integrations", () => {
+    test("the ChatGPT usage integration is on unless it is turned off", () => {
+      expect(isCodexUsageEnabled(loadSettings())).toBe(true)
+      expect(isCodexUsageEnabled({})).toBe(true)
+      expect(isCodexUsageEnabled({ integrations: {} })).toBe(true)
+    })
+
+    test("an explicit setting wins in both directions", () => {
+      expect(isCodexUsageEnabled({ integrations: { codexUsage: false } })).toBe(false)
+      expect(isCodexUsageEnabled({ integrations: { codexUsage: true } })).toBe(true)
+    })
+
+    test("the toggle round-trips through disk", () => {
+      setCodexUsageEnabled(false)
+      expect(isCodexUsageEnabled(loadSettings())).toBe(false)
+      setCodexUsageEnabled(true)
+      expect(isCodexUsageEnabled(loadSettings())).toBe(true)
+    })
+
+    test("toggling one integration does not clobber its siblings", () => {
+      // saveSettings merges shallowly, so a nested update has to read and
+      // re-spread the existing block or the next integration added here would
+      // silently lose its setting.
+      writeFileSync(settingsFile, JSON.stringify({
+        activeProfile: "work",
+        integrations: { codexUsage: true, somethingElse: true },
+      }))
+
+      setCodexUsageEnabled(false)
+
+      const settings = loadSettings()
+      expect(settings.integrations?.codexUsage).toBe(false)
+      expect((settings.integrations as Record<string, unknown>).somethingElse).toBe(true)
+      expect(settings.activeProfile).toBe("work")
+    })
   })
 })
