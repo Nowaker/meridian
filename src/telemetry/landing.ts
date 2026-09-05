@@ -67,6 +67,13 @@ export const landingHtml = `<!DOCTYPE html>
   .usage-row .w-reset { color: var(--muted); font-size: 11px; width: 76px; text-align: right; }
   .no-usage { font-size: 12px; color: var(--muted); padding: 4px 0; }
 
+  /* ChatGPT account cards — read-only, so no switchable/active affordances */
+  .codex-note { font-size: 12px; color: var(--muted); padding: 4px 0; }
+  .codex-note.warn { color: var(--yellow); }
+  .codex-note.bad { color: var(--red); }
+  .codex-credits { font-size: 11px; color: var(--muted); margin-top: 10px;
+    padding-top: 8px; border-top: 1px solid var(--border); }
+
   /* Traffic strip — one compact surface */
   .strip { display: flex; flex-wrap: wrap; background: var(--surface); border: 1px solid var(--border);
     border-radius: 12px; padding: 14px 4px; margin-bottom: 24px; }
@@ -126,6 +133,84 @@ function paceText(pc){
 function paceColor(pc){return pc.status==='over'?'var(--red)':pc.status==='ahead'?'var(--yellow)':'var(--green)'}
 
 function resetIn(ts){if(ts==null)return '';var d=ts-Date.now();if(d<=0)return 'resetting…';var m=Math.ceil(d/60000);if(m<60)return 'in '+m+'m';var h=Math.floor(m/60);if(h<24)return 'in '+h+'h'+(m%60?' '+(m%60)+'m':'');var days=Math.floor(h/24);return 'in '+days+'d'+(h%24?' '+(h%24)+'h':'')}
+
+function codexErrorText(e){
+  if(!e)return '';
+  var m={no_token:'no access token in the pool yet',
+    invalid_token:'access token unreadable',
+    token_expired:'token expired \u00b7 oc-codex refreshes it on next use',
+    identity_mismatch:'credentials do not match this account',
+    unauthorized:'sign-in refused \u00b7 log in again with oc-codex',
+    rate_limited:'usage lookup rate limited',
+    upstream_error:'usage lookup failed',
+    invalid_response:'unexpected response from ChatGPT'};
+  return m[e]||String(e).replace(/_/g,' ');
+}
+// A token that has merely aged out is oc-codex's routine business and must not
+// be drawn as a fault; a refusal or a credential filed under the wrong account
+// is one, and needs a human.
+function codexErrorTone(e){return e==='unauthorized'||e==='identity_mismatch'||e==='invalid_token'?'bad':''}
+// Only a pool that is present and broken is worth saying anything about. An
+// absent pool means oc-codex simply is not installed, and a Meridian user who
+// has never heard of it must see no trace of this integration.
+function codexPoolNote(e){
+  if(e==='pool_unreadable')return 'The oc-codex account pool could not be read.';
+  if(e==='invalid_pool')return 'The oc-codex account pool is not in a format this build understands.';
+  return '';
+}
+function codexCredits(rc){
+  if(!rc)return '';
+  var n=rc.availableCount;
+  if(n==null||n<=0)return '';
+  var parts=[n+' usage reset'+(n===1?'':'s')+' available'];
+  if(rc.applicableAvailableCount>0)parts.push(rc.applicableAvailableCount+' redeemable now');
+  var soonest=null,list=rc.credits||[];
+  for(var i=0;i<list.length;i++){var t=list[i]&&list[i].expiresAt;if(typeof t!=='number')continue;if(soonest===null||t<soonest)soonest=t}
+  if(soonest!==null)parts.push('earliest expires '+resetIn(soonest));
+  return '<div class="codex-credits">'+esc(parts.join(' \u00b7 '))+'</div>';
+}
+
+function codexSection(cx){
+  if(!cx||!Array.isArray(cx.entries))return '';
+  if(cx.entries.length===0){
+    var note=codexPoolNote(cx.error);
+    return note?'<div class="section"><div class="section-title">ChatGPT Accounts</div><div class="codex-note">'+esc(note)+'</div></div>':'';
+  }
+  var cards='';
+  for(var i=0;i<cx.entries.length;i++){
+    var e=cx.entries[i];
+    var wins=(e.windows||[]).filter(function(w){return w.utilization!=null});
+    // The widest window is the subscription allowance; narrower ones are burst
+    // limits inside it. Position says nothing — pro reports the weekly limit as
+    // the primary window while team still reports 5h there.
+    var head=null,headWidth=-Infinity;
+    for(var j=0;j<wins.length;j++){
+      var width=typeof wins[j].limitWindowSeconds==='number'?wins[j].limitWindowSeconds:-1;
+      if(head===null||width>headWidth){head=wins[j];headWidth=width}
+    }
+    var rows='';
+    for(var k=0;k<wins.length;k++){
+      var w=wins[k],pct=Math.round(w.utilization*100),col=utilColor(w.utilization);
+      rows+='<div class="usage-row"><span class="w-label">'+esc(w.type)+'</span>'
+        +'<div class="w-bar"><div class="w-fill" style="width:'+Math.min(pct,100)+'%;background:'+col+'"></div></div>'
+        +'<span class="w-pct" style="color:'+col+'">'+pct+'%</span>'
+        +'<span class="w-reset">'+resetIn(w.resetsAt)+'</span></div>';
+    }
+    var tone=codexErrorTone(e.error);
+    if(e.error)rows+='<div class="codex-note'+(tone?' '+tone:'')+'">'+esc(codexErrorText(e.error))+'</div>';
+    if(e.stale)rows+='<div class="codex-note">showing the last usage Meridian could read</div>';
+    if(!rows)rows='<div class="no-usage">no usage data yet</div>';
+    var plan=e.plan?'<span class="pool-chip">'+esc(e.plan.label)+(e.plan.multiplier?' \u00b7 '+esc(e.plan.multiplier):'')+'</span>':'';
+    var headline=head
+      ?'<span class="profile-cost" style="color:'+utilColor(head.utilization)+'">'+Math.max(0,100-Math.round(head.utilization*100))+'%</span>'
+      :'<span class="profile-cost">\u2014</span>';
+    cards+='<div class="profile-card">'
+      +'<div class="profile-head"><span class="profile-name"><span class="prof-dot"></span>'+esc(e.identity||e.id||'')+' '+plan+'</span>'+headline+'</div>'
+      +(head?'<div class="profile-sub">of '+esc(head.type)+' allowance left</div>':'')
+      +rows+codexCredits(e.resetCredits)+'</div>';
+  }
+  return '<div class="section"><div class="section-title">ChatGPT Accounts</div><div class="profile-grid">'+cards+'</div></div>';
+}
 
 function introSection(h){
   var meta=[];
@@ -222,24 +307,28 @@ function strip(items){
 
 async function refresh(){
   try{
-    const [health,stats,quota,profiles]=await Promise.all([
+    const [health,stats,quota,profiles,codex]=await Promise.all([
       fetch('/health').then(r=>r.json()),
       fetch('/telemetry/summary?window=86400000').then(r=>r.json()),
       fetch('/v1/usage/quota/all').then(r=>r.json()).catch(function(){return null}),
-      fetch('/profiles/list').then(r=>r.json()).catch(function(){return null})
+      fetch('/profiles/list').then(r=>r.json()).catch(function(){return null}),
+      fetch('/v1/usage/codex').then(r=>r.json()).catch(function(){return null})
     ]);
-    render(health,stats,quota,profiles);
+    render(health,stats,quota,profiles,codex);
   }catch(e){document.getElementById('content').innerHTML='<div style="color:var(--red);padding:40px;text-align:center">Could not connect</div>'}
 }
 
 function tokens(v){if(v==null)return '—';if(v>=1e6)return (v/1e6).toFixed(1)+'M';if(v>=1e3)return (v/1e3).toFixed(1)+'k';return String(v)}
 
-function render(h,s,q,pl){
+function render(h,s,q,pl,cx){
   let o='';
   o+=introSection(h);
 
   // Accounts — per-profile usage + est cost; click a card to switch
   o+=profileSection(q,s,pl,h);
+
+  // ChatGPT accounts — read-only, and absent entirely unless oc-codex is here
+  o+=codexSection(cx);
 
   // Last 24 hours — meaningful signals only. Errors and envelope
   // violations appear only when there is something to report.
