@@ -60,6 +60,29 @@ const CHATGPT_PROFILE: ProfileConfig = {
   accountUserId: "user_seat_C0RSu9",
 }
 
+/**
+ * A second seat sharing the FIRST one's `accountId`, which is what the
+ * operator's real pool looks like - one workspace id, two people (F6). Keyed
+ * on `accountUserId` these stay two accounts; keyed on the workspace they
+ * would collapse into one and every rotation assertion below would pass
+ * against a pool that had silently become a pool of one.
+ */
+const SECOND_PROFILE: ProfileConfig = {
+  id: "chatgpt-second",
+  provider: "openai",
+  type: "chatgpt-oauth",
+  accountUserId: "user_seat_zStirX",
+}
+
+function secondAccount(): ChatGptAccount {
+  return account({
+    accountUserId: "user_seat_zStirX",
+    email: "second@example.test",
+    refreshToken: "refresh-second",
+    accessToken: "access-second",
+  })
+}
+
 function account(overrides: Partial<ChatGptAccount> = {}): ChatGptAccount {
   return {
     accountUserId: "user_seat_C0RSu9",
@@ -87,6 +110,7 @@ interface OutboundCall {
 }
 
 const outbound: OutboundCall[] = []
+let codexReply: (authorization: string) => Response = () => sse()
 const realFetch = globalThis.fetch
 const savedClaudePath = process.env.MERIDIAN_CLAUDE_PATH
 const savedStorePath = process.env.MERIDIAN_CHATGPT_STORE_PATH
@@ -118,10 +142,10 @@ function boot(storePath: string, profiles: ProfileConfig[]) {
   return createProxyServer({ port: 0, host: "127.0.0.1", silent: true, profiles })
 }
 
-function responses(body: unknown): Request {
+function responses(body: unknown, headers: Record<string, string> = {}): Request {
   return new Request("http://localhost/v1/responses", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
   })
 }
@@ -139,7 +163,11 @@ beforeAll(() => {
     async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
       outbound.push({ url, init })
-      if (url === CODEX_URL) return sse()
+      // Keyed on the bearer rather than an attempt counter, so answering per
+      // seat and proving each attempt carried ITS OWN token are one assertion.
+      if (url === CODEX_URL) {
+        return codexReply(new Headers(init?.headers).get("authorization") ?? "")
+      }
       if (url === OPENAI_TOKEN_URL) {
         return new Response(
           JSON.stringify({ access_token: "access-rotated", refresh_token: "refresh-rotated", expires_in: 3600 }),
@@ -156,6 +184,7 @@ beforeAll(() => {
 
 afterEach(() => {
   outbound.length = 0
+  codexReply = () => sse()
 })
 
 afterAll(() => {
@@ -473,5 +502,121 @@ describe("the owned lifecycle", () => {
     // Released rather than left for the stale-reclaim path: a lock outliving
     // its process makes the next start wait for a timeout it did not need to.
     expect(existsSync(chatGptLockPath(storePath))).toBe(false)
+  }, 30_000)
+})
+
+/**
+ * Rotation, through a real server rather than an injected pool.
+ *
+ * The backend's own tests hand it a seat list, so they prove the loop and
+ * nothing about where the list comes from. These prove the composition: the
+ * profiles supply the order, the store supplies the credentials, and the
+ * OpenAI partition of the exhaustion tracker is what carries a bench from one
+ * request to the next.
+ */
+describe("rotation across the seats this instance owns", () => {
+  async function twoSeats() {
+    const storePath = freshStorePath()
+    await seed(storePath, account(), secondAccount())
+    const server = boot(storePath, [CLAUDE_PROFILE, CHATGPT_PROFILE, SECOND_PROFILE])
+    await server.chatGptUpstream!.acquire()
+    return { storePath, server }
+  }
+
+  const codexAttempts = () =>
+    outbound
+      .filter(call => call.url === CODEX_URL)
+      .map(call => new Headers(call.init!.headers).get("authorization"))
+
+  it("hands a rate-limited seat's turn to the next one, and the client sees one clean stream", async () => {
+    const { server } = await twoSeats()
+    codexReply = auth => auth === "Bearer access-seat"
+      ? new Response("{\"error\":\"spent\"}", { status: 429, headers: { "content-type": "application/json" } })
+      : sse()
+
+    try {
+      const res = await server.app.fetch(responses({ model: "gpt-5-codex", input: "hi" }))
+
+      expect(res.status).toBe(200)
+      expect(await res.text()).not.toContain("spent")
+      expect(codexAttempts()).toEqual(["Bearer access-seat", "Bearer access-second"])
+    } finally {
+      server.chatGptUpstream!.release()
+    }
+  }, 30_000)
+
+  it("remembers the bench, so the next turn does not re-probe a spent seat", async () => {
+    const { server } = await twoSeats()
+    codexReply = auth => auth === "Bearer access-seat"
+      ? new Response("{}", { status: 429, headers: { "content-type": "application/json" } })
+      : sse()
+
+    try {
+      await server.app.fetch(responses({ model: "gpt-5-codex", input: "hi" }))
+      outbound.length = 0
+      const res = await server.app.fetch(responses({ model: "gpt-5-codex", input: "hi" }))
+
+      expect(res.status).toBe(200)
+      // Straight to the healthy seat. Re-probing a spent one costs a real
+      // failing request on the request path, every request, for the whole
+      // window - which is the loop the cooldown exists to prevent.
+      expect(codexAttempts()).toEqual(["Bearer access-second"])
+    } finally {
+      server.chatGptUpstream!.release()
+    }
+  }, 30_000)
+
+  it("FAILS once every owned seat is spent, and never borrows a Claude account", async () => {
+    const { server } = await twoSeats()
+    codexReply = () => new Response("{}", { status: 429, headers: { "content-type": "application/json" } })
+
+    try {
+      const first = await server.app.fetch(responses({ model: "gpt-5-codex", input: "hi" }))
+      expect(first.status).toBe(429)
+      expect(codexAttempts()).toEqual(["Bearer access-seat", "Bearer access-second"])
+
+      outbound.length = 0
+      const second = await server.app.fetch(responses({ model: "gpt-5-codex", input: "hi" }))
+      const body = await second.json() as { error?: { type?: string; message?: string } }
+
+      expect(second.status).toBe(503)
+      expect(body.error?.type).toBe("overloaded_error")
+      expect(body.error?.message).toContain("ChatGPT")
+      expect(codexAttempts()).toEqual([])
+      // R8. "input: Field required" is the Claude translation layer's own
+      // refusal, so its ABSENCE is what proves no Anthropic profile was asked
+      // to cover for a spent ChatGPT pool.
+      expect(body.error?.message).not.toContain("Field required")
+    } finally {
+      server.chatGptUpstream!.release()
+    }
+  }, 30_000)
+
+  it("keeps a conversation on the seat that already holds its prompt prefix", async () => {
+    const { server } = await twoSeats()
+
+    try {
+      // Pinned to the SECOND seat, which is not the one the pool leads with.
+      // That is what makes the next assertion discriminating: without affinity
+      // the unpinned turn below goes to the head of the pool instead.
+      await server.app.fetch(responses(
+        { model: "gpt-5-codex", input: "hi", prompt_cache_key: "conv-9f04" },
+        { "x-meridian-profile": SECOND_PROFILE.id },
+      ))
+      outbound.length = 0
+
+      await server.app.fetch(responses({ model: "gpt-5-codex", input: "again", prompt_cache_key: "conv-9f04" }))
+      const sameConversation = codexAttempts()
+      outbound.length = 0
+
+      await server.app.fetch(responses({ model: "gpt-5-codex", input: "hi", prompt_cache_key: "conv-unrelated" }))
+      const newConversation = codexAttempts()
+
+      expect(sameConversation).toEqual(["Bearer access-second"])
+      // The control: an unrelated conversation is not dragged along behind it.
+      expect(newConversation).toEqual(["Bearer access-seat"])
+    } finally {
+      server.chatGptUpstream!.release()
+    }
   }, 30_000)
 })

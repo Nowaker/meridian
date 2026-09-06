@@ -50,7 +50,11 @@ function backendWith(
   const calls: RecordedCall[] = []
   const backend = createChatGptBackend<Request>({
     inboundRequest: context => context,
-    selectAccount: () => account,
+    // A pool of exactly one, so these keep testing what ONE request does to
+    // the wire. Rotation across several seats is chatgpt-rotation.test.ts.
+    candidateSeats: () => account ? [account.accountUserId] : [],
+    seatCredentials: () => account,
+    benchSeat: () => {},
     fetchImpl: async (url, init) => {
       calls.push({ url, init })
       return reply()
@@ -197,7 +201,9 @@ describe("chatGptBackend - what it refuses", () => {
   function createChatGptBackendThatThrows() {
     const backend = createChatGptBackend<Request>({
       inboundRequest: context => context,
-      selectAccount: () => ACCOUNT,
+      candidateSeats: () => [ACCOUNT.accountUserId],
+      seatCredentials: () => ACCOUNT,
+      benchSeat: () => {},
       fetchImpl: () => { throw new Error("ECONNREFUSED at 10.0.0.1") },
     })
     return { backend }
@@ -220,7 +226,9 @@ describe("chatGptBackend - the body it is given has usually been read already", 
       // equivalent one. Rebuilding needs the bytes back, and getting them back
       // is asynchronous, so the contract has to permit it.
       inboundRequest: async () => inbound(),
-      selectAccount: () => ACCOUNT,
+      candidateSeats: () => [ACCOUNT.accountUserId],
+      seatCredentials: () => ACCOUNT,
+      benchSeat: () => {},
       fetchImpl: async (url, init) => {
         calls.push({ url, init })
         return sseStream(["event: response.created\ndata: {}\n\n"])

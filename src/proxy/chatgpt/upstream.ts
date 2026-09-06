@@ -24,22 +24,51 @@
  * of failure this project has already paid for once.
  */
 
+import { AssignmentStore, type ProfileExhaustion } from "../routing"
 import type { UpstreamBackend, UpstreamRequest } from "../upstream/backend"
 import { createChatGptBackend, type ChatGptServingAccount, type UpstreamFetch } from "./backend"
 import { createChatGptCredentialStore, type ChatGptCredentialStore } from "./credentials"
 import { acquireWriterLease, type WriterLease } from "./lease"
 import { chatGptLockPath } from "./paths"
 import { createChatGptRefresher, type ChatGptRefresher } from "./refresh"
+import type { ChatGptFailure } from "./stream"
 
 /** Renew this far ahead of expiry, matching the Anthropic path's own margin. */
 const ACCESS_TOKEN_BUFFER_MS = 5 * 60_000
+
+/** How long a spent seat sits out when nothing said when it frees up. Matches the Anthropic pool's `PRIORITY_DEFAULT_COOLDOWN_MS`. */
+const DEFAULT_COOLDOWN_MS = 10 * 60_000
+
+/** Bounded because forgetting an affinity costs a cold prefix and nothing else. */
+const MAX_CONVERSATIONS = 5_000
+
+/**
+ * The conversation this body belongs to, which is what a ChatGPT seat's prompt
+ * cache is keyed on (D5). Deliberately not Claude's session machinery: a
+ * Responses turn has no SDK session, no fork and no rollback authority to own.
+ */
+function conversationKey(body: Record<string, unknown> | undefined): string | undefined {
+  const key = body?.prompt_cache_key
+  return typeof key === "string" && key.length > 0 ? key : undefined
+}
 
 export interface ChatGptUpstreamOptions<Ctx> {
   storePath: string
   /** Rebuild the inbound request; the dispatch seam has already spent the original's body. */
   inboundRequest: (context: Ctx) => Request | Promise<Request>
-  /** Which seat serves this request, or null when no ChatGPT profile answers for it. */
-  selectSeat: (request: UpstreamRequest<Ctx>) => string | null
+  /**
+   * The seats this request is entitled to, in configured order, before
+   * cooldown and affinity are applied. Empty when no ChatGPT profile answers
+   * for it. A client naming one explicitly gets that one alone: an explicit
+   * claim is honoured rather than rotated away from.
+   */
+  configuredSeats: (request: UpstreamRequest<Ctx>) => readonly string[]
+  /**
+   * The OPENAI partition of the provider-scoped tracker, never a shared one.
+   * Profile and seat ids are operator-chosen strings, so a tracker holding
+   * both vendors would let a spent Claude account bench a ChatGPT seat.
+   */
+  exhaustion: ProfileExhaustion
   leaseWaitMs?: number
   staleMs?: number
   heartbeatMs?: number
@@ -80,16 +109,32 @@ export function createChatGptUpstream<Ctx>(
     }
   }
 
-  const servingAccount = async (
-    request: UpstreamRequest<Ctx>,
-  ): Promise<ChatGptServingAccount | null> => {
-    // Checked here rather than at acquisition. A holder can be displaced after
-    // a crash-recovery window, and the moment before a token is spent is the
-    // only one at which discovering that is still useful.
-    if (!store || !refresher || !holdsLease()) return null
+  const affinity = new AssignmentStore(MAX_CONVERSATIONS)
 
-    const accountUserId = options.selectSeat(request)
-    if (!accountUserId) return null
+  const candidateSeats = (
+    request: UpstreamRequest<Ctx>,
+    body: Record<string, unknown> | undefined,
+  ): readonly string[] => {
+    // Checked here rather than only at acquisition. A holder can be displaced
+    // after a crash-recovery window, and the moment before a token is spent is
+    // the only one at which discovering that is still useful.
+    if (!store || !refresher || !holdsLease()) return []
+
+    const live = options.configuredSeats(request).filter(id => !options.exhaustion.isExhausted(id))
+
+    // A conversation stays on the seat that already holds its prompt prefix,
+    // for as long as that seat can serve. Moving it costs a full cold cache,
+    // so only a seat that has actually dropped out gets one moved off it - and
+    // only NEW conversations drain back once it returns.
+    const sticky = conversationKey(body)
+    const preferred = sticky ? affinity.get(sticky)?.profileId : undefined
+    return preferred !== undefined && live.includes(preferred)
+      ? [preferred, ...live.filter(id => id !== preferred)]
+      : live
+  }
+
+  const seatCredentials = async (accountUserId: string): Promise<ChatGptServingAccount | null> => {
+    if (!store || !refresher || !holdsLease()) return null
 
     // By seat, never by workspace: one `accountId` is shared between distinct
     // people in the operator's real pool, so a lookup that fell back to it
@@ -110,12 +155,27 @@ export function createChatGptUpstream<Ctx>(
     return { accountUserId, accountId: account.accountId, accessToken: outcome.accessToken }
   }
 
+  // The provider states when a seat frees up in the headers of the response
+  // that refused it; reading those is the next commit. Until then every bench
+  // takes the conservative default, which self-heals rather than guessing.
+  const benchSeat = (accountUserId: string, failure: ChatGptFailure): void => {
+    options.exhaustion.mark(accountUserId, now() + DEFAULT_COOLDOWN_MS, failure.kind)
+  }
+
+  const noteServed = (body: Record<string, unknown> | undefined, accountUserId: string): void => {
+    const key = conversationKey(body)
+    if (key) affinity.set(key, { profileId: accountUserId, requestId: undefined })
+  }
+
   return {
     ownedAccounts: owned.length,
 
     backend: createChatGptBackend<Ctx>({
       inboundRequest: options.inboundRequest,
-      selectAccount: servingAccount,
+      candidateSeats,
+      seatCredentials,
+      benchSeat,
+      noteServed,
       ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
     }),
 

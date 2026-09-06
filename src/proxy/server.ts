@@ -6632,19 +6632,38 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           body: await c.req.text(),
           signal: c.req.raw.signal,
         }),
-        selectSeat: (request) => {
+        exhaustion: providerExhaustion.for("openai"),
+        configuredSeats: (request) => {
+          const requested = request.context.req.header("x-meridian-profile") || undefined
           try {
-            return resolveProfileForProvider(
+            // An explicit header is a claim about WHICH account, so it is
+            // served by that one or not at all. Rotating off it would answer a
+            // question the client did not ask, on an account it did not name.
+            if (requested) {
+              return [resolveProfileForProvider(
+                "openai",
+                finalConfig.profiles,
+                finalConfig.defaultProfile,
+                requested,
+              ).accountUserId]
+            }
+            const pool = profilesForProvider(getEffectiveProfiles(finalConfig.profiles), "openai")
+            if (pool.length === 0) return []
+            // The account this instance would have picked before rotation
+            // existed leads the pool, so an operator's active choice is still
+            // the one that serves while it can. Deduped: two profiles naming
+            // one seat would otherwise make it two attempts at the same door.
+            const active = resolveProfileForProvider(
               "openai",
               finalConfig.profiles,
               finalConfig.defaultProfile,
-              request.context.req.header("x-meridian-profile") || undefined,
             ).accountUserId
+            return [...new Set([active, ...pool.map(profile => profile.accountUserId)])]
           } catch (error) {
             // Having no OpenAI profile to pick is this instance's own state and
             // means nothing can serve. A MISMATCH is the client's error and is
             // answered 4xx by the dispatcher, so it keeps travelling.
-            if (error instanceof NoProfileForProviderError) return null
+            if (error instanceof NoProfileForProviderError) return []
             throw error
           }
         },

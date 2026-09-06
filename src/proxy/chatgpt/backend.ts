@@ -15,14 +15,22 @@
  * against chatgpt.com must not be handed chatgpt.com's cookies by a proxy
  * standing in the middle.
  *
- * Account SELECTION is injected rather than decided here. Rotation, cooldown
- * and failover are provider-partitioned routing concerns; this module's job
- * ends at "serve this request with this account, or say plainly that it
- * cannot be served".
+ * WHICH seats exist, in what order, and for how long a spent one stays
+ * benched are injected. What is decided here is the thing the seam calls one
+ * complete provider request: try a seat, read far enough into the answer to
+ * know whether the SEAT failed, and hand the turn on if it did.
+ *
+ * Retrying stops exactly where the sniffer's scan stops, and that is not a
+ * coincidence - it is the same rule stated once. A failure the sniffer
+ * reports arrived while the stream had produced nothing, so nobody has seen
+ * the turn and another seat may serve it. A failure it does not report
+ * arrived after output the client already holds, and serving that turn again
+ * would bill a second account to deliver the same work twice.
  */
 
 import type { UpstreamBackend, UpstreamRequest } from "../upstream/backend"
 import { buildCodexRequest } from "./request"
+import { sniffChatGptFailure, type ChatGptFailure } from "./stream"
 
 export interface ChatGptServingAccount {
   /** The seat, carried so a caller can attribute the outcome to the right account. */
@@ -45,10 +53,25 @@ export interface ChatGptBackendOptions<Ctx> {
    * getting them back is asynchronous.
    */
   inboundRequest: (context: Ctx) => Request | Promise<Request>
-  selectAccount: (
+  /** Seats to try, best first. Empty means nothing here can serve this request. */
+  candidateSeats: (
     request: UpstreamRequest<Ctx>,
     body: Record<string, unknown> | undefined,
-  ) => Promise<ChatGptServingAccount | null> | ChatGptServingAccount | null
+  ) => readonly string[] | Promise<readonly string[]>
+  /**
+   * This seat's credentials, or null when it has none usable right now.
+   *
+   * Null SKIPS the seat without benching it. A seat waiting on a human to log
+   * in again has already been reported by whatever discovered that; benching
+   * it here would restate a fact and reset its clock on every request.
+   */
+  seatCredentials: (
+    accountUserId: string,
+  ) => ChatGptServingAccount | null | Promise<ChatGptServingAccount | null>
+  /** Called once per spent seat per turn, before the turn moves on to the next one. */
+  benchSeat: (accountUserId: string, failure: ChatGptFailure) => void
+  /** Which seat served this conversation, so the next turn of it can prefer the same one. */
+  noteServed?: (body: Record<string, unknown> | undefined, accountUserId: string) => void
   fetchImpl?: UpstreamFetch
 }
 
@@ -60,6 +83,15 @@ function errorResponse(status: number, type: string, message: string): Response 
     status,
     headers: { "content-type": "application/json" },
   })
+}
+
+function forwardResponse(upstream: Response, body: ReadableStream<Uint8Array>): Response {
+  const headers = new Headers()
+  for (const name of FORWARDED_RESPONSE_HEADERS) {
+    const value = upstream.headers.get(name)
+    if (value !== null) headers.set(name, value)
+  }
+  return new Response(body, { status: upstream.status, headers })
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -96,39 +128,60 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
         return errorResponse(400, "invalid_request_error", "Request body must be valid JSON")
       }
 
-      const account = await options.selectAccount(request, parsed)
-      if (!account) {
-        return errorResponse(
-          503,
-          "overloaded_error",
-          "No ChatGPT account is available to serve this request.",
-        )
+      let spent: Response | undefined
+      for (const accountUserId of await options.candidateSeats(request, parsed)) {
+        const account = await options.seatCredentials(accountUserId)
+        if (!account) continue
+
+        const { url, headers } = buildCodexRequest(parsed, account)
+
+        let upstream: Response
+        try {
+          upstream = await dispatch(url, {
+            method: "POST",
+            headers,
+            // Every attempt sends the SAME original bytes: a second seat must
+            // be offered the request the first one refused, not a re-encoding.
+            body: rawBody,
+            // A bearer credential must never be replayed to a redirect target.
+            redirect: "error",
+            signal: inbound.signal,
+          })
+        } catch {
+          // The thrown detail can name internal hosts and, on some clients,
+          // quote the request that produced it. Report the shape, not the text.
+          // Not a seat failure either: an unreachable provider is unreachable
+          // for every seat, so trying the rest would multiply a dead request.
+          return errorResponse(502, "api_error", "The ChatGPT upstream could not be reached.")
+        }
+
+        const sniffed = await sniffChatGptFailure(upstream)
+        const answer = forwardResponse(upstream, sniffed.body)
+
+        if (!sniffed.failure) {
+          options.noteServed?.(parsed, accountUserId)
+          return answer
+        }
+        // A provider-side fault says nothing about this seat. Benching six
+        // healthy accounts and re-sending during an incident would make the
+        // incident worse and leave the pool cold once it passed.
+        if (sniffed.failure.kind === "transient") return answer
+
+        options.benchSeat(accountUserId, sniffed.failure)
+        // Only the last refusal is returned, so release the ones before it
+        // rather than leaving their connections held open by an unread body.
+        void spent?.body?.cancel().catch(() => {})
+        spent = answer
       }
 
-      const { url, headers } = buildCodexRequest(parsed, account)
-
-      let upstream: Response
-      try {
-        upstream = await dispatch(url, {
-          method: "POST",
-          headers,
-          body: rawBody,
-          // A bearer credential must never be replayed to a redirect target.
-          redirect: "error",
-          signal: inbound.signal,
-        })
-      } catch {
-        // The thrown detail can name internal hosts and, on some clients,
-        // quote the request that produced it. Report the shape, not the text.
-        return errorResponse(502, "api_error", "The ChatGPT upstream could not be reached.")
-      }
-
-      const responseHeaders = new Headers()
-      for (const name of FORWARDED_RESPONSE_HEADERS) {
-        const value = upstream.headers.get(name)
-        if (value !== null) responseHeaders.set(name, value)
-      }
-      return new Response(upstream.body, { status: upstream.status, headers: responseHeaders })
+      // The last seat's OWN answer, carrying the status and whatever wait the
+      // provider chose to state. Replacing it with an invented error would
+      // discard both. Only a pool with nothing left to try has none.
+      return spent ?? errorResponse(
+        503,
+        "overloaded_error",
+        "Every ChatGPT account this Meridian owns is spent or unavailable.",
+      )
     },
   }
 }
