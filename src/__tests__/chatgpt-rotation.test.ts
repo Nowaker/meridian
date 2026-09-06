@@ -20,6 +20,7 @@
 import { describe, expect, it } from "bun:test"
 import { createChatGptBackend, type ChatGptServingAccount } from "../proxy/chatgpt/backend"
 import type { ChatGptFailure } from "../proxy/chatgpt/stream"
+import type { ChatGptRateLimit } from "../proxy/chatgpt/windows"
 import type { UpstreamRequest } from "../proxy/upstream/backend"
 
 const SHARED_ACCOUNT_ID = "05cd9f04-1111-2222-3333-444444989a40"
@@ -353,5 +354,80 @@ describe("rotation - containment survives it", () => {
 
     expect(response.headers.get("set-cookie")).toBeNull()
     expect(response.headers.get("x-codex-turn-state")).toBeNull()
+  })
+})
+
+/**
+ * The provider states this seat's remaining allowance on the response it just
+ * answered with - refusals and successes alike. Reading it there is what lets
+ * a spent seat be benched from the turn it COMPLETED rather than from the next
+ * turn it fails, which is one wasted request per account per window.
+ */
+describe("rotation - what the answer says about the seat that gave it", () => {
+  const SPENT: Record<string, string> = {
+    "x-codex-primary-used-percent": "100",
+    "x-codex-primary-window-minutes": "10080",
+    "x-codex-primary-reset-at": String(Math.floor((Date.now() + 3 * 86_400_000) / 1000)),
+    "x-codex-secondary-window-minutes": "0",
+    "x-codex-secondary-reset-at": "",
+  }
+
+  function observing(reply: (seat: string) => Response) {
+    const benched: Array<{ seat: string; weeklySpent: boolean }> = []
+    const noted: Array<{ seat: string; weeklySpent: boolean }> = []
+    const record = (seat: string, limits: ChatGptRateLimit | null) => ({
+      seat,
+      weeklySpent: limits?.primary_window?.used_percent === 100
+        && limits?.primary_window?.limit_window_seconds === 604_800,
+    })
+
+    const backend = createChatGptBackend<Request>({
+      inboundRequest: context => context,
+      candidateSeats: () => [SEAT_A.accountUserId, SEAT_B.accountUserId],
+      seatCredentials: id => BY_SEAT[id] ?? null,
+      benchSeat: (id, _failure, limits) => { benched.push(record(id, limits)) },
+      noteSeatLimits: (id, limits) => { noted.push(record(id, limits)) },
+      fetchImpl: async (_url, init) => {
+        const bearer = new Headers(init.headers).get("authorization")?.replace("Bearer ", "") ?? ""
+        return reply(BY_TOKEN[bearer]!)
+      },
+    })
+    return { backend, benched, noted }
+  }
+
+  it("reports a spent window from a response that SERVED, before it ever fails", async () => {
+    const h = observing(() => new Response(CREATED + DELTA, {
+      status: 200,
+      headers: { "content-type": "text/event-stream", ...SPENT },
+    }))
+
+    await h.backend.handle(responsesRequest(inbound()))
+
+    expect(h.noted).toEqual([{ seat: SEAT_A.accountUserId, weeklySpent: true }])
+    expect(h.benched).toEqual([])
+  })
+
+  it("hands the refusal's own window to the bench, so the seat sits out until it frees", async () => {
+    const h = observing(seat => seat === SEAT_A.accountUserId
+      ? new Response("{}", { status: 429, headers: { "content-type": "application/json", ...SPENT } })
+      : new Response(CREATED + DELTA, { status: 200, headers: { "content-type": "text/event-stream" } }))
+
+    await h.backend.handle(responsesRequest(inbound()))
+
+    expect(h.benched).toEqual([{ seat: SEAT_A.accountUserId, weeklySpent: true }])
+    // The seat that served said nothing about its allowance, which is not the
+    // same as saying it is spent.
+    expect(h.noted).toEqual([{ seat: SEAT_B.accountUserId, weeklySpent: false }])
+  })
+
+  it("says nothing about a seat whose answer carried no limit headers", async () => {
+    const h = observing(() => new Response("{}", { status: 429, headers: { "content-type": "application/json" } }))
+
+    await h.backend.handle(responsesRequest(inbound()))
+
+    expect(h.benched).toEqual([
+      { seat: SEAT_A.accountUserId, weeklySpent: false },
+      { seat: SEAT_B.accountUserId, weeklySpent: false },
+    ])
   })
 })

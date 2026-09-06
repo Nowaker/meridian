@@ -31,6 +31,7 @@
 import type { UpstreamBackend, UpstreamRequest } from "../upstream/backend"
 import { buildCodexRequest } from "./request"
 import { sniffChatGptFailure, type ChatGptFailure } from "./stream"
+import { chatGptRateLimitFromHeaders, type ChatGptRateLimit } from "./windows"
 
 export interface ChatGptServingAccount {
   /** The seat, carried so a caller can attribute the outcome to the right account. */
@@ -68,8 +69,24 @@ export interface ChatGptBackendOptions<Ctx> {
   seatCredentials: (
     accountUserId: string,
   ) => ChatGptServingAccount | null | Promise<ChatGptServingAccount | null>
-  /** Called once per spent seat per turn, before the turn moves on to the next one. */
-  benchSeat: (accountUserId: string, failure: ChatGptFailure) => void
+  /**
+   * Called once per spent seat per turn, before the turn moves on to the next
+   * one. `rateLimit` is what the refusal itself said about when this seat
+   * frees up, or null when it said nothing.
+   */
+  benchSeat: (
+    accountUserId: string,
+    failure: ChatGptFailure,
+    rateLimit: ChatGptRateLimit | null,
+  ) => void
+  /**
+   * What a SUCCESSFUL answer said about the seat that gave it.
+   *
+   * A seat reports itself spent on the last turn it serves, so acting on that
+   * costs nothing, while waiting for it to refuse costs one failed request per
+   * account per window.
+   */
+  noteSeatLimits?: (accountUserId: string, rateLimit: ChatGptRateLimit | null) => void
   /** Which seat served this conversation, so the next turn of it can prefer the same one. */
   noteServed?: (body: Record<string, unknown> | undefined, accountUserId: string) => void
   fetchImpl?: UpstreamFetch
@@ -156,9 +173,11 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
         }
 
         const sniffed = await sniffChatGptFailure(upstream)
+        const rateLimit = chatGptRateLimitFromHeaders(upstream.headers)
         const answer = forwardResponse(upstream, sniffed.body)
 
         if (!sniffed.failure) {
+          options.noteSeatLimits?.(accountUserId, rateLimit)
           options.noteServed?.(parsed, accountUserId)
           return answer
         }
@@ -167,7 +186,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
         // incident worse and leave the pool cold once it passed.
         if (sniffed.failure.kind === "transient") return answer
 
-        options.benchSeat(accountUserId, sniffed.failure)
+        options.benchSeat(accountUserId, sniffed.failure, rateLimit)
         // Only the last refusal is returned, so release the ones before it
         // rather than leaving their connections held open by an unread body.
         void spent?.body?.cancel().catch(() => {})

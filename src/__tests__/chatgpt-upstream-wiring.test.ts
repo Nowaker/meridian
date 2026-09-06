@@ -620,3 +620,48 @@ describe("rotation across the seats this instance owns", () => {
     }
   }, 30_000)
 })
+
+describe("a seat that reports itself spent on the answer it just served", () => {
+  it("sits out the NEXT turn, without having to refuse one first", async () => {
+    const storePath = freshStorePath()
+    await seed(storePath, account(), secondAccount())
+    const server = boot(storePath, [CLAUDE_PROFILE, CHATGPT_PROFILE, SECOND_PROFILE])
+    await server.chatGptUpstream!.acquire()
+
+    // A 200. It serves the turn AND says its weekly window is gone.
+    codexReply = auth => new Response("event: response.created\ndata: {}\n\n", {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream",
+        ...(auth === "Bearer access-seat"
+          ? {
+              "x-codex-primary-used-percent": "100",
+              "x-codex-primary-window-minutes": "10080",
+              "x-codex-primary-reset-at": String(Math.floor((Date.now() + 3 * 86_400_000) / 1000)),
+              "x-codex-secondary-window-minutes": "0",
+              "x-codex-secondary-reset-at": "",
+            }
+          : {}),
+      },
+    })
+
+    try {
+      const first = await server.app.fetch(responses({ model: "gpt-5-codex", input: "hi" }))
+      expect(first.status).toBe(200)
+      outbound.length = 0
+
+      const second = await server.app.fetch(responses({ model: "gpt-5-codex", input: "hi" }))
+      expect(second.status).toBe(200)
+
+      // Never asked again. Waiting for it to refuse would spend one real
+      // request per account per window to learn what it already told us.
+      expect(
+        outbound
+          .filter(call => call.url === CODEX_URL)
+          .map(call => new Headers(call.init!.headers).get("authorization")),
+      ).toEqual(["Bearer access-second"])
+    } finally {
+      server.chatGptUpstream!.release()
+    }
+  }, 30_000)
+})

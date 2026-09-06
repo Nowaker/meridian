@@ -86,6 +86,76 @@ function resetInstant(window: ChatGptUsageWindow, now: number): number | null {
 }
 
 /**
+ * A number a header actually stated.
+ *
+ * Present-and-EMPTY is how a plan without a second window reports that
+ * window's reset, and it is not the same as absent: `Number("")` is 0, which
+ * survives every plausibility check and reads as a reset in 1970 - so an
+ * account that is spent for a week looks free.
+ */
+function headerNumber(headers: Headers, name: string): number | undefined {
+  const raw = headers.get(name)
+  if (raw === null || raw.trim() === "") return undefined
+  const value = Number(raw)
+  return Number.isFinite(value) ? value : undefined
+}
+
+/**
+ * One window from the `x-codex-` headers of an ordinary inference response.
+ *
+ * WIDTH ARRIVES IN MINUTES HERE and in seconds from `/wham/usage`, so it is
+ * converted at this edge and nowhere else - every other line in this module
+ * speaks seconds. Reading 10080 as seconds turns a week into under three
+ * hours, which un-benches a spent account almost immediately and re-probes it
+ * with a real failing request for the rest of the week.
+ *
+ * Only the account-wide `primary`/`secondary` pair is read. `bengalfox` is a
+ * SEPARATE allowance with its own two windows (the usage endpoint calls it
+ * GPT-5.3-Codex-Spark); an account spent there still serves everything else,
+ * so benching the seat for it would sideline a usable account.
+ */
+function windowFromHeaders(
+  headers: Headers,
+  position: "primary" | "secondary",
+): ChatGptUsageWindow | null {
+  const minutes = headerNumber(headers, `x-codex-${position}-window-minutes`)
+  // A zero width is how a plan says it does not have this window at all.
+  if (minutes === undefined || minutes <= 0) return null
+
+  const window: ChatGptUsageWindow = { limit_window_seconds: minutes * 60 }
+  const usedPercent = headerNumber(headers, `x-codex-${position}-used-percent`)
+  if (usedPercent !== undefined) window.used_percent = usedPercent
+
+  const resetAt = headerNumber(headers, `x-codex-${position}-reset-at`)
+  if (resetAt !== undefined && resetAt > 0) {
+    window.reset_at = resetAt
+  } else {
+    const resetAfter = headerNumber(headers, `x-codex-${position}-reset-after-seconds`)
+    if (resetAfter !== undefined && resetAfter > 0) window.reset_after_seconds = resetAfter
+  }
+  return window
+}
+
+/**
+ * The account's limit state as reported on the response that just served, or
+ * null when this response said nothing about it.
+ *
+ * The provider states this on every answer, refusals and successes alike, so
+ * a spent seat can be benched from the turn it just completed rather than
+ * from the next turn it fails. That difference is one wasted request per
+ * account per window.
+ */
+export function chatGptRateLimitFromHeaders(headers: Headers): ChatGptRateLimit | null {
+  const primary = windowFromHeaders(headers, "primary")
+  const secondary = windowFromHeaders(headers, "secondary")
+  if (!primary && !secondary) return null
+  return {
+    ...(primary ? { primary_window: primary } : {}),
+    ...(secondary ? { secondary_window: secondary } : {}),
+  }
+}
+
+/**
  * When this account frees up, or null when nothing here proves it is capped.
  *
  * Null is a real answer rather than a failure: the caller keeps its own

@@ -23,7 +23,7 @@
  * all.
  */
 import { describe, expect, it } from "bun:test"
-import { chatGptCooldownCapMs, chatGptCooldownUntil } from "../proxy/chatgpt/windows"
+import { chatGptCooldownCapMs, chatGptCooldownUntil, chatGptRateLimitFromHeaders } from "../proxy/chatgpt/windows"
 
 const NOW = Date.UTC(2026, 8, 6, 12, 0, 0)
 
@@ -266,4 +266,144 @@ describe("chatGptCooldownUntil - the four live plan shapes", () => {
       expect(until).toBe(resetAt)
     })
   }
+})
+
+/**
+ * The same state, arriving on the headers of an ordinary inference response.
+ *
+ * Captured live 2026-09-05 from a 200 on `/backend-api/codex/responses`. It
+ * means a seat can be benched from the response it just SERVED, rather than
+ * from the next request it fails - which is the difference between one wasted
+ * turn per spent account and none.
+ *
+ * THE UNIT IS DIFFERENT HERE. `/wham/usage` states a window's width in
+ * SECONDS (`limit_window_seconds`); these headers state it in MINUTES. Read
+ * one as the other and a weekly window becomes a 168-second one, so the
+ * account is un-benched almost immediately and re-probed with a real failing
+ * request for the rest of the week.
+ */
+describe("chatGptRateLimitFromHeaders - the same windows, in the other unit", () => {
+  /** The pro account's real headers, minus the opaque turn state. */
+  const LIVE = {
+    "x-codex-plan-type": "pro",
+    "x-codex-active-limit": "premium",
+    "x-codex-primary-used-percent": "41",
+    "x-codex-primary-window-minutes": "10080",
+    "x-codex-primary-reset-at": "1789235170",
+    "x-codex-primary-reset-after-seconds": "571307",
+    "x-codex-primary-over-secondary-limit-percent": "0",
+    "x-codex-secondary-used-percent": "0",
+    "x-codex-secondary-window-minutes": "0",
+    // PRESENT AND EMPTY on a single-window plan, which is not the same as
+    // absent and very much not the same as zero: `Number("")` is 0, which
+    // reads as a reset in 1970, which reads as an account that is free now.
+    "x-codex-secondary-reset-at": "",
+    "x-codex-secondary-reset-after-seconds": "0",
+    "x-codex-bengalfox-limit-name": "GPT-5.3-Codex-Spark",
+    "x-codex-bengalfox-primary-used-percent": "5",
+    "x-codex-bengalfox-primary-window-minutes": "300",
+    "x-codex-bengalfox-primary-reset-at": "1788676607",
+    "x-codex-credits-balance": "0",
+  }
+
+  it("reads the primary window, converting minutes to the seconds the rest of this module speaks", () => {
+    const limits = chatGptRateLimitFromHeaders(new Headers(LIVE))
+
+    expect(limits?.primary_window).toEqual({
+      used_percent: 41,
+      limit_window_seconds: WEEKLY,
+      reset_at: 1_789_235_170,
+    })
+  })
+
+  it("does not mistake a window's MINUTES for its seconds", () => {
+    // 300 minutes is the five-hour window. Read as 300 seconds it would be
+    // capped at an hour, so a spent 5h window would be re-probed 4 hours early.
+    const limits = chatGptRateLimitFromHeaders(new Headers({
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-window-minutes": "300",
+      "x-codex-primary-reset-at": String(Math.floor((NOW + 4 * HOUR_MS) / 1000)),
+    }))
+
+    expect(limits?.primary_window?.limit_window_seconds).toBe(FIVE_HOUR)
+    expect(chatGptCooldownUntil(limits, NOW)).toBe(NOW + 4 * HOUR_MS)
+  })
+
+  it("omits a window the plan does not have rather than inventing one at epoch 0", () => {
+    const limits = chatGptRateLimitFromHeaders(new Headers(LIVE))
+
+    // Zero width means DISABLED. Carrying it through as a window whose reset
+    // is in the past would make every account look permanently available.
+    expect(limits?.secondary_window ?? null).toBeNull()
+    expect(chatGptCooldownUntil(limits, NOW)).toBeNull()
+  })
+
+  it("does not read an empty header as the number zero", () => {
+    // `Number("")` is 0, and 0 is a perfectly plausible used-percent - so an
+    // empty header recorded as `used_percent: 0` is a claim the provider never
+    // made. It reported NOTHING about this window, which is not the same as
+    // reporting that none of it is gone.
+    const resetAt = Math.floor((NOW + DAY_MS) / 1000)
+    const limits = chatGptRateLimitFromHeaders(new Headers({
+      "x-codex-primary-used-percent": "",
+      "x-codex-primary-window-minutes": "10080",
+      "x-codex-primary-reset-at": String(resetAt),
+    }))
+
+    expect(limits?.primary_window).toEqual({ limit_window_seconds: WEEKLY, reset_at: resetAt })
+    expect(chatGptCooldownUntil(limits, NOW)).toBeNull()
+  })
+
+  it("benches from a response that SUCCEEDED, once its primary window is spent", () => {
+    const resetAt = NOW + 3 * DAY_MS
+    const limits = chatGptRateLimitFromHeaders(new Headers({
+      ...LIVE,
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-reset-at": String(Math.floor(resetAt / 1000)),
+    }))
+
+    expect(chatGptCooldownUntil(limits, NOW)).toBe(resetAt)
+  })
+
+  it("ignores the bengalfox limit, which is a different allowance entirely", () => {
+    // GPT-5.3-Codex-Spark has its own primary AND secondary windows. An
+    // account spent there can still serve everything else, so benching the
+    // SEAT for it would sideline a usable account.
+    const limits = chatGptRateLimitFromHeaders(new Headers({
+      ...LIVE,
+      "x-codex-bengalfox-primary-used-percent": "100",
+      "x-codex-bengalfox-primary-reset-at": String(Math.floor((NOW + DAY_MS) / 1000)),
+      "x-codex-bengalfox-secondary-used-percent": "100",
+      "x-codex-bengalfox-secondary-window-minutes": "10080",
+      "x-codex-bengalfox-secondary-reset-at": String(Math.floor((NOW + 5 * DAY_MS) / 1000)),
+    }))
+
+    expect(limits?.primary_window?.used_percent).toBe(41)
+    expect(chatGptCooldownUntil(limits, NOW)).toBeNull()
+  })
+
+  it("falls back to the relative reset when no absolute one is given", () => {
+    const limits = chatGptRateLimitFromHeaders(new Headers({
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-window-minutes": "10080",
+      "x-codex-primary-reset-after-seconds": "3600",
+    }))
+
+    expect(chatGptCooldownUntil(limits, NOW)).toBe(NOW + HOUR_MS)
+  })
+
+  it("reports nothing at all for a response that carries no limit headers", () => {
+    expect(chatGptRateLimitFromHeaders(new Headers())).toBeNull()
+    expect(chatGptRateLimitFromHeaders(new Headers({ "content-type": "text/event-stream" }))).toBeNull()
+  })
+
+  it("ignores a malformed number rather than benching on it", () => {
+    const limits = chatGptRateLimitFromHeaders(new Headers({
+      "x-codex-primary-used-percent": "not-a-number",
+      "x-codex-primary-window-minutes": "10080",
+      "x-codex-primary-reset-at": String(Math.floor((NOW + DAY_MS) / 1000)),
+    }))
+
+    expect(chatGptCooldownUntil(limits, NOW)).toBeNull()
+  })
 })

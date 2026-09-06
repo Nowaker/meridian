@@ -32,6 +32,7 @@ import { acquireWriterLease, type WriterLease } from "./lease"
 import { chatGptLockPath } from "./paths"
 import { createChatGptRefresher, type ChatGptRefresher } from "./refresh"
 import type { ChatGptFailure } from "./stream"
+import { chatGptCooldownUntil, type ChatGptRateLimit } from "./windows"
 
 /** Renew this far ahead of expiry, matching the Anthropic path's own margin. */
 const ACCESS_TOKEN_BUFFER_MS = 5 * 60_000
@@ -155,11 +156,30 @@ export function createChatGptUpstream<Ctx>(
     return { accountUserId, accountId: account.accountId, accessToken: outcome.accessToken }
   }
 
-  // The provider states when a seat frees up in the headers of the response
-  // that refused it; reading those is the next commit. Until then every bench
-  // takes the conservative default, which self-heals rather than guessing.
-  const benchSeat = (accountUserId: string, failure: ChatGptFailure): void => {
-    options.exhaustion.mark(accountUserId, now() + DEFAULT_COOLDOWN_MS, failure.kind)
+  // The refusal usually states when this seat frees up, and a real reset beats
+  // a guess in both directions: benching a weekly window for ten minutes
+  // re-probes it with a failing request every ten minutes for days, and
+  // benching a five-hour one for a week idles an account that recovered.
+  const benchSeat = (
+    accountUserId: string,
+    failure: ChatGptFailure,
+    rateLimit: ChatGptRateLimit | null,
+  ): void => {
+    options.exhaustion.mark(
+      accountUserId,
+      chatGptCooldownUntil(rateLimit, now()) ?? now() + DEFAULT_COOLDOWN_MS,
+      failure.kind,
+    )
+  }
+
+  // A seat that just served can already be out of allowance, and it says so on
+  // that very answer. Benching it here spends nothing; leaving it costs the
+  // next request a real refusal to discover the same fact. Nothing is marked
+  // unless a window is genuinely spent - a healthy account reports its windows
+  // too, and presence is not exhaustion.
+  const noteSeatLimits = (accountUserId: string, rateLimit: ChatGptRateLimit | null): void => {
+    const until = chatGptCooldownUntil(rateLimit, now())
+    if (until !== null) options.exhaustion.mark(accountUserId, until, "quota_spent")
   }
 
   const noteServed = (body: Record<string, unknown> | undefined, accountUserId: string): void => {
@@ -175,6 +195,7 @@ export function createChatGptUpstream<Ctx>(
       candidateSeats,
       seatCredentials,
       benchSeat,
+      noteSeatLimits,
       noteServed,
       ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
     }),
