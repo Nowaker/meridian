@@ -129,7 +129,7 @@ Verified empirically: a Meridian started with `MERIDIAN_CONFIG_DIR` pointed at a
 - Meridian MUST NOT write `~/.opencode/oc-codex-multi-auth-accounts.json`, and MUST NOT refresh a token read from it. The read-only guarantee in `src/proxy/codex/pool.ts` and `src/__tests__/codex-no-write.test.ts` stays intact and unmodified.
 - Provider MUST be resolved from the requested model BEFORE profile resolution, routing, session lookup or transcript work.
 - A ChatGPT request MUST NEVER reach the Claude Agent SDK path, Claude env construction (`profiles.ts:216-242`), or Claude token refresh (`tokenRefresh.ts`).
-- An OpenAI profile MUST NEVER reach `/auth/refresh` (`server.ts:7215`), which would POST a ChatGPT refresh token to the Anthropic token endpoint.
+- An OpenAI profile MUST NEVER reach ANY Anthropic credential path. This is not only the `/auth/refresh` route (`server.ts:7215`): the background loop `ensureFreshTokenForProfiles` (`server.ts:340`) walks EVERY profile into `ensureFreshToken`, gated by no route and no header, and would send a single-use ChatGPT refresh token to the Anthropic token endpoint on its own schedule. Every all-profiles loop MUST be provider-filtered BEFORE it calls `resolveProfile` - see the table in Task 3.
 - A missing or provider-mismatched profile MUST error. It MUST NOT fall through to the "Unknown profile ... Using first configured profile" path at `profiles.ts:202-208`.
 - Account identity is `accountUserId`. `accountId` alone is forbidden as a key anywhere in rotation, caching, cooldown or storage.
 - Every upstream response MUST be validated to name the account it was requested for before its contents are used or cached.
@@ -201,18 +201,18 @@ Option (c), a Meridian refresh SERVICE that hands tokens to a slimmed plugin, is
 
 `choosePriorityProfile()` and `ProfileExhaustion` (`src/proxy/routing.ts:139-187`) operate on opaque string ids and absolute `until` timestamps. They need NO algorithmic change.
 
-What is Anthropic-coupled is the INPUT: `CooldownWindowType = "five_hour" | "seven_day"` and `COOLDOWN_WINDOWS` (`routing.ts:250-269`), fed by SDK `rate_limit_info`. ChatGPT reports window WIDTH in seconds, and the widths observed live are 18000 (5h), 604800 (weekly) and **2592000 (30d, free tier)**. The windows are nested under `rate_limit`, NOT at the top level of the `/backend-api/wham/usage` response. Reading them from the top level returns null on every account.
+What is Anthropic-coupled is the INPUT: `CooldownWindowType = "five_hour" | "seven_day"` and `COOLDOWN_WINDOWS` (`routing.ts:250-269`), fed by SDK `rate_limit_info`. ChatGPT reports window WIDTH in seconds, and the widths observed live are 18000 (5h), 604800 (weekly) and **2592000 (30d, free tier)**.
 
-Window layout varies by plan, verified live against all six accounts:
+**Confirmed empirically 2026-09-05**, against all six of the operator's real accounts and independently re-captured by the integrator an hour later. The windows are nested under `rate_limit`, NOT at the top level of the `/backend-api/wham/usage` payload - read from the top level they are null on every account:
 
 | `plan_type` | `rate_limit.primary_window` width | `rate_limit.secondary_window` |
 |---|---|---|
 | `pro` | 604800 (weekly) | null |
-| `team` | 18000 (5h) | 604800 (weekly) |
 | `self_serve_business_prolite` | 604800 (weekly) | null |
+| `team` | 18000 (5h) | 604800 (weekly) |
 | `free` | 2592000 (30d) | null |
 
-Three of the four distinct plan shapes report the WEEKLY window as `primary_window`; only `team` uses the 5h-primary / weekly-secondary layout. Reading "primary" as "the 5h window" is wrong on four of the six live accounts. **Position must never imply width** - always read `limit_window_seconds`.
+Three of the four distinct plan shapes report the WEEKLY window as `primary_window`; only `team` uses the 5h-primary / weekly-secondary layout, so reading "primary" as "the 5h window" is wrong on four of the six live accounts. **Position must never imply width** - every window MUST be labelled from `limit_window_seconds` and NEVER from which key it arrived under. The 30d free-tier width also rules out the reference implementation's rule of treating anything at or above six days as "weekly", which understates that allowance more than fourfold.
 
 **Decision:** keep one profile catalog for the UI, but partition pools and state by provider. Resolve model -> provider first, then derive that provider's candidate order, active profile, assignment store and exhaustion tracker. A GPT request with no OpenAI account FAILS; it does not borrow an Anthropic one. Provider-specific code converts each vendor's window vocabulary into an absolute `until` before calling `mark()`.
 
@@ -311,8 +311,25 @@ The distinction that makes this safe rather than a cross-provider fallback is th
 
 **Files:**
 - Modify: `src/proxy/profiles.ts:55-75`, `:187-214`, `:216-242`
-- Modify: `src/proxy/server.ts:7215` (`/auth/refresh`), `:7548`, `:7858`
+- Modify: ALL EIGHT `resolveProfile` call sites in `src/proxy/server.ts` - enumerated below
 - Create: `src/__tests__/profiles-provider.test.ts`
+
+**Every `resolveProfile` call site at `9d22324`.** Four of them iterate over EVERY profile, so an OpenAI entry in `profiles.json` reaches those with no route and no header to gate it. A constraint written against a route does not cover them.
+
+| Line | Site | All profiles? | What it does with the result | Hazard once an OpenAI profile exists |
+|---|---|---|---|---|
+| 340 | `ensureFreshTokenForProfiles` | YES | `credentialStoreForProfile(resolved)` -> `ensureFreshToken(store)` | **CREDENTIAL LOSS.** Sends the single-use ChatGPT refresh token to `platform.claude.com`. See R11 |
+| 1729 | `/v1/messages` | no | request path | Superseded by the Task 1 seam |
+| 7016 | `/health` | no (active only) | `Object.keys(healthProfile.env).length` | THROWS. Caddy's probe requires literal `"status":"healthy"`, so the instance silently leaves rotation |
+| 7092 | `/profiles/list` | YES | `Object.keys(resolved.env).length` | THROWS. Dashboard and header chip dead |
+| 7215 | `/auth/refresh` | no | `credentialStoreForProfile(profile)` at `:7220` | Anthropic refresh of a ChatGPT token |
+| 7548 | audit | no | - | Audit for the same hazard |
+| 7858 | audit | no | `credentialStore: credentialStoreForProfile(profile)` at `:7870` | Anthropic credential store built for an OpenAI profile |
+| 8082 | auth keepalive, every 45s | YES | `Object.keys(resolved.env).length` | THROWS every 45s inside a background timer |
+
+`ResolvedOpenAI` deliberately has NO `env` field (D2). That is what makes the credential leak structurally impossible, and it is exactly why the three `Object.keys(...env)` sites throw rather than quietly misbehave. Do not "fix" this by giving the OpenAI arm an empty `env`.
+
+**Filter BEFORE you resolve.** In each all-profiles loop the provider filter must sit ahead of the `resolveProfile` call itself, not between that call and the `env` read. Step 2 requires a provider-mismatched resolution to THROW, so a loop that resolves first and filters afterwards is filtering after the exception has already been raised. This is an ordering requirement, not a stylistic one.
 
 **Interfaces:**
 - Produces: `type PersistedProfile = LegacyAnthropicProfile | OpenAIProfile` (legacy arm: `provider?: "anthropic"`)
@@ -323,7 +340,8 @@ The distinction that makes this safe rather than a cross-provider fallback is th
 - [ ] **Step 2:** Failing test: `resolveProfileForProvider("openai", ...)` with no OpenAI profile THROWS, and specifically does not emit the `Unknown profile ... Using first configured profile` warning from `profiles.ts:206`.
 - [ ] **Step 3:** Failing test: `buildResolvedProfile` cannot be reached with an OpenAI profile - assert at the type level and with a runtime guard test that no `CLAUDE_CONFIG_DIR` / `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` is ever produced for `provider: "openai"`.
 - [ ] **Step 4:** Failing test: `POST /auth/refresh` with `x-meridian-profile` naming an OpenAI profile returns 4xx and makes NO outbound request. Today that path would POST a ChatGPT refresh token to `https://platform.claude.com/v1/oauth/token`.
-- [ ] **Step 5:** Implement. Audit `server.ts:7548` and `:7858` for the same hazard.
+- [ ] **Step 5:** Failing test for the four unrouted loops - the one that catches `:340`. Put an OpenAI profile in `profiles.json` beside an Anthropic one, spy on the outbound Anthropic token endpoint, then assert ALL of: `GET /health` returns 200 carrying literal `"status":"healthy"`; `GET /profiles/list` returns 200 and lists BOTH profiles; one `ensureFreshTokenForProfiles` pass and one 45s keepalive tick each complete without throwing; and the spy recorded ZERO requests for the OpenAI profile. This must fail against today's code before it passes.
+- [ ] **Step 6:** Implement. In every all-profiles loop (`:340`, `:7092`, `:8082`) the provider filter MUST precede the `resolveProfile` call, not merely precede the `env` read or the credential-store construction - Step 2 makes a mismatched resolution throw, so filtering after the call is filtering after the exception. Give `/health` (`:7016`) an OpenAI-safe path. Audit `:7548` and `:7858` for the same hazard.
 
 ---
 
@@ -511,8 +529,9 @@ Ordered. Do not reorder. Each step names its own verification.
 | R8 | Cross-provider fallback | A GPT request served by a Claude account, or vice versa | Provider resolved first (Task 2); mismatch ERRORS (Task 3) |
 | R9 | `HOME` not isolated on the new host | The new instance becomes a second writer of the operator's ANTHROPIC credentials - R1 for the other vendor | Task 11 Steps 1-2; `MERIDIAN_CONFIG_DIR` is explicitly NOT sufficient (F7) |
 | R10 | A bearer token sent to the wrong host | Credential disclosure | Constant origin; `redirect: "error"`; outbound allowlist (Task 6) |
+| R11 | `ensureFreshTokenForProfiles` (`server.ts:340`) walks an OpenAI profile into the Anthropic refresh | R1-class. The single-use ChatGPT refresh token is spent against `platform.claude.com` and the account dies. No route, no header, no ChatGPT traffic required - a background loop does it unprompted | Provider-filter every all-profiles loop (Task 3 Step 6); the Task 3 Step 5 spy test asserts zero Anthropic token requests for an OpenAI profile |
 
-**Irreversible if wrong:** R1, R2, R3, R5 all end in the same place - a ChatGPT account that cannot be recovered by any amount of retrying, only by a human logging in again. Everything else in this plan is a bug; those four are data loss.
+**Irreversible if wrong:** R1, R2, R3, R5, R11 all end in the same place - a ChatGPT account that cannot be recovered by any amount of retrying, only by a human logging in again. Everything else in this plan is a bug; those five are data loss. R11 is the easiest of them to ship by accident: it needs no ChatGPT request at all, only an OpenAI entry in `profiles.json` and one tick of a timer that is already running.
 
 ---
 
