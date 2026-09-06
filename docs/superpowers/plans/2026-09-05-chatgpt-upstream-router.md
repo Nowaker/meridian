@@ -18,6 +18,8 @@
 
 This plan does NOT extend the read-only ChatGPT usage cards on `feat/codex-account-usage`. That feature reads `~/.opencode/oc-codex-multi-auth-accounts.json` and is structurally forbidden from writing it or refreshing a token (`src/proxy/codex/pool.ts`, pinned by `src/__tests__/codex-no-write.test.ts` - both on that branch, see Prerequisite). Every constraint in that module stays exactly as it is. This plan builds a SEPARATE, WRITABLE, Meridian-owned credential store beside it.
 
+This plan does NOT retire upstream's Codex-CLI-on-Claude feature. F1 notes that `docs/superpowers/specs/2026-07-08-codex-responses-api-design.md` runs in the opposite direction to this one; both survive. An instance that owns no ChatGPT accounts keeps translating a GPT model name onto Claude exactly as it does today, byte-identically. See D6.
+
 This plan does NOT propose putting the ChatGPT backend upstream. See "PR Decomposition": only the provider-neutral seam is upstream-shaped.
 
 ---
@@ -105,7 +107,9 @@ The token endpoint and client id are hardcoded to Anthropic (`tokenRefresh.ts:27
 
 `accountId` is NOT unique. In the operator's live pool, `accountId` `05cd9f04...` is shared by two different emails belonging to two different users. `accountUserId` is the only safe key. This is recorded in `CodexPoolAccount` in `src/proxy/codex/pool.ts` (on `feat/codex-account-usage`; see Prerequisite) and was confirmed against the real file.
 
-Worse, upstream ignores a mismatched scope header: a `GET /backend-api/wham/usage` sent with an `ChatGPT-Account-ID` that disagrees with the bearer token returns **HTTP 200 carrying the token's own account**, not an error. Any code that trusts the response without comparing `account_id` AND the token's `chatgpt_user_id` claim will silently attribute one account's state to another.
+The claim names are `chatgpt_account_user_id` (the seat) and `chatgpt_account_id` (the workspace), both under the `https://api.openai.com/auth` namespace - `lib/auth/token-utils.ts:432-436`, `:446-452`. An earlier revision of this finding named the seat claim `chatgpt_user_id`, which does not exist; a wrong claim name in the contract is worse than no claim name.
+
+Worse, upstream ignores a mismatched scope header: a `GET /backend-api/wham/usage` sent with an `ChatGPT-Account-ID` that disagrees with the bearer token returns **HTTP 200 carrying the token's own account**, not an error. Any code that trusts the response without comparing `account_id` AND the token's `chatgpt_account_user_id` claim will silently attribute one account's state to another. Verified live against all six accounts: a request whose scope header MATCHES the token always returns that account, so a test that only ever sends matching headers proves nothing - the validation test must send a deliberately mismatched header and assert the 200 is rejected.
 
 ### F7. `MERIDIAN_CONFIG_DIR` does not isolate an instance; `HOME` does
 
@@ -197,13 +201,39 @@ Option (c), a Meridian refresh SERVICE that hands tokens to a slimmed plugin, is
 
 `choosePriorityProfile()` and `ProfileExhaustion` (`src/proxy/routing.ts:139-187`) operate on opaque string ids and absolute `until` timestamps. They need NO algorithmic change.
 
-What is Anthropic-coupled is the INPUT: `CooldownWindowType = "five_hour" | "seven_day"` and `COOLDOWN_WINDOWS` (`routing.ts:250-269`), fed by SDK `rate_limit_info`. ChatGPT reports window WIDTH in seconds, and the widths observed live are 18000 (5h), 604800 (weekly) and **2592000 (30d, free tier)**. Window layout also varies by tier: Pro and Business Premium report the weekly limit as `primary_window` with `secondary_window` null, while Business Standard still uses the older 5h-primary / weekly-secondary shape. Reading "primary" as "the 5h window" is wrong on four of the six live accounts.
+What is Anthropic-coupled is the INPUT: `CooldownWindowType = "five_hour" | "seven_day"` and `COOLDOWN_WINDOWS` (`routing.ts:250-269`), fed by SDK `rate_limit_info`. ChatGPT reports window WIDTH in seconds, and the widths observed live are 18000 (5h), 604800 (weekly) and **2592000 (30d, free tier)**. The windows are nested under `rate_limit`, NOT at the top level of the `/backend-api/wham/usage` response. Reading them from the top level returns null on every account.
+
+Window layout varies by plan, verified live against all six accounts:
+
+| `plan_type` | `rate_limit.primary_window` width | `rate_limit.secondary_window` |
+|---|---|---|
+| `pro` | 604800 (weekly) | null |
+| `team` | 18000 (5h) | 604800 (weekly) |
+| `self_serve_business_prolite` | 604800 (weekly) | null |
+| `free` | 2592000 (30d) | null |
+
+Three of the four distinct plan shapes report the WEEKLY window as `primary_window`; only `team` uses the 5h-primary / weekly-secondary layout. Reading "primary" as "the 5h window" is wrong on four of the six live accounts. **Position must never imply width** - always read `limit_window_seconds`.
 
 **Decision:** keep one profile catalog for the UI, but partition pools and state by provider. Resolve model -> provider first, then derive that provider's candidate order, active profile, assignment store and exhaustion tracker. A GPT request with no OpenAI account FAILS; it does not borrow an Anthropic one. Provider-specific code converts each vendor's window vocabulary into an absolute `until` before calling `mark()`.
 
 ### D5. ChatGPT gets prompt-cache affinity, not Claude's transcript machinery
 
 Claude's durable transcript assignment exists to own SDK session generations, forks and rollback authority. A ChatGPT request has none of those. Simple affinity keyed on the raw Responses `prompt_cache_key` - which is exactly what the plugin already puts in `conversation_id` / `session_id` - is sufficient and far cheaper.
+
+### D6. Provider dispatch is gated on INSTANCE-LEVEL ownership
+
+Resolving a GPT model name to `provider: "openai"` and dispatching on that unconditionally would retire upstream's Codex-CLI-on-Claude feature for every deployment that never configures a ChatGPT account. F1 records that feature; nothing else in this plan reconciled it. The cost is not hypothetical: this branch is destined for `main-nowaker`, which is what the operator's `meridian-dev` on 3457 runs from, and that instance will own zero ChatGPT accounts.
+
+**Decision:** dispatch consults the provider only when this Meridian OWNS ChatGPT accounts. Resolve `chatgptUpstreamEnabled` ONCE at startup from Meridian's OWN store - never the plugin pool.
+
+- **Enabled:** GPT families resolve to `"openai"` with NO per-request fallback, ever. Every account exhausted or failed means the request FAILS. Task 8 Step 2's guarantee holds in full.
+- **Disabled:** `providerForModel` is not consulted for dispatch at all, and a GPT name keeps today's translate-onto-Claude meaning byte-identically.
+
+The distinction that makes this safe rather than a cross-provider fallback is that the gate is INSTANCE-LEVEL and resolved once, not per-request availability. A per-request fallback would be R8. An instance that was never given ChatGPT credentials is not falling back to anything - it is running its pre-existing behavior, unchanged.
+
+`providerForModel` itself stays pure and exactly as specified: 15 families to `"openai"`, unknown and absent to `"anthropic"`. The gate is a separate predicate at the dispatch point.
+
+**The mode MUST be observable.** Log it with its account count at startup and report it on `/health`. An operator has to be able to answer "will this instance serve GPT from ChatGPT or from Claude?" without reading source. An invisible mode is exactly how the 13-hour outage of 2026-09-04 happened: an instance served plausible answers from a state nobody could see.
 
 ---
 
@@ -390,7 +420,7 @@ Today's failover sniffer (`server.ts:1043`) recognizes an Anthropic `event: erro
 - Modifies: exhaustion tracking to be per-provider (separate instances, or provider-qualified keys)
 
 - [ ] **Step 1:** Failing test: an Anthropic exhaustion mark does NOT bench an OpenAI profile and vice versa. Use ids that COLLIDE across providers - unique synthetic ids would miss a shared-tracker bug.
-- [ ] **Step 2:** Failing test: a GPT request with zero OpenAI accounts configured FAILS with a clear error and does not select an Anthropic profile.
+- [ ] **Step 2:** Failing test: on an instance that OWNS ChatGPT accounts, zero AVAILABLE OpenAI accounts FAILS with a clear error and never selects an Anthropic profile. An instance that owns none is a different case entirely and is governed by D6, not by this step.
 - [ ] **Step 3:** Failing test: window widths 18000, 604800 and 2592000 each produce a correct absolute `until`. The 30d free-tier width must not be collapsed into "weekly" - that understates the window by more than fourfold.
 - [ ] **Step 4:** Failing test: a Business Standard payload (5h primary + weekly secondary) and a Pro payload (weekly primary, secondary null) both bench correctly. Position must never imply width.
 - [ ] **Step 5:** Implement. `choosePriorityProfile` and `ProfileExhaustion` keep their current algorithms; only their inputs change.
