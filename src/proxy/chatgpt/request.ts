@@ -22,7 +22,10 @@ const ORIGINATOR = "codex_cli_rs"
 const RESPONSES_BETA = "responses=experimental"
 const RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
 
-/** The tiers the reference implementation sends the responses-lite hint for. */
+/**
+ * The tiers that accept the responses-lite hint at all. Necessary rather than
+ * sufficient - see `bodySupportsResponsesLite`.
+ */
 const RESPONSES_LITE_MODELS: ReadonlySet<string> = new Set([
   "gpt-5.6-sol",
   "gpt-5.6-terra",
@@ -32,6 +35,29 @@ const RESPONSES_LITE_MODELS: ReadonlySet<string> = new Set([
   "gpt-daybreak-blue",
   "gpt-daybreak-red",
 ])
+
+/**
+ * Whether the client's own body already meets the responses-lite mode's
+ * preconditions.
+ *
+ * Measured against the provider on 2026-09-05: the header selects a mode, and
+ * a body that does not already satisfy it is refused - first `400 ... requires
+ * reasoning.context to be all_turns`, then `400 ... requires
+ * parallel_tool_calls to be false`. Ordinary Codex traffic satisfies neither,
+ * so gating on the model alone 400s every request on those tiers.
+ *
+ * The body is NOT adjusted to fit. This path is raw passthrough and the body
+ * belongs to the client; all-turns reasoning and serialised tool calls are
+ * behavioural changes, not formatting. Dropping the header costs an
+ * optimisation, which is why both reads are strict - an absent
+ * `parallel_tool_calls` is not a false one.
+ */
+function bodySupportsResponsesLite(body: Record<string, unknown>): boolean {
+  if (body.parallel_tool_calls !== false) return false
+  const reasoning = body.reasoning
+  if (typeof reasoning !== "object" || reasoning === null) return false
+  return "context" in reasoning && reasoning.context === "all_turns"
+}
 
 export interface CodexRequestAccount {
   /** The workspace, sent as the scope header. */
@@ -68,7 +94,12 @@ export function buildCodexRequest(
   headers.set("content-type", "application/json")
 
   const model = body?.model
-  if (typeof model === "string" && RESPONSES_LITE_MODELS.has(model)) {
+  if (
+    body
+    && typeof model === "string"
+    && RESPONSES_LITE_MODELS.has(model)
+    && bodySupportsResponsesLite(body)
+  ) {
     headers.set(RESPONSES_LITE_HEADER, "true")
   }
 

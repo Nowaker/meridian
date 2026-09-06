@@ -124,17 +124,71 @@ describe("buildCodexRequest - the organization header stays off", () => {
 })
 
 describe("buildCodexRequest - the responses-lite hint", () => {
-  it("is sent for every tier that expects it", () => {
+  // Measured against the provider on 2026-09-05: this header selects a MODE
+  // with body preconditions, not a free optimisation. Sent with an ordinary
+  // body it is answered `400 ... requires reasoning.context to be all_turns`,
+  // and once that is satisfied, `400 ... requires parallel_tool_calls to be
+  // false`. This path is raw passthrough, so the body belongs to the client
+  // and must not be edited to suit a header Meridian chose to add.
+  const READY = { reasoning: { context: "all_turns" }, parallel_tool_calls: false }
+
+  it("is sent when the client's own body already satisfies both preconditions", () => {
     for (const model of LITE_MODELS) {
-      const { headers } = buildCodexRequest({ model }, ACCOUNT)
+      const { headers } = buildCodexRequest({ model, ...READY }, ACCOUNT)
 
       expect(headers.get("x-openai-internal-codex-responses-lite")).toBe("true")
+      expect(names(headers)).toEqual(
+        [...BASE_HEADERS, "x-openai-internal-codex-responses-lite"].sort(),
+      )
     }
   })
 
-  it("is absent for every other model, including the ones with no model at all", () => {
+  it("is absent for an ordinary Codex body, which it would otherwise 400 on every request", () => {
+    // Exactly the shape this repo captured from Codex 0.143 under "Verified
+    // wire format" in docs/superpowers/specs/2026-07-08-codex-responses-api-design.md:
+    // parallel_tool_calls true, no reasoning.context at all. gpt-5.6-sol is in
+    // the lite set and is a model the operator actually runs.
+    for (const model of LITE_MODELS) {
+      const { headers } = buildCodexRequest({ model, parallel_tool_calls: true }, ACCOUNT)
+
+      expect(headers.get("x-openai-internal-codex-responses-lite")).toBeNull()
+      expect(names(headers)).toEqual(BASE_HEADERS)
+    }
+  })
+
+  it("needs BOTH preconditions rather than either", () => {
+    for (const half of [
+      { reasoning: { context: "all_turns" } },
+      { parallel_tool_calls: false },
+      { reasoning: { context: "all_turns" }, parallel_tool_calls: true },
+      { reasoning: { context: "auto" }, parallel_tool_calls: false },
+    ]) {
+      const { headers } = buildCodexRequest({ model: "gpt-5.6-sol", ...half }, ACCOUNT)
+
+      expect(headers.get("x-openai-internal-codex-responses-lite")).toBeNull()
+    }
+  })
+
+  it("reads both preconditions strictly, never inferring one from an absence", () => {
+    // An absent `parallel_tool_calls` is not a false one, and what upstream
+    // defaults it to is unobserved. Guessing wrong costs a 400 on every
+    // request; omitting the header costs an optimisation and nothing else.
+    for (const body of [
+      { model: "gpt-5.6-sol", reasoning: { context: "all_turns" } },
+      { model: "gpt-5.6-sol", reasoning: { context: "all_turns" }, parallel_tool_calls: 0 },
+      { model: "gpt-5.6-sol", reasoning: { context: "all_turns" }, parallel_tool_calls: null },
+      { model: "gpt-5.6-sol", reasoning: "all_turns", parallel_tool_calls: false },
+      { model: "gpt-5.6-sol", reasoning: null, parallel_tool_calls: false },
+    ]) {
+      const { headers } = buildCodexRequest(body, ACCOUNT)
+
+      expect(headers.get("x-openai-internal-codex-responses-lite")).toBeNull()
+    }
+  })
+
+  it("is absent for every other model, even with a body that would satisfy it", () => {
     for (const model of ["gpt-5-codex", "codex-max", "codex", "gpt-5.4", "gpt-5.1", undefined]) {
-      const { headers } = buildCodexRequest({ model }, ACCOUNT)
+      const { headers } = buildCodexRequest({ model, ...READY }, ACCOUNT)
 
       expect(headers.get("x-openai-internal-codex-responses-lite")).toBeNull()
       expect(names(headers)).toEqual(BASE_HEADERS)
