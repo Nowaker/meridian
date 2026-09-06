@@ -121,6 +121,31 @@ Verified empirically: a Meridian started with `MERIDIAN_CONFIG_DIR` pointed at a
 
 `systemd/user/meridian-og.service` in the operator's dotfiles already documents this conclusion and overrides `HOME` instead.
 
+### F8. The outbound contract, measured against the provider
+
+Every other finding here was read out of the reference implementation's source. This one is different in kind: it was captured by firing Meridian's own `buildCodexRequest` at `https://chatgpt.com/backend-api/codex/responses` for real.
+
+**Scope, stated so it is not over-read.** 2026-09-05. Four requests, ONE account (`e1dde4`, `plan_type: pro`), model `gpt-5.6-sol`. An existing access token read from the pool; no refresh, no write, no other account touched. Probe at `opencode-tools/tmp/ai-codex-wire-probe.ts`, which imports `readFileSync` and no write primitive.
+
+**F8.1 The contract in F2 is accepted as built.** HTTP 200, full stream, usage block. `authorization`, `chatgpt-account-id`, `openai-beta: responses=experimental`, `originator: codex_cli_rs`, `accept: text/event-stream`, `conversation_id` + `session_id` from the cache key, `openai-organization` absent. This was the largest unproven assumption in the plan and it is no longer an assumption.
+
+**F8.2 `x-openai-internal-codex-responses-lite` is a MODE, not a hint.** Sent with an ordinary body it is refused, and each refusal names the next precondition: `requires reasoning.context to be all_turns`, then `requires parallel_tool_calls to be false`. Selecting it from the model name alone therefore 400s EVERY request on all seven lite-set tiers - including `gpt-5.6-sol`, and including this repo's own captured Codex 0.143 shape (`parallel_tool_calls: true`, no `reasoning.context`; see the "Verified wire format" section of `docs/superpowers/specs/2026-07-08-codex-responses-api-design.md`). Fixed by sending it only when the client's body ALREADY satisfies both. The body is never adjusted to fit: both preconditions are behavioural, and rewriting them would break the byte-for-byte passthrough Task 6 Step 4 pins.
+
+**F8.3 The success SSE sequence, observed.** Nine events, no `[DONE]` sentinel:
+
+`response.created` -> `response.in_progress` -> `response.output_item.added` -> `response.content_part.added` -> `response.output_text.delta` -> `response.output_text.done` -> `response.content_part.done` -> `response.output_item.done` -> `response.completed` (carrying `usage`).
+
+This CONFIRMS Task 7's premise rather than qualifying it: `response.created` is the first frame on the SUCCESS path too, identical to the failure path, so "the first frame is not an error" cannot mean success. That is exactly the trap the Anthropic sniffer at `server.ts:1043` would fall into, and it is why the ChatGPT sniffer scans the whole preamble.
+
+**F8.4 The full rate-limit state comes back ON the inference response.** The same state `/wham/usage` reports, delivered free on a request already being made and always current rather than as-of-last-poll: `x-codex-primary-used-percent`, `-window-minutes`, `-reset-at`, `-reset-after-seconds`, the matching `secondary` set, `x-codex-plan-type`, and a `x-codex-bengalfox-*` set. Present on 400s as well as 200s. This is the structural analogue of recording SDK `rate_limit_info` on the Claude path, so a future backend can mark exhaustion without a second HTTP call.
+
+NOT implemented in the MVP: `chatgpt/windows.ts` consumes the `/wham/usage` payload shape only, and no plan step asks for header-driven exhaustion. Four traps for whoever does build it, all observed rather than inferred:
+
+- **Width is MINUTES in these headers and SECONDS in `/wham/usage`.** `10080` is the weekly window here; `604800` is the same window there. Mixing the units is silently wrong by 60x. Name the unit at the call site.
+- **`x-codex-secondary-reset-at` arrives as an EMPTY STRING when there is no secondary window, not absent.** `Number("")` is `0`, which reads as epoch 0, which reads as "reset long ago", which reads as "available". Treat `x-codex-secondary-window-minutes: 0` as DISABLED and never trust a reset instant alone.
+- **The `bengalfox` set is a SECOND, INDEPENDENT limit** with its own primary and secondary windows - the `additional_rate_limits` entry `/wham/usage` names `GPT-5.3-Codex-Spark`. An account can sit at 0% on its weekly primary while bengalfox is spent, so collapsing them loses a usable window.
+- **`x-codex-turn-state` MUST NOT be logged.** It is opaque Fernet material carrying per-turn server state. Not an auth credential - a request still needs the bearer - but unverifiable opaque material has no place in a log line, a test fixture or an error body.
+
 ---
 
 ## Global Constraints
@@ -300,7 +325,7 @@ The distinction that makes this safe rather than a cross-provider fallback is th
 **Interfaces:**
 - Produces: `providerForModel(model: string | null | undefined): ProviderId` - pure, no I/O.
 
-- [ ] **Step 1:** Failing tests pinning the live GPT family list to `"openai"`. The families present in the operator's pool are: `gpt-5-codex`, `codex-max`, `codex`, `gpt-6-astra`, `gpt-daybreak-blue`, `gpt-daybreak-red`, `gpt-5.6-cyber`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-pro`, `gpt-5.2`, `gpt-5.1`.
+- [ ] **Step 1:** Failing tests pinning the live GPT family list to `"openai"`. The families present in the operator's pool are: `gpt-5-codex`, `codex-max`, `codex`, `gpt-6-astra`, `gpt-daybreak-blue`, `gpt-daybreak-red`, `gpt-5.6-cyber`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-pro`, `gpt-5.2`, `gpt-5.1`. **This list is a rotation key set, not a verified capability list - see Open Question 5.** `gpt-5.4` is refused by the endpoint on at least one plan, so the list must be re-measured before D6 is enabled anywhere.
 - [ ] **Step 2:** Failing tests pinning every Claude alias (`sonnet`, `opus`, `haiku`, `fable`, `mythos`, and their `[1m]` variants) to `"anthropic"`, INCLUDING an unknown/absent model, which must default to `"anthropic"` so no existing request changes provider.
 - [ ] **Step 3:** Implement. Dispatch on the result at both seams.
 - [ ] **Step 4:** Regression: full suite plus a live Claude request, proving default-to-anthropic held.
@@ -403,6 +428,7 @@ The distinction that makes this safe rather than a cross-provider fallback is th
 - [ ] **Step 3:** Failing test: `redirect: "error"`. A bearer credential must never be replayed to a redirect target.
 - [ ] **Step 4:** Failing test: the response body streams through byte-for-byte, with no Responses -> Anthropic translation on this path.
 - [ ] **Step 5:** Implement. Origin is a constant; no operator base-URL override.
+- [ ] **Step 6:** The responses-lite header is a MODE with body preconditions, not a free hint (F8.2). Send it only when the client's body ALREADY carries `reasoning.context: "all_turns"` AND `parallel_tool_calls: false`; never write those into the body to earn it. Selecting it from the model name alone 400s every request on all seven lite-set tiers, ordinary Codex traffic included.
 
 ---
 
@@ -416,6 +442,8 @@ The distinction that makes this safe rather than a cross-provider fallback is th
 - Produces: `sniffChatGptFailure(res: Response): Promise<{ failure: ChatGptFailure | null; body: ReadableStream }>`
 
 Today's failover sniffer (`server.ts:1043`) recognizes an Anthropic `event: error` as the FIRST frame, and the failover-eligible set is exactly two Anthropic classifications: `ACCOUNT_FAILOVER_ERROR_TYPES = { "rate_limit_error", "billing_error" }` (`errors.ts:507-510`). A Responses stream emits neither shape.
+
+The observed nine-event success sequence is in F8.3. It confirms rather than qualifies Step 1: `response.created` opens the SUCCESS path too, so a first frame that is not an error proves nothing at all, and there is no `[DONE]` sentinel to lean on either.
 
 - [ ] **Step 1:** Failing test: a stream of `response.created` followed by `response.failed` is classified as a FAILURE. Naive reuse of the existing sniffer reads the first frame as content and reports success.
 - [ ] **Step 2:** Failing test: a failure arriving AFTER any output or tool-call frame is NOT retried on another account. Retrying there duplicates work the client has already seen.
@@ -572,3 +600,4 @@ Cut them until ownership and the raw Responses path are proven end to end.
 2. **Should `x-meridian-profile` be able to name an OpenAI profile explicitly?** It would be useful for testing a specific account, but it lets a client override provider partitioning. Recommend: allow, but validate that the named profile's provider matches the model-derived provider, and error on mismatch.
 3. **What happens to the plugin after cutover?** D3 retires it for the migrated accounts. If the operator wants opencode to keep working without pointing at Meridian, that is option (c) and needs its own design.
 4. **Per-model quota keys.** The plugin tracks reset times per model family and per `family:model` pair. The MVP treats an account as one bucket. Confirm that is acceptable before building; if not, the exhaustion key must carry the model family.
+5. **Which GPT families does the Codex endpoint actually serve?** Task 2 pins fifteen families to `"openai"`, taken from `activeIndexByFamily` in the plugin pool. That is the plugin's ROTATION KEY SET, not a capability list for `/backend-api/codex/responses`, and the two are not the same question. Measured 2026-09-05 (F8, same single pro account), `gpt-5.4` is refused outright: `The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account.` Under D6-enabled ownership that family - and possibly `gpt-5.4-mini`, `gpt-5.4-pro`, `gpt-5.2`, `gpt-5.1` - would route to ChatGPT and fail, where today they are served by Claude through the translation layer. **This is not grounds to prune the list.** One account proves one account; support may be plan-dependent, and deleting a family that a Business or Team plan does serve would be the same mistake in the other direction. VERIFICATION REQUIRED BEFORE D6 IS ENABLED ANYWHERE: one request per pinned family across at least two plan tiers, recording accepted-or-refused per family, and the list rebuilt from that table. Until it exists, Task 2's list is an assumption wearing the clothes of a measurement.
