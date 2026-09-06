@@ -34,8 +34,17 @@ export interface ChatGptServingAccount {
 export type UpstreamFetch = (url: string, init: RequestInit) => Promise<Response>
 
 export interface ChatGptBackendOptions<Ctx> {
-  /** How to reach the inbound HTTP request from the host's context, so this module never imports Hono. */
-  inboundRequest: (context: Ctx) => Request
+  /**
+   * How to reach the inbound HTTP request from the host's context, so this
+   * module never imports Hono.
+   *
+   * May be async, and usually has to be: the dispatch seam reads the model out
+   * of the body to choose a provider, which spends the original request's
+   * stream, so a host reaching this point holds a Request that answers `Body
+   * already used`. Rebuilding an equivalent one needs the bytes back, and
+   * getting them back is asynchronous.
+   */
+  inboundRequest: (context: Ctx) => Request | Promise<Request>
   selectAccount: (
     request: UpstreamRequest<Ctx>,
     body: Record<string, unknown> | undefined,
@@ -78,7 +87,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
         )
       }
 
-      const inbound = options.inboundRequest(request.context)
+      const inbound = await options.inboundRequest(request.context)
       const rawBody = await inbound.text()
       let parsed: Record<string, unknown> | undefined
       try {

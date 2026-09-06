@@ -44,6 +44,22 @@ export interface ProxyInstance {
   close(): Promise<void>
 }
 
+/**
+ * The owned ChatGPT credentials, as much of them as a host needs to see.
+ *
+ * Narrower than the module's own type on purpose: the full one is generic over
+ * the HTTP context so it can carry a backend, and naming that here would put
+ * Hono into a leaf module.
+ */
+export interface ChatGptUpstreamControl {
+  readonly ownedAccounts: number
+  /** Whether a ChatGPT request could actually be served right now. */
+  isServing(): boolean
+  /** Take refresh authority for these accounts. Rejects rather than degrading. */
+  acquire(): Promise<void>
+  release(): void
+}
+
 /** Return type of createProxyServer — avoids leaking Hono internals to consumers */
 export interface ProxyServer {
   /** The HTTP app — pass `app.fetch` to your server of choice */
@@ -64,6 +80,8 @@ export interface ProxyServer {
   getInFlightCount?(): number
   /** Run one fail-closed transcript maintenance sweep. */
   sweepSessionGc?(): Promise<void>
+  /** Present only when this instance owns ChatGPT credentials. Absent means it has none to take authority over. */
+  chatGptUpstream?: ChatGptUpstreamControl
 }
 
 export const DEFAULT_PROXY_CONFIG: ProxyConfig = {

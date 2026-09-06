@@ -93,6 +93,11 @@ const inertStore: CredentialStore = {
 const anthropicTokenRequests: string[] = []
 const realFetch = globalThis.fetch
 const savedClaudePath = process.env.MERIDIAN_CLAUDE_PATH
+// Pinned at a path that is never created. This file uses startProxyServer,
+// which ACQUIRES the ChatGPT writer lease when the store holds anything — so
+// unpinned, once the operator has run the importer, a test run would seize
+// refresh authority from the instance actually serving with it.
+const savedStorePath = process.env.MERIDIAN_CHATGPT_STORE_PATH
 
 let instance: ProxyInstance
 let baseUrl: string
@@ -100,6 +105,7 @@ let startupTokenRequests: string[] = []
 
 beforeAll(async () => {
   process.env.MERIDIAN_CLAUDE_PATH = fakeClaude
+  process.env.MERIDIAN_CHATGPT_STORE_PATH = join(scratch, "chatgpt-accounts.json")
 
   globalThis.fetch = Object.assign(
     async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
@@ -139,6 +145,8 @@ afterAll(async () => {
   globalThis.fetch = realFetch
   if (savedClaudePath === undefined) delete process.env.MERIDIAN_CLAUDE_PATH
   else process.env.MERIDIAN_CLAUDE_PATH = savedClaudePath
+  if (savedStorePath === undefined) delete process.env.MERIDIAN_CHATGPT_STORE_PATH
+  else process.env.MERIDIAN_CHATGPT_STORE_PATH = savedStorePath
   rmSync(scratch, { recursive: true, force: true })
 })
 
@@ -165,7 +173,12 @@ describe("mixed Anthropic + ChatGPT pool", () => {
     // Resolved past the leading ChatGPT entry to the Anthropic one.
     expect(body.auth?.loggedIn).toBe(true)
     expect(body.auth?.email).toBe("synthetic@example.test")
-    expect(body.upstream).toEqual({ gptModels: "chatgpt", chatgptAccounts: 2 })
+    // Two ChatGPT PROFILES, zero ChatGPT CREDENTIALS. /health reports what
+    // this instance can serve rather than what it was told about, so both
+    // numbers describe the store and neither describes profiles.json — an
+    // instance that answered "chatgpt" here would be advertising a provider
+    // it has no token for.
+    expect(body.upstream).toEqual({ gptModels: "claude", chatgptAccounts: 0 })
   })
 
   test("/profiles/list reports both providers rather than hiding one", async () => {

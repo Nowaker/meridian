@@ -10,9 +10,28 @@
  *
  * The pinned list is the model families present in the live account pool.
  */
-import { describe, test, expect } from "bun:test"
+import { afterAll, beforeAll, describe, test, expect } from "bun:test"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { providerForModel } from "../proxy/upstream/provider"
 import { createProxyServer } from "../proxy/server"
+
+// Pinned at a path that is never created. Unpinned, every server booted below
+// reads the operator's OWN ChatGPT store, so these tests would start passing
+// or failing according to whether that machine has completed its cutover.
+const storeScratch = mkdtempSync(join(tmpdir(), "meridian-provider-gate-"))
+const savedStorePath = process.env.MERIDIAN_CHATGPT_STORE_PATH
+
+beforeAll(() => {
+  process.env.MERIDIAN_CHATGPT_STORE_PATH = join(storeScratch, "chatgpt-accounts.json")
+})
+
+afterAll(() => {
+  if (savedStorePath === undefined) delete process.env.MERIDIAN_CHATGPT_STORE_PATH
+  else process.env.MERIDIAN_CHATGPT_STORE_PATH = savedStorePath
+  rmSync(storeScratch, { recursive: true, force: true })
+})
 
 const OPENAI_MODELS = [
   "gpt-5-codex",
@@ -99,7 +118,10 @@ describe("providerForModel — anything unrecognized defaults to anthropic", () 
 describe("dispatch — a pinned GPT model leaves Claude only where ChatGPT is owned", () => {
   const boot = () => createProxyServer({ port: 0, host: "127.0.0.1", silent: true })
 
-  const bootOwningChatGpt = () => createProxyServer({
+  // Configured, and owning nothing. Ownership is CREDENTIALS in Meridian's own
+  // store (D6), so naming a ChatGPT profile is a statement of intent that the
+  // gate does not act on until an import has actually put a token there.
+  const bootWithChatGptProfile = () => createProxyServer({
     port: 0,
     host: "127.0.0.1",
     silent: true,
@@ -116,32 +138,38 @@ describe("dispatch — a pinned GPT model leaves Claude only where ChatGPT is ow
       body: JSON.stringify(body),
     })
 
-  // The behavior change is scoped to an instance that OWNS ChatGPT accounts
-  // (D6). There, a Codex CLI request naming gpt-5-codex stops being translated
-  // onto Claude and says the model is unserved rather than quietly borrowing a
-  // Claude account. Task 6 turns this 404 into a served ChatGPT request; the
-  // half that must survive that change is that Claude is not the answer.
-  test("/v1/responses with gpt-5-codex reports the model as unserved", async () => {
-    const { app } = bootOwningChatGpt()
-    const res = await app.fetch(post("/v1/responses", { model: "gpt-5-codex", input: "hi" }))
+  // Naming a ChatGPT profile changes NOTHING on its own, and that is the
+  // property protecting the two instances live on this machine: either could
+  // be handed a profile before its credentials exist, and neither may alter
+  // what a GPT model name means until it actually holds a token.
+  //
+  // The owned direction cannot be proved here — it needs a seeded store and a
+  // held lease — so it lives in chatgpt-upstream-wiring.test.ts, which pins
+  // both that an owned instance reaches ChatGPT and that an owned instance
+  // unable to serve FAILS rather than borrowing a Claude account.
+  test("/v1/responses with gpt-5-codex still reaches Claude while no credentials are held", async () => {
+    const { app } = bootWithChatGptProfile()
+    // No `input`, deliberately. It is what stops the request at the marker
+    // below instead of proceeding into the Agent SDK, which no test here has.
+    const res = await app.fetch(post("/v1/responses", { model: "gpt-5-codex" }))
 
-    expect(res.status).toBe(404)
-    const body = await res.json() as { error?: { type?: string; message?: string } }
-    expect(body.error?.type).toBe("not_found_error")
-    expect(body.error?.message).toContain("gpt-5-codex")
+    // The translation layer's own refusal, reachable only on the Claude path.
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({
+      error: { type: "invalid_request_error", message: "input: Field required", code: null },
+    })
   })
 
-  test("/v1/messages with gpt-5-codex reports the model as unserved", async () => {
-    const { app } = bootOwningChatGpt()
+  test("/v1/messages with gpt-5-codex is likewise unaffected by the profile alone", async () => {
+    const { app } = bootWithChatGptProfile()
     const res = await app.fetch(post("/v1/messages", {
       model: "gpt-5-codex",
       messages: [{ role: "user", content: "hi" }],
     }))
 
-    expect(res.status).toBe(404)
-    const body = await res.json() as { error?: { type?: string; message?: string } }
-    expect(body.error?.type).toBe("not_found_error")
-    expect(body.error?.message).toContain("gpt-5-codex")
+    // Anything but 404: a 404 would mean the profile alone had flipped the
+    // gate and routed this at a provider with no credentials behind it.
+    expect(res.status).not.toBe(404)
   })
 
   test("a Claude model still reaches the translation layer untouched", async () => {

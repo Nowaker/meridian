@@ -34,6 +34,7 @@ import { dirname } from "node:path"
 import { syncDirectoryDurablySync } from "../session/durableFileSystem"
 import { acquireWriterLease, type WriterLease } from "./lease"
 import { createChatGptCredentialStore } from "./credentials"
+import { chatGptLockPath } from "./paths"
 
 /** The plugin's storage schema this importer was written against. */
 const SUPPORTED_POOL_VERSION = 3
@@ -291,7 +292,7 @@ export async function importCodexPool(options: PoolImportOptions): Promise<PoolI
   const accounts = readPool(options.poolPath)
 
   const lease = await acquireWriterLease({
-    lockPath: `${storePath}.lock`,
+    lockPath: chatGptLockPath(storePath),
     staleMs: options.staleMs,
     heartbeatMs: options.heartbeatMs,
     waitMs: options.leaseWaitMs ?? 0,

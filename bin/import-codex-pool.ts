@@ -21,6 +21,7 @@ import {
   PoolSourceError,
   type PoolImportOptions,
 } from "../src/proxy/chatgpt/importPool"
+import { chatGptStorePath } from "../src/proxy/chatgpt/paths"
 
 const USAGE = `Move the oc-codex-multi-auth pool into Meridian's own ChatGPT store, once.
 
@@ -29,7 +30,8 @@ const USAGE = `Move the oc-codex-multi-auth pool into Meridian's own ChatGPT sto
   --pool <path>    Source pool to READ. Never written.
                    Default: $MERIDIAN_CODEX_POOL_PATH, else
                    ~/.opencode/oc-codex-multi-auth-accounts.json
-  --store <path>   Destination. Default: ~/.config/meridian/chatgpt-accounts.json
+  --store <path>   Destination. Default: $MERIDIAN_CHATGPT_STORE_PATH, else
+                   ~/.config/meridian/chatgpt-accounts.json
   --force          Permit replacing an existing store. Requires --backup.
   --backup <path>  Where the replaced store is preserved. Must not exist.
   --wait <ms>      How long to wait for the writer lease. Default 0.
@@ -45,7 +47,7 @@ function defaultPoolPath(): string {
 }
 
 function defaultStorePath(): string {
-  return join(homedir(), ".config", "meridian", "chatgpt-accounts.json")
+  return chatGptStorePath()
 }
 
 function parseArgs(argv: readonly string[]): PoolImportOptions | null {

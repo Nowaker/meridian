@@ -203,3 +203,46 @@ describe("chatGptBackend - what it refuses", () => {
     return { backend }
   }
 })
+
+describe("chatGptBackend - the body it is given has usually been read already", () => {
+  // Measured, not assumed: Hono's `c.req.json()` resolves through `raw.json()`,
+  // so once the dispatch seam has peeked at `model` to choose a provider, the
+  // underlying Request answers `Body already used`. A backend that reaches for
+  // that stream itself fails EVERY request that arrives through dispatch while
+  // passing every test that hands it a fresh Request.
+  it("serves when the host rebuilds the request it already consumed", async () => {
+    const consumed = inbound()
+    await consumed.text()
+
+    const calls: RecordedCall[] = []
+    const backend = createChatGptBackend<Request>({
+      // What a host with a consumed original must be able to do: rebuild an
+      // equivalent one. Rebuilding needs the bytes back, and getting them back
+      // is asynchronous, so the contract has to permit it.
+      inboundRequest: async () => inbound(),
+      selectAccount: () => ACCOUNT,
+      fetchImpl: async (url, init) => {
+        calls.push({ url, init })
+        return sseStream(["event: response.created\ndata: {}\n\n"])
+      },
+    })
+
+    const response = await backend.handle(responsesRequest(consumed))
+
+    expect(response.status).toBe(200)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.init.body).toBe(BODY)
+  })
+
+  it("fails loudly rather than posting an empty body when the host hands over a spent request", async () => {
+    // An empty body would be a real, billable request for nothing, answered
+    // with a shape no client asked for. Refusing to send is the safe failure.
+    const consumed = inbound()
+    await consumed.text()
+
+    const { backend, calls } = backendWith(() => sseStream([]))
+
+    await expect(backend.handle(responsesRequest(consumed))).rejects.toThrow()
+    expect(calls).toHaveLength(0)
+  })
+})

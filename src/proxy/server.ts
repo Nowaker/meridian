@@ -85,10 +85,12 @@ import { runTransformHook, buildPipeline, createRequestContext } from "./transfo
 import { getAdapterTransforms } from "./transforms/registry"
 import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
-import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, getEffectiveProfiles, restoreActiveProfile, profilesForProvider, ProfileProviderMismatchError, type ResolvedAnthropicProfile } from "./profiles"
+import { resolveProfile, resolveProfileForProvider, listProfiles, setActiveProfile, getActiveProfileId, getEffectiveProfiles, restoreActiveProfile, profilesForProvider, ProfileProviderMismatchError, NoProfileForProviderError, type ResolvedAnthropicProfile } from "./profiles"
 import { createUpstreamRegistry, UnknownProviderError, type UpstreamEndpoint } from "./upstream/backend"
 import { createAnthropicBackend } from "./upstream/anthropic"
 import { providerForModel } from "./upstream/provider"
+import { createChatGptUpstream } from "./chatgpt/upstream"
+import { chatGptStorePath } from "./chatgpt/paths"
 import {
   getRoutingMode,
   getPriorityFailbackPolicy,
@@ -6610,22 +6612,61 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // route-declaration time.
   const upstream = createUpstreamRegistry<Context>()
 
-  // Resolved ONCE, here, and never per request. An instance that owns no
-  // ChatGPT accounts keeps translating GPT model names onto Claude exactly as
-  // it always has; only an instance that owns some routes them away. Deciding
-  // this per request instead would make it a cross-provider fallback, which
-  // is the thing provider scoping exists to prevent.
+  // Resolved ONCE, here, and never per request. Ownership means CREDENTIALS in
+  // Meridian's own store, not a profile naming an account it does not hold, so
+  // an instance that owns nothing keeps translating GPT model names onto Claude
+  // exactly as it always has. Deciding this per request instead would make it a
+  // cross-provider fallback, which is the thing provider scoping exists to
+  // prevent.
   const ownedChatGptProfiles = profilesForProvider(getEffectiveProfiles(finalConfig.profiles), "openai")
-  const chatgptUpstreamEnabled = ownedChatGptProfiles.length > 0
-  const gptModelRouting = chatgptUpstreamEnabled ? "chatgpt" : "claude"
+  const chatGptUpstream = ownedChatGptProfiles.length > 0
+    ? createChatGptUpstream<Context>({
+        storePath: chatGptStorePath(),
+        // Rebuilt rather than forwarded: dispatch has already read this body to
+        // pick a provider, so the original answers "Body already used". The
+        // bytes come back from Hono's memo, so the client's own body is what
+        // reaches the provider.
+        inboundRequest: async (c) => new Request(c.req.url, {
+          method: c.req.raw.method,
+          headers: c.req.raw.headers,
+          body: await c.req.text(),
+          signal: c.req.raw.signal,
+        }),
+        selectSeat: (request) => {
+          try {
+            return resolveProfileForProvider(
+              "openai",
+              finalConfig.profiles,
+              finalConfig.defaultProfile,
+              request.context.req.header("x-meridian-profile") || undefined,
+            ).accountUserId
+          } catch (error) {
+            // Having no OpenAI profile to pick is this instance's own state and
+            // means nothing can serve. A MISMATCH is the client's error and is
+            // answered 4xx by the dispatcher, so it keeps travelling.
+            if (error instanceof NoProfileForProviderError) return null
+            throw error
+          }
+        },
+      })
+    : undefined
+  if (chatGptUpstream) upstream.registerBackend(chatGptUpstream.backend)
+  const chatgptUpstreamEnabled = chatGptUpstream !== undefined
+  // Three-valued because owning accounts and being able to serve them are not
+  // the same state, and reporting the first as the second is the 2026-09-04
+  // shape: a confident answer nobody outside could check.
+  const gptModelRouting = (): "chatgpt" | "claude" | "unavailable" =>
+    !chatGptUpstream ? "claude" : chatGptUpstream.isServing() ? "chatgpt" : "unavailable"
 
-  // Hono memoizes the parsed body, so the handler downstream awaits this very
-  // promise rather than re-reading a consumed stream. A rejection is memoized
-  // too, which is why a malformed body is swallowed here on purpose: rethrowing
-  // would replace the handler's canonical invalid-JSON 400 with a dispatch error.
+  // Read as TEXT rather than JSON. Hono memoizes either, so the handler
+  // downstream still parses normally, but only the text is handed back byte for
+  // byte - and the ChatGPT path forwards the client's own bytes rather than a
+  // re-serialization of them. A malformed body is swallowed here on purpose:
+  // rethrowing would replace the handler's canonical invalid-JSON 400 with a
+  // dispatch error.
   const peekRequestedModel = async (c: Context): Promise<string | undefined> => {
     try {
-      const body = await c.req.json() as { model?: unknown } | null
+      const body = JSON.parse(await c.req.text()) as { model?: unknown } | null
       return typeof body?.model === "string" ? body.model : undefined
     } catch {
       return undefined
@@ -7085,7 +7126,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           build: currentBuild(),
           error: "Could not verify auth status",
           mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
-          upstream: { gptModels: gptModelRouting, chatgptAccounts: ownedChatGptProfiles.length },
+          upstream: { gptModels: gptModelRouting(), chatgptAccounts: chatGptUpstream?.ownedAccounts ?? 0 },
         })
       }
       if (!auth.loggedIn) {
@@ -7095,7 +7136,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           build: currentBuild(),
           error: "Not logged in. Run: claude login",
           auth: { loggedIn: false },
-          upstream: { gptModels: gptModelRouting, chatgptAccounts: ownedChatGptProfiles.length },
+          upstream: { gptModels: gptModelRouting(), chatgptAccounts: chatGptUpstream?.ownedAccounts ?? 0 },
         }, 503)
       }
       // Resolved Claude executable + which step produced it. Diagnostic
@@ -7130,7 +7171,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           ...renewal,
         },
         mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
-        upstream: { gptModels: gptModelRouting, chatgptAccounts: ownedChatGptProfiles.length },
+        upstream: { gptModels: gptModelRouting(), chatgptAccounts: chatGptUpstream?.ownedAccounts ?? 0 },
         ...(claudeExecutableInfo ? { claudeExecutable: claudeExecutableInfo } : {}),
         plugin: { opencode: checkPluginConfigured() ? "configured" : "not-configured" },
       })
@@ -7141,7 +7182,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         build: currentBuild(),
         error: "Could not verify auth status",
         mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
-        upstream: { gptModels: gptModelRouting, chatgptAccounts: ownedChatGptProfiles.length },
+        upstream: { gptModels: gptModelRouting(), chatgptAccounts: chatGptUpstream?.ownedAccounts ?? 0 },
       })
     }
   })
@@ -8031,6 +8072,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     },
     getInFlightCount: () => inFlightRequests,
     sweepSessionGc,
+    chatGptUpstream,
   }
 }
 
@@ -8068,8 +8110,14 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
     forceAbortInFlight,
     getInFlightCount,
     sweepSessionGc,
+    chatGptUpstream,
   } = createProxyServer(config)
   if (initPlugins) await initPlugins()
+
+  // Fail startup rather than degrade. An instance that owns ChatGPT accounts
+  // and cannot take refresh authority for them must not run beside whatever
+  // holds it: two processes exchanging one single-use token is unrecoverable.
+  if (chatGptUpstream) await chatGptUpstream.acquire()
 
   // Only the owned HTTP-server lifecycle starts a periodic sweep. Embedders
   // using createProxyServer().app still sweep opportunistically after managed
@@ -8115,8 +8163,11 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
       console.log(`Model pins: fable=${pins.ANTHROPIC_DEFAULT_FABLE_MODEL} opus=${pins.ANTHROPIC_DEFAULT_OPUS_MODEL} sonnet=${pins.ANTHROPIC_DEFAULT_SONNET_MODEL} haiku=${pins.ANTHROPIC_DEFAULT_HAIKU_MODEL}`)
       // Resolved once and otherwise invisible. An instance whose mode nobody
       // can read is how the 2026-09-04 outage stayed unnoticed for 13 hours.
-      const chatgptAccounts = profilesForProvider(getEffectiveProfiles(finalConfig.profiles), "openai").length
-      console.log(`GPT models: ${chatgptAccounts > 0 ? "chatgpt" : "claude"} (${chatgptAccounts} ChatGPT account(s) owned)`)
+      const chatgptAccounts = chatGptUpstream?.ownedAccounts ?? 0
+      const gptRouting = chatGptUpstream?.isServing()
+        ? "chatgpt"
+        : chatgptAccounts > 0 ? "unavailable" : "claude"
+      console.log(`GPT models: ${gptRouting} (${chatgptAccounts} ChatGPT account(s) owned)`)
       // Surface the resolved Claude executable + which step picked it.
       // When users hit "wrong claude got picked" failure modes (e.g. a
       // bun-shimmed `claude` on PATH, see #478), this single line is what
@@ -8238,6 +8289,10 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
             timer.unref?.()
           })
         }
+        // Released here rather than at the end: nothing in flight can still be
+        // spending a token by now, and a failing transcript sweep must not
+        // strand refresh authority that the next process would then wait out.
+        chatGptUpstream?.release()
         // Never delete while an unjoined request may still own an SDK child.
         if ((getInFlightCount?.() ?? 0) === 0) {
           if (sweepSessionGc) await sweepSessionGc()
