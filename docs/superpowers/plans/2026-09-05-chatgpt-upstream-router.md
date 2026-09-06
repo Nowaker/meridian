@@ -137,14 +137,14 @@ Every other finding here was read out of the reference implementation's source. 
 
 This CONFIRMS Task 7's premise rather than qualifying it: `response.created` is the first frame on the SUCCESS path too, identical to the failure path, so "the first frame is not an error" cannot mean success. That is exactly the trap the Anthropic sniffer at `server.ts:1043` would fall into, and it is why the ChatGPT sniffer scans the whole preamble.
 
-**F8.4 The full rate-limit state comes back ON the inference response.** The same state `/wham/usage` reports, delivered free on a request already being made and always current rather than as-of-last-poll: `x-codex-primary-used-percent`, `-window-minutes`, `-reset-at`, `-reset-after-seconds`, the matching `secondary` set, `x-codex-plan-type`, and a `x-codex-bengalfox-*` set. Present on 400s as well as 200s. This is the structural analogue of recording SDK `rate_limit_info` on the Claude path, so a future backend can mark exhaustion without a second HTTP call.
+**F8.4 The full rate-limit state comes back ON the inference response.** The same state `/wham/usage` reports, delivered free on a request already being made and always current rather than as-of-last-poll: `x-codex-primary-used-percent`, `-window-minutes`, `-reset-at`, `-reset-after-seconds`, the matching `secondary` set, `x-codex-plan-type`, and a `x-codex-bengalfox-*` set. Present on 400s as well as 200s. This is the structural analogue of recording SDK `rate_limit_info` on the Claude path, and it is what lets the ChatGPT backend mark exhaustion without a second HTTP call.
 
-NOT implemented in the MVP: `chatgpt/windows.ts` consumes the `/wham/usage` payload shape only, and no plan step asks for header-driven exhaustion. Four traps for whoever does build it, all observed rather than inferred:
+IMPLEMENTED in Task 6b, not deferred. `chatGptRateLimitFromHeaders` (`chatgpt/windows.ts`) reads this set off every provider answer; the backend hands it to the bench on a refusal and to `noteSeatLimits` on a success, so a seat that reports itself spent on the turn it just SERVED sits out the next one instead of having to refuse one first. All four traps below were observed rather than inferred, and each now names the guard that answers it:
 
-- **Width is MINUTES in these headers and SECONDS in `/wham/usage`.** `10080` is the weekly window here; `604800` is the same window there. Mixing the units is silently wrong by 60x. Name the unit at the call site.
-- **`x-codex-secondary-reset-at` arrives as an EMPTY STRING when there is no secondary window, not absent.** `Number("")` is `0`, which reads as epoch 0, which reads as "reset long ago", which reads as "available". Treat `x-codex-secondary-window-minutes: 0` as DISABLED and never trust a reset instant alone.
-- **The `bengalfox` set is a SECOND, INDEPENDENT limit** with its own primary and secondary windows - the `additional_rate_limits` entry `/wham/usage` names `GPT-5.3-Codex-Spark`. An account can sit at 0% on its weekly primary while bengalfox is spent, so collapsing them loses a usable window.
-- **`x-codex-turn-state` MUST NOT be logged.** It is opaque Fernet material carrying per-turn server state. Not an auth credential - a request still needs the bearer - but unverifiable opaque material has no place in a log line, a test fixture or an error body.
+- **Width is MINUTES in these headers and SECONDS in `/wham/usage`.** `10080` is the weekly window here; `604800` is the same window there. Mixing the units is silently wrong by 60x. Converted once, at `windowFromHeaders`, so every other line in the module speaks seconds.
+- **`x-codex-secondary-reset-at` arrives as an EMPTY STRING when there is no secondary window, not absent.** `Number("")` is `0`, which reads as epoch 0, which reads as "reset long ago", which reads as "available". `headerNumber` refuses a blank before any arithmetic, and `x-codex-secondary-window-minutes: 0` yields no window at all.
+- **The `bengalfox` set is a SECOND, INDEPENDENT limit** with its own primary and secondary windows - the `additional_rate_limits` entry `/wham/usage` names `GPT-5.3-Codex-Spark`. An account can sit at 0% on its weekly primary while bengalfox is spent, so collapsing them loses a usable window. Only the account-wide `primary`/`secondary` pair is read; bengalfox is parsed past and acted on nowhere, which means Spark-specific exhaustion has no handling at all - absent by choice, and the honest remainder of this finding.
+- **`x-codex-turn-state` MUST NOT be logged.** It is opaque Fernet material carrying per-turn server state. Not an auth credential - a request still needs the bearer - but unverifiable opaque material has no place in a log line, a test fixture or an error body. Nothing under `chatgpt/` logs a header at all, and the backend forwards only `content-type` and `cache-control` back to the client.
 
 ---
 
@@ -271,10 +271,13 @@ The distinction that makes this safe rather than a cross-provider fallback is th
 - Create `src/proxy/upstream/provider.ts`: pure `providerForModel(model): "anthropic" | "openai"`.
 - Create `src/proxy/chatgpt/backend.ts`: the ChatGPT backend - request construction, dispatch, rotation, retry.
 - Create `src/proxy/chatgpt/credentials.ts`: Meridian-owned ChatGPT credential store; atomic writes under an exclusive cross-process lease.
+- Create `src/proxy/chatgpt/importPool.ts`: the importer's own reader and writer, in `src/` rather than in `bin/` because `bin/` sits outside the tsconfig `include` and is checked by nothing. The entry point stays argv parsing and printing.
 - Create `src/proxy/chatgpt/lease.ts`: the writer lease. Startup acquisition, heartbeat, fail-closed release.
+- Create `src/proxy/chatgpt/paths.ts`: the owned store's path and its lock, defined ONCE. A lock derived one way by the importer and another by the server is not a lock: both processes take one happily and each believes it holds refresh authority.
 - Create `src/proxy/chatgpt/refresh.ts`: single-writer OAuth refresh against `https://auth.openai.com/oauth/token`.
 - Create `src/proxy/chatgpt/request.ts`: pure header/URL construction for `/backend-api/codex/responses`.
 - Create `src/proxy/chatgpt/stream.ts`: Responses SSE failure classification (the analogue of `sniffAccountFailure`).
+- Create `src/proxy/chatgpt/upstream.ts`: what an instance that OWNS ChatGPT accounts may do with them - lease lifecycle, seat selection, cooldown and affinity. Returns `undefined` when the store holds nothing, so an instance owning none has no method with which to take a lease.
 - Create `src/proxy/chatgpt/windows.ts`: ChatGPT rate-limit windows -> absolute `until` timestamps.
 - Create `bin/import-codex-pool.ts`: ONE-SHOT importer, pool -> Meridian store. Run once, at cutover, by a human.
 
@@ -432,6 +435,47 @@ The distinction that makes this safe rather than a cross-provider fallback is th
 
 ---
 
+### Task 6b: Compose the sniffer and the windows into the response path
+
+Tasks 7 and 8 each produced exactly the interface their own steps specify, and nothing called either one: `sniffChatGptFailure` and `chatGptCooldownUntil` had a single non-test occurrence apiece, their own definition. So a spent seat failed the request while every other owned seat sat unused - strictly worse than the plugin this replaces, which rotates. No step between Task 6 and Task 10 asked for the composition, which is how it came to be missing rather than wrong. Task 10 cannot run until this is true.
+
+**Files:**
+- Modify: `src/proxy/chatgpt/backend.ts`, `src/proxy/chatgpt/upstream.ts`, `src/proxy/chatgpt/windows.ts`, `src/proxy/server.ts`
+- Create: `src/__tests__/chatgpt-rotation.test.ts`
+
+**Interfaces:**
+- Produces: `chatGptRateLimitFromHeaders(headers): ChatGptRateLimit | null` - pure
+- Modifies: `ChatGptBackendOptions` - the single `selectAccount` becomes `candidateSeats` + `seatCredentials` + `benchSeat` + `noteSeatLimits` + `noteServed`, so the backend owns the loop and the host owns the pool
+
+Two commits, each independently reviewable and each droppable on its own.
+
+**Commit 1 - rotation.**
+
+- [ ] **Step 1:** Failing test: a 429 on the leading seat is served by the NEXT seat, and the client sees one clean stream with nothing of the refusal in it.
+- [ ] **Step 2:** Failing test: a `response.failed` behind the preamble fails over; a `response.failed` AFTER any output or tool-call frame does NOT. Task 7 Step 2 draws that line and the loop must not undo it - retrying there bills a second account for work the client already holds.
+- [ ] **Step 3:** Failing test: a mid-content transport drop passes through untouched. Never yank a stream a client is consuming.
+- [ ] **Step 4:** Failing test: with every owned seat spent, the request FAILS and no Anthropic profile is selected. R8, pinned at the backend as well as at the routing layer.
+- [ ] **Step 5:** Failing test: each attempt carries ITS OWN seat's bearer and scope header, and the SAME original bytes. A second seat must be offered the request the first one refused, not a re-encoding of it.
+- [ ] **Step 6:** Implement. Candidate order comes from the OPENAI partition of the provider-scoped tracker, skipping benched seats. Affinity is keyed on the raw Responses `prompt_cache_key` (D5): a conversation stays on the seat that already holds its prompt prefix for as long as that seat can serve, and only NEW conversations drain back once it returns.
+
+**Commit 2 - header-driven exhaustion (F8.4).**
+
+- [ ] **Step 1:** Failing test per trap: width in MINUTES not seconds, a present-and-empty `reset-at`, bengalfox as a separate allowance, and `x-codex-turn-state` reaching neither a log, a fixture, nor the client.
+- [ ] **Step 2:** Failing test: a seat that reports its window spent on a response that SUCCEEDED sits out the next turn without having to refuse one first.
+- [ ] **Step 3:** Failing test: a refusal's own stated reset is what benches the seat; the conservative default applies only where the refusal said nothing.
+- [ ] **Step 4:** Implement. Nothing is marked unless a window is genuinely spent - a healthy account reports its windows too, and presence is not exhaustion.
+
+**Four calls made inside the above, recorded so they are not read as oversights:**
+
+- A provider **5xx does not rotate**. A provider-side fault says nothing about a seat, so trying all six during an incident multiplies load and leaves the whole pool benched once it passes.
+- Once every seat has refused, the **last seat's own answer** is returned rather than a synthesized error, so its status and whatever wait it stated both survive.
+- A seat whose credentials cannot be produced is **skipped without being benched**. A seat mid-reauth was already reported by whatever discovered that; benching it here would restate the fact and reset its clock on every request.
+- A proactive bench is recorded with reason `quota_spent`, so an exhaustion snapshot distinguishes "the seat told us" from "the seat refused us".
+
+**Not proven by any of it.** The loop has never met a real 429 from `chatgpt.com`: every test is against a mocked upstream, and F8's probe proved the outbound contract rather than the failover. That closes at Runbook step 6, not here.
+
+---
+
 ### Task 7: Responses SSE failure classification
 
 **Files:**
@@ -586,8 +630,9 @@ Cut them until ownership and the raw Responses path are proven end to end.
 - Tasks 1-3 change no observable Claude behavior: full suite green plus a live `/v1/messages` and `/v1/responses` smoke.
 - Task 4 lease exclusion is proven with a real second OS process, not an in-process mock.
 - Task 5 durability is proven by restarting Meridian and re-serving the canary account.
-- Tasks 4, 8 and 9 all use fixtures whose `accountId` values COLLIDE, because unique synthetic ids cannot catch the real bug.
+- Tasks 4, 6b, 8 and 9 all use fixtures whose `accountId` values COLLIDE, because unique synthetic ids cannot catch the real bug.
 - Task 6 outbound contract is proven against a recording proxy, asserting the exact header set - including the headers that must be ABSENT.
+- Task 6b rotation is proven against a MOCKED upstream only: failover, no-retry-after-output, mid-content drop and every-seat-spent, each pinned by a mutation that fails that test alone. The loop has never met a real 429 from `chatgpt.com` - that closes at Runbook step 6, not in the suite.
 - Task 7 is proven with recorded Responses SSE transcripts covering created-then-failed, failure-after-output, and mid-content drop.
 - The pool file is byte-identical (hash + mtime) after Task 9 runs.
 - No test, log line, error body or dashboard response ever contains a token.
@@ -599,5 +644,5 @@ Cut them until ownership and the raw Responses path are proven end to end.
 1. **Does the ChatGPT backend need Meridian's telemetry envelope auditing?** The envelope integrity checks are written against Anthropic wire contracts. Passing a raw Responses stream through them may be meaningless or actively wrong. Recommend: exclude for the MVP, revisit once the path is stable.
 2. **Should `x-meridian-profile` be able to name an OpenAI profile explicitly?** It would be useful for testing a specific account, but it lets a client override provider partitioning. Recommend: allow, but validate that the named profile's provider matches the model-derived provider, and error on mismatch.
 3. **What happens to the plugin after cutover?** D3 retires it for the migrated accounts. If the operator wants opencode to keep working without pointing at Meridian, that is option (c) and needs its own design.
-4. **Per-model quota keys.** The plugin tracks reset times per model family and per `family:model` pair. The MVP treats an account as one bucket. Confirm that is acceptable before building; if not, the exhaustion key must carry the model family.
+4. **Per-model quota keys.** The plugin tracks reset times per model family and per `family:model` pair. Task 6b built the one-bucket shape: an exhaustion mark is keyed on `accountUserId` alone, so a seat benched after a `gpt-5.6-sol` refusal is benched for every model. That is the right shape for what the backend actually reads - `primary`/`secondary` are account-wide windows and say nothing per family - but it cannot express a per-family allowance, and one exists: `bengalfox` (`GPT-5.3-Codex-Spark`) carries its own two windows and is deliberately parsed past (F8.4). So today a seat spent on Spark alone is not benched at all, which is correct and also the whole of the handling. Acting on a per-family limit REQUIRES the exhaustion key to carry the family first; marking one from a family-scoped window against a seat-scoped key would sideline an account that can still serve everything else.
 5. **Which GPT families does the Codex endpoint actually serve?** Task 2 pins fifteen families to `"openai"`, taken from `activeIndexByFamily` in the plugin pool. That is the plugin's ROTATION KEY SET, not a capability list for `/backend-api/codex/responses`, and the two are not the same question. Measured 2026-09-05 (F8, same single pro account), `gpt-5.4` is refused outright: `The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account.` Under D6-enabled ownership that family - and possibly `gpt-5.4-mini`, `gpt-5.4-pro`, `gpt-5.2`, `gpt-5.1` - would route to ChatGPT and fail, where today they are served by Claude through the translation layer. **This is not grounds to prune the list.** One account proves one account; support may be plan-dependent, and deleting a family that a Business or Team plan does serve would be the same mistake in the other direction. VERIFICATION REQUIRED BEFORE D6 IS ENABLED ANYWHERE: one request per pinned family across at least two plan tiers, recording accepted-or-refused per family, and the list rebuilt from that table. Until it exists, Task 2's list is an assumption wearing the clothes of a measurement.
