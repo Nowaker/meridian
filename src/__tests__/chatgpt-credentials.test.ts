@@ -49,6 +49,7 @@ function account(overrides: Partial<ChatGptAccount> & { accountUserId: string })
     accessToken: null,
     expiresAt: null,
     tokenRotatedAt: null,
+    exchangeStartedAt: null,
     ...overrides,
   }
 }

@@ -50,6 +50,13 @@ export interface ChatGptAccount {
   accessToken: string | null
   expiresAt: number | null
   tokenRotatedAt: number | null
+  /**
+   * Stamped before an exchange is dispatched and cleared only by the commit
+   * that records its result. Surviving therefore means the replacement token
+   * was never written down, so `refreshToken` may already be spent - which is
+   * a state to report, never one to retry. See refresh.ts.
+   */
+  exchangeStartedAt: number | null
 }
 
 export class WriterLeaseRequiredError extends Error {
@@ -155,6 +162,7 @@ function parseAccount(value: unknown, path: string, index: number): ChatGptAccou
     accessToken: nullableString(record.accessToken),
     expiresAt: nullableNumber(record.expiresAt),
     tokenRotatedAt: nullableNumber(record.tokenRotatedAt),
+    exchangeStartedAt: nullableNumber(record.exchangeStartedAt),
   }
 }
 
