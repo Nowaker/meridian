@@ -95,7 +95,7 @@ import {
   shouldPromotePriorityAssignment,
   resolvePriorityOrder,
   choosePriorityProfile,
-  ProfileExhaustion,
+  ProviderExhaustion,
   AssignmentStore,
   resolveCooldownUntil,
   findCooldownReset,
@@ -916,7 +916,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // take a second slot from the same concurrency budget as its own parent and
   // deadlock the pool whenever MERIDIAN_MAX_CONCURRENT is 1. State is per
   // proxy instance.
-  const priorityExhaustion = new ProfileExhaustion()
+  // Partitioned by provider, so a spent Claude account can never bench a
+  // ChatGPT one that happens to share its id. Anthropic reads its own
+  // partition under the name it always had, leaving every existing call site
+  // below untouched.
+  const providerExhaustion = new ProviderExhaustion()
+  const priorityExhaustion = providerExhaustion.for("anthropic")
   const PRIORITY_ASSIGNMENTS_MAX = 5000
   const priorityAssignments = new AssignmentStore(PRIORITY_ASSIGNMENTS_MAX)
   // The per-window reset cap lives in routing.ts (cooldownCapMs): a single

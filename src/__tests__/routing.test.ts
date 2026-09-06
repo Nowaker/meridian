@@ -16,6 +16,7 @@ import {
   resolvePriorityOrder,
   choosePriorityProfile,
   ProfileExhaustion,
+  ProviderExhaustion,
   RENDEZVOUS_STABLE_GUARD,
   AssignmentStore,
   resolveCooldownUntil,
@@ -401,5 +402,82 @@ describe("resolveCooldownUntil (#790)", () => {
       { type: "seven_day_fable", resetsAt: NOW + 3 * DAY, exhausted: true },
     ], NOW, DEFAULT_MS)
     expect(until).toBe(NOW + DEFAULT_MS)
+  })
+})
+
+/**
+ * Provider-partitioned exhaustion (Task 8).
+ *
+ * Every id below COLLIDES across providers on purpose. A profile id is an
+ * operator-chosen string, so "personal" naming both a Claude account and a
+ * ChatGPT one is ordinary rather than contrived - and unique synthetic ids
+ * would let a single shared tracker pass every assertion here while a real
+ * deployment silently benched the wrong vendor's account.
+ */
+describe("ProviderExhaustion - one tracker per provider", () => {
+  const T0 = 1_800_000_000_000
+  const SHARED = "personal"
+
+  it("an Anthropic mark does not bench the identically-named OpenAI profile", () => {
+    const ex = new ProviderExhaustion(() => T0)
+    ex.for("anthropic").mark(SHARED, T0 + 60_000, "rate_limit_error")
+
+    expect(ex.for("anthropic").isExhausted(SHARED)).toBe(true)
+    expect(ex.for("openai").isExhausted(SHARED)).toBe(false)
+  })
+
+  it("an OpenAI mark does not bench the identically-named Anthropic profile", () => {
+    const ex = new ProviderExhaustion(() => T0)
+    ex.for("openai").mark(SHARED, T0 + 60_000, "rate_limit_error")
+
+    expect(ex.for("openai").isExhausted(SHARED)).toBe(true)
+    expect(ex.for("anthropic").isExhausted(SHARED)).toBe(false)
+  })
+
+  it("keeps one tracker per provider rather than a fresh one per call", () => {
+    const ex = new ProviderExhaustion(() => T0)
+    ex.for("anthropic").mark(SHARED, T0 + 60_000, "rate_limit_error")
+
+    expect(ex.for("anthropic").isExhausted(SHARED)).toBe(true)
+  })
+
+  it("reports each provider's marks separately", () => {
+    const ex = new ProviderExhaustion(() => T0)
+    ex.for("anthropic").mark(SHARED, T0 + 60_000, "rate_limit_error")
+    ex.for("openai").mark(SHARED, T0 + 120_000, "stream_failed")
+
+    expect(ex.for("anthropic").snapshot())
+      .toEqual([{ id: SHARED, until: T0 + 60_000, reason: "rate_limit_error" }])
+    expect(ex.for("openai").snapshot())
+      .toEqual([{ id: SHARED, until: T0 + 120_000, reason: "stream_failed" }])
+  })
+
+  it("expires each provider's marks on its own clock reading", () => {
+    let now = T0
+    const ex = new ProviderExhaustion(() => now)
+    ex.for("anthropic").mark(SHARED, T0 + 60_000, "rate_limit_error")
+    ex.for("openai").mark(SHARED, T0 + 600_000, "rate_limit_error")
+
+    now = T0 + 60_001
+    expect(ex.for("anthropic").isExhausted(SHARED)).toBe(false)
+    expect(ex.for("openai").isExhausted(SHARED)).toBe(true)
+  })
+
+  it("a GPT pool with every account spent never answers with a Claude one", () => {
+    // The guarantee is not "an OpenAI id comes back" - it is that no Anthropic
+    // id can, because the candidate order this chooses from was derived for
+    // one provider. Healthy Claude accounts sitting right beside it are not
+    // eligible, which is the whole of R8.
+    const ex = new ProviderExhaustion(() => T0)
+    const anthropicOrder = ["personal", "work"]
+    const openaiOrder = ["personal", "work"].map(id => `gpt-${id}`)
+    for (const id of openaiOrder) ex.for("openai").mark(id, T0 + 60_000, "rate_limit_error")
+
+    const pick = choosePriorityProfile(openaiOrder, id => ex.for("openai").isExhausted(id))
+
+    expect(pick?.allExhausted).toBe(true)
+    expect(openaiOrder).toContain(pick!.id)
+    expect(anthropicOrder).not.toContain(pick!.id)
+    for (const id of anthropicOrder) expect(ex.for("anthropic").isExhausted(id)).toBe(false)
   })
 })

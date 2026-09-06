@@ -23,6 +23,7 @@
  */
 
 import { createHash } from "node:crypto"
+import type { ProviderId } from "./upstream/backend"
 
 export type RoutingMode = "active" | "sticky" | "priority"
 export type PriorityFailbackPolicy = "new-conversation" | "next-user-turn"
@@ -194,6 +195,32 @@ export class ProfileExhaustion {
       out.push({ id, until: entry.until, reason: entry.reason })
     }
     return out
+  }
+}
+
+/**
+ * One `ProfileExhaustion` per provider, so a mark can never cross vendors.
+ *
+ * Profile ids are operator-chosen strings, so one id naming both a Claude
+ * account and a ChatGPT one is ordinary rather than contrived - and a shared
+ * tracker would let either bench the other.
+ *
+ * Separate maps rather than provider-qualified keys: qualifying is something
+ * a caller can forget at one site out of six, and the forgotten site looks
+ * exactly like the correct ones.
+ */
+export class ProviderExhaustion {
+  private readonly byProvider = new Map<ProviderId, ProfileExhaustion>()
+
+  constructor(private readonly now: () => number = Date.now) {}
+
+  for(provider: ProviderId): ProfileExhaustion {
+    let tracker = this.byProvider.get(provider)
+    if (!tracker) {
+      tracker = new ProfileExhaustion(this.now)
+      this.byProvider.set(provider, tracker)
+    }
+    return tracker
   }
 }
 
