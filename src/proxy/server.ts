@@ -86,6 +86,8 @@ import { getAdapterTransforms } from "./transforms/registry"
 import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
 import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, getEffectiveProfiles, restoreActiveProfile, type ResolvedProfile } from "./profiles"
+import { createUpstreamRegistry } from "./upstream/backend"
+import { createAnthropicBackend } from "./upstream/anthropic"
 import {
   getRoutingMode,
   getPriorityFailbackPolicy,
@@ -6593,6 +6595,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     )
   }
 
+  // Backends are registered far below this line, once every handler they wrap
+  // exists. That is safe because `backendFor` runs per request rather than at
+  // route-declaration time.
+  const upstream = createUpstreamRegistry<Context>()
+
   const handleWithQueue = async (c: Context, endpoint: string) => {
     // An internal hop carries a request the public route already admitted;
     // re-checking the gate here would refuse work that is legitimately in
@@ -6854,8 +6861,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     }
   }
 
-  app.post("/v1/messages", (c) => handleWithQueue(c, "/v1/messages"))
-  app.post("/messages", (c) => handleWithQueue(c, "/messages"))
+  const dispatchMessages = (c: Context, route: string) =>
+    upstream.backendFor("anthropic").handle({ context: c, endpoint: "messages", route })
+
+  app.post("/v1/messages", (c) => dispatchMessages(c, "/v1/messages"))
+  app.post("/messages", (c) => dispatchMessages(c, "/messages"))
 
   /**
    * Cancel a session's live requests and everything live below it.
@@ -7417,7 +7427,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // loop — mirroring /v1/chat/completions. Tagged x-meridian-agent: codex so
   // the codex adapter is selected (forces passthrough; preset OFF).
   // See src/proxy/openaiResponses.ts for the translation logic.
-  app.post("/v1/responses", async (c) => {
+  const handleResponsesUpstream = async (c: Context) => {
     if (draining) return drainingResponse("openai")
     const rawBody = await c.req.json() as ResponsesRequest
     const anthropicBody = translateResponsesToAnthropic(rawBody)
@@ -7535,7 +7545,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         "Connection": "keep-alive",
       },
     })
-  })
+  }
+
+  upstream.registerBackend(createAnthropicBackend<Context>({
+    messages: (request) => handleWithQueue(request.context, request.route),
+    responses: (request) => handleResponsesUpstream(request.context),
+  }))
+
+  app.post("/v1/responses", (c) => upstream.backendFor("anthropic").handle({
+    context: c,
+    endpoint: "responses",
+    route: "/v1/responses",
+  }))
 
   // --- Model Discovery ---
   // Returns available Claude models in OpenAI-compatible format.
