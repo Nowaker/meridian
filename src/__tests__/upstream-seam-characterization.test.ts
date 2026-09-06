@@ -50,9 +50,12 @@ describe("seam characterization — /v1/messages", () => {
 })
 
 describe("seam characterization — /v1/responses", () => {
+  // The model here is incidental to what this pins (the translation layer's
+  // own 400) but it must stay a Claude one: from Task 2 a pinned GPT family
+  // resolves to a different provider and never reaches this code path.
   test("rejects a body with no input", async () => {
     const { app } = boot()
-    const res = await app.fetch(post("/v1/responses", JSON.stringify({ model: "gpt-5-codex" })))
+    const res = await app.fetch(post("/v1/responses", JSON.stringify({ model: "claude-sonnet-5" })))
 
     expect(res.status).toBe(400)
     expect(await res.json()).toEqual({

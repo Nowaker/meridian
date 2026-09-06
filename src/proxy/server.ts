@@ -86,8 +86,9 @@ import { getAdapterTransforms } from "./transforms/registry"
 import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
 import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, getEffectiveProfiles, restoreActiveProfile, type ResolvedProfile } from "./profiles"
-import { createUpstreamRegistry } from "./upstream/backend"
+import { createUpstreamRegistry, UnknownProviderError, type UpstreamEndpoint } from "./upstream/backend"
 import { createAnthropicBackend } from "./upstream/anthropic"
+import { providerForModel } from "./upstream/provider"
 import {
   getRoutingMode,
   getPriorityFailbackPolicy,
@@ -6600,6 +6601,34 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // route-declaration time.
   const upstream = createUpstreamRegistry<Context>()
 
+  // Hono memoizes the parsed body, so the handler downstream awaits this very
+  // promise rather than re-reading a consumed stream. A rejection is memoized
+  // too, which is why a malformed body is swallowed here on purpose: rethrowing
+  // would replace the handler's canonical invalid-JSON 400 with a dispatch error.
+  const peekRequestedModel = async (c: Context): Promise<string | undefined> => {
+    try {
+      const body = await c.req.json() as { model?: unknown } | null
+      return typeof body?.model === "string" ? body.model : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  const dispatchUpstream = async (c: Context, endpoint: UpstreamEndpoint, route: string) => {
+    const model = await peekRequestedModel(c)
+    const provider = providerForModel(model)
+    try {
+      return await upstream.backendFor(provider).handle({ context: c, endpoint, route })
+    } catch (error) {
+      if (!(error instanceof UnknownProviderError)) throw error
+      const message = `Model "${model ?? "unknown"}" is served by the "${provider}" provider, `
+        + "which this Meridian has no configured upstream for."
+      return endpoint === "responses"
+        ? c.json({ error: { type: "not_found_error", message, code: null } }, 404)
+        : c.json({ type: "error", error: { type: "not_found_error", message } }, 404)
+    }
+  }
+
   const handleWithQueue = async (c: Context, endpoint: string) => {
     // An internal hop carries a request the public route already admitted;
     // re-checking the gate here would refuse work that is legitimately in
@@ -6861,11 +6890,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     }
   }
 
-  const dispatchMessages = (c: Context, route: string) =>
-    upstream.backendFor("anthropic").handle({ context: c, endpoint: "messages", route })
-
-  app.post("/v1/messages", (c) => dispatchMessages(c, "/v1/messages"))
-  app.post("/messages", (c) => dispatchMessages(c, "/messages"))
+  app.post("/v1/messages", (c) => dispatchUpstream(c, "messages", "/v1/messages"))
+  app.post("/messages", (c) => dispatchUpstream(c, "messages", "/messages"))
 
   /**
    * Cancel a session's live requests and everything live below it.
@@ -7552,11 +7578,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     responses: (request) => handleResponsesUpstream(request.context),
   }))
 
-  app.post("/v1/responses", (c) => upstream.backendFor("anthropic").handle({
-    context: c,
-    endpoint: "responses",
-    route: "/v1/responses",
-  }))
+  app.post("/v1/responses", (c) => dispatchUpstream(c, "responses", "/v1/responses"))
 
   // --- Model Discovery ---
   // Returns available Claude models in OpenAI-compatible format.
