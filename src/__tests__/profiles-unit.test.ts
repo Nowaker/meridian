@@ -179,8 +179,8 @@ describe("listProfiles", () => {
   test("lists all profiles with types and active status", () => {
     const result = listProfiles(profiles, undefined)
     expect(result).toHaveLength(2)
-    expect(result[0]).toEqual({ id: "personal", type: "claude-max", isActive: true })
-    expect(result[1]).toEqual({ id: "work", type: "api", isActive: false })
+    expect(result[0]).toEqual({ id: "personal", provider: "anthropic", type: "claude-max", isActive: true })
+    expect(result[1]).toEqual({ id: "work", provider: "anthropic", type: "api", isActive: false })
   })
 
   test("marks default profile as active", () => {
@@ -206,7 +206,7 @@ describe("listProfiles", () => {
       [{ id: "ci", type: "oauth-token", oauthToken: "sk-ant-oat01-foo" }],
       undefined,
     )
-    expect(result[0]).toEqual({ id: "ci", type: "oauth-token", isActive: true })
+    expect(result[0]).toEqual({ id: "ci", provider: "anthropic", type: "oauth-token", isActive: true })
   })
 })
 

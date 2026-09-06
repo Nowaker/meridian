@@ -96,8 +96,18 @@ describe("providerForModel — anything unrecognized defaults to anthropic", () 
   })
 })
 
-describe("dispatch — a pinned GPT model no longer reaches Claude", () => {
+describe("dispatch — a pinned GPT model leaves Claude only where ChatGPT is owned", () => {
   const boot = () => createProxyServer({ port: 0, host: "127.0.0.1", silent: true })
+
+  const bootOwningChatGpt = () => createProxyServer({
+    port: 0,
+    host: "127.0.0.1",
+    silent: true,
+    profiles: [
+      { id: "claude-personal", type: "claude-max" },
+      { id: "chatgpt-work", provider: "openai", type: "chatgpt-oauth", accountUserId: "user_AAA" },
+    ],
+  })
 
   const post = (path: string, body: unknown) =>
     new Request(`http://localhost${path}`, {
@@ -106,12 +116,13 @@ describe("dispatch — a pinned GPT model no longer reaches Claude", () => {
       body: JSON.stringify(body),
     })
 
-  // BEHAVIOR CHANGE, pinned deliberately. Before this task a Codex CLI request
-  // naming gpt-5-codex was translated and served by Claude. It now resolves to
-  // a provider this deployment has no backend for, and says so instead of
-  // quietly borrowing a Claude account.
+  // The behavior change is scoped to an instance that OWNS ChatGPT accounts
+  // (D6). There, a Codex CLI request naming gpt-5-codex stops being translated
+  // onto Claude and says the model is unserved rather than quietly borrowing a
+  // Claude account. Task 6 turns this 404 into a served ChatGPT request; the
+  // half that must survive that change is that Claude is not the answer.
   test("/v1/responses with gpt-5-codex reports the model as unserved", async () => {
-    const { app } = boot()
+    const { app } = bootOwningChatGpt()
     const res = await app.fetch(post("/v1/responses", { model: "gpt-5-codex", input: "hi" }))
 
     expect(res.status).toBe(404)
@@ -121,7 +132,7 @@ describe("dispatch — a pinned GPT model no longer reaches Claude", () => {
   })
 
   test("/v1/messages with gpt-5-codex reports the model as unserved", async () => {
-    const { app } = boot()
+    const { app } = bootOwningChatGpt()
     const res = await app.fetch(post("/v1/messages", {
       model: "gpt-5-codex",
       messages: [{ role: "user", content: "hi" }],
@@ -168,6 +179,78 @@ describe("dispatch — a pinned GPT model no longer reaches Claude", () => {
     expect(await res.json()).toEqual({
       type: "error",
       error: { type: "invalid_request_error", message: "Request body must be valid JSON" },
+    })
+  })
+})
+
+/**
+ * The gate (D6). `providerForModel` is consulted for dispatch only on an
+ * instance that OWNS ChatGPT accounts. An instance that owns none keeps
+ * upstream's Codex-CLI-on-Claude behavior byte for byte, which is what
+ * meridian-dev and every existing deployment are.
+ *
+ * Both directions are proved without the Agent SDK by using the translation
+ * layer's own "input: Field required" as the marker for "reached the Claude
+ * path". A request dispatched away never produces it.
+ */
+describe("provider dispatch — instance ownership gate", () => {
+  const CHATGPT_PROFILE = {
+    id: "chatgpt-work",
+    provider: "openai" as const,
+    type: "chatgpt-oauth" as const,
+    accountUserId: "user_gate_AAA",
+  }
+  const CLAUDE_PROFILE = { id: "claude-personal", type: "claude-max" as const }
+
+  const responses = (body: unknown) =>
+    new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+
+  test("owning no ChatGPT account leaves a GPT model on the translate-to-Claude path", async () => {
+    const { app } = createProxyServer({
+      port: 0,
+      host: "127.0.0.1",
+      silent: true,
+      profiles: [CLAUDE_PROFILE],
+    })
+    const res = await app.fetch(responses({ model: "gpt-5-codex" }))
+
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({
+      error: { type: "invalid_request_error", message: "input: Field required", code: null },
+    })
+  })
+
+  test("a Claude model still reaches Claude on an enabled instance", async () => {
+    const { app } = createProxyServer({
+      port: 0,
+      host: "127.0.0.1",
+      silent: true,
+      profiles: [CLAUDE_PROFILE, CHATGPT_PROFILE],
+    })
+    const res = await app.fetch(responses({ model: "claude-sonnet-5" }))
+
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({
+      error: { type: "invalid_request_error", message: "input: Field required", code: null },
+    })
+  })
+
+  test("an unpinned model stays on Claude even on an enabled instance", async () => {
+    const { app } = createProxyServer({
+      port: 0,
+      host: "127.0.0.1",
+      silent: true,
+      profiles: [CLAUDE_PROFILE, CHATGPT_PROFILE],
+    })
+    const res = await app.fetch(responses({ model: "gpt-4o" }))
+
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({
+      error: { type: "invalid_request_error", message: "input: Field required", code: null },
     })
   })
 })

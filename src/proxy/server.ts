@@ -85,7 +85,7 @@ import { runTransformHook, buildPipeline, createRequestContext } from "./transfo
 import { getAdapterTransforms } from "./transforms/registry"
 import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
-import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, getEffectiveProfiles, restoreActiveProfile, type ResolvedProfile } from "./profiles"
+import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, getEffectiveProfiles, restoreActiveProfile, profilesForProvider, ProfileProviderMismatchError, type ResolvedAnthropicProfile } from "./profiles"
 import { createUpstreamRegistry, UnknownProviderError, type UpstreamEndpoint } from "./upstream/backend"
 import { createAnthropicBackend } from "./upstream/anthropic"
 import { providerForModel } from "./upstream/provider"
@@ -328,7 +328,7 @@ function forkAttemptMeta(meta: RequestMeta, attempt: number): RequestMeta {
   }
 }
 
-function credentialStoreForProfile(profile: ResolvedProfile): CredentialStore | undefined {
+function credentialStoreForProfile(profile: ResolvedAnthropicProfile): CredentialStore | undefined {
   if (profile.type !== "claude-max") return undefined
   return createPlatformCredentialStore(
     profile.env.CLAUDE_CONFIG_DIR ? { claudeConfigDir: profile.env.CLAUDE_CONFIG_DIR } : undefined
@@ -336,7 +336,11 @@ function credentialStoreForProfile(profile: ResolvedProfile): CredentialStore | 
 }
 
 async function ensureFreshTokenForProfiles(config: ProxyConfig): Promise<void> {
-  const profiles = getEffectiveProfiles(config.profiles)
+  // Filtered by provider BEFORE resolution, not after. Handing a ChatGPT
+  // profile to this loop would POST its refresh token to Anthropic's token
+  // endpoint, and ChatGPT refresh tokens are single-use: one such request
+  // ends the account permanently, recoverable only by a human re-login.
+  const profiles = profilesForProvider(getEffectiveProfiles(config.profiles), "anthropic")
   if (profiles.length === 0) return
 
   for (const profile of profiles) {
@@ -6601,6 +6605,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // route-declaration time.
   const upstream = createUpstreamRegistry<Context>()
 
+  // Resolved ONCE, here, and never per request. An instance that owns no
+  // ChatGPT accounts keeps translating GPT model names onto Claude exactly as
+  // it always has; only an instance that owns some routes them away. Deciding
+  // this per request instead would make it a cross-provider fallback, which
+  // is the thing provider scoping exists to prevent.
+  const ownedChatGptProfiles = profilesForProvider(getEffectiveProfiles(finalConfig.profiles), "openai")
+  const chatgptUpstreamEnabled = ownedChatGptProfiles.length > 0
+  const gptModelRouting = chatgptUpstreamEnabled ? "chatgpt" : "claude"
+
   // Hono memoizes the parsed body, so the handler downstream awaits this very
   // promise rather than re-reading a consumed stream. A rejection is memoized
   // too, which is why a malformed body is swallowed here on purpose: rethrowing
@@ -6616,10 +6629,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
   const dispatchUpstream = async (c: Context, endpoint: UpstreamEndpoint, route: string) => {
     const model = await peekRequestedModel(c)
-    const provider = providerForModel(model)
+    const provider = chatgptUpstreamEnabled ? providerForModel(model) : "anthropic"
     try {
       return await upstream.backendFor(provider).handle({ context: c, endpoint, route })
     } catch (error) {
+      if (error instanceof ProfileProviderMismatchError) {
+        return endpoint === "responses"
+          ? c.json({ error: { type: "invalid_request_error", message: error.message, code: null } }, 400)
+          : c.json({ type: "error", error: { type: "invalid_request_error", message: error.message } }, 400)
+      }
       if (!(error instanceof UnknownProviderError)) throw error
       const message = `Model "${model ?? "unknown"}" is served by the "${provider}" provider, `
         + "which this Meridian has no configured upstream for."
@@ -7062,6 +7080,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           build: currentBuild(),
           error: "Could not verify auth status",
           mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
+          upstream: { gptModels: gptModelRouting, chatgptAccounts: ownedChatGptProfiles.length },
         })
       }
       if (!auth.loggedIn) {
@@ -7070,7 +7089,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           version: serverVersion,
           build: currentBuild(),
           error: "Not logged in. Run: claude login",
-          auth: { loggedIn: false }
+          auth: { loggedIn: false },
+          upstream: { gptModels: gptModelRouting, chatgptAccounts: ownedChatGptProfiles.length },
         }, 503)
       }
       // Resolved Claude executable + which step produced it. Diagnostic
@@ -7105,6 +7125,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           ...renewal,
         },
         mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
+        upstream: { gptModels: gptModelRouting, chatgptAccounts: ownedChatGptProfiles.length },
         ...(claudeExecutableInfo ? { claudeExecutable: claudeExecutableInfo } : {}),
         plugin: { opencode: checkPluginConfigured() ? "configured" : "not-configured" },
       })
@@ -7115,6 +7136,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         build: currentBuild(),
         error: "Could not verify auth status",
         mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
+        upstream: { gptModels: gptModelRouting, chatgptAccounts: ownedChatGptProfiles.length },
       })
     }
   })
@@ -7125,6 +7147,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     const profiles = listProfiles(finalConfig.profiles, finalConfig.defaultProfile)
     // Enrich with live auth status
     const enriched = await Promise.all(profiles.map(async (p) => {
+      // A ChatGPT profile is listed with its provider and no Claude auth
+      // enrichment. Resolving one through the Anthropic chain would throw,
+      // and omitting it entirely would report a configured account as absent.
+      if (p.provider === "openai") {
+        return {
+          ...p,
+          email: null,
+          subscriptionType: null,
+          loggedIn: false,
+          lastCheckedAt: null,
+          lastSuccessAt: null,
+        }
+      }
       const resolved = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, p.id)
       const envOverrides = Object.keys(resolved.env).length > 0 ? resolved.env : undefined
       const auth = await getClaudeAuthStatusAsync(
@@ -7248,11 +7283,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   })
 
   app.post("/auth/refresh", async (c) => {
-    const profile = resolveProfile(
-      finalConfig.profiles,
-      finalConfig.defaultProfile,
-      c.req.header("x-meridian-profile") || undefined
-    )
+    // This route refreshes against Anthropic's token endpoint. A ChatGPT
+    // profile named here must be refused BEFORE any outbound request: its
+    // refresh token is single-use, so sending it to the wrong provider does
+    // not fail harmlessly, it destroys the account.
+    const requestedProfileId = c.req.header("x-meridian-profile") || undefined
+    let profile: ResolvedAnthropicProfile
+    try {
+      profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, requestedProfileId)
+    } catch (error) {
+      if (!(error instanceof ProfileProviderMismatchError)) throw error
+      return c.json({ success: false, message: error.message }, 400)
+    }
     const store = credentialStoreForProfile(profile)
     const success = store ? await refreshOAuthToken(store) : false
     if (success) {
@@ -7898,11 +7940,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // auth resolved by the design module (design token first, then profile
   // credentials).
   app.post("/v1/design/*", async (c) => {
-    const profile = resolveProfile(
-      finalConfig.profiles,
-      finalConfig.defaultProfile,
-      c.req.header("x-meridian-profile") || undefined
-    )
+    // Anthropic's Design API. A named ChatGPT profile carries no Claude
+    // credential to authenticate with, so it is refused rather than falling
+    // through to whatever credential the design module would find next.
+    let profile: ResolvedAnthropicProfile
+    try {
+      profile = resolveProfile(
+        finalConfig.profiles,
+        finalConfig.defaultProfile,
+        c.req.header("x-meridian-profile") || undefined
+      )
+    } catch (error) {
+      if (!(error instanceof ProfileProviderMismatchError)) throw error
+      return c.json({ type: "error", error: { type: "invalid_request_error", message: error.message } }, 400)
+    }
     const url = new URL(c.req.url)
     const upstreamUrl = `${DESIGN_UPSTREAM_ORIGIN}${url.pathname}${url.search}`
 
@@ -8057,6 +8108,10 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
       console.log(`Telemetry dashboard: http://${finalConfig.host}:${info.port}/telemetry`)
       const pins = resolveSdkModelDefaults()
       console.log(`Model pins: fable=${pins.ANTHROPIC_DEFAULT_FABLE_MODEL} opus=${pins.ANTHROPIC_DEFAULT_OPUS_MODEL} sonnet=${pins.ANTHROPIC_DEFAULT_SONNET_MODEL} haiku=${pins.ANTHROPIC_DEFAULT_HAIKU_MODEL}`)
+      // Resolved once and otherwise invisible. An instance whose mode nobody
+      // can read is how the 2026-09-04 outage stayed unnoticed for 13 hours.
+      const chatgptAccounts = profilesForProvider(getEffectiveProfiles(finalConfig.profiles), "openai").length
+      console.log(`GPT models: ${chatgptAccounts > 0 ? "chatgpt" : "claude"} (${chatgptAccounts} ChatGPT account(s) owned)`)
       // Surface the resolved Claude executable + which step picked it.
       // When users hit "wrong claude got picked" failure modes (e.g. a
       // bun-shimmed `claude` on PATH, see #478), this single line is what
@@ -8119,8 +8174,11 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
   if (effectiveProfiles.length > 0) {
     const AUTH_KEEPALIVE_MS = 45_000 // 45s — well within the 60s TTL
     authKeepaliveInterval = setInterval(async () => {
-      // Re-read effective profiles on each tick (picks up new profiles from disk)
-      const currentProfiles = getEffectiveProfiles(finalConfig.profiles)
+      // Re-read effective profiles on each tick (picks up new profiles from disk).
+      // Anthropic only. Each id goes below as an EXPLICIT request, so an
+      // unfiltered ChatGPT profile throws a provider mismatch inside a
+      // background interval - an unhandled rejection every 45 seconds.
+      const currentProfiles = profilesForProvider(getEffectiveProfiles(finalConfig.profiles), "anthropic")
       for (const profile of currentProfiles) {
         const resolved = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, profile.id)
         if (Object.keys(resolved.env).length > 0) {

@@ -52,11 +52,26 @@ export function loadProfilesFromDisk(): ProfileConfig[] {
   }
 }
 
+/**
+ * The three ANTHROPIC auth mechanisms. Not providers — `api` and
+ * `oauth-token` keep their current Anthropic meaning permanently and are
+ * never reinterpreted.
+ */
 export type ProfileType = "claude-max" | "api" | "oauth-token"
 
-export interface ProfileConfig {
+export type ProfileProvider = "anthropic" | "openai"
+
+export type ProfileAuthType = ProfileType | "chatgpt-oauth"
+
+export interface AnthropicProfileConfig {
   /** Unique profile identifier (e.g. "personal", "work") */
   id: string
+  /**
+   * Optional, and permanently so: every profile written before ChatGPT
+   * support existed omits it, and an untouched profiles.json has to keep
+   * working. An absent provider normalizes to "anthropic".
+   */
+  provider?: "anthropic"
   /**
    * Auth type. Inferred from the populated credential field when omitted:
    *   - `oauthToken`        → "oauth-token" (CLAUDE_CODE_OAUTH_TOKEN)
@@ -74,11 +89,102 @@ export interface ProfileConfig {
   oauthToken?: string
 }
 
-export interface ResolvedProfile {
+export interface OpenAIProfileConfig {
+  id: string
+  provider: "openai"
+  type?: "chatgpt-oauth"
+  /**
+   * Seat identity, the `chatgpt_account_user_id` claim. Deliberately NOT
+   * `accountId`: that one is shared between distinct users in a real pool, so
+   * keying anything on it merges two accounts into one.
+   */
+  accountUserId: string
+  /**
+   * Declared `never` rather than simply omitted. Omitting them would make a
+   * union whose members disagree about which fields exist, breaking every
+   * existing read of `profile.claudeConfigDir`; declaring them impossible
+   * keeps those reads compiling while making a Claude credential on a ChatGPT
+   * profile a compile error rather than a runtime discovery.
+   */
+  claudeConfigDir?: never
+  apiKey?: never
+  baseUrl?: never
+  oauthToken?: never
+}
+
+export type ProfileConfig = AnthropicProfileConfig | OpenAIProfileConfig
+
+export interface ResolvedAnthropicProfile {
+  provider: "anthropic"
   id: string
   type: ProfileType
   /** Env vars to overlay on the SDK subprocess environment */
   env: Record<string, string>
+}
+
+/**
+ * Carries NO `env`, and that absence is the safety property rather than an
+ * oversight: there is no shape in which a ChatGPT profile can be handed to
+ * the Claude environment builder or the Claude token refresher.
+ */
+export interface ResolvedOpenAIProfile {
+  provider: "openai"
+  id: string
+  authType: "chatgpt-oauth"
+  accountUserId: string
+}
+
+export type ResolvedProfile = ResolvedAnthropicProfile | ResolvedOpenAIProfile
+
+/** Answer this with a 4xx: it is never retryable and never a reason to fall back. */
+export class ProfileProviderMismatchError extends Error {
+  readonly profileId: string
+  readonly requestedProvider: ProfileProvider
+  readonly actualProvider: ProfileProvider
+
+  constructor(profileId: string, requestedProvider: ProfileProvider, actualProvider: ProfileProvider) {
+    super(
+      `Profile "${profileId}" authenticates against "${actualProvider}", `
+      + `but this request requires "${requestedProvider}".`,
+    )
+    this.name = "ProfileProviderMismatchError"
+    this.profileId = profileId
+    this.requestedProvider = requestedProvider
+    this.actualProvider = actualProvider
+  }
+}
+
+export class NoProfileForProviderError extends Error {
+  readonly provider: ProfileProvider
+
+  constructor(provider: ProfileProvider) {
+    super(`No profile is configured for the "${provider}" provider.`)
+    this.name = "NoProfileForProviderError"
+    this.provider = provider
+  }
+}
+
+export function profileProvider(profile: ProfileConfig): ProfileProvider {
+  return profile.provider === "openai" ? "openai" : "anthropic"
+}
+
+export function profilesForProvider(
+  profiles: readonly ProfileConfig[],
+  provider: "anthropic",
+): AnthropicProfileConfig[]
+export function profilesForProvider(
+  profiles: readonly ProfileConfig[],
+  provider: "openai",
+): OpenAIProfileConfig[]
+export function profilesForProvider(
+  profiles: readonly ProfileConfig[],
+  provider: ProfileProvider,
+): ProfileConfig[]
+export function profilesForProvider(
+  profiles: readonly ProfileConfig[],
+  provider: ProfileProvider,
+): ProfileConfig[] {
+  return profiles.filter(profile => profileProvider(profile) === provider)
 }
 
 const DEFAULT_PROFILE_ID = "default"
@@ -183,28 +289,97 @@ export function resolveProfile(
   defaultProfile: string | undefined,
   requestedId?: string,
   options?: ResolveProfileOptions
+): ResolvedAnthropicProfile {
+  return resolveProfileForProvider("anthropic", profiles, defaultProfile, requestedId, options)
+}
+
+export function resolveProfileForProvider(
+  provider: "anthropic",
+  profiles: ProfileConfig[] | undefined,
+  defaultProfile: string | undefined,
+  requestedId?: string,
+  options?: ResolveProfileOptions,
+): ResolvedAnthropicProfile
+export function resolveProfileForProvider(
+  provider: "openai",
+  profiles: ProfileConfig[] | undefined,
+  defaultProfile: string | undefined,
+  requestedId?: string,
+  options?: ResolveProfileOptions,
+): ResolvedOpenAIProfile
+export function resolveProfileForProvider(
+  provider: ProfileProvider,
+  profiles: ProfileConfig[] | undefined,
+  defaultProfile: string | undefined,
+  requestedId?: string,
+  options?: ResolveProfileOptions,
+): ResolvedProfile
+export function resolveProfileForProvider(
+  provider: ProfileProvider,
+  profiles: ProfileConfig[] | undefined,
+  defaultProfile: string | undefined,
+  requestedId?: string,
+  options?: ResolveProfileOptions,
 ): ResolvedProfile {
-  const effective = getEffectiveProfiles(profiles)
+  const all = getEffectiveProfiles(profiles)
+
+  // An explicitly named profile is a claim the client made. If it names a
+  // profile belonging to another vendor the claim is false, and serving it
+  // regardless is the cross-provider mix-up this scoping exists to prevent.
+  if (requestedId) {
+    const named = all.find(p => p.id === requestedId)
+    if (named && profileProvider(named) !== provider) {
+      throw new ProfileProviderMismatchError(requestedId, provider, profileProvider(named))
+    }
+  }
+
+  if (provider === "openai") {
+    const candidates = profilesForProvider(all, "openai")
+    if (candidates.length === 0) throw new NoProfileForProviderError("openai")
+    const chosen = requestedId
+      ? candidates.find(p => p.id === requestedId)
+      : candidates.find(p => p.id === activeProfileId)
+        ?? candidates.find(p => p.id === defaultProfile)
+        ?? candidates[0]
+    // An explicit id naming nothing at all errors here rather than falling
+    // back. Unlike the Anthropic chain there is no legacy behavior to keep.
+    if (!chosen) throw new NoProfileForProviderError("openai")
+    return {
+      provider: "openai",
+      id: chosen.id,
+      authType: "chatgpt-oauth",
+      accountUserId: chosen.accountUserId,
+    }
+  }
+
+  const candidates = profilesForProvider(all, "anthropic")
 
   // No profiles configured — return empty env (standard single-account mode)
-  if (effective.length === 0) {
-    return { id: DEFAULT_PROFILE_ID, type: "claude-max", env: {} }
+  if (candidates.length === 0) {
+    return { provider: "anthropic", id: DEFAULT_PROFILE_ID, type: "claude-max", env: {} }
   }
 
   // Sticky assignment: only in sticky mode, only with a session identity,
   // and always subordinate to an explicit header override.
   const stickyId =
     options?.routingMode === "sticky" && options.stickySessionKey
-      ? pickStickyProfile(options.stickySessionKey, effective.map(p => p.id))
+      ? pickStickyProfile(options.stickySessionKey, candidates.map(p => p.id))
       : undefined
 
+  // An ambient selection naming another vendor's profile is skipped in
+  // silence: that is a valid configuration rather than a typo, and warning
+  // about it on every /health and every 45s keepalive tick would be noise. An
+  // id naming nothing at all still reaches the warning below, as it always has.
+  const ambient = (id: string | undefined): string | undefined =>
+    id && all.some(p => p.id === id) && !candidates.some(p => p.id === id) ? undefined : id
+
   // Priority: header > sticky > active > config default > first profile
-  const resolvedId = requestedId || stickyId || activeProfileId || defaultProfile || effective[0]!.id
-  const profile = effective.find(p => p.id === resolvedId)
+  const resolvedId = requestedId || stickyId || ambient(activeProfileId) || ambient(defaultProfile) || candidates[0]!.id
+  const profile = candidates.find(p => p.id === resolvedId)
 
   if (!profile) {
     console.warn(`[meridian] Unknown profile "${resolvedId}". Using first configured profile.`)
-    return buildResolvedProfile(effective[0]!)
+    return buildResolvedProfile(candidates[0]!)
   }
 
   return buildResolvedProfile(profile)
@@ -213,7 +388,7 @@ export function resolveProfile(
 /**
  * Build env overrides for a profile config.
  */
-function buildResolvedProfile(profile: ProfileConfig): ResolvedProfile {
+function buildResolvedProfile(profile: AnthropicProfileConfig): ResolvedAnthropicProfile {
   if (profile.oauthToken || profile.type === "oauth-token") {
     const env: Record<string, string> = {}
     if (profile.oauthToken) {
@@ -224,7 +399,7 @@ function buildResolvedProfile(profile: ProfileConfig): ResolvedProfile {
       // to ~/.claude — see query.ts re: upstream claude-code#20553.
       env.CLAUDE_CONFIG_DIR = join(homedir(), ".config", "meridian", "profiles", profile.id)
     }
-    return { id: profile.id, type: "oauth-token", env }
+    return { provider: "anthropic", id: profile.id, type: "oauth-token", env }
   }
 
   const type = profile.type ?? "claude-max"
@@ -233,13 +408,13 @@ function buildResolvedProfile(profile: ProfileConfig): ResolvedProfile {
     const env: Record<string, string> = {}
     if (profile.apiKey) env.ANTHROPIC_API_KEY = profile.apiKey
     if (profile.baseUrl) env.ANTHROPIC_BASE_URL = profile.baseUrl
-    return { id: profile.id, type, env }
+    return { provider: "anthropic", id: profile.id, type, env }
   }
 
   // claude-max: override config directory
   const env: Record<string, string> = {}
   if (profile.claudeConfigDir) env.CLAUDE_CONFIG_DIR = profile.claudeConfigDir
-  return { id: profile.id, type, env }
+  return { provider: "anthropic", id: profile.id, type, env }
 }
 
 /**
@@ -248,14 +423,15 @@ function buildResolvedProfile(profile: ProfileConfig): ResolvedProfile {
 export function listProfiles(
   profiles: ProfileConfig[] | undefined,
   defaultProfile: string | undefined
-): Array<{ id: string; type: ProfileType; isActive: boolean }> {
+): Array<{ id: string; provider: ProfileProvider; type: ProfileAuthType; isActive: boolean }> {
   const effective = getEffectiveProfiles(profiles)
   if (effective.length === 0) return []
 
   const currentActive = activeProfileId || defaultProfile || effective[0]!.id
   return effective.map(p => ({
     id: p.id,
-    type: p.type ?? "claude-max",
+    provider: profileProvider(p),
+    type: p.provider === "openai" ? "chatgpt-oauth" : (p.type ?? "claude-max"),
     isActive: p.id === currentActive,
   }))
 }
