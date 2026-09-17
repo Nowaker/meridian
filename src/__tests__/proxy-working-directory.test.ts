@@ -6,13 +6,18 @@
  * not the proxy's installation directory.
  *
  * Configurable via CLAUDE_PROXY_WORKDIR env var. When the resolved cwd
- * doesn't exist on the proxy host (remote-server case, issue #381) we
- * fall back to process.cwd() to keep the SDK spawn from dying with
- * ENOENT.
+ * doesn't exist on the proxy host (remote-server case, issue #381) we fall
+ * back to a neutral directory to keep the SDK spawn from dying with ENOENT
+ * — neutral rather than process.cwd(), so the claude_code preset cannot
+ * report meridian's own branch and commits as the client's repository.
+ *
+ * A request that claims no directory at all still defaults to process.cwd(),
+ * because that value is claimed and so keys fingerprint bucketing.
  */
 
 import { describe, it, expect, mock, beforeEach } from "bun:test"
 import { tmpdir } from "node:os"
+import { neutralSdkWorkingDirectory } from "../proxy/cwd"
 import { assistantMessage } from "./helpers"
 
 let mockMessages: any[] = []
@@ -98,7 +103,7 @@ describe("Working directory", () => {
     }
   })
 
-  it("should fall back to process.cwd() when CLAUDE_PROXY_WORKDIR points at a non-existent path (#381)", async () => {
+  it("should fall back to the neutral directory when CLAUDE_PROXY_WORKDIR points at a non-existent path (#381)", async () => {
     const original = process.env.CLAUDE_PROXY_WORKDIR
     process.env.CLAUDE_PROXY_WORKDIR = "/this/definitely/does/not/exist/zzz"
 
@@ -111,14 +116,14 @@ describe("Working directory", () => {
         messages: [{ role: "user", content: "hello" }],
       })).json()
 
-      expect(capturedQueryParams.options.cwd).toBe(process.cwd())
+      expect(capturedQueryParams.options.cwd).toBe(neutralSdkWorkingDirectory())
     } finally {
       if (original) process.env.CLAUDE_PROXY_WORKDIR = original
       else delete process.env.CLAUDE_PROXY_WORKDIR
     }
   })
 
-  it("should fall back to process.cwd() when client-supplied cwd doesn't exist (#381 remote-host case)", async () => {
+  it("should fall back to the neutral directory when client-supplied cwd doesn't exist (#381 remote-host case)", async () => {
     const original = process.env.CLAUDE_PROXY_WORKDIR
     delete process.env.CLAUDE_PROXY_WORKDIR
     delete process.env.MERIDIAN_WORKDIR
@@ -136,7 +141,8 @@ describe("Working directory", () => {
         messages: [{ role: "user", content: "hello" }],
       })).json()
 
-      expect(capturedQueryParams.options.cwd).toBe(process.cwd())
+      expect(capturedQueryParams.options.cwd).not.toBe(process.cwd())
+      expect(capturedQueryParams.options.cwd).toBe(neutralSdkWorkingDirectory())
     } finally {
       if (original) process.env.CLAUDE_PROXY_WORKDIR = original
     }

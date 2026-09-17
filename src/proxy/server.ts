@@ -10,7 +10,7 @@ import { rateLimitStore } from "./rateLimitStore"
 import { guardUpstreamIdle, UpstreamIdleError } from "./streamIdleGuard"
 import { linkRequestAbort } from "./requestAbort"
 import { fetchOAuthUsage, fetchOAuthUsageResult } from "./oauthUsage"
-import { resolveSdkWorkingDirectory } from "./cwd"
+import { neutralSdkWorkingDirectory, resolveSdkWorkingDirectory } from "./cwd"
 import type { Context } from "hono"
 import { DEFAULT_PROXY_CONFIG } from "./types"
 import { env, envBool } from "../env"
@@ -841,7 +841,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // Issue #381 — when meridian runs on a remote host and the client is
         // on another machine, the claimed cwd may not exist locally; the SDK
         // would otherwise fail with a misleading "binary not found" error.
-        // resolveSdkWorkingDirectory falls back to process.cwd() in that case.
+        // resolveSdkWorkingDirectory falls back to a neutral directory then.
         const cwdResolution = resolveSdkWorkingDirectory({
           envOverride: process.env.MERIDIAN_WORKDIR ?? process.env.CLAUDE_PROXY_WORKDIR,
           // Adapters that hand back an SDK-safe path win. Otherwise fall back to
@@ -849,7 +849,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           // so the subprocess never chdirs into a layout that may not exist
           // here). resolveSdkWorkingDirectory validates existence, so this is
           // only adopted when the directory is genuinely present on the proxy
-          // host; a remote client still falls back to process.cwd() as in #381.
+          // host; a remote client still falls back as in #381.
           //
           // Without this the SDK chdirs to the proxy's own directory and its
           // env block advertises that path, so the model composes absolute
@@ -857,8 +857,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           // while reporting success (#744). Adopting the client's path when it
           // exists removes the contradiction at the source rather than relying
           // on the cwd note to argue the model out of it.
+          //
+          // neutralFallback applies that same principle to the case where no
+          // client path exists here: an empty directory outside any repository,
+          // so the preset cannot report meridian's own branch and commits to a
+          // remote client as that client's repository. `fallback` stays
+          // process.cwd() because it is *claimed*, and so keys fingerprint
+          // bucketing for clients that report no directory at all.
           adapterCwd: adapter.extractWorkingDirectory(body) ?? adapter.extractClientWorkingDirectory?.(body),
           fallback: process.cwd(),
+          neutralFallback: neutralSdkWorkingDirectory(),
         })
         const workingDirectory = cwdResolution.workingDirectory
         if (cwdResolution.fellBack) {
