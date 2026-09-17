@@ -205,6 +205,13 @@ function computePassthroughMaxTurns(
  * (typical of a remote Claude Code → network-proxy setup). Without this note
  * the SDK's env block leaks `sdkCwd` into the model's context and Claude
  * reports that as its working directory.
+ *
+ * That same block also states a platform, OS version and shell. Those belong
+ * to the subprocess and cannot be removed from here — the preset is generated
+ * inside the SDK and we may only append to it — but in passthrough mode the
+ * tool calls execute back on the CLIENT, so an unqualified `Platform: linux`
+ * sends a macOS client down the wrong shell, sudo and coreutils paths. Scope
+ * them instead.
  */
 export function buildCwdNote(sdkCwd: string, clientCwd?: string): string {
   if (!clientCwd || clientCwd === sdkCwd) return ""
@@ -221,7 +228,10 @@ export function buildCwdNote(sdkCwd: string, clientCwd?: string): string {
     `<meridian-note>\n` +
     `You are reached through a proxy. The subprocess running you resides at ` +
     `"${sdkCwd}" on the proxy host, but that is not the user's working directory. ` +
-    `Always treat "${clientCwd}" as the working directory when referring to files or paths.\n` +
+    `Always treat "${clientCwd}" as the working directory when referring to files or paths. ` +
+    `The \`# Environment\` block describes that same proxy host: its platform, OS version ` +
+    `and shell belong to the subprocess, not necessarily to the machine where your tool ` +
+    `calls actually run. Prefer platform facts from the client's own context.\n` +
     `</meridian-note>`
   )
 }
