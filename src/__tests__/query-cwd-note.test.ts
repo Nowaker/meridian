@@ -47,4 +47,14 @@ describe("buildCwdNote", () => {
   it("treats an empty clientCwd as no-op", () => {
     expect(buildCwdNote("/srv/proxy", "")).toBe("")
   })
+
+  // The preset's platform/OS/shell describe the SDK subprocess. Passthrough
+  // runs the tools back on the client, so an unqualified "Platform: linux"
+  // sends a macOS client down the wrong sudo and coreutils paths.
+  it("scopes the preset's platform facts to the proxy host", () => {
+    const note = buildCwdNote("/srv/proxy", "/Users/alice/app")
+    expect(note).toContain("# Environment")
+    expect(note).toContain("platform, OS version")
+    expect(note).toContain("not necessarily")
+  })
 })

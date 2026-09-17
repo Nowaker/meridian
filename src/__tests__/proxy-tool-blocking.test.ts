@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { neutralSdkWorkingDirectory } from "../proxy/cwd"
 import { assistantMessage } from "./helpers"
 
 let capturedQueryParams: any = null
@@ -219,7 +220,8 @@ describe("SDK cwd for a claude-code client (#744)", () => {
     // would fail the SDK spawn with a misleading error.
     return postAs(systemFor("/definitely/not/here/meridian-744")).then((params) => {
       expect(params?.options?.cwd).not.toBe("/definitely/not/here/meridian-744")
-      expect(params?.options?.cwd).toBe(process.cwd())
+      expect(params?.options?.cwd).not.toBe(process.cwd())
+      expect(params?.options?.cwd).toBe(neutralSdkWorkingDirectory())
     })
   })
 })
