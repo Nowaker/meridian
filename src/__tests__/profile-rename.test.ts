@@ -21,6 +21,7 @@ import {
   resetActiveProfile,
   type ProfileConfig,
 } from "../proxy/profiles"
+import { resolvePriorityOrder } from "../proxy/routing"
 import { setSetting, getSetting } from "../settings"
 
 const PROFILES_DIR = "/cfg/meridian/profiles"
@@ -348,6 +349,36 @@ describe("applyProfileRename", () => {
     applyProfileRename("work", "employer", { profilesDir, configFile })
 
     expect(getSetting("activeProfile")).toBe("personal")
+  })
+
+  test("renaming a profile outside the pool order leaves it alone", () => {
+    seed([{ id: "work" }, { id: "spare" }])
+    setSetting("profileOrder", ["spare"])
+
+    applyProfileRename("work", "employer", { profilesDir, configFile })
+
+    expect(getSetting("profileOrder")).toEqual(["spare"])
+  })
+
+  test("the pool order follows the rename, keeping the profile's position", () => {
+    seed([{ id: "work" }, { id: "spare" }])
+    setSetting("profileOrder", ["work", "spare"])
+
+    const result = applyProfileRename("work", "employer", { profilesDir, configFile })
+
+    expect(result.ok).toBe(true)
+    expect(getSetting("profileOrder")).toEqual(["employer", "spare"])
+    expect(resolvePriorityOrder(["employer", "spare"], getSetting("profileOrder")))
+      .toEqual({ order: ["employer", "spare"], unknown: [] })
+  })
+
+  test("renaming a different profile leaves the pool order alone", () => {
+    seed([{ id: "work" }, { id: "personal" }])
+    setSetting("profileOrder", ["personal", "work"])
+
+    applyProfileRename("work", "employer", { profilesDir, configFile })
+
+    expect(getSetting("profileOrder")).toEqual(["personal", "employer"])
   })
 
   test("a renamed profile still resolves under its old name", () => {
