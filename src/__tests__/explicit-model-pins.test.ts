@@ -11,9 +11,12 @@
 
 import { describe, it, expect, mock, beforeEach } from "bun:test"
 
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 // ---------- unit: explicitModelPin + canonical bump ----------
 
-const { explicitModelPin, CANONICAL_SONNET_MODEL, CANONICAL_OPUS_MODEL } = await import("../proxy/models")
+const { explicitModelPin, CANONICAL_FABLE_MODEL, CANONICAL_SONNET_MODEL, CANONICAL_OPUS_MODEL } = await import("../proxy/models")
 
 describe("explicitModelPin (#631)", () => {
   it("pins fully-versioned sonnet ids", () => {
@@ -22,6 +25,7 @@ describe("explicitModelPin (#631)", () => {
   })
 
   it("pins fully-versioned opus and date-suffixed haiku ids", () => {
+    expect(explicitModelPin("claude-opus-5-5[1m]")).toEqual({ ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-opus-5-5" })
     expect(explicitModelPin("claude-opus-5")).toEqual({ ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-opus-5" })
     expect(explicitModelPin("claude-opus-4-7")).toEqual({ ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-opus-4-7" })
     expect(explicitModelPin("claude-haiku-4-5-20251001")).toEqual({ ANTHROPIC_DEFAULT_HAIKU_MODEL: "claude-haiku-4-5-20251001" })
@@ -29,6 +33,7 @@ describe("explicitModelPin (#631)", () => {
 
   it("routes mythos ids through the fable tier pin", () => {
     expect(explicitModelPin("claude-mythos-5")).toEqual({ ANTHROPIC_DEFAULT_FABLE_MODEL: "claude-mythos-5" })
+    expect(explicitModelPin("claude-fable-5-1")).toEqual({ ANTHROPIC_DEFAULT_FABLE_MODEL: "claude-fable-5-1" })
     expect(explicitModelPin("claude-fable-5")).toEqual({ ANTHROPIC_DEFAULT_FABLE_MODEL: "claude-fable-5" })
   })
 
@@ -54,7 +59,13 @@ describe("canonical sonnet pin (#631)", () => {
 
 describe("canonical opus pin", () => {
   it("bare opus means the current Opus", () => {
-    expect(CANONICAL_OPUS_MODEL).toBe("claude-opus-5")
+    expect(CANONICAL_OPUS_MODEL).toBe("claude-opus-5-5")
+  })
+})
+
+describe("canonical fable pin", () => {
+  it("bare fable means the current Fable", () => {
+    expect(CANONICAL_FABLE_MODEL).toBe("claude-fable-5-1")
   })
 })
 
@@ -62,7 +73,9 @@ describe("canonical opus pin", () => {
 
 let queryEnvs: Array<Record<string, string | undefined>> = []
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+import { resolveMockSdkSessionId } from "./helpers"
+
+installSdkMock(() => ({
   query: (opts: any) => {
     queryEnvs.push(opts.options?.env || {})
     return (async function* () {
@@ -78,20 +91,20 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
           stop_reason: "end_turn",
           usage: { input_tokens: 5, output_tokens: 2 },
         },
-        session_id: "sdk-1",
+        session_id: resolveMockSdkSessionId(opts.options, "sdk-1"),
       }
     })()
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "explicit-model-pins.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -134,10 +147,10 @@ describe("explicit model pins reach the subprocess env (#631)", () => {
     expect(queryEnvs[0]!.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("claude-sonnet-5")
   })
 
-  it("bare opus resolves via the canonical pin (now Opus 5)", async () => {
+  it("bare opus resolves via the canonical pin (now Opus 5.5)", async () => {
     const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
     const res = await post(app, "opus")
     expect(res.status).toBe(200)
-    expect(queryEnvs[0]!.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe("claude-opus-5")
+    expect(queryEnvs[0]!.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe("claude-opus-5-5")
   })
 })

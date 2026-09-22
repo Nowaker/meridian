@@ -7,6 +7,9 @@
 
 import { describe, it, expect, mock, beforeEach } from "bun:test"
 
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 // A real, valid 1x1 red PNG (69 bytes).
 const RED_PNG_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
@@ -15,7 +18,9 @@ const RED_PNG_B64 =
 // iterable of user messages; a dropped image degrades this to a plain string.
 let capturedPrompt: any = null
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+import { resolveMockSdkSessionId } from "./helpers"
+
+installSdkMock(() => ({
   query: (opts: any) => {
     capturedPrompt = opts.prompt
     return (async function* () {
@@ -31,20 +36,20 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
           stop_reason: "end_turn",
           usage: { input_tokens: 20, output_tokens: 5 },
         },
-        session_id: "sdk-1",
+        session_id: resolveMockSdkSessionId(opts.options, "sdk-1"),
       }
     })()
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: { tool: () => {}, registerTool: () => ({}) } }),
   tool: () => ({}),
-}))
+}), "proxy-responses-image.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 

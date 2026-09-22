@@ -3,17 +3,23 @@ import { openCodeTransforms } from "./opencode"
 import { crushTransforms } from "./crush"
 import { droidTransforms } from "./droid"
 import { piTransforms } from "./pi"
+import { primeTransforms } from "./prime"
 import { forgeCodeTransforms } from "./forgecode"
 import { passthroughTransforms } from "./passthrough"
 import { cherryTransforms } from "./cherry"
 import { codexTransforms } from "./codex"
 import { claudeCodeTransforms } from "./claudecode"
+import { polytokenTransforms } from "./polytoken"
 
 const ADAPTER_TRANSFORMS: Record<string, readonly Transform[]> = {
   opencode: openCodeTransforms,
   crush: crushTransforms,
   droid: droidTransforms,
   pi: piTransforms,
+  // Prime Agent is a Pi fork with a different tool surface (one `ipython`
+  // tool, not Pi's read/write/edit/bash/glob/grep), so it needs its own
+  // config rather than sharing Pi's.
+  prime: primeTransforms,
   forgecode: forgeCodeTransforms,
   passthrough: passthroughTransforms,
   cherry: cherryTransforms,
@@ -32,6 +38,10 @@ const ADAPTER_TRANSFORMS: Record<string, readonly Transform[]> = {
   // Codex (/v1/responses): OpenCode's tool config + a follow-on transform
   // that forces passthrough (Codex executes its own tools). See #475.
   codex: [...openCodeTransforms, ...codexTransforms],
+  // Polytoken native client: pure passthrough plumbing keyed by base name.
+  // Keyed by adapter.name ("polytoken"); instances resolve behavior via
+  // baseName, so an instance keeps these transforms.
+  polytoken: polytokenTransforms,
 }
 
 export function getAdapterTransforms(adapterName: string): readonly Transform[] {

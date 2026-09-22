@@ -1,0 +1,29 @@
+# gitleaks false positives, all in upstream's own test files.
+#
+# Each entry is file:rule:line for a `generic-api-key` hit on a TEST FIXTURE,
+# not a credential: openai-responses/proxy-responses-endpoint use 36-char
+# session cache keys, priority-session-store uses "conversation-*" route keys.
+# The rule matches on entropy and variable naming, not on a real secret.
+#
+# All three files are byte-identical to rynfar/meridian upstream/main, so this
+# content is already public. Verified at the 1.75.0 merge.
+#
+# Fingerprints carry line numbers on purpose: if upstream edits these files the
+# entries stop matching and the scan blocks again, forcing a fresh look.
+src/__tests__/openai-responses.test.ts:generic-api-key:629
+src/__tests__/openai-responses.test.ts:generic-api-key:636
+src/__tests__/openai-responses.test.ts:generic-api-key:644
+src/__tests__/proxy-responses-endpoint.test.ts:generic-api-key:253
+src/__tests__/priority-session-store.test.ts:generic-api-key:101
+src/__tests__/priority-session-store.test.ts:generic-api-key:440
+src/__tests__/priority-session-store.test.ts:generic-api-key:459
+src/__tests__/priority-session-store.test.ts:generic-api-key:479
+src/__tests__/priority-session-store.test.ts:generic-api-key:530
+src/__tests__/priority-session-store.test.ts:generic-api-key:538
+src/__tests__/priority-session-store.test.ts:generic-api-key:549
+src/__tests__/priority-session-store.test.ts:generic-api-key:867
+
+# Same story under the DreamHost custom ruleset: an upstream test sets
+# process.env.OPENAI_API_KEY to a literal beginning "fixture-". File is
+# byte-identical to upstream/main.
+src/__tests__/antigravity-gaps.test.ts:dreamhost-service-credentials:297

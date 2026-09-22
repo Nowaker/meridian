@@ -5,7 +5,7 @@
  * observability and routing hygiene, not durable truth. After a restart the
  * next refusal re-establishes everything.
  *
- * `RefusalStore` holds the latest refusal per profile, so a UI can say "this
+ * `SpentStore` holds the latest refusal per profile, so a UI can say "this
  * account is refusing" alongside the cached percentages instead of replacing
  * them. Measured on the live fleet: an account rendered `5h 67% / 7d 7%` while
  * every request through it was being refused, because those percentages are a
@@ -25,7 +25,7 @@
 
 import type { LimitDiagnosis } from "./limitDetection"
 
-export interface RefusalRecord {
+export interface SpentRecord {
   profileId: string
   /** When the refusal was observed (epoch ms). */
   at: number
@@ -39,10 +39,10 @@ export interface RefusalRecord {
 /**
  * How long a refusal stands when nothing told us when the window reopens.
  * Matches the priority router's own conservative default, so an account is
- * never shown as refusing for longer than routing would avoid it.
+ * never shown as spent for longer than routing would avoid it.
  */
 const SPENT_DEFAULT_TTL_MS = 10 * 60_000
-/** Longest a single refusal is allowed to keep an account marked refusing. */
+/** Longest a single refusal is allowed to keep an account marked spent. */
 const SPENT_MAX_TTL_MS = 6 * 60 * 60_000
 
 /**
@@ -50,8 +50,8 @@ const SPENT_MAX_TTL_MS = 6 * 60 * 60_000
  * read-time expiry `ProfileExhaustion` uses, so the two never disagree about
  * whether an account is currently in trouble).
  */
-export class RefusalStore {
-  private readonly records = new Map<string, RefusalRecord>()
+export class SpentStore {
+  private readonly records = new Map<string, SpentRecord>()
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -60,13 +60,13 @@ export class RefusalStore {
    * exhaustion mark (where a longer cooldown must win), the newest refusal is
    * by definition the best description of the account's current state.
    */
-  record(profileId: string, diagnosis: LimitDiagnosis, message: string): RefusalRecord {
+  record(profileId: string, diagnosis: LimitDiagnosis, message: string): SpentRecord {
     const at = this.now()
     const resets = diagnosis.resetsAt
     const until = resets && resets > at
       ? Math.min(resets, at + SPENT_MAX_TTL_MS)
       : at + SPENT_DEFAULT_TTL_MS
-    const record: RefusalRecord = {
+    const record: SpentRecord = {
       profileId,
       at,
       diagnosis,
@@ -77,7 +77,7 @@ export class RefusalStore {
     return record
   }
 
-  get(profileId: string): RefusalRecord | undefined {
+  get(profileId: string): SpentRecord | undefined {
     const record = this.records.get(profileId)
     if (!record) return undefined
     if (record.until !== null && record.until <= this.now()) {
@@ -88,8 +88,8 @@ export class RefusalStore {
   }
 
   /** Live records only - expired ones are dropped on read. */
-  snapshot(): RefusalRecord[] {
-    const out: RefusalRecord[] = []
+  snapshot(): SpentRecord[] {
+    const out: SpentRecord[] = []
     for (const id of [...this.records.keys()]) {
       const record = this.get(id)
       if (record) out.push(record)

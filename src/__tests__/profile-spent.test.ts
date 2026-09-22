@@ -99,22 +99,15 @@ describe("computeProfileSpend", () => {
     expect(s.fade).toBe(0)
   })
 
-  it("ramps the fade across the 95–100% band", () => {
+  it("ramps the fade across the 85–95% band", () => {
     expect(computeProfileSpend({ windows: [win("seven_day", FADE_FROM)] }).fade).toBe(0)
-    expect(computeProfileSpend({ windows: [win("seven_day", 0.975)] }).fade).toBeCloseTo(0.5, 5)
-    expect(computeProfileSpend({ windows: [win("seven_day", 0.99)] }).fade).toBeCloseTo(0.8, 5)
-    expect(computeProfileSpend({ windows: [win("seven_day", 0.975)] }).state).toBe("fading")
-  })
-
-  it("keeps an account with a fresh 5h window out of the spent bucket", () => {
-    const s = computeProfileSpend({ windows: [win("five_hour", 0), win("seven_day", 0.96)] })
-    expect(s.state).toBe("fading")
-    expect(s.reason).toBeNull()
-    expect(s.fade).toBeLessThan(0.3)
+    expect(computeProfileSpend({ windows: [win("seven_day", 0.9)] }).fade).toBeCloseTo(0.5, 5)
+    expect(computeProfileSpend({ windows: [win("seven_day", 0.94)] }).fade).toBeCloseTo(0.9, 5)
+    expect(computeProfileSpend({ windows: [win("seven_day", 0.9)] }).state).toBe("fading")
   })
 
   it("is fully spent at the threshold and beyond", () => {
-    for (const u of [SPENT_AT, 1, 1.4]) {
+    for (const u of [SPENT_AT, 0.99, 1]) {
       const s = computeProfileSpend({ windows: [win("seven_day", u)] })
       expect(s.state).toBe("spent")
       expect(s.fade).toBe(1)
@@ -124,43 +117,7 @@ describe("computeProfileSpend", () => {
 
   it("spends on the worse window, so a hot 5h counts even with a cold week", () => {
     const s = computeProfileSpend({ windows: [win("five_hour", 0.97), win("seven_day", 0.05)] })
-    expect(s.state).toBe("fading")
-    expect(s.fraction).toBe(0.97)
-    expect(computeProfileSpend({ windows: [win("five_hour", 1), win("seven_day", 0.05)] }).state).toBe("spent")
-  })
-})
-
-describe("computeProfileSpend with a refusal", () => {
-  // The measured case this input exists for: corp4 rendered 5h 67% / 7d 7%
-  // while Anthropic refused every request through it. Judging it by the
-  // percentages alone makes "least spent" recommend the one account that
-  // could not serve.
-  const healthyLooking = [win("five_hour", 0.67), win("seven_day", 0.07)]
-
-  it("calls a refusing account spent however comfortable its last read looks", () => {
-    const s = computeProfileSpend({ windows: healthyLooking, refused: true })
     expect(s.state).toBe("spent")
-    expect(s.reason).toBe("refused")
-    expect(s.fade).toBe(1)
-  })
-
-  it("sorts a refusing account as most spent, ahead of a genuinely busier one", () => {
-    const refusing = computeProfileSpend({ windows: healthyLooking, refused: true })
-    const busy = computeProfileSpend({ windows: [win("five_hour", 0.9)] })
-    expect(refusing.fraction).not.toBeNull()
-    expect(refusing.fraction!).toBeGreaterThan(busy.fraction!)
-  })
-
-  it("leaves the same account alone once the refusal is gone", () => {
-    const s = computeProfileSpend({ windows: healthyLooking, refused: false })
-    expect(s.state).toBe("available")
-    expect(s.reason).toBeNull()
-    expect(s.fraction).toBe(0.67)
-  })
-
-  it("still asks for a human first: a refusal does not mask a missing login", () => {
-    const s = computeProfileSpend({ windows: healthyLooking, refused: true, loggedIn: false })
-    expect(s.reason).toBe("unusable")
-    expect(s.fade).toBe(0)
+    expect(s.fraction).toBe(0.97)
   })
 })

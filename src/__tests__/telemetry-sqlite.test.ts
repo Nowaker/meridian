@@ -2,7 +2,9 @@ import { describe, expect, it, beforeEach, afterEach } from "bun:test"
 import { mkdtempSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
+import Database from "libsql"
 import { createSqliteStores } from "../telemetry/sqlite"
+import { collapseRouteChains, summarizeRoutes } from "../telemetry/routeChain"
 import type { ITelemetryStore, IDiagnosticLogStore, RequestMetric } from "../telemetry/types"
 
 function makeMetric(overrides: Partial<RequestMetric> = {}): RequestMetric {
@@ -63,6 +65,21 @@ describe("SqliteTelemetryStore", () => {
     }
     const recent = store.getRecent({ limit: 3 })
     expect(recent.length).toBe(3)
+  })
+
+  it("describes itself as durable, with the retention and file behind it", () => {
+    store.record(makeMetric({ timestamp: 5_000 }))
+    store.record(makeMetric({ timestamp: 9_000 }))
+
+    const described = store.describe()
+    expect(described.kind).toBe("sqlite")
+    expect(described.held).toBe(2)
+    expect(described.retentionDays).toBe(7)
+    expect(described.oldestTimestamp).toBe(5_000)
+    expect(described.dbPath).toBe(join(tmpDir, "test.db"))
+    expect(described.dbBytes).toBeGreaterThan(0)
+    // A ring capacity would be a lie here: nothing is evicted by count.
+    expect(described.capacity).toBeUndefined()
   })
 
   it("filters by model", () => {
@@ -145,6 +162,8 @@ describe("SqliteTelemetryStore", () => {
       sdkSessionId: "sess-abc",
       status: 200,
       queueWaitMs: 5,
+      sessionQueueWaitMs: 2,
+      sdkQueueWaitMs: 3,
       proxyOverheadMs: 12,
       ttfbMs: 120,
       upstreamDurationMs: 800,
@@ -175,6 +194,8 @@ describe("SqliteTelemetryStore", () => {
     expect(retrieved!.sessionDiscoveredCount).toBe(3)
     expect(retrieved!.messageCount).toBe(5)
     expect(retrieved!.sdkSessionId).toBe("sess-abc")
+    expect(retrieved!.sessionQueueWaitMs).toBe(2)
+    expect(retrieved!.sdkQueueWaitMs).toBe(3)
     expect(retrieved!.inputTokens).toBe(1200)
     expect(retrieved!.outputTokens).toBe(340)
     expect(retrieved!.cacheReadInputTokens).toBe(900)
@@ -366,17 +387,148 @@ describe("SqliteTelemetryStore — memory-store parity for newer fields", () => 
     expect(summary.envelopeViolationCount).toBe(1)
   })
 
-  it("migrates a pre-existing DB created before the new columns", () => {
+  it("migrates a genuinely legacy DB that predates the added columns", () => {
     const dbPath = join(tmpDir, "t3.db")
-    // First open creates the schema (current); to simulate an OLD db we drop
-    // the new columns' data path by writing a metric without them, closing,
-    // and re-opening — the ALTER TABLE migrations must be idempotent.
+
+    // Build the OLD table by hand. Opening through createSqliteStores would
+    // create today's schema, so every ALTER TABLE could be deleted and the
+    // test would still pass — it has to start from a table that really is
+    // missing the columns.
+    const legacy = new Database(dbPath)
+    legacy.exec(`
+      CREATE TABLE metrics (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id           TEXT    NOT NULL,
+        timestamp            INTEGER NOT NULL,
+        adapter              TEXT,
+        model                TEXT    NOT NULL,
+        request_model        TEXT,
+        mode                 TEXT    NOT NULL,
+        is_resume            INTEGER NOT NULL,
+        is_passthrough       INTEGER NOT NULL,
+        lineage_type         TEXT,
+        has_deferred_tools   INTEGER,
+        deferred_tool_count  INTEGER,
+        tool_count           INTEGER,
+        discovered_tools     TEXT,
+        session_discovered_count INTEGER,
+        message_count        INTEGER,
+        sdk_session_id       TEXT,
+        status               INTEGER NOT NULL,
+        queue_wait_ms        REAL    NOT NULL,
+        proxy_overhead_ms    REAL    NOT NULL,
+        ttfb_ms              REAL,
+        upstream_duration_ms REAL    NOT NULL,
+        total_duration_ms    REAL    NOT NULL,
+        content_blocks       INTEGER NOT NULL,
+        text_events          INTEGER NOT NULL,
+        error                TEXT,
+        input_tokens         INTEGER,
+        output_tokens        INTEGER,
+        cache_read_input_tokens INTEGER,
+        cache_creation_input_tokens INTEGER,
+        cache_hit_rate       REAL
+      );
+    `)
+    const legacyColumns = (legacy.prepare("PRAGMA table_info(metrics)").all() as Array<{ name: string }>)
+      .map(c => c.name)
+    expect(legacyColumns).not.toContain("session_queue_wait_ms")
+    expect(legacyColumns).not.toContain("sdk_queue_wait_ms")
+    expect(legacyColumns).not.toContain("profile_id")
+    expect(legacyColumns).not.toContain("route_kind")
+    expect(legacyColumns).not.toContain("route_refused_bucket")
+
+    legacy.exec(`
+      INSERT INTO metrics (
+        request_id, timestamp, model, mode, is_resume, is_passthrough, status,
+        queue_wait_ms, proxy_overhead_ms, ttfb_ms, upstream_duration_ms,
+        total_duration_ms, content_blocks, text_events
+      ) VALUES ('req-old', ${Date.now()}, 'sonnet', 'stream', 0, 0, 200, 5, 12, 120, 800, 850, 3, 10);
+    `)
+    legacy.close()
+
+    // Opening through the real entrypoint must run the ALTERs in place.
+    const migrated = createSqliteStores(dbPath, 7)
+    migrated.telemetry.record(makeMetric({
+      requestId: "req-new",
+      profileId: "work",
+      sessionQueueWaitMs: 42,
+      sdkQueueWaitMs: 7,
+      routeKind: "active+priority-hop",
+      routeGroupId: "g1",
+      routeAttempt: 2,
+      routeRefusedBucket: "five_hour",
+    }))
+
+    const rows = migrated.telemetry.getRecent({ limit: 10 })
+    const fresh = rows.find(r => r.requestId === "req-new")!
+    expect(fresh.profileId).toBe("work")
+    expect(fresh.sessionQueueWaitMs).toBe(42)
+    expect(fresh.sdkQueueWaitMs).toBe(7)
+    expect(fresh.routeKind).toBe("active+priority-hop")
+    expect(fresh.routeGroupId).toBe("g1")
+    expect(fresh.routeAttempt).toBe(2)
+    expect(fresh.routeRefusedBucket).toBe("five_hour")
+
+    // The pre-existing row survives and reads back on the NOT NULL DEFAULT 0
+    // columns rather than throwing or coming back null.
+    const old = rows.find(r => r.requestId === "req-old")!
+    expect(old).toBeDefined()
+    expect(old.profileId).toBeUndefined()
+    expect(old.sessionQueueWaitMs ?? 0).toBe(0)
+    expect(old.sdkQueueWaitMs ?? 0).toBe(0)
+
+    // Idempotent: a second open re-runs the ALTERs and must not throw.
+    expect(() => createSqliteStores(dbPath, 7)).not.toThrow()
+  })
+
+  it("rebuilds a failover's account chain from a database reopened after a restart", () => {
+    // The point of persisting the route columns at all: the ring buffer holds
+    // under an hour, so "which account refused last night" is only answerable
+    // if the hops survive the process. Reopening the file is the restart.
+    const dbPath = join(tmpDir, "reopen.db")
     const first = createSqliteStores(dbPath, 7)
-    first.telemetry.record(makeMetric({ requestId: "req-old" }))
-    const second = createSqliteStores(dbPath, 7)
-    second.telemetry.record(makeMetric({ requestId: "req-new", profileId: "work" }))
-    const rows = second.telemetry.getRecent({ limit: 10 })
-    expect(rows.find(r => r.requestId === "req-new")!.profileId).toBe("work")
-    expect(rows.find(r => r.requestId === "req-old")!.profileId).toBeUndefined()
+    first.telemetry.record(makeMetric({
+      requestId: "req-1", profileId: "corp4", timestamp: 1000,
+      routeKind: "priority-hop", routeGroupId: "g1", routeAttempt: 1,
+      status: 429, error: "rate_limit_error", routeRefusedBucket: "seven_day",
+    }))
+    first.telemetry.record(makeMetric({
+      requestId: "req-1", profileId: "corp2", timestamp: 2000,
+      routeKind: "priority-hop", routeGroupId: "g1", routeAttempt: 2,
+    }))
+    first.close()
+
+    const reopened = createSqliteStores(dbPath, 7)
+    const collapsed = collapseRouteChains(reopened.telemetry.getRecent({ limit: 10 }))
+    reopened.close()
+
+    expect(collapsed).toHaveLength(1)
+    expect(collapsed[0]!.routeKind).toBe("priority")
+    expect(collapsed[0]!.profileId).toBe("corp2")
+    expect(collapsed[0]!.routeChain).toEqual([
+      { profileId: "corp4", ok: false, status: 429, error: "rate_limit_error", refusedBucket: "seven_day" },
+      { profileId: "corp2", ok: true, status: 200, error: null },
+    ])
+  })
+
+  it("tallies accounts across a reopened database", () => {
+    const dbPath = join(tmpDir, "tally.db")
+    const first = createSqliteStores(dbPath, 7)
+    first.telemetry.record(makeMetric({
+      profileId: "corp4", timestamp: 1000, routeKind: "priority",
+      status: 429, error: "rate_limit_error", routeRefusedBucket: "five_hour",
+    }))
+    first.telemetry.record(makeMetric({ profileId: "corp2", timestamp: 2000, routeKind: "priority" }))
+    first.close()
+
+    const reopened = createSqliteStores(dbPath, 7)
+    const tally = summarizeRoutes(collapseRouteChains(reopened.telemetry.getRecent({ limit: 10 })))
+    reopened.close()
+
+    expect(tally.requests).toBe(2)
+    expect(tally.unserved).toBe(1)
+    expect(tally.byProfile.corp4).toEqual({ served: 0, refused: 1, refusedBuckets: { five_hour: 1 } })
+    expect(tally.byProfile.corp2!.served).toBe(1)
   })
 })

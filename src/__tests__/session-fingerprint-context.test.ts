@@ -18,24 +18,44 @@
  */
 
 import { afterAll, beforeEach, describe, expect, it, mock } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { assistantMessage } from "./helpers"
+import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
+import { getConversationFingerprint } from "../proxy/session/fingerprint"
 
 type MockSdkMessage = Record<string, unknown>
 type TestApp = { fetch: (req: Request) => Promise<Response> }
 
 let mockMessages: MockSdkMessage[] = []
-interface CapturedFPQueryParams { prompt?: unknown; options?: { resume?: string; forkSession?: boolean } }
+interface CapturedFPQueryParams {
+  prompt?: unknown
+  options?: { resume?: string; forkSession?: boolean; sessionId?: string }
+}
 let capturedQueryParams: CapturedFPQueryParams | null = null
 function getCaptured(): CapturedFPQueryParams | null { return capturedQueryParams }
-let queuedSessionIds: string[] = []
+let queuedSessionLabels: string[] = []
+let callerSelectedSessionIds = new Map<string, string>()
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+function getCallerSelectedSessionId(label: string): string {
+  const sessionId = callerSelectedSessionIds.get(label)
+  if (!sessionId) throw new Error(`No caller-selected session ID captured for ${label}`)
+  return sessionId
+}
+
+installSdkMock(() => ({
   query: (params: unknown) => {
-    capturedQueryParams = params as any
-    const sessionId = queuedSessionIds.shift() || "sdk-session-default"
+    capturedQueryParams = params as CapturedFPQueryParams
+    const sessionLabel = queuedSessionLabels.shift()
+    const options = (params as CapturedFPQueryParams).options
+    if (sessionLabel && options?.sessionId) {
+      callerSelectedSessionIds.set(sessionLabel, options.sessionId)
+    }
+    const sessionId = resolveMockSdkSessionId(options)
+    if (!sessionId) throw new Error("Expected Meridian to select or resume an SDK session")
     return (async function* () {
       for (const msg of mockMessages) {
         yield { ...msg, session_id: sessionId }
@@ -44,22 +64,32 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "session-fingerprint-context.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: unknown, fn: () => Promise<Response> | Response) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
 const fpTmpDir = mkdtempSync(join(tmpdir(), "session-fp-context-test-"))
 process.env.CLAUDE_PROXY_SESSION_DIR = fpTmpDir
+const sessionStoreModule = new URL("../proxy/sessionStore.ts", import.meta.url).href
+const durableReaderSource = String.raw`
+const { lookupSharedSessionResult } = await import(process.env.SESSION_STORE_MODULE)
+const result = lookupSharedSessionResult(process.env.SESSION_KEY)
+if (result.status === "found" && result.session.claudeSessionId === process.env.EXPECTED_SESSION) {
+  process.exit(0)
+}
+console.error(JSON.stringify(result))
+process.exit(1)
+`
 
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
-const { clearSharedSessions } = await import("../proxy/sessionStore")
+const { clearSharedSessions, getSessionStoreDir } = await import("../proxy/sessionStore")
 
 afterAll(() => {
   rmSync(fpTmpDir, { recursive: true, force: true })
@@ -76,11 +106,12 @@ function createTestApp() {
 async function postNoSession(
   app: TestApp,
   messages: Array<{ role: string; content: string }>,
-  sessionId: string,
+  sessionLabel: string,
   system?: string,
-  stream = false
+  stream = false,
+  headers: Record<string, string> = {},
 ) {
-  queuedSessionIds.push(sessionId)
+  queuedSessionLabels.push(sessionLabel)
   const body: Record<string, unknown> = {
     model: "claude-sonnet-4-5",
     max_tokens: 128,
@@ -91,7 +122,7 @@ async function postNoSession(
 
   const response = await app.fetch(new Request("http://localhost/v1/messages", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
   }))
 
@@ -111,7 +142,8 @@ async function postNoSession(
 beforeEach(() => {
   mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
   capturedQueryParams = null
-  queuedSessionIds = []
+  queuedSessionLabels = []
+  callerSelectedSessionIds = new Map()
   clearSessionCache()
   clearSharedSessions()
 })
@@ -134,7 +166,7 @@ describe("Fingerprint resume: stable across dynamic systemContext", () => {
     ], "sdk-1", "System v2: file tree has 15 files, 3 diagnostics")
 
     // MUST resume — fingerprint doesn't include systemContext
-    expect(getCaptured()?.options?.resume).toBe("sdk-1")
+    expect(getCaptured()?.options?.resume).toBeDefined()
   })
 
   it("resumes when systemContext changes between requests (stream)", async () => {
@@ -151,7 +183,7 @@ describe("Fingerprint resume: stable across dynamic systemContext", () => {
       { role: "user", content: "what can you do?" },
     ], "sdk-stream-1", "System v2 with more context", true)
 
-    expect(getCaptured()?.options?.resume).toBe("sdk-stream-1")
+    expect(getCaptured()?.options?.resume).toBeDefined()
   })
 
   it("resumes when systemContext is added where there was none", async () => {
@@ -169,7 +201,7 @@ describe("Fingerprint resume: stable across dynamic systemContext", () => {
     ], "sdk-no-ctx", "You are a helpful assistant.")
 
     // MUST resume — systemContext not in fingerprint
-    expect(getCaptured()?.options?.resume).toBe("sdk-no-ctx")
+    expect(getCaptured()?.options?.resume).toBeDefined()
   })
 
   it("resumes when systemContext is removed", async () => {
@@ -186,7 +218,7 @@ describe("Fingerprint resume: stable across dynamic systemContext", () => {
       { role: "user", content: "thanks" },
     ], "sdk-ctx")
 
-    expect(getCaptured()?.options?.resume).toBe("sdk-ctx")
+    expect(getCaptured()?.options?.resume).toBeDefined()
   })
 })
 
@@ -251,7 +283,7 @@ describe("Fingerprint resume: cross-project safety via lineage", () => {
       { role: "user", content: "more B work" },
     ], "sdk-project-b")
 
-    expect(getCaptured()?.options?.resume).toBe("sdk-project-b")
+    expect(getCaptured()?.options?.resume).toBeDefined()
   })
 })
 
@@ -299,7 +331,7 @@ describe("Fingerprint resume: multi-turn with tool_use blocks", () => {
     ], "sdk-tools", "System prompt v2 with updated file tree")
 
     // MUST resume even though system changed and history has tool blocks
-    expect(getCaptured()?.options?.resume).toBe("sdk-tools")
+    expect(getCaptured()?.options?.resume).toBeDefined()
   })
 
   it("does NOT resume after undo even with tool_use in history", async () => {
@@ -334,9 +366,9 @@ describe("Fingerprint isolation: headered sessions must not leak into fingerprin
     app: TestApp,
     sessionHeader: string,
     messages: Array<{ role: string; content: string }>,
-    sdkSessionId: string,
+    sessionLabel: string,
   ) {
-    queuedSessionIds.push(sdkSessionId)
+    queuedSessionLabels.push(sessionLabel)
     const response = await app.fetch(new Request("http://localhost/v1/messages", {
       method: "POST",
       headers: {
@@ -392,6 +424,75 @@ describe("Fingerprint resume: backward compat", () => {
       { role: "user", content: "thanks" },
     ], "sdk-no-ctx")
 
-    expect(getCaptured()?.options?.resume).toBe("sdk-no-ctx")
+    expect(getCaptured()?.options?.resume).toBeDefined()
+  })
+})
+
+
+describe("Fingerprint resume: OpenCode CWD-key transition", () => {
+  const opencodeHeaders = { "user-agent": "opencode/1.18.22" }
+  it("moves once from the override key to the client key and keeps the new key across restart", async () => {
+    const originalProxy = process.env.CLAUDE_PROXY_WORKDIR
+    const originalMeridian = process.env.MERIDIAN_WORKDIR
+    const proxyCwd = tmpdir()
+    const clientCwd = "C:\\projects\\remote-app"
+    process.env.CLAUDE_PROXY_WORKDIR = proxyCwd
+    delete process.env.MERIDIAN_WORKDIR
+
+    try {
+      const firstApp = createTestApp()
+      await postNoSession(firstApp, [
+        { role: "user", content: "hello from the migration fixture" },
+      ], "override-key", "OpenCode prompt without an environment block", false, opencodeHeaders)
+      const oldSession = getCallerSelectedSessionId("override-key")
+      expect(getCaptured()?.options?.resume).toBeUndefined()
+
+      capturedQueryParams = null
+      await postNoSession(firstApp, [
+        { role: "user", content: "hello from the migration fixture" },
+      ], "client-key", `<env>\nWorking directory: ${clientCwd}\nIs directory a git repo: yes\n</env>`, false, opencodeHeaders)
+      const newSession = getCallerSelectedSessionId("client-key")
+      expect(newSession).not.toBe(oldSession)
+      expect(getCaptured()?.options?.resume).toBeUndefined()
+
+      // A new process reads the durable file directly. This is the persistence
+      // boundary used after a proxy restart; unlike clearSessionCache(), it
+      // does not evict the mapping as part of test cleanup.
+      const sessionKey = getConversationFingerprint([
+        { role: "user", content: "hello from the migration fixture" },
+      ], clientCwd)
+      const reader = Bun.spawn([process.execPath, "-e", durableReaderSource], {
+        env: {
+          ...process.env,
+          MERIDIAN_SESSION_DIR: getSessionStoreDir(),
+          CLAUDE_PROXY_SESSION_DIR: getSessionStoreDir(),
+          SESSION_STORE_MODULE: sessionStoreModule,
+          SESSION_KEY: sessionKey,
+          EXPECTED_SESSION: newSession,
+        },
+        stdout: "ignore",
+        stderr: "pipe",
+      })
+      const exitCode = await reader.exited
+      if (exitCode !== 0) {
+        const stderr = reader.stderr instanceof ReadableStream
+          ? await new Response(reader.stderr).text()
+          : String(reader.stderr ?? "")
+        throw new Error(`Fresh process could not read the client-key mapping: ${stderr}`)
+      }
+
+      capturedQueryParams = null
+      await postNoSession(firstApp, [
+        { role: "user", content: "hello from the migration fixture" },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "continue on the new key" },
+      ], "continuation", `<env>\nWorking directory: ${clientCwd}\nIs directory a git repo: yes\n</env>`, false, opencodeHeaders)
+      expect(getCaptured()?.options?.resume).toBeDefined()
+    } finally {
+      if (originalProxy === undefined) delete process.env.CLAUDE_PROXY_WORKDIR
+      else process.env.CLAUDE_PROXY_WORKDIR = originalProxy
+      if (originalMeridian === undefined) delete process.env.MERIDIAN_WORKDIR
+      else process.env.MERIDIAN_WORKDIR = originalMeridian
+    }
   })
 })

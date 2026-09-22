@@ -10,7 +10,7 @@ import { profileFactsJs } from "../telemetry/profileFacts"
 import { landingHtml } from "../telemetry/landing"
 import { profilePageHtml } from "../telemetry/profilePage"
 
-interface Fact { label: string; value: string; tone: string; note?: string; hint?: string }
+interface Fact { label: string; value: string; tone: string }
 
 const evaluated = new Function(
   profileFactsJs + "\nreturn { profileFacts: profileFacts, timeAgo: timeAgo };",
@@ -31,7 +31,7 @@ function valueOf(p: Record<string, unknown>, label: string): string | undefined 
 
 describe("profileFacts", () => {
   test("status is always stated, even for a profile with nothing else known", () => {
-    expect(labels({})).toEqual(["Status", "Owner"])
+    expect(labels({})).toEqual(["Status"])
   })
 
   test("a logged-in account reads as authenticated, in the affirmative tone", () => {
@@ -58,13 +58,13 @@ describe("profileFacts", () => {
 
   test("the organization sits between the email and the plan", () => {
     const rows = labels({ email: "a@b.c", organizationName: "Acme Inc", subscriptionType: "max" })
-    expect(rows).toEqual(["Status", "Owner", "Email", "Organization", "Plan"])
+    expect(rows).toEqual(["Status", "Email", "Organization", "Plan"])
   })
 
   test("email and plan are stated when known and omitted when not", () => {
     expect(valueOf({ email: "a@b.c" }, "Email")).toBe("a@b.c")
     expect(valueOf({ subscriptionType: "max" }, "Plan")).toBe("max")
-    expect(labels({ email: null, subscriptionType: null })).toEqual(["Status", "Owner"])
+    expect(labels({ email: null, subscriptionType: null })).toEqual(["Status"])
   })
 
   test("last verified is stated in the affirmative tone", () => {
@@ -84,7 +84,7 @@ describe("profileFacts", () => {
   })
 
   test("last checked is stated when nothing ever verified", () => {
-    expect(labels({ loggedIn: false, lastCheckedAt: Date.now() })).toEqual(["Status", "Owner", "Last Checked"])
+    expect(labels({ loggedIn: false, lastCheckedAt: Date.now() })).toEqual(["Status", "Last Checked"])
   })
 
   test("the full set reads in card order", () => {
@@ -94,90 +94,9 @@ describe("profileFacts", () => {
       email: "a@b.c",
       organizationName: "Acme Inc",
       subscriptionType: "max",
-      allowance: "5x",
       lastSuccessAt: at - 60_000,
       lastCheckedAt: at,
-    })).toEqual(["Status", "Owner", "Email", "Organization", "Plan", "Allowance", "Last Verified", "Last Checked"])
-  })
-})
-
-describe("ownership and allowance", () => {
-  test("the stored vocabulary is shown in the words the dropdown uses", () => {
-    expect(valueOf({ owner: "own" }, "Owner")).toBe("Mine")
-    expect(valueOf({ owner: "loaner" }, "Owner")).toBe("Borrowed")
-  })
-
-  test("an undesignated account still gets a row, reading Not set", () => {
-    expect(valueOf({ owner: null }, "Owner")).toBe("Not set")
-    expect(valueOf({}, "Owner")).toBe("Not set")
-  })
-
-  test("an unrecognized designation falls back to Not set rather than echoing it", () => {
-    expect(valueOf({ owner: "mine" }, "Owner")).toBe("Not set")
-  })
-
-  test("owner sits directly after status, as it does on the card", () => {
-    expect(labels({ owner: "own", email: "a@b.c" })).toEqual(["Status", "Owner", "Email"])
-  })
-
-  test("the allowance carries the sentence that qualifies the number", () => {
-    const fact = profileFacts({ allowance: "5x", rateLimitTier: "default_claude_max_20x" })
-      .find(f => f.label === "Allowance")!
-    expect(fact.value).toBe("5x")
-    expect(fact.note).toBe("of a Pro plan\u2019s Claude Code usage")
-    expect(fact.hint).toBe("default_claude_max_20x")
-  })
-
-  test("an account with no allowance gets no allowance row", () => {
-    expect(labels({ allowance: null })).not.toContain("Allowance")
-  })
-
-  test("the plan prefers the label that distinguishes 5x from 20x", () => {
-    expect(valueOf({ subscriptionType: "max", planLabel: "Max 20x" }, "Plan")).toBe("Max 20x")
-    expect(valueOf({ subscriptionType: "max" }, "Plan")).toBe("max")
-  })
-})
-
-describe("the account family and the plan within it", () => {
-  test("they are two rows, because two fields answer them", () => {
-    const p = { accountType: "Team", planName: "Premium seat" }
-    expect(valueOf(p, "Account")).toBe("Team")
-    expect(valueOf(p, "Plan")).toBe("Premium seat")
-  })
-
-  test("a known family with an unknowable plan still states the family", () => {
-    expect(labels({ accountType: "Team" })).toEqual(["Status", "Owner", "Account"])
-  })
-
-  test("the seat outranks every coarser name for the same account", () => {
-    expect(valueOf({
-      accountType: "Team",
-      planName: "Standard seat",
-      planLabel: "Team",
-      subscriptionType: "team",
-    }, "Plan")).toBe("Standard seat")
-  })
-
-  test("the plan's hint is the field that sized it", () => {
-    // A Team seat is sized by `seat_tier`, so showing `rate_limit_tier` there
-    // would name the field that cannot tell Premium from Standard - measured,
-    // both of this fleet's seat kinds disagree with it.
-    const seat = profileFacts({ planName: "Premium seat", seatTier: "team_tier_1", rateLimitTier: "default_claude_max_5x" })
-      .find(f => f.label === "Plan")!
-    expect(seat.hint).toBe("team_tier_1")
-    const personal = profileFacts({ planName: "Max 20x", rateLimitTier: "default_claude_max_20x" })
-      .find(f => f.label === "Plan")!
-    expect(personal.hint).toBe("default_claude_max_20x")
-  })
-
-  test("the account sits between the organization and the plan", () => {
-    expect(labels({
-      email: "a@b.c",
-      organizationName: "Acme Inc",
-      accountType: "Team",
-      planName: "Premium seat",
-      allowance: "6.25x",
-    })).toEqual(["Status", "Owner", "Email", "Organization", "Account", "Plan", "Allowance"])
+    })).toEqual(["Status", "Email", "Organization", "Plan", "Last Verified", "Last Checked"])
   })
 })
 

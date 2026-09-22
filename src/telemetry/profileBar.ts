@@ -123,6 +123,29 @@ export const profileBarCss = `
   .meridian-header .mh-profile .mh-profile-type {
     color: var(--muted, #8b949e); font-size: 10px;
   }
+  /* Build chip — two mutually exclusive states, and the colour is not a
+     style choice: "update available" is a link to the releases page, so it
+     is blue (interactive); "local/dev build" is a meta annotation with no
+     href, so it is violet. Swapping them would break the DESIGN.md rule. */
+  .meridian-header .mh-build {
+    display: none; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 500; white-space: nowrap;
+    padding: 3px 10px; border-radius: 20px; text-decoration: none;
+    transition: background 0.15s;
+  }
+  .meridian-header .mh-build.visible { display: inline-flex; }
+  .meridian-header .mh-build.update {
+    color: var(--accent, #58a6ff);
+    background: rgba(88,166,255,0.12);
+    border: 1px solid rgba(88,166,255,0.35);
+  }
+  .meridian-header .mh-build.update:hover { background: rgba(88,166,255,0.18); }
+  .meridian-header .mh-build.provenance {
+    color: var(--accent2, #bc8cff);
+    background: rgba(188,140,255,0.12);
+    border: 1px solid rgba(188,140,255,0.35);
+    cursor: default;
+  }
   .meridian-header .mh-profile.following { border-color: var(--accent2, #bc8cff); }
   .meridian-header .mh-profile .mh-profile-follow {
     color: var(--accent2, #bc8cff); font-size: 10px;
@@ -141,24 +164,28 @@ export const profileBarCss = `
   @media (max-width: 720px) {
     .meridian-header { gap: 10px; padding: 10px 16px; flex-wrap: wrap; }
     .meridian-header .mh-name { display: none; }
+    .meridian-header .mh-nav { order: 3; flex-basis: 100%; min-width: 0; overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+    .meridian-header .mh-nav a { flex-shrink: 0; }
     .meridian-header .mh-status .mh-status-text { display: none; }
   }
 `
 
 export const profileBarHtml = `
 <header class="meridian-header" id="meridianHeader">
-  <a class="mh-brand" href="/">
+  <a class="mh-brand" href="/" aria-label="Meridian home">
     ${meridianLogoSvg}
     <span class="mh-name">Meridian</span>
   </a>
   <nav class="mh-nav">
     <a href="/" id="nav-home">Home</a>
+    <a href="/providers" id="nav-providers">Providers</a>
     <a href="/telemetry" id="nav-telemetry">Telemetry</a>
     <a href="/profiles" id="nav-profiles">Profiles</a>
     <a href="/settings" id="nav-settings">Settings</a>
     <a href="/plugins" id="nav-plugins">Plugins</a>
   </nav>
   <div class="mh-right">
+    <a class="mh-build" id="mhBuild" target="_blank" rel="noopener"></a>
     <a class="mh-profile" id="mhProfile" href="/" title="Active profile — switch from the home page"></a>
     <span class="mh-status" id="mhStatus"><span class="mh-dot" id="mhDot"></span><span class="mh-status-text" id="mhStatusText"></span></span>
   </div>
@@ -168,6 +195,7 @@ export const profileBarHtml = `
 export const profileBarJs = `
 (function() {
   var profileChip = document.getElementById('mhProfile');
+  var buildChip = document.getElementById('mhBuild');
   var statusDot = document.getElementById('mhDot');
   var statusText = document.getElementById('mhStatusText');
 
@@ -182,11 +210,42 @@ export const profileBarJs = `
 
   function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
+  // Build provenance chip. Hidden entirely for a current npm install, which
+  // is the case that needs no comment.
+  function renderBuild(build) {
+    if (!buildChip) return;
+    if (!build) { buildChip.className = 'mh-build'; return; }
+    if (build.source !== 'npm') {
+      buildChip.textContent = (build.source === 'dev' ? 'dev build' : 'local build') + (build.dirty ? ' *' : '');
+      buildChip.removeAttribute('href');
+      buildChip.title = 'Not an npm release — the reported version ' + build.version +
+        ' is the tree\\'s last release, not proof of what is running' +
+        (build.branch ? '\\nbranch: ' + build.branch : '') +
+        (build.sha ? '\\ncommit: ' + build.sha.slice(0, 8) : '') +
+        (build.dirty ? '\\nuncommitted changes present' : '');
+      buildChip.className = 'mh-build provenance visible';
+      return;
+    }
+    if (build.updateAvailable) {
+      buildChip.textContent = build.latest + ' available';
+      buildChip.href = 'https://github.com/rynfar/meridian/releases';
+      buildChip.title = 'Running ' + build.version + ' — update with:\\nnpm install -g @rynfar/meridian@latest';
+      buildChip.className = 'mh-build update visible';
+      return;
+    }
+    buildChip.className = 'mh-build';
+  }
+
   function loadHeader() {
     fetch('/health').then(function(r) { return r.json(); }).then(function(h) {
       var st = h.status === 'healthy' ? 'healthy' : h.status === 'degraded' ? 'degraded' : 'unhealthy';
       statusDot.className = 'mh-dot ' + st;
       statusText.textContent = st === 'healthy' ? 'Operational' : st === 'degraded' ? 'Degraded' : 'Offline';
+      renderBuild(h.build);
+      if (h.backend === 'antigravity') {
+        ['nav-telemetry','nav-profiles','nav-settings','nav-plugins'].forEach(function(id) { document.getElementById(id).hidden = true; });
+        profileChip.removeAttribute('href');
+      }
     }).catch(function() {
       statusDot.className = 'mh-dot unhealthy';
       statusText.textContent = 'Offline';
@@ -220,3 +279,29 @@ export const profileBarJs = `
   window.meridianHeaderRefresh = loadHeader;
 })();
 `
+
+/** Native desktop chrome: system appearance with the canonical Meridian hues.
+ * Web pages continue using themeCss and the shared profile header above. */
+export const desktopThemeCss = `
+  :root {
+    color-scheme: light dark;
+    --bg: #f4f5f7; --surface: #ffffff; --surface2: #edeff2;
+    --border: #dde0e5; --text: #23272e; --muted: #69717e;
+    --accent: #176bce; --accent2: #8250b5;
+    --green: #237c40; --yellow: #976400; --red: #ca3b36;
+    --sidebar: #e9edf1; --control: #ffffff; --control-border: #d0d5dc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --surface: #161b22; --surface2: #1c2128;
+      --border: #30363d; --text: #e6edf3; --muted: #8b949e;
+      --accent: #58a6ff; --accent2: #bc8cff;
+      --green: #3fb950; --yellow: #d29922; --red: #f85149;
+      --sidebar: #161b22; --control: #242b35; --control-border: #39424e;
+    }
+  }
+  body { background: var(--bg); }
+  html.native-glass body { background: transparent; }
+`
+
+export const desktopWindowColors = { transparent: '#00000000', dark: '#0d1117', light: '#f4f5f7' } as const

@@ -6,11 +6,14 @@
  */
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
-import { assistantMessage } from "./helpers"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
+import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
 
 let capturedQueryParams: any = null
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: any) => {
     capturedQueryParams = params
     return (async function* () {
@@ -25,20 +28,20 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
           stop_reason: "end_turn",
           usage: { input_tokens: 10, output_tokens: 5 },
         },
-        session_id: "sess-1",
+        session_id: resolveMockSdkSessionId(params.options, "sess-1"),
       }
     })()
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "proxy-multimodal.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -245,8 +248,11 @@ describe("Multimodal content", () => {
       messages.push(msg)
     }
 
-    // Should have all 3 messages (system context now in SDK option, not in prompt)
-    expect(messages.length).toBeGreaterThanOrEqual(3)
+    // A complete history is one SDK input, so generation cannot start before
+    // the final turn arrives. All original role content remains present.
+    expect(messages).toHaveLength(1)
+    const replay = JSON.stringify(messages[0].message.content)
+    for (const text of ["look at this", "I see it", "what color is it?"]) expect(replay).toContain(text)
     // All should have the user type wrapper (SDK requirement)
     for (const msg of messages) {
       expect(msg.type).toBe("user")

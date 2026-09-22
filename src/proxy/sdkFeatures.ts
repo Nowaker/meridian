@@ -6,6 +6,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs"
+import { dirname } from "node:path"
 import { configDir, configPath } from "../configDir"
 
 export interface AdapterFeatures {
@@ -107,11 +108,45 @@ const ADAPTER_DEFAULTS: Record<string, Partial<AdapterFeatures>> = {
   cherry: {
     codeSystemPrompt: false,
   },
+  // Prime Agent ships ~17-19KB of its own harness doctrine — RLM control
+  // semantics, subagent delegation guidance, continual-harness state. Layering
+  // Claude Code's ~28KB preset on top duplicates and contradicts it, so keep
+  // the preset OFF (same rationale as codex/jcode/cherry). Users can flip it on
+  // via the settings UI.
+  //
+  // Measured rather than assumed: 6 multi-round `ipython` loops per arm, driven
+  // through Meridian with the real captured Prime Agent prompt and tool schema.
+  // Both arms scored identically on what matters — every run called only
+  // `ipython`, ran all three requested steps in order, and finished. The preset
+  // bought nothing, so OFF keeps the behaviour and saves ~28KB per request.
+  // (Both arms also re-ran the final cell in most samples; since it appears
+  // equally with the preset on, it is a property of the task and model, not of
+  // this setting.)
+  prime: {
+    codeSystemPrompt: false,
+  },
   // Codex CLI endpoint (/v1/responses). Codex ships its own ~21KB harness
   // instructions; keep the Claude Code preset OFF so they aren't overridden
   // (same rationale as openai). Passthrough is forced in the adapter itself.
   codex: {
     codeSystemPrompt: false,
+  },
+  // Polytoken is a native Anthropic Messages client that owns its prompt and
+  // its tool loop end to end. Layering the ~28KB Claude Code preset (or any
+  // Claude Code harness context) on top would override the client's prompt and
+  // inject foreign instructions, so the preset stays OFF and memory/dreaming/
+  // sharedMemory/claudeMd stay off — the client's system prompt IS the prompt.
+  // Signed/redacted thinking is preserved through the native response paths
+  // regardless: supportsThinking true on the adapter, and thinkingPassthrough
+  // is not a signature-stripping control. Explicit user/instance overrides
+  // keep their documented precedence.
+  polytoken: {
+    codeSystemPrompt: false,
+    clientSystemPrompt: true,
+    claudeMd: "off" as const,
+    memory: false,
+    dreaming: false,
+    sharedMemory: false,
   },
 }
 
@@ -122,16 +157,14 @@ function getConfigPath(): string {
 }
 
 let cachedConfig: FeatureConfig | null = null
-let cachedConfigPath: string | null = null
 let lastReadTime = 0
+let lastReadPath: string | undefined
 const CACHE_TTL_MS = 5000
 
 function readConfig(): FeatureConfig {
   const now = Date.now()
   const path = getConfigPath()
-  if (cachedConfig && cachedConfigPath === path && now - lastReadTime < CACHE_TTL_MS) return cachedConfig
-
-  cachedConfigPath = path
+  if (cachedConfig && lastReadPath === path && now - lastReadTime < CACHE_TTL_MS) return cachedConfig
   try {
     if (existsSync(path)) {
       cachedConfig = JSON.parse(readFileSync(path, "utf-8")) as FeatureConfig
@@ -142,6 +175,7 @@ function readConfig(): FeatureConfig {
     cachedConfig = {}
   }
   lastReadTime = now
+  lastReadPath = path
   return cachedConfig
 }
 
@@ -149,11 +183,12 @@ function writeConfig(config: FeatureConfig): void {
   const path = getConfigPath()
   const tmp = `${path}.tmp`
   try {
+    mkdirSync(dirname(path), { recursive: true })
     writeFileSync(tmp, JSON.stringify(config, null, 2))
     renameSync(tmp, path)
     cachedConfig = config
-    cachedConfigPath = path
     lastReadTime = Date.now()
+    lastReadPath = path
   } catch (e) {
     console.error("[sdk-features] write failed:", (e as Error).message)
   }

@@ -12,8 +12,10 @@
  *   2. Prior turns are packed into a <conversation_history> block in the
  *      system prompt so Claude has context
  *   3. Each chat completions request gets a fresh SDK session
- * This is intentional — OpenAI-format clients replay full history themselves
- * and don't benefit from Meridian's session resumption.
+ * A request that carries a session key the adapter recognizes (Jcode's
+ * x-jcode-session, or the OpenCode-family x-opencode-session /
+ * x-session-affinity) is exempt: it keeps its real messages and resumes like
+ * any keyed client. An unkeyed request keeps the packing above.
  */
 
 // ---------------------------------------------------------------------------
@@ -67,6 +69,15 @@ export interface OpenAiChatToolCustom {
 
 export type OpenAiChatTool = OpenAiChatToolFunction | OpenAiChatToolCustom
 
+export interface OpenAiResponseFormat {
+  type: "text" | "json_object" | "json_schema"
+  json_schema?: {
+    name?: string
+    schema?: unknown
+    strict?: boolean
+  }
+}
+
 export interface OpenAiChatRequest {
   model?: string
   messages?: OpenAiMessage[]
@@ -79,13 +90,17 @@ export interface OpenAiChatRequest {
   /** Standard OpenAI reasoning level (low/medium/high/…). */
   reasoning_effort?: string
   /** Anthropic-style nesting some clients use. */
-  output_config?: { effort?: string }
+  output_config?: { effort?: string; format?: unknown }
+  /** Standard OpenAI structured output (json_schema / json_object / text). */
+  response_format?: OpenAiResponseFormat
   stream_options?: { include_usage?: boolean }
 }
 
 export interface OpenAiTranslationOptions {
   /** Keep append-only turns intact so Meridian can verify and resume lineage. */
   preserveConversationHistory?: boolean
+  /** Providers without native reasoning blocks must retain literal markup. */
+  preserveThinkingText?: boolean
 }
 
 export interface AnthropicTextBlock {
@@ -128,12 +143,40 @@ export interface AnthropicRequestBody {
   /** Reasoning effort carried from the OpenAI request so the internal
    *  /v1/messages hop forwards it to the SDK (value gated by normalizeEffort). */
   reasoning_effort?: string
-  output_config?: { effort?: string }
+  output_config?: { effort?: string; format?: unknown }
 }
 
 export interface AnthropicUsage {
   input_tokens?: number
   output_tokens?: number
+  cache_read_input_tokens?: number
+  cache_creation_input_tokens?: number
+}
+
+const ANTHROPIC_USAGE_FIELDS = [
+  "input_tokens",
+  "output_tokens",
+  "cache_read_input_tokens",
+  "cache_creation_input_tokens",
+] as const
+
+/** Merge cumulative usage snapshots without erasing fields omitted by a delta. */
+export function mergeAnthropicUsage(
+  current: AnthropicUsage | undefined,
+  update: AnthropicUsage,
+): AnthropicUsage {
+  const merged = { ...current }
+  for (const field of ANTHROPIC_USAGE_FIELDS) {
+    if (typeof update[field] === "number") merged[field] = update[field]
+  }
+  return merged
+}
+
+/** Anthropic reports fresh, cache-read, and cache-written input separately. */
+export function totalAnthropicInputTokens(usage: AnthropicUsage | undefined): number {
+  return (usage?.input_tokens ?? 0)
+    + (usage?.cache_read_input_tokens ?? 0)
+    + (usage?.cache_creation_input_tokens ?? 0)
 }
 
 export interface AnthropicContentBlockText {
@@ -207,7 +250,20 @@ export interface OpenAiStreamChunk {
     }
     finish_reason: "stop" | "length" | "tool_calls" | null
   }>
-  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }
+  usage?: {
+    prompt_tokens: number
+    completion_tokens: number
+    total_tokens: number
+    // `cached_tokens` is OpenAI's field. `cache_write_tokens` is NOT — it is a
+    // Meridian extension carrying Anthropic's cache_creation_input_tokens, which
+    // OpenAI has no equivalent for and which bills at a premium. Kept because a
+    // cost-tracking client cannot reconstruct it, deliberately named so it is
+    // obviously not spec. Clients that ignore unknown keys are unaffected.
+    prompt_tokens_details: {
+      cached_tokens: number
+      cache_write_tokens: number
+    }
+  }
 }
 
 export interface OpenAiCompletionFunctionToolCall {
@@ -247,6 +303,15 @@ export interface OpenAiCompletion {
     prompt_tokens: number
     completion_tokens: number
     total_tokens: number
+    // `cached_tokens` is OpenAI's field. `cache_write_tokens` is NOT — it is a
+    // Meridian extension carrying Anthropic's cache_creation_input_tokens, which
+    // OpenAI has no equivalent for and which bills at a premium. Kept because a
+    // cost-tracking client cannot reconstruct it, deliberately named so it is
+    // obviously not spec. Clients that ignore unknown keys are unaffected.
+    prompt_tokens_details: {
+      cached_tokens: number
+      cache_write_tokens: number
+    }
   }
 }
 
@@ -418,6 +483,35 @@ function summarizeAnthropicContent(content: string | AnthropicContentBlock[]): s
 // ---------------------------------------------------------------------------
 
 /**
+ * Map OpenAI's `response_format` onto Anthropic's `output_config.format`.
+ *
+ * `json_object` is forwarded intact rather than widened into a permissive
+ * `{"type":"object"}` schema: Anthropic has no schema-less JSON mode, and
+ * accepting it silently would promise an enforcement the request never gets.
+ * parseOutputFormat rejects it with an actionable message.
+ */
+function translateResponseFormat(format: unknown): unknown {
+  // An explicit JSON `null` must behave exactly like omission. Plenty of
+  // OpenAI-compatible clients serialize an unset optional as `null` rather than
+  // dropping the key, and this runs before any validation: reading `.type` off
+  // it threw a TypeError out of a handler with no try/catch, turning a request
+  // that worked before structured output existed into a 500.
+  if (format === undefined || format === null) return undefined
+  // Anything that is not an object is forwarded untouched so parseOutputFormat
+  // rejects it with a 400 naming the client's own field, rather than being
+  // silently ignored here.
+  if (typeof format !== "object") return format
+  const shape = format as OpenAiResponseFormat
+  if (shape.type === "text") return undefined
+  // `name` is a client-side label; `strict` has no equivalent - the SDK always
+  // validates, which is never weaker than strict asked for.
+  if (shape.type === "json_schema") {
+    return { type: "json_schema", schema: shape.json_schema?.schema }
+  }
+  return { type: shape.type }
+}
+
+/**
  * Translate an OpenAI /v1/chat/completions request body into an Anthropic
  * /v1/messages request body.
  *
@@ -440,14 +534,26 @@ export function translateOpenAiToAnthropic(
     if (msg.role === "system") {
       if (text) systemParts.push(text)
     } else if (msg.role === "tool") {
-      turns.push({
-        role: "user",
-        content: [{
-          type: "tool_result",
-          tool_use_id: msg.tool_call_id ?? "",
-          content: translateOpenAiContentToAnthropic(msg.content ?? "")
-        }]
-      })
+      // OpenAI carries one `tool` message per tool_call_id; Anthropic wants
+      // every tool_result of one assistant turn in the single user message
+      // that follows it, and a passthrough checkpoint resume refuses a batch
+      // split across user turns. Consecutive results coalesce into one turn.
+      const block: AnthropicContentBlock = {
+        type: "tool_result",
+        tool_use_id: msg.tool_call_id ?? "",
+        content: translateOpenAiContentToAnthropic(msg.content ?? "")
+      }
+      const previous = turns[turns.length - 1]
+      if (
+        previous?.role === "user" &&
+        Array.isArray(previous.content) &&
+        previous.content.length > 0 &&
+        previous.content.every(b => b.type === "tool_result")
+      ) {
+        previous.content.push(block)
+      } else {
+        turns.push({ role: "user", content: [block] })
+      }
     } else if (msg.role === "assistant") {
       const msgContent = translateOpenAiContentToAnthropic(msg.content ?? "")
       const content: AnthropicContentBlock[] = []
@@ -457,7 +563,7 @@ export function translateOpenAiToAnthropic(
       const endOfThink = firstBlock?.type === "text" && firstBlock.text.startsWith("<think>")
         ? firstBlock.text.indexOf("</think>")
         : -1
-      if (firstBlock?.type === "text" && firstBlock.text.startsWith("<think>") && endOfThink !== -1) {
+      if (!options.preserveThinkingText && firstBlock?.type === "text" && firstBlock.text.startsWith("<think>") && endOfThink !== -1) {
         // Extract <think>...</think> to thinking block. Skip a single optional
         // trailing newline after </think> for readability, but tolerate its
         // absence rather than dropping the first character of the answer.
@@ -537,9 +643,10 @@ export function translateOpenAiToAnthropic(
     }
   }
 
-  // Pack prior turns into system context so each request is a fresh session.
-  // OpenAI clients resend full history; Meridian's session system would
-  // misclassify repeated history as undo/diverged. This avoids that.
+  // An unkeyed request packs prior turns into system context so each request
+  // is a fresh session: without a key a resent full history could only be
+  // misclassified as undo/diverged. A keyed request keeps its turns and is
+  // verified by lineage instead (see the design note at the top of the file).
   let systemPrompt = systemParts.join("\n")
   let messagesToSend: AnthropicMessage[] = turns
 
@@ -572,7 +679,19 @@ export function translateOpenAiToAnthropic(
   // and OpenAI clients always run at the model default. Validation happens
   // downstream via normalizeEffort.
   if (body.reasoning_effort !== undefined) result.reasoning_effort = body.reasoning_effort
-  if (body.output_config?.effort !== undefined) result.output_config = { effort: body.output_config.effort }
+
+  // Structured output. `response_format` is the standard OpenAI spelling;
+  // `output_config.format` is accepted too because some clients send the
+  // Anthropic shape at this endpoint. Both are forwarded unvalidated so the
+  // single check in parseOutputFormat rejects them at the HTTP boundary.
+  const outputFormat = translateResponseFormat(body.response_format) ?? body.output_config?.format
+  const effort = body.output_config?.effort
+  if (effort !== undefined || outputFormat !== undefined) {
+    const outputConfig: NonNullable<AnthropicRequestBody["output_config"]> = {}
+    if (effort !== undefined) outputConfig.effort = effort
+    if (outputFormat !== undefined) outputConfig.format = outputFormat
+    result.output_config = outputConfig
+  }
 
   return result
 }
@@ -630,7 +749,7 @@ export function translateAnthropicToOpenAi(
         .join("")
     : ""
 
-  const promptTokens = response.usage?.input_tokens ?? 0
+  const promptTokens = totalAnthropicInputTokens(response.usage)
   const completionTokens = response.usage?.output_tokens ?? 0
 
   return {
@@ -652,6 +771,10 @@ export function translateAnthropicToOpenAi(
       prompt_tokens: promptTokens,
       completion_tokens: completionTokens,
       total_tokens: promptTokens + completionTokens,
+      prompt_tokens_details: {
+        cached_tokens: response.usage?.cache_read_input_tokens ?? 0,
+        cache_write_tokens: response.usage?.cache_creation_input_tokens ?? 0,
+      },
     },
   }
 }
@@ -680,7 +803,7 @@ export interface AnthropicSseEvent {
     | { type: "text"; text?: string }
     | { type: "thinking"; thinking?: string }
     | AnthropicToolUseBlock
-  message?: { id?: string }
+  message?: { id?: string; usage?: AnthropicUsage }
   usage?: AnthropicUsage
 }
 
@@ -726,8 +849,12 @@ export function createSseTranslator(ctx: SseTranslatorContext): SseTranslator {
       toolCallIndex++
     }
 
+    if (event.type === "message_start" && event.message?.usage) {
+      lastUsage = mergeAnthropicUsage(lastUsage, event.message.usage)
+    }
+
     if (event.type === "message_delta" && event.usage) {
-      lastUsage = event.usage
+      lastUsage = mergeAnthropicUsage(lastUsage, event.usage)
     }
 
     return translateAnthropicSseEvent(
@@ -742,7 +869,7 @@ export function createSseTranslator(ctx: SseTranslatorContext): SseTranslator {
 
   translate.buildUsageChunk = () => {
     if (!ctx.includeUsage || !lastUsage) return null
-    const promptTokens = lastUsage.input_tokens ?? 0
+    const promptTokens = totalAnthropicInputTokens(lastUsage)
     const completionTokens = lastUsage.output_tokens ?? 0
     return {
       id: ctx.completionId,
@@ -754,6 +881,10 @@ export function createSseTranslator(ctx: SseTranslatorContext): SseTranslator {
         prompt_tokens: promptTokens,
         completion_tokens: completionTokens,
         total_tokens: promptTokens + completionTokens,
+        prompt_tokens_details: {
+          cached_tokens: lastUsage.cache_read_input_tokens ?? 0,
+          cache_write_tokens: lastUsage.cache_creation_input_tokens ?? 0,
+        },
       },
     }
   }
@@ -938,9 +1069,15 @@ const FULL_CAPABILITIES: ModelCapabilities = Object.freeze({
 
 /**
  * Return the static list of available Claude models in OpenAI format.
- * Context windows reflect subscription capabilities.
+ *
+ * @param extendedContextIncluded - whether the caller's subscription includes
+ *   the 1M window on the Opus/Fable tiers (Max, Team, Enterprise). Callers
+ *   derive this from `subscriptionIncludesExtendedContext` in models.ts so the
+ *   advertised window matches what the proxy actually routes to. Sonnet stays
+ *   200k on every plan because Sonnet 1M is always billed as Extra Usage, and
+ *   Haiku has no 1M variant at all.
  */
-export function buildModelList(isMaxSubscription: boolean, now = Math.floor(Date.now() / 1000)): OpenAiModel[] {
+export function buildModelList(extendedContextIncluded: boolean, now = Math.floor(Date.now() / 1000)): OpenAiModel[] {
   return [
     {
       id: "claude-sonnet-5",
@@ -961,12 +1098,24 @@ export function buildModelList(isMaxSubscription: boolean, now = Math.floor(Date
       capabilities: FULL_CAPABILITIES,
     },
     {
+      id: "claude-opus-5-5",
+      object: "model",
+      created: now,
+      owned_by: "anthropic",
+      display_name: "Claude Opus 5.5",
+      context_window: extendedContextIncluded ? 1_000_000 : 200_000,
+      capabilities: {
+        ...FULL_CAPABILITIES,
+        thinking: { supported: true, types: { adaptive: { supported: true }, enabled: { supported: false } } },
+      },
+    },
+    {
       id: "claude-opus-5",
       object: "model",
       created: now,
       owned_by: "anthropic",
       display_name: "Claude Opus 5",
-      context_window: isMaxSubscription ? 1_000_000 : 200_000,
+      context_window: extendedContextIncluded ? 1_000_000 : 200_000,
       capabilities: FULL_CAPABILITIES,
     },
     {
@@ -975,7 +1124,7 @@ export function buildModelList(isMaxSubscription: boolean, now = Math.floor(Date
       created: now,
       owned_by: "anthropic",
       display_name: "Claude Opus 4.6",
-      context_window: isMaxSubscription ? 1_000_000 : 200_000,
+      context_window: extendedContextIncluded ? 1_000_000 : 200_000,
       capabilities: FULL_CAPABILITIES,
     },
     {
@@ -984,7 +1133,7 @@ export function buildModelList(isMaxSubscription: boolean, now = Math.floor(Date
       created: now,
       owned_by: "anthropic",
       display_name: "Claude Opus 4.7",
-      context_window: isMaxSubscription ? 1_000_000 : 200_000,
+      context_window: extendedContextIncluded ? 1_000_000 : 200_000,
       capabilities: FULL_CAPABILITIES,
     },
     {
@@ -993,7 +1142,16 @@ export function buildModelList(isMaxSubscription: boolean, now = Math.floor(Date
       created: now,
       owned_by: "anthropic",
       display_name: "Claude Opus 4.8",
-      context_window: isMaxSubscription ? 1_000_000 : 200_000,
+      context_window: extendedContextIncluded ? 1_000_000 : 200_000,
+      capabilities: FULL_CAPABILITIES,
+    },
+    {
+      id: "claude-fable-5-1",
+      object: "model",
+      created: now,
+      owned_by: "anthropic",
+      display_name: "Claude Fable 5.1",
+      context_window: extendedContextIncluded ? 1_000_000 : 200_000,
       capabilities: FULL_CAPABILITIES,
     },
     {
@@ -1002,7 +1160,7 @@ export function buildModelList(isMaxSubscription: boolean, now = Math.floor(Date
       created: now,
       owned_by: "anthropic",
       display_name: "Claude Fable 5",
-      context_window: isMaxSubscription ? 1_000_000 : 200_000,
+      context_window: extendedContextIncluded ? 1_000_000 : 200_000,
       capabilities: FULL_CAPABILITIES,
     },
     {

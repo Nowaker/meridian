@@ -7,6 +7,9 @@
  */
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import {
   messageStart,
   toolUseBlockStart,
@@ -17,6 +20,7 @@ import {
   parseSSE,
   assistantMessage,
   makeRequest,
+  withMockSdkSessionId,
 } from "./helpers"
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk"
 
@@ -24,11 +28,13 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk"
 let mockMessages: SDKMessage[] = []
 let capturedQueryParams: any = {}
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (opts: any) => {
     capturedQueryParams = opts
     return (async function* () {
-      for (const msg of mockMessages) yield msg
+      for (const msg of mockMessages) {
+        yield withMockSdkSessionId(msg, opts.options)
+      }
     })()
   },
   createSdkMcpServer: () => ({
@@ -36,14 +42,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
     name: "test",
     instance: { tool: () => {}, registerTool: () => ({}) },
   }),
-}))
+}), "deferred-tool-loading.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: unknown, fn: () => unknown) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: { tool: () => {}, registerTool: () => ({}) } }),
 }))
 
@@ -258,7 +264,7 @@ describe("auto-defer — threshold-based deferral via HTTP", () => {
     expect(capturedQueryParams.options.maxTurns).toBe(4)
   })
 
-  it("sets maxTurns to 3 when no deferred tools (passthrough base budget)", async () => {
+  it("caps maxTurns at 1 when no deferred tools — nothing needs a turn past the tool handoff", async () => {
     mockMessages = [assistantMessage([{ type: "text", text: "Hello" }])]
 
     await app().fetch(new Request("http://localhost/v1/messages", {
@@ -271,7 +277,7 @@ describe("auto-defer — threshold-based deferral via HTTP", () => {
       })),
     }))
 
-    expect(capturedQueryParams.options.maxTurns).toBe(3)
+    expect(capturedQueryParams.options.maxTurns).toBe(1)
   })
 
   it("disables auto-defer when threshold is 0", async () => {

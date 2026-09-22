@@ -263,12 +263,13 @@ describe("a refresh preserves an already-persisted plan", () => {
     resetInflightRefresh()
   })
 
-  it("keeps subscriptionType and rateLimitTier across a token refresh", async () => {
+  it("keeps subscriptionType, rateLimitTier and seatTier across a token refresh", async () => {
     const { refreshOAuthToken } = await import("../proxy/tokenRefresh")
 
     let stored = buildLoginCredentials(TOKEN_DATA, {
-      subscriptionType: "max",
-      rateLimitTier: "default_claude_max_20x",
+      subscriptionType: "team",
+      rateLimitTier: "default_claude_max_5x",
+      seatTier: "team_tier_1",
     })
     const store: CredentialStore = {
       async read() { return JSON.parse(JSON.stringify(stored)) },
@@ -283,8 +284,9 @@ describe("a refresh preserves an already-persisted plan", () => {
 
     expect(await refreshOAuthToken(store)).toBe(true)
     expect(stored.claudeAiOauth.accessToken).toBe("rotated-access-token")
-    expect(stored.claudeAiOauth.subscriptionType).toBe("max")
-    expect(stored.claudeAiOauth.rateLimitTier).toBe("default_claude_max_20x")
+    expect(stored.claudeAiOauth.subscriptionType).toBe("team")
+    expect(stored.claudeAiOauth.rateLimitTier).toBe("default_claude_max_5x")
+    expect(stored.claudeAiOauth.seatTier).toBe("team_tier_1")
   })
 
   it("does not invent a plan for a credential written before this change", async () => {
@@ -301,5 +303,42 @@ describe("a refresh preserves an already-persisted plan", () => {
     expect(await refreshOAuthToken(store)).toBe(true)
     // A refresh cannot repair an already-blind profile: only a re-login can.
     expect("subscriptionType" in stored.claudeAiOauth).toBe(false)
+  })
+})
+
+describe("getStoredPlanFields", () => {
+  it("reads subscriptionType, rateLimitTier and seatTier from store", async () => {
+    const { getStoredPlanFields } = await import("../proxy/tokenRefresh")
+    const store: CredentialStore = {
+      async read() {
+        return {
+          claudeAiOauth: {
+            accessToken: "tok",
+            refreshToken: "ref",
+            expiresAt: 1000,
+            subscriptionType: "team",
+            rateLimitTier: "default_claude_max_5x",
+            seatTier: "team_tier_1",
+          }
+        }
+      },
+      async write() { return true },
+    }
+    const fields = await getStoredPlanFields(store)
+    expect(fields).toEqual({
+      subscriptionType: "team",
+      rateLimitTier: "default_claude_max_5x",
+      seatTier: "team_tier_1",
+    })
+  })
+
+  it("returns empty object when store has no credentials or read fails", async () => {
+    const { getStoredPlanFields } = await import("../proxy/tokenRefresh")
+    const store: CredentialStore = {
+      async read() { return null },
+      async write() { return true },
+    }
+    const fields = await getStoredPlanFields(store)
+    expect(fields).toEqual({})
   })
 })

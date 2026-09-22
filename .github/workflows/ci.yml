@@ -67,7 +67,31 @@ jobs:
       # Run only the resolver tests on Windows. Useful even though they use
       # mocked deps, because the test runner itself exercises path joining,
       # file URL parsing, etc., on the real Windows runtime.
+      - run: bun test src/__tests__/antigravity-expansion.test.ts src/__tests__/antigravity-gaps.test.ts
       - run: bun test src/__tests__/claude-executable-resolver.test.ts
+        shell: bash
+
+      # Exercise the real Windows SDK process wrapper, PowerShell incarnation
+      # capture, abort handling, stderr draining, and exact join semantics.
+      - run: bun test src/__tests__/sdk-process-gate.test.ts src/__tests__/process-incarnation.test.ts
+        shell: bash
+
+      # Node cannot open directory handles for fsync on Windows. Exercise real
+      # sidecar publication and all three stale-lock recovery protocols there.
+      - run: bun test src/__tests__/durable-file-system.test.ts src/__tests__/windows-durable-storage.test.ts
+        shell: bash
+
+      # Exercise Windows client paths through extraction, query construction,
+      # and the HTTP adapter boundary. These assertions intentionally avoid
+      # resolving the client path on the runner.
+      - run: bun test src/__tests__/opencode-cwd-note.test.ts src/__tests__/query-cwd-note.test.ts src/__tests__/proxy-working-directory.test.ts
+        shell: bash
+
+      # Session GC's fenced deletion path was a silent no-op on win32 until it
+      # was ported. The ubuntu job runs this file too, but the win32-only
+      # branches (handle-based join, taskkill tree kill, pid-reuse-proof
+      # deleting-claim recovery) only execute on a real Windows runtime.
+      - run: bun test src/__tests__/session-lifecycle-windows-gc.test.ts
         shell: bash
 
       # Plugin loader exercises `await import(absolutePath)` which on Windows

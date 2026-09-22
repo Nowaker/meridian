@@ -9,6 +9,9 @@
  */
 
 import { describe, it, expect, mock, beforeAll, afterAll, beforeEach, afterEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import {
   messageStart,
   textBlockStart,
@@ -20,18 +23,19 @@ import {
   messageStop,
   assistantMessage,
   parseSSE,
+  withMockSdkSessionId,
 } from "./helpers"
 
 // --- Mock SDK ---
 let mockMessages: any[] = []
 let capturedQueryParams: any = null
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: any) => {
     capturedQueryParams = params
     return (async function* () {
       for (const msg of mockMessages) {
-        yield msg
+        yield withMockSdkSessionId(msg, params.options)
       }
     })()
   },
@@ -41,14 +45,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
     instance: {},
   }),
   tool: () => ({}),
-}))
+}), "integration.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 

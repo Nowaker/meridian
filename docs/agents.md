@@ -1,10 +1,19 @@
 # Agent Setup
 
+This guide covers Claude client setup. For the Antigravity preview, use the
+[Pi/OpenCode setup guide](antigravity.md) and [support matrix](antigravity-support.md).
+
 [← Back to README](../README.md)
 
-Per-agent configuration for every tested client. All agents share the same basics — point the tool at `http://127.0.0.1:3456` with any API key value — but several have their own config formats or adapters, documented here.
+Client configurations and existing verification notes. Examples use a local proxy with authentication disabled; replace placeholder keys with your `MERIDIAN_API_KEY` when enabled. Model lists are examples, not account entitlements: inspect `GET /v1/models` and match the client context window to the proxy's configured window.
+
+[OpenCode](#opencode) · [Crush](#crush) · [Droid](#droid-factory-ai) · [Cline](#cline) · [Aider](#aider) · [Codex](#codex-cli) · [OpenAI clients](#openai-compatible-tools-open-webui-continue-etc) · [Jcode](#jcode) · [Cherry Studio](#cherry-studio) · [ForgeCode](#forgecode) · [Pi](#pi) · [Prime Agent](#prime-agent) · [Claude Code](#claude-code) · [Polytoken](#polytoken) · [Hermes](#hermes-agent)
+
+Shell environment examples use POSIX syntax. In PowerShell, set variables with `$env:NAME = "value"` before launching the client.
 
 ### OpenCode
+
+### OpenCode V1
 
 **Step 1: Run `meridian setup` (required, one time)**
 
@@ -12,13 +21,16 @@ Per-agent configuration for every tested client. All agents share the same basic
 meridian setup
 ```
 
-This adds the Meridian plugin to your OpenCode global config (`~/.config/opencode/opencode.json`). The plugin enables:
+When V1 and V2 are both installed, the default command keeps V1 selected. You can
+also select it explicitly:
 
-- **Session tracking** — reliable conversation continuity across requests
-- **Safe model defaults** — Opus uses 1M context (included with Max subscription); Sonnet uses 200k to avoid Extra Usage charges ([details](configuration.md#configuration))
-- **Subagent model selection** — subagents automatically use `sonnet`/`opus` (200k), preserving rate-limit budget
+```bash
+meridian setup --v1
+```
 
-If the plugin is missing, Meridian warns at startup and reports `"plugin": "not-configured"` in the health endpoint.
+Setup adds the V1 Meridian plugin to the OpenCode global config
+(`~/.config/opencode/opencode.json`). It preserves unrelated plugin entries and
+all other settings.
 
 **Step 2: Start**
 
@@ -26,14 +38,132 @@ If the plugin is missing, Meridian warns at startup and reports `"plugin": "not-
 ANTHROPIC_API_KEY=x ANTHROPIC_BASE_URL=http://127.0.0.1:3456 opencode
 ```
 
-Or set these in your shell profile so they're always active:
+Or set these in your shell profile so they are always active:
 
 ```bash
 export ANTHROPIC_API_KEY=x
 export ANTHROPIC_BASE_URL=http://127.0.0.1:3456
 ```
 
+### OpenCode V2 beta
+
+#### Host support policy
+
+Meridian pins and qualifies explicit public OpenCode V2 beta releases:
+`@opencode-ai/cli@0.0.0-beta-18314`, `0.0.0-beta-18866`, and `0.0.0-beta-19271`.
+
+Because upstream V2 plugin interfaces, session headers, subagent tracking, and
+compaction hooks are under active iteration, Meridian enforces a strict
+fail-closed policy rather than permitting wildcard or unverified host versions.
+A V2 release is only added to `SUPPORTED_OPENCODE_V2_VERSIONS` after passing the
+full end-to-end package gate (`scripts/e2e-opencode-v2-package.mjs --live --extended`),
+verifying:
+
+1. **Plugin configuration & loading:** bundled and source plugin installation via `meridian setup --v2`.
+2. **Session continuity & replay:** durable lineage across turns, restarts, and file store rehydration.
+3. **Branching & undo:** tool execution, prefix rollback detection, and isolated fork histories.
+4. **Subagent & agent isolation:** detached title/summary work, independent concurrent subagents, and compaction.
+5. **Model discovery & effort variants:** `GET /v1/models` catalog synchronization, cold-start cache seeding, and cache invalidation.
+
+Unverified releases, phantom versions, and nightly/dev builds are rejected by
+`meridian setup --v2` with an informative message listing the verified releases.
+
+Install a supported beta and select its executable:
+
+```bash
+npm install -g --prefix ~/.local @opencode-ai/cli@0.0.0-beta-19271
+meridian setup --v2 --opencode-bin ~/.local/bin/opencode2
+```
+
+If your binary is elsewhere, pass that path to `--opencode-bin`. V2 can
+self-update to a newer beta, so keep it pinned and launch it with automatic
+updates disabled while this compatibility target is current:
+
+```bash
+export OPENCODE_DISABLE_AUTOUPDATE=1
+```
+
+Configure V2's Anthropic provider to use Meridian. Keep the existing settings in
+`~/.config/opencode/opencode.json`; the important provider fields are:
+
+```json
+{
+  "model": "anthropic/claude-opus-4-6",
+  "small_model": "anthropic/claude-haiku-4-5",
+  "providers": {
+    "anthropic": {
+      "settings": {
+        "apiKey": "x",
+        "baseURL": "http://127.0.0.1:3456/v1"
+      },
+      "models": {
+        "claude-opus-4-6": { "name": "Claude Opus 4.6" },
+        "claude-haiku-4-5": { "name": "Claude Haiku 4.5" }
+      }
+    }
+  }
+}
+```
+
+V2 renamed these keys: it reads `providers` and `settings`, where V1 read
+`provider` and `options`. A V1-shaped block is silently ignored, so the client
+would talk to the real Anthropic API instead of Meridian. Anything you put under
+`models` is your own override and wins over both the built-in catalog and
+Meridian's advertised models.
+
+Then start the pinned client:
+
+```bash
+OPENCODE_DISABLE_AUTOUPDATE=1 ~/.local/bin/opencode2
+```
+
+The V2 plugin uses the native `model.request` and `http.request` hooks. It keeps
+primary and compaction requests attached to the correct OpenCode session,
+detaches concurrent hidden title/summary requests, and gives each visible
+subagent its own trusted identity. Request bodies and model input are unchanged.
+
+The V2 plugin also reads `GET /v1/models` from the configured Meridian base URL
+and writes what it finds into V2's model catalog: the context window your
+subscription actually gets, and one model variant per effort level the proxy
+accepts. This corrects OpenCode's built-in models.dev entries, which advertise a
+1M Sonnet that Meridian deliberately serves at 200k. Select an effort with
+`provider/model#variant`, for example `anthropic/claude-opus-5#high`. Discovery
+never blocks startup: if Meridian is unreachable or answers with anything
+unexpected, and nothing has been discovered before, the catalog is left exactly
+as OpenCode built it.
+
+Discovery cannot run until OpenCode has finished assembling the catalog, so the
+first request against a freshly started server used to see only the built-in
+entries and reject a Meridian-only variant with `provider.no-route`. The plugin
+now caches each successful discovery in
+`~/.config/meridian/opencode-v2-catalog.json` and seeds the catalog from it
+before the first request, so a cold `anthropic/claude-haiku-4-5#xhigh` works.
+The cache is refreshed by every successful discovery and is ignored after seven
+days.
+
+**What this means if you change the provider.** While a cache is present, a
+freshly started server uses the last catalog Meridian served rather than
+OpenCode's built-in entries — including when Meridian is down. If you repoint
+the provider at something that is not Meridian, discovery notices that no
+Meridian base URL is configured, deletes the cache and rebuilds the catalog
+without it; the run after that is back to OpenCode's own entries. To clear it by
+hand, delete that file. The very first run after a brand-new install has no
+cache yet, so a Meridian-only variant still needs one prior request.
+
+For either generation, the plugin enables:
+
+- **Session tracking** — reliable conversation continuity across requests
+- **Safe hidden-agent concurrency** — title and summary work cannot advance the primary lineage
+- **Model defaults** — Opus requests 1M context; Sonnet uses 200k by default ([defaults and account eligibility](configuration.md#configuration))
+- **Subagent model selection** — subagents use the 200k tier, preserving rate-limit budget
+
+If the plugin is missing, Meridian warns at request time. Restart OpenCode after
+running setup so it loads the selected plugin.
+
 #### oh-my-opencagent (OMO)
+
+> **OpenCode V1:** The integration below is validated on V1. Do not assume that
+> its plugin schema is compatible with the pinned V2 beta.
 
 [oh-my-opencagent](https://github.com/nicobailey/oh-my-opencagent) adds multi-agent orchestration on top of OpenCode. It works transparently through Meridian with no extra configuration — OMO uses the same OpenCode headers and tool format, so Meridian detects it automatically.
 
@@ -55,11 +185,12 @@ Add a provider to `~/.config/crush/crush.json`:
       "base_url": "http://127.0.0.1:3456",
       "api_key": "dummy",
       "models": [
+        { "id": "claude-fable-5-1",  "name": "Claude Fable 5.1 (1M)",   "context_window": 1000000, "default_max_tokens": 32768, "can_reason": true, "supports_attachments": true },
         { "id": "claude-fable-5",    "name": "Claude Fable 5 (1M)",     "context_window": 1000000, "default_max_tokens": 32768, "can_reason": true, "supports_attachments": true },
         { "id": "claude-opus-5",     "name": "Claude Opus 5 (1M)",      "context_window": 1000000, "default_max_tokens": 32768, "can_reason": true, "supports_attachments": true },
         { "id": "claude-opus-4-8",   "name": "Claude Opus 4.8 (1M)",    "context_window": 1000000, "default_max_tokens": 32768, "can_reason": true, "supports_attachments": true },
         { "id": "claude-opus-4-7",   "name": "Claude Opus 4.7 (1M)",    "context_window": 1000000, "default_max_tokens": 32768, "can_reason": true, "supports_attachments": true },
-        { "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6 (1M)",  "context_window": 1000000, "default_max_tokens": 64000, "can_reason": true, "supports_attachments": true },
+        { "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6",       "context_window": 200000, "default_max_tokens": 64000, "can_reason": true, "supports_attachments": true },
         { "id": "claude-opus-4-6",   "name": "Claude Opus 4.6 (1M)",    "context_window": 1000000, "default_max_tokens": 32768, "can_reason": true, "supports_attachments": true },
         { "id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5", "context_window": 200000,  "default_max_tokens": 16384, "can_reason": true, "supports_attachments": true }
       ]
@@ -82,6 +213,7 @@ Add Meridian as a custom model provider in `~/.factory/settings.json`:
 ```json
 {
   "customModels": [
+    { "model": "claude-fable-5-1",        "name": "Fable 5.1 (Meridian)",  "provider": "anthropic", "baseUrl": "http://127.0.0.1:3456", "apiKey": "x" },
     { "model": "claude-fable-5",          "name": "Fable 5 (Meridian)",    "provider": "anthropic", "baseUrl": "http://127.0.0.1:3456", "apiKey": "x" },
     { "model": "claude-opus-5",           "name": "Opus 5 (Meridian)",     "provider": "anthropic", "baseUrl": "http://127.0.0.1:3456", "apiKey": "x" },
     { "model": "claude-opus-4-8",         "name": "Opus 4.8 (Meridian)",   "provider": "anthropic", "baseUrl": "http://127.0.0.1:3456", "apiKey": "x" },
@@ -116,7 +248,7 @@ cline auth --provider anthropic --apikey "dummy" --modelid "claude-sonnet-4-6"
 **3. Run:**
 
 ```bash
-cline --yolo "refactor the login function"
+cline "refactor the login function"
 ```
 
 No plugin needed — Cline uses the standard Anthropic SDK.
@@ -165,15 +297,24 @@ Meridian speaks the OpenAI protocol natively — no LiteLLM or translation proxy
 
 **`GET /v1/models`** — returns available Claude models in OpenAI format
 
-Point any OpenAI-compatible tool at `http://127.0.0.1:3456` with any API key value:
+Set the OpenAI API base to `http://127.0.0.1:3456/v1` (clients append `/chat/completions` or `/models`). Use your proxy key if authentication is enabled:
 
 ```bash
-# Open WebUI: set OpenAI API base to http://127.0.0.1:3456, API key to any value
-# Continue: set apiBase to http://127.0.0.1:3456 with provider: openai
-# Any OpenAI SDK: set base_url="http://127.0.0.1:3456", api_key="dummy"
+# Open WebUI: OpenAI API base = http://127.0.0.1:3456/v1
+# Continue: apiBase = http://127.0.0.1:3456/v1, provider = openai
+# OpenAI SDK: base_url="http://127.0.0.1:3456/v1", api_key="x"
 ```
 
-> **Note:** Multi-turn conversations work by packing prior turns into the system prompt. Each request is a fresh SDK session — OpenAI clients replay full history themselves and don't use Meridian's session resumption.
+> **Note:** A request without a session key has its prior turns packed into the system prompt and runs on a fresh SDK session — the client replays the full history itself. A request keyed by `x-opencode-session` or `x-session-affinity` (Jcode: `x-jcode-session`) keeps its real messages and resumes one SDK session per key, under the contract every keyed client has:
+>
+> - turns under one key are serialized; a turn that lost the race and no longer holds the committed history is refused with HTTP 400 (`This session advanced while the request was waiting`) — retry it with the latest history;
+> - the history per key must be append-only: an edited turn forks at the edit as an undo, a rewritten middle replays fresh;
+> - a retry of an identical body is classified `replayed-request` and replays fresh — a second, billed answer;
+> - at this endpoint `x-session-affinity` is read as conversation identity, not a stickiness hint — send a distinct value per conversation, or omit it.
+
+### Jcode
+
+Use `/v1/chat/completions` with a stable `x-jcode-session` header. The dedicated `jcode` adapter preserves append-only history for SDK session reuse. Explicit selection uses `x-meridian-agent: jcode`; automatic detection requires both a `jcode/` User-Agent and a valid session header. Generic OpenAI clients retain their separate history-packing behavior.
 
 ### Cherry Studio
 
@@ -246,9 +387,210 @@ Pi uses the `@mariozechner/pi-ai` library which supports a configurable `baseUrl
 }
 ```
 
-Pi mimics Claude Code's User-Agent, so automatic detection isn't possible. The `x-meridian-agent: pi` header in the config above tells Meridian to use the Pi adapter. Alternatively, if Pi is your only agent, you can set `MERIDIAN_DEFAULT_AGENT=pi` as an env var instead.
+Pi mimics Claude Code's User-Agent, so automatic detection isn't possible. The `x-meridian-agent: pi` header in the config above tells Meridian to use the Pi adapter. For reliable tool-loop continuity, also configure [session affinity](configuration.md#client-driven-tool-loops-need-a-session-header). Alternatively, if Pi is your only agent, you can set `MERIDIAN_DEFAULT_AGENT=pi` as an env var instead.
 
 Pi runs in passthrough mode by default — it executes its own tools and Meridian just forwards the `tool_use` blocks. Opt out with `MERIDIAN_PASSTHROUGH=0`.
+
+[Oh My Pi](https://www.npmjs.com/package/@oh-my-pi/pi-coding-agent) (`omp`) is
+built on the same runtime and uses the Pi adapter. Its config lives in
+`~/.omp/agent/models.yml` and takes the same three keys:
+
+```yaml
+providers:
+  anthropic:
+    baseUrl: http://127.0.0.1:3456
+    apiKey: x
+    headers:
+      x-meridian-agent: pi
+```
+
+omp runs its main turn, title generation and mid-turn side questions
+concurrently under one session id. Meridian serializes them and answers a
+conflicting late request by replaying its own history. It does not reject that
+request merely because another caller committed while it waited. Normal
+upstream errors and cancellation still apply. The mapping follows the last
+completed caller: if that is a side call, the next main turn may also need a
+fresh replay. Separate session identities avoid this extra replay cost.
+
+Fresh side requests use their own tool declarations. Tool definitions omitted
+on a continuation can be inherited only from that same published SDK branch;
+a failed side request does not replace its tool cache.
+
+### Prime Agent
+
+**Concurrent RLM subagents are not production-safe.** Existing investigations observed overload amplification, cache churn during fresh replay, lost child-task context, and undelivered tool envelopes. Use one active agent for unattended or usage-sensitive work. Distinct child session keys and parent cancellation support do not establish reliable orchestration. The dated evidence below distinguishes real-client tests from protocol replays.
+
+[Prime Agent](https://www.npmjs.com/package/prime-agent) is a fork of Pi with a
+different prompt and tool surface, so it uses its own `prime` adapter rather
+than Pi's. Its only tool by default is `ipython`, a persistent kernel in the
+client — passthrough is effectively required, and internal mode
+(`MERIDIAN_PASSTHROUGH=0`) drops that tool entirely.
+
+Connect it with an extension. Save as `.prime/agent/extensions/meridian.ts` in
+a project, or `~/.prime/agent/extensions/meridian.ts` globally:
+
+```typescript
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+
+const MERIDIAN_PROVIDER = "meridian"
+
+export default function (pi: ExtensionAPI) {
+  pi.registerProvider(MERIDIAN_PROVIDER, {
+    name: "Meridian (Claude Max)",
+    baseUrl: "http://127.0.0.1:3456",
+    apiKey: "MERIDIAN_API_KEY",       // env var name, or any literal if auth is off
+    api: "anthropic-messages",
+    headers: { "x-meridian-agent": "prime" },
+    models: [
+      {
+        id: "claude-opus-5",
+        name: "Claude Opus 5 (Meridian)",
+        reasoning: true,
+        input: ["text", "image"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1000000,
+        maxTokens: 64000,
+      },
+    ],
+  })
+
+  // Required, not an optimisation — see below.
+  pi.on("before_provider_request", (event: any, ctx: any) => {
+    if (ctx?.model?.provider !== MERIDIAN_PROVIDER) return undefined
+    const sessionId = ctx?.sessionManager?.getSessionId?.()
+    if (typeof sessionId !== "string" || !sessionId) return undefined
+    const identity: Record<string, string> = { session_id: sessionId }
+    // Optional, and only present on newer Prime Agent builds. It is what lets
+    // Meridian cancel a whole subagent tree — see "Subagent cancellation".
+    const parentSessionId = ctx?.sessionManager?.getParentSessionId?.()
+    if (typeof parentSessionId === "string" && parentSessionId) {
+      identity.parent_session_id = parentSessionId
+    }
+    return {
+      ...(event.payload as Record<string, unknown>),
+      metadata: { user_id: JSON.stringify(identity) },
+    }
+  })
+}
+```
+
+Then pick a model with `/model` or `--provider meridian --model claude-opus-5`.
+
+**`contextWindow` must say `1000000`.** Provider models registered this way are
+static — Prime Agent never calls `GET /v1/models` for them — so this literal is
+the *only* thing driving the TUI footer and auto-compaction
+(`contextTokens > contextWindow - reserveTokens`). Meridian routes every primary
+`opus` request to the SDK's `opus[1m]` alias, so a `200000` here compacts the
+conversation at a fifth of the window you are actually paying for. Restart Prime
+Agent after editing: providers are registered once per process.
+
+Set it back to `200000` if you opt out of extended context on the proxy side —
+`MERIDIAN_1M_CONTEXT_SUPPORT=0`, `MERIDIAN_OPUS_MODEL=opus`, or a plan that
+doesn't include Opus 1M (Meridian then falls back to plain `opus` after one
+Extra-Usage rejection). Leaving `1000000` in that case surfaces as upstream
+errors on long conversations instead of local compaction.
+
+`maxTokens: 64000` advertises a client output budget. Meridian does not enforce
+`max_tokens` by default; see [output limits](configuration.md#known-limitations).
+
+Registering a **new** provider rather than overriding `anthropic` means
+installing this changes nothing until you select one of its models, so an
+already-running agent is unaffected.
+
+**The `before_provider_request` hook is required.** Prime Agent sends no session
+identity of its own, and under passthrough every tool round ends in a
+`tool_result` — which Meridian treats as a self-contained request needing no
+session resume. Each round then replays the whole conversation into a fresh
+session, and since that replay strips the assistant's `tool_use` blocks by
+design, the model loses track of what it has already run. Stamping
+`metadata.user_id` makes each round a continuation instead, so the SDK keeps the
+real tool calls in its own session state. `getSessionId()` is distinct per
+agent, so RLM children get their own keys rather than colliding with the parent.
+
+**Subagent cancellation.** RLM children reach Meridian as independent requests
+on their own session keys, so cancelling the parent used to leave every child
+running — holding an SDK permit and billing the subscription until its own
+socket closed. `parent_session_id` closes that: it names the child's *immediate*
+parent, Meridian keeps a registry of in-flight requests and their parent links,
+and aborting a parent's request aborts every live request in the subtree below
+it, evicting each one's session mapping exactly as a direct cancel does.
+
+Three limits are deliberate. Only an actual abort propagates — a parent turn
+that merely finishes leaves its children alone, because a child routinely
+outlives the turn that spawned it. Only *live* requests are tracked; a session
+with nothing in flight is not remembered. And a client that omits
+`parent_session_id` is unaffected, which is the whole gate — there is no config
+flag. `POST /v1/sessions/<key>/cancel` cancels a subtree explicitly if you want
+to stop one without dropping sockets, and `/telemetry/summary` reports the
+counts under `sessionTree`.
+
+Detection is by the `x-meridian-agent: prime` header above, or
+`MERIDIAN_DEFAULT_AGENT=prime`. There is deliberately no User-Agent rule: in
+API-key mode Prime Agent sends the generic `Anthropic/JS <version>` that every
+Anthropic SDK client sends, so matching on it would misroute unrelated traffic.
+
+**Known limitation — file-change tracking.** Meridian reads file changes out of
+`ipython` cells for `%%bash` bodies, `!` shell escapes, and `await edit(path=…)`
+calls. It does **not** parse arbitrary Python writes (`open(p, "w").write(…)`,
+`Path.write_text`, library calls), which would need real dataflow analysis. Those
+edits still happen; they just don't appear in Meridian's file-change summary.
+
+#### What was verified, and what wasn't
+
+Measured on 2026-08-13/14 against Prime Agent 0.7.2:
+
+| Verified | How |
+|---|---|
+| Adapter selection, live turns | Real `prime-agent` binary through Meridian |
+| Tool-round session continuity | 45/45 rounds resumed as continuations across 12 sessions |
+| RLM children get distinct keys | Parent and depth-1 child carried different `metadata.user_id` on the wire |
+| Works with `codeSystemPrompt` off | 6 multi-round loops per arm; preset on vs off scored identically |
+| Survives long idle gaps | 7-minute silence, then `lineage=continuation` and the model recalled a codeword set before the gap |
+| Not metered as a third-party app | Negative control → full 18KB prompt → control again, all passing with the preset off |
+
+**Not verified: cron/scheduled tick delivery.** Two attempts, neither
+conclusive. Against a shared supervisor the scheduler fired (`runs=3`) but no
+request reached Meridian. Against an isolated supervisor, `schedule add` itself
+hung and never persisted the job. Session continuity across a worker restart is
+likewise untested.
+
+Four constraints make this awkward to exercise, all learned the hard way:
+
+- Only *resident* workers can be scheduled against. `print`, `rpc` and `json`
+  create **client-owned** workers, which Prime Agent deliberately omits from
+  schedules — so every headless mode is structurally ineligible. A resident
+  worker needs an interactive session, which needs a TTY (a pty works).
+- The `--daemon-socket` flag must come **before** the subcommand:
+  `prime-agent --daemon-socket <path> schedule list`. Placed after, it is
+  rejected as an unknown option, which reads misleadingly like the subcommand
+  cannot target a custom socket.
+- `PRIME_AGENT_CODING_AGENT_DIR` does **not** isolate a session from a shared
+  supervisor. The supervisor writes sessions into whichever agent directory
+  *it* was started with, so a test run against an already-running daemon lands
+  its sessions in that daemon's store. The supervisor socket is likewise global
+  per UID (`$TMPDIR/prime-agent-<uid>/daemon.sock`), so real isolation needs
+  `--daemon-socket` *and* a matching `PRIME_AGENT_CODING_AGENT_DIR`.
+- A dangling `~/.cache/meridian` makes Meridian return
+  `500 ENOENT … mkdir '~/.cache/meridian'` on affected requests. The client
+  retries and appears to hang, which is easy to misread as the agent stalling.
+  Check that path resolves before diagnosing anything else.
+
+A resident worker configured this way *does* reach Meridian — verified — so the
+remaining gap is specifically the scheduler, not the transport.
+
+The long-idle result above covers the part Meridian owns — a turn arriving on a
+session after a quiet gap resumes rather than replaying.
+
+Also not verified: the real client driving its own IPython kernel through a full
+tool loop. Kernel provisioning stalled in the isolated test environment; the
+tool-round evidence above comes from replaying Prime Agent's exact prompt and
+tool schema rather than from its kernel.
+
+**The metering result is a dated snapshot, not a property of the prompt.** It
+means "not flagged on this account at this moment" — the same classifier was
+observed changing its answer within a single day during the OpenClaw work. If
+you hit `400 You're out of extra usage` on Prime Agent traffic, re-measure
+before assuming the prompt is fine.
 
 ### Claude Code
 
@@ -341,6 +683,64 @@ The design token is stored at `~/.config/meridian/design-token.json` (mode `0600
 
 > Contributed by [@sittitep](https://github.com/sittitep) (#543).
 
+### Polytoken
+
+[Polytoken](https://polytoken.dev/) talks native Anthropic Messages and executes its own tools, so Meridian always runs it in passthrough mode. tool_use blocks come back to Polytoken, which executes them client-side and posts `tool_result` continuations.
+
+```yaml
+# Polytoken provider config (config.yaml)
+providers:
+  meridian:
+    kind:
+      type: catalog
+      name: anthropic
+    url: http://127.0.0.1:3456
+    auth:
+      type: static_key
+      key: <the proxy's MERIDIAN_API_KEY, if set>
+    headers:
+      x-meridian-profile: work   # optional profile pin
+```
+
+Polytoken selection signals (full precedence follows below):
+
+1. A valid `X-Polytoken-Session` header — Polytoken is selected and that header **is the session identity**.
+2. A `Polytoken <version>` or `Polytoken/<version>` User-Agent (token-boundary match; `PolytokenImpostor` does not match). UA-only selection never manufactures identity: without a valid native header there is no session key, so tool-result continuations run independent and are never resumed (plain text turns still fall back to the generic first-message fingerprint, as for any other headerless client).
+3. `x-meridian-agent: polytoken` / `MERIDIAN_DEFAULT_AGENT=polytoken` for explicit selection.
+
+An explicit `x-meridian-agent` override (built-in adapter or instance name)
+beats everything above it: it is checked before the native header. The full
+order is explicit selection → native header → automatic instance match
+rules → the User-Agent chain. Unrelated OpenCode headers (`x-opencode-*`,
+`x-session-affinity`) have no effect on Polytoken traffic.
+
+Contract notes:
+
+- **The session header is identity, not authentication.** Same trust model as
+  every other adapter's headers — protect the proxy with `MERIDIAN_API_KEY`
+  if it is network-exposed.
+- **Client-owned tools are mandatory.** Passthrough cannot be disabled for
+  this protocol: an instance `passthrough: false` or a global
+  `MERIDIAN_PASSTHROUGH=0` is ineffective for `polytoken` (all other
+  adapters keep their normal precedence). Tool names, descriptions, schemas,
+  and `Task`/`task` `subagent_type` values are preserved: no alias
+  rewriting, no SDK subagent routing. The proxy still repairs common
+  input slips (camelCase keys, string-typed numbers) the same way it does
+  for every adapter, before the call reaches the client.
+- **Native prompt defaults.** No Claude Code preset is layered on
+  (`codeSystemPrompt: false`); the client's system prompt is the prompt.
+  Memory/dreaming/CLAUDE.md injection stay off. Explicit overrides via
+  `/settings` or an instance's `features` still apply.
+- **Thinking.** Thinking blocks from the model are preserved through
+  streaming and non-streaming responses, signatures included (redacted
+  thinking rides the same path; automated coverage exercises the signed
+  form on the non-streaming route). The thinking-generation and
+  `thinkingPassthrough` settings keep their existing semantics.
+- **Profile scoping.** With non-default profiles, the native key is scoped
+  per profile (`<profile>:<key>`) for resume state, exactly like other
+  keyed adapters. Blank/missing keys never resume (by design — no invented
+  fallback identity).
+
 ### Any Anthropic-compatible tool
 
 ```bash
@@ -360,8 +760,8 @@ model:
   base_url: http://127.0.0.1:3456
 ```
 
-Any `ANTHROPIC_API_KEY` value satisfies Hermes' credential check; Meridian
-handles the real authentication. Note that Hermes profiles have isolated
+Use `ANTHROPIC_API_KEY=x` when proxy authentication is disabled, or the configured
+`MERIDIAN_API_KEY` value when enabled. Meridian handles upstream authentication. Note that Hermes profiles have isolated
 `HERMES_HOME` directories: repeat the config for each profile.
 
 **Strongly recommended:** install the
@@ -369,7 +769,7 @@ handles the real authentication. Note that Hermes profiles have isolated
 it, every agentic turn ending in a `tool_result` is treated as an
 independent session and prompt-cache reuse is lost (each turn re-bills
 cache creation for the whole history). With it, sessions are resumed and
-cache hit rates reach ~100% on long runs. The plugin also wires
+historical long runs showed high cache reuse; the rate is workload-dependent. The plugin also wires
 `x-request-id`, `x-meridian-source` and `x-opencode-effort` for per-task
 cost control and telemetry correlation.
 
@@ -378,10 +778,68 @@ which matches no detection heuristic, so plain Hermes traffic falls through
 to whatever `MERIDIAN_DEFAULT_AGENT` names — `opencode` only when that
 variable is unset. Installing `meridian-affinity` changes this: the
 `x-session-affinity` header it injects resolves to the **`opencode`**
-adapter regardless of the default.
+adapter unless a stronger explicit adapter selection is present.
 
 That is usually what you want — the plugin's headers are the ones the
 OpenCode adapter reads — but it is a real switch, not a no-op. If you run
 `MERIDIAN_DEFAULT_AGENT=pi` (or anything else) and rely on that adapter's
 transforms for Hermes, set the adapter explicitly per request rather than
 letting the header decide.
+
+## Compatibility at a glance
+
+| Agent | Status | Notes |
+|-------|--------|-------|
+| [OpenCode](https://github.com/anomalyco/opencode) | ✅ Verified | V1 and pinned V2 beta support; requires the matching `meridian setup` mode ([setup](#opencode)) — tools, durable resume, restart, undo, compaction, parallel subagents |
+| [ForgeCode](https://forgecode.dev) | ✅ Verified | Provider config (see [Agent Setup](#agent-setup)) — passthrough tool execution, session resume, streaming |
+| [Droid (Factory AI)](https://factory.ai/product/ide) | ✅ Verified | BYOK config (see [Agent Setup](#agent-setup)) — full tool support, session resume, streaming |
+| [Crush](https://github.com/charmbracelet/crush) | ✅ Verified | Provider config (see [Agent Setup](#agent-setup)) — full tool support, session resume, headless `crush run` |
+| [Cline](https://github.com/cline/cline) | ✅ Verified | Config (see [Agent Setup](#agent-setup)) — full tool support, file read/write/edit, bash, session resume |
+| [Aider](https://github.com/paul-gauthier/aider) | ✅ Verified | Env vars — file editing, streaming; `--no-stream` broken (litellm bug) |
+| [Open WebUI](https://github.com/open-webui/open-webui) | ✅ Verified | OpenAI-compatible endpoints — set base URL to `http://127.0.0.1:3456` |
+| [Pi](https://github.com/mariozechner/pi-coding-agent) | ✅ Verified | models.json config (see [Agent Setup](#agent-setup)) — full tool support via passthrough; detected via `x-meridian-agent: pi` header |
+| [Prime Agent](https://www.npmjs.com/package/prime-agent) | ⚠️ Single-agent verified | Extension config (see [Agent Setup](#agent-setup)) — reliable with one active agent. Concurrent RLM subagents receive distinct session keys, but are not yet production-safe; see [Prime Agent subagents](#prime-agent-subagents). The extension's `metadata.user_id` stamp is **required**, not optional. |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | ✅ Verified | `ANTHROPIC_BASE_URL` — remote clients share a Max subscription over the network; client CWD preserved in system prompt |
+| [Cherry Studio](https://github.com/CherryHQ/cherry-studio) | ✅ Verified | `cherry` adapter (see [Agent Setup](#agent-setup)) — chat client with Claude's built-in web search via internal mode |
+| [Polytoken](https://polytoken.dev/) | ✅ Verified | Provider config (see [Agent Setup](#Polytoken)) — `X-Polytoken-Session` identity, mandatory client-owned tools (passthrough cannot be disabled), signed-thinking passthrough |
+| Jcode | ✅ Verified | `/v1/chat/completions` + `x-jcode-session` header — dedicated `jcode` adapter keeps append-only history intact, so retained sessions resume on one SDK session (90.9% cache hit on turn 2 of a two-turn Opus session) |
+| [Codex CLI](https://github.com/openai/codex) | ✅ Verified | `/v1/responses` (see [Agent Setup](#agent-setup)) — Responses-API provider, passthrough tool execution; verified on 0.144 (plain + tool-driving turns) |
+| [Continue](https://github.com/continuedev/continue) | 🔲 Untested | OpenAI-compatible endpoints should work — set `apiBase` to `http://127.0.0.1:3456` |
+
+### Prime Agent subagents
+
+Prime Agent is reliable through Meridian with one active agent. RLM children have
+separate session identities and can execute successfully, but concurrent subagent
+orchestration is not yet production-safe. Observed failure modes include overload
+amplification, expensive cache churn after fresh-session replay, loss of child-task
+context during recovery, and undelivered tool envelopes. Use a single active Prime
+Agent for unattended or usage-sensitive work until coordinated fixes land in Prime
+Agent and Meridian.
+
+Parent-to-child cancellation is handled on the Meridian side: when the extension
+stamps `parent_session_id` alongside the child's session id, aborting a parent's
+in-flight request aborts every live request in the subtree below it and evicts
+each one's session mapping. See
+[Subagent cancellation](#prime-agent).
+
+Prime Agent can keep Opus on the root session while selecting Sol for an individual
+child. A child inherits its parent's model unless the `rlm` call supplies an exact
+`provider/model` selector returned by `rlm.find_models()`:
+
+```python
+sol_models = await rlm.find_models("sol")
+print(sol_models)  # choose an available exact selector for your authenticated providers
+
+child = await rlm(
+    "Review this change and report your findings to the parent.",
+    name="sol-reviewer",
+    model="openai-codex/gpt-5.6-sol",
+)
+```
+
+The selector above requires an authenticated OpenAI Codex provider in Prime Agent;
+Prime Inference may expose a different Sol selector. Explicit child model selection
+reduces Claude Max pressure, but does not by itself fix the orchestration and
+cancellation limitations above.
+
+Tested an agent or built a plugin? [Open an issue](https://github.com/rynfar/meridian/issues) and we'll add it.

@@ -18,7 +18,7 @@
 import { existsSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import { configPath, defaultConfigDir } from "../configDir"
-import { setSetting, getSetting } from "./settings"
+import { setSetting, getSetting } from "../settings"
 import { pickStickyProfile, type RoutingMode } from "./routing"
 import { adoptedProfiles, followedActiveProfile } from "./followActive"
 
@@ -89,12 +89,10 @@ export function loadProfilesFromDisk(): ProfileConfig[] {
       diskProfilesCache = JSON.parse(readFileSync(file, "utf-8"))
     }
     diskProfilesCacheAt = Date.now()
-    diskProfilesCachePath = file
     return diskProfilesCache
   } catch (err) {
     console.warn(`[meridian] Failed to read ${file}: ${err instanceof Error ? err.message : err}`)
     diskProfilesCacheAt = Date.now()
-    diskProfilesCachePath = file
     diskProfilesCache = []
     return []
   }
@@ -205,11 +203,6 @@ export function getEffectiveActiveProfileId(configProfiles: ProfileConfig[] | un
   return resolveActiveProfileId(getEffectiveProfiles(configProfiles).map(p => p.id))
 }
 
-export function clearActiveProfile(): void {
-  activeProfileId = undefined
-  setSetting("activeProfile", undefined)
-}
-
 /** Reset active profile — for testing only. */
 export function resetActiveProfile(): void {
   activeProfileId = undefined
@@ -251,7 +244,7 @@ export function enableDiskProfileDiscovery(): void {
   diskDiscoveryEnabled = true
 }
 
-/** Disable disk auto-discovery — for testing only.
+/** Turn disk auto-discovery back off.
  *
  *  The flag is process-global and one-way, so a test file that imports
  *  `bin/cli.ts` turns it on for every file that runs after it in the same
@@ -330,15 +323,7 @@ export function resolveProfile(
   requestedId?: string,
   options?: ResolveProfileOptions
 ): ResolvedProfile {
-  return resolveProfileFromPool(getEffectiveProfiles(profiles), defaultProfile, requestedId, options)
-}
-
-export function resolveProfileFromPool(
-  effective: readonly ProfileConfig[],
-  defaultProfile: string | undefined,
-  requestedId?: string,
-  options?: ResolveProfileOptions
-): ResolvedProfile {
+  const effective = getEffectiveProfiles(profiles)
 
   // No profiles configured — return empty env (standard single-account mode)
   if (effective.length === 0) {

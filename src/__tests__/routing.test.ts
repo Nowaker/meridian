@@ -8,9 +8,26 @@
  * to the removed arm (minimal cache disruption).
  */
 import { describe, it, expect } from "bun:test"
-import { pickStickyProfile, getRoutingMode, resolvePriorityOrder, choosePriorityProfile, chooseActivePriorityCandidates, ProfileExhaustion, RENDEZVOUS_STABLE_GUARD, AssignmentStore } from "../proxy/routing"
+import {
+  pickStickyProfile,
+  getRoutingMode,
+  getPriorityFailbackPolicy,
+  shouldPromotePriorityAssignment,
+  resolvePriorityOrder,
+  choosePriorityProfile,
+  chooseActivePriorityCandidates,
+  ProfileExhaustion,
+  RENDEZVOUS_STABLE_GUARD,
+  AssignmentStore,
+  resolveCooldownUntil,
+  cooldownCapMs,
+  type PriorityAssignment,
+  type PriorityPromotionInput,
+} from "../proxy/routing"
 
 const PROFILES = ["personal", "work"]
+const WORK_ASSIGNMENT: PriorityAssignment = { profileId: "work", requestId: "request-1" }
+const PERSONAL_ASSIGNMENT: PriorityAssignment = { profileId: "personal", requestId: "request-1" }
 
 describe("pickStickyProfile", () => {
   it("is deterministic: same session always maps to the same profile", () => {
@@ -143,6 +160,38 @@ describe("priority routing (#priority-spec)", () => {
   })
 })
 
+describe("priority failback policy", () => {
+  it("resolves unset and invalid values to new-conversation and accepts next-user-turn", () => {
+    // Given
+    const values = [undefined, "eventually", "next-user-turn"]
+
+    // When
+    const actual = values.map(getPriorityFailbackPolicy)
+
+    // Then
+    expect(actual).toEqual(["new-conversation", "new-conversation", "next-user-turn"])
+  })
+
+  it("promotes only for a changed human request under next-user-turn", () => {
+    // Given
+    const assignment = { profileId: "personal", requestId: "request-1" }
+    const cases: readonly PriorityPromotionInput[] = [
+      { policy: "new-conversation", requestId: "request-2", requestKind: "human", assignment },
+      { policy: "next-user-turn", requestId: "request-1", requestKind: "human", assignment },
+      { policy: "next-user-turn", requestId: "request-2", requestKind: "human", assignment },
+      { policy: "next-user-turn", requestId: "request-2", requestKind: "synthetic", assignment },
+      { policy: "next-user-turn", requestId: "request-2", requestKind: "unknown", assignment },
+      { policy: "next-user-turn", requestId: "request-2", requestKind: undefined, assignment },
+    ]
+
+    // When
+    const actual = cases.map(shouldPromotePriorityAssignment)
+
+    // Then
+    expect(actual).toEqual([false, false, true, false, false, false])
+  })
+})
+
 describe("ProfileExhaustion tracker", () => {
   const T0 = 1_800_000_000_000
 
@@ -179,77 +228,180 @@ describe("ProfileExhaustion tracker", () => {
 describe("AssignmentStore", () => {
   it("stores and returns assignments", () => {
     const store = new AssignmentStore(10)
-    store.set("a", "work")
-    expect(store.get("a")).toBe("work")
+    store.set("a", WORK_ASSIGNMENT)
+    expect(store.get("a")).toEqual(WORK_ASSIGNMENT)
     expect(store.get("missing")).toBeUndefined()
     expect(store.size).toBe(1)
   })
 
   it("overwrites an existing key without growing", () => {
     const store = new AssignmentStore(10)
-    store.set("a", "work")
-    store.set("a", "personal")
-    expect(store.get("a")).toBe("personal")
+    store.set("a", WORK_ASSIGNMENT)
+    store.set("a", PERSONAL_ASSIGNMENT)
+    expect(store.get("a")).toEqual(PERSONAL_ASSIGNMENT)
     expect(store.size).toBe(1)
+  })
+
+  it("rejects a stale compare-and-set after a newer assignment wins", () => {
+    const store = new AssignmentStore(10)
+    store.set("a", PERSONAL_ASSIGNMENT)
+    const stale = store.get("a")
+    expect(stale).toEqual(PERSONAL_ASSIGNMENT)
+    if (stale === undefined) return
+    const preferred = { profileId: "work", requestId: "request-2" }
+
+    expect(store.compareAndSet("a", stale, preferred)).toBe(true)
+    expect(store.compareAndSet("a", stale, PERSONAL_ASSIGNMENT)).toBe(false)
+    expect(store.get("a")).toEqual(preferred)
   })
 
   it("evicts the oldest entry once over capacity", () => {
     const store = new AssignmentStore(2)
-    store.set("a", "work")
-    store.set("b", "work")
-    store.set("c", "work")
+    store.set("a", WORK_ASSIGNMENT)
+    store.set("b", WORK_ASSIGNMENT)
+    store.set("c", WORK_ASSIGNMENT)
     expect(store.size).toBe(2)
     expect(store.get("a")).toBeUndefined()
-    expect(store.get("b")).toBe("work")
-    expect(store.get("c")).toBe("work")
+    expect(store.get("b")).toEqual(WORK_ASSIGNMENT)
+    expect(store.get("c")).toEqual(WORK_ASSIGNMENT)
   })
 
   it("refreshes recency on WRITE so a re-assigned key is not evicted first", () => {
     // The FIFO bug: a bare Map.set() on an existing key does not reorder it,
     // so "a" would still be evicted despite being the most recently written.
     const store = new AssignmentStore(2)
-    store.set("a", "work")
-    store.set("b", "work")
-    store.set("a", "personal")
-    store.set("c", "work")
-    expect(store.get("a")).toBe("personal")
+    store.set("a", WORK_ASSIGNMENT)
+    store.set("b", WORK_ASSIGNMENT)
+    store.set("a", PERSONAL_ASSIGNMENT)
+    store.set("c", WORK_ASSIGNMENT)
+    expect(store.get("a")).toEqual(PERSONAL_ASSIGNMENT)
     expect(store.get("b")).toBeUndefined()
   })
 
   it("refreshes recency on READ so an actively used key is not evicted first", () => {
     const store = new AssignmentStore(2)
-    store.set("a", "work")
-    store.set("b", "work")
-    expect(store.get("a")).toBe("work") // "a" is in active use
-    store.set("c", "work")
-    expect(store.get("a")).toBe("work")
+    store.set("a", WORK_ASSIGNMENT)
+    store.set("b", WORK_ASSIGNMENT)
+    expect(store.get("a")).toEqual(WORK_ASSIGNMENT) // "a" is in active use
+    store.set("c", WORK_ASSIGNMENT)
+    expect(store.get("a")).toEqual(WORK_ASSIGNMENT)
     expect(store.get("b")).toBeUndefined()
   })
 
   it("does not refresh recency for a missing key", () => {
     const store = new AssignmentStore(2)
-    store.set("a", "work")
-    store.set("b", "work")
+    store.set("a", WORK_ASSIGNMENT)
+    store.set("b", WORK_ASSIGNMENT)
     expect(store.get("nope")).toBeUndefined()
-    store.set("c", "work")
+    store.set("c", WORK_ASSIGNMENT)
     expect(store.get("a")).toBeUndefined()
-    expect(store.get("b")).toBe("work")
+    expect(store.get("b")).toEqual(WORK_ASSIGNMENT)
   })
 
   it("with max 0, an entry is evicted immediately after being written", () => {
     const store = new AssignmentStore(0)
-    store.set("a", "work")
+    store.set("a", WORK_ASSIGNMENT)
     expect(store.size).toBe(0)
     expect(store.get("a")).toBeUndefined()
   })
 
   it("with max 1, only the newest entry survives", () => {
     const store = new AssignmentStore(1)
-    store.set("a", "work")
-    store.set("b", "personal")
+    store.set("a", WORK_ASSIGNMENT)
+    store.set("b", PERSONAL_ASSIGNMENT)
     expect(store.size).toBe(1)
     expect(store.get("a")).toBeUndefined()
-    expect(store.get("b")).toBe("personal")
+    expect(store.get("b")).toEqual(PERSONAL_ASSIGNMENT)
+  })
+})
+
+// #790: a weekly-capped profile matched no `five_hour` entry, fell through to
+// the 10-minute default, and was re-probed every 10 minutes — with a real
+// failing upstream request on the request path — for the rest of the weekly
+// window. These pin the reset actually chosen and, just as importantly, the
+// per-window cap: a single 6-hour bound silently flattens a weekly reset and
+// recreates the same loop at a slower interval.
+describe("resolveCooldownUntil (#790)", () => {
+  const NOW = 1_700_000_000_000
+  const MIN = 60_000
+  const HOUR = 60 * MIN
+  const DAY = 24 * HOUR
+  const DEFAULT_MS = 10 * MIN
+
+  it("benches to the weekly reset when the weekly window is exhausted", () => {
+    const until = resolveCooldownUntil(
+      [{ type: "seven_day", resetsAt: NOW + 3 * DAY, exhausted: true }],
+      NOW, DEFAULT_MS,
+    )
+    expect(until).toBe(NOW + 3 * DAY)
+  })
+
+  it("does not flatten a weekly reset to the five-hour cap", () => {
+    // The trap: with one 6-hour cap this returns NOW + 6h and the profile is
+    // re-probed every six hours for days instead of every ten minutes.
+    const until = resolveCooldownUntil(
+      [{ type: "seven_day", resetsAt: NOW + 5 * DAY, exhausted: true }],
+      NOW, DEFAULT_MS,
+    )
+    expect(until).toBeGreaterThan(NOW + 6 * HOUR)
+    expect(until).toBe(NOW + 5 * DAY)
+  })
+
+  it("prefers the weekly reset when both windows are exhausted", () => {
+    // Inside a weekly cap the account stays unusable after the five-hour
+    // window rolls over, so benching to the shorter reset resumes probing a
+    // still-capped account.
+    const until = resolveCooldownUntil([
+      { type: "five_hour", resetsAt: NOW + 2 * HOUR, exhausted: true },
+      { type: "seven_day", resetsAt: NOW + 4 * DAY, exhausted: true },
+    ], NOW, DEFAULT_MS)
+    expect(until).toBe(NOW + 4 * DAY)
+  })
+
+  it("keeps five-hour behaviour unchanged", () => {
+    const until = resolveCooldownUntil(
+      [{ type: "five_hour", resetsAt: NOW + 2 * HOUR, exhausted: true }],
+      NOW, DEFAULT_MS,
+    )
+    expect(until).toBe(NOW + 2 * HOUR)
+  })
+
+  it("still bounds an absurd reset, per window", () => {
+    expect(resolveCooldownUntil(
+      [{ type: "five_hour", resetsAt: NOW + 400 * DAY, exhausted: true }], NOW, DEFAULT_MS,
+    )).toBe(NOW + cooldownCapMs("five_hour"))
+    expect(resolveCooldownUntil(
+      [{ type: "seven_day", resetsAt: NOW + 400 * DAY, exhausted: true }], NOW, DEFAULT_MS,
+    )).toBe(NOW + cooldownCapMs("seven_day"))
+  })
+
+  it("treats a present-but-healthy window as no evidence", () => {
+    // A healthy account always carries both windows with future resets, so
+    // presence alone must never bench a profile.
+    const until = resolveCooldownUntil([
+      { type: "five_hour", resetsAt: NOW + 2 * HOUR, exhausted: false },
+      { type: "seven_day", resetsAt: NOW + 3 * DAY, exhausted: false },
+    ], NOW, DEFAULT_MS)
+    expect(until).toBe(NOW + DEFAULT_MS)
+  })
+
+  it("ignores a past or missing reset", () => {
+    expect(resolveCooldownUntil(
+      [{ type: "seven_day", resetsAt: NOW - HOUR, exhausted: true }], NOW, DEFAULT_MS,
+    )).toBe(NOW + DEFAULT_MS)
+    expect(resolveCooldownUntil(
+      [{ type: "seven_day", resetsAt: null, exhausted: true }], NOW, DEFAULT_MS,
+    )).toBe(NOW + DEFAULT_MS)
+  })
+
+  it("does not bench a whole profile for a per-model weekly cap", () => {
+    // Deliberate: sidelining an account for days because one model's budget ran
+    // out would be worse than the bug. Documented as a known remainder.
+    const until = resolveCooldownUntil([
+      { type: "seven_day_opus", resetsAt: NOW + 3 * DAY, exhausted: true },
+      { type: "seven_day_fable", resetsAt: NOW + 3 * DAY, exhausted: true },
+    ], NOW, DEFAULT_MS)
+    expect(until).toBe(NOW + DEFAULT_MS)
   })
 })
 

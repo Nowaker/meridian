@@ -45,6 +45,8 @@ export const SAFE_AUTH_STRING_KEYS: ReadonlySet<string> = new Set([
   "billing_type",
   "subscriptionType",
   "rateLimitTier",
+  "seat_tier",
+  "seatTier",
 ])
 
 /**

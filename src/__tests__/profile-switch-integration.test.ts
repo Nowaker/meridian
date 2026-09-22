@@ -5,26 +5,30 @@
  * and settings persistence contract.
  */
 import { describe, test, expect, beforeEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
 import { mock } from "bun:test"
 
 // Mock the SDK before importing server
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
-  query: (opts: Record<string, unknown>) => {
+import { resolveMockSdkSessionId } from "./helpers"
+
+installSdkMock(() => ({
+  query: (opts: { options?: { sessionId?: string } }) => {
     return (async function* () {
       yield {
         type: "assistant",
         message: { type: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn" },
         parent_tool_use_id: null,
         uuid: crypto.randomUUID(),
-        session_id: `session-${Date.now()}`,
+        session_id: resolveMockSdkSessionId(opts.options, `session-${Date.now()}`),
       }
     })()
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "profile-switch-integration.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: unknown, fn: () => unknown) => fn(),
 }))

@@ -7,6 +7,9 @@
  */
 
 import { describe, it, expect, mock, beforeEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import {
   messageStart,
   textBlockStart,
@@ -14,24 +17,29 @@ import {
   blockStop,
   messageDelta,
   messageStop,
+  resolveMockSdkSessionId,
 } from "./helpers"
 
 let capturedOptions: any[] = []
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (opts: any) => {
     capturedOptions.push(opts.options || {})
     const isStreaming = opts.options?.includePartialMessages === true
+    const sessionId = resolveMockSdkSessionId(opts.options)
+    const withReturnedSessionId = (message: any) => sessionId
+      ? { ...message, session_id: sessionId }
+      : message
     return (async function* () {
       // Fire the PreToolUse deny hook if present (passthrough capture path)
       const preHook = opts?.options?.hooks?.PreToolUse?.[0]?.hooks?.[0]
       if (isStreaming) {
-        yield messageStart("msg-1")
-        yield textBlockStart(0)
-        yield textDelta(0, "Hello from Codex")
-        yield blockStop(0)
-        yield messageDelta("end_turn")
-        yield messageStop()
+        yield withReturnedSessionId(messageStart("msg-1"))
+        yield withReturnedSessionId(textBlockStart(0))
+        yield withReturnedSessionId(textDelta(0, "Hello from Codex"))
+        yield withReturnedSessionId(blockStop(0))
+        yield withReturnedSessionId(messageDelta("end_turn"))
+        yield withReturnedSessionId(messageStop())
       }
       void preHook
       yield {
@@ -46,20 +54,20 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
           stop_reason: "end_turn",
           usage: { input_tokens: 11, output_tokens: 4 },
         },
-        session_id: "sdk-1",
+        session_id: sessionId,
       }
     })()
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: { tool: () => {}, registerTool: () => ({}) } }),
   tool: () => ({}),
-}))
+}), "proxy-responses-endpoint.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -146,6 +154,40 @@ describe("/v1/responses (#475)", () => {
     expect(lastCompleted).toContain("Hello from Codex")
   })
 
+  it("stream: forwards internal SSE keepalive comments to the client", async () => {
+    const app = createTestApp()
+    const originalFetch = app.fetch.bind(app)
+    const internalFrames = [
+      `data: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", content: [], model: "claude-sonnet-5", stop_reason: null, usage: { input_tokens: 11, output_tokens: 0 } } })}`,
+      ": ping",
+      `data: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}`,
+      `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hello from Codex" } })}`,
+      ": ping",
+      `data: ${JSON.stringify({ type: "content_block_stop", index: 0 })}`,
+      `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 4 } })}`,
+      `data: ${JSON.stringify({ type: "message_stop" })}`,
+    ]
+    app.fetch = (req, env, executionCtx) => {
+      if (req.url === "http://internal/v1/messages") {
+        return Promise.resolve(new Response(`${internalFrames.join("\n\n")}\n\n`, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        }))
+      }
+      return originalFetch(req, env, executionCtx)
+    }
+
+    const res = await postResponses(app, { model: "claude-sonnet-5", input: "hi", stream: true })
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    const pingLines = text.split("\n").filter((l: string) => l === ": ping")
+    expect(pingLines).toHaveLength(2)
+    expect(text).toContain("event: response.output_text.delta")
+    expect(text).toContain("event: response.completed")
+    const lastCompleted = text.split("event: response.completed")[1] || ""
+    expect(lastCompleted).toContain("Hello from Codex")
+  })
+
   it("is advertised in the root endpoint list", async () => {
     const app = createTestApp()
     const res = await app.fetch(new Request("http://localhost/", { headers: { accept: "application/json" } }))
@@ -183,7 +225,8 @@ describe("/v1/responses session continuity via prompt_cache_key (#655)", () => {
     expect(r2.status).toBe(200)
     expect(capturedOptions).toHaveLength(2)
     expect(capturedOptions[0].resume).toBeUndefined()
-    expect(capturedOptions[1].resume).toBe("sdk-1")
+    expect(capturedOptions[0].sessionId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(capturedOptions[1].resume).toBe(capturedOptions[0].sessionId)
   })
 
   it("does not resume across different prompt_cache_keys", async () => {
@@ -198,5 +241,82 @@ describe("/v1/responses session continuity via prompt_cache_key (#655)", () => {
     await postResponses(app, { model: "claude-sonnet-5", input: [userItem], stream: false })
     await postResponses(app, { model: "claude-sonnet-5", input: loopTurnInput, stream: false })
     expect(capturedOptions[1].resume).toBeUndefined()
+  })
+})
+
+describe("/v1/responses keeps a spawned Codex thread out of its parent's session", () => {
+  beforeEach(() => {
+    clearSessionCache()
+    capturedOptions = []
+  })
+
+  const parentKey = "01a077c4-9c1c-73d1-bddb-7887bef18554"
+  const childThread = "01a07806-a29d-79b3-af96-876d8fa1be83"
+
+  const userItem = {
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: "Read data.txt and count the lines." }],
+  }
+  const loopTurnInput = [
+    userItem,
+    { type: "function_call", name: "exec_command", arguments: '{"cmd":"wc -l data.txt"}', call_id: "toolu_test_1" },
+    { type: "function_call_output", call_id: "toolu_test_1", output: "3 data.txt" },
+  ]
+
+  // Codex Desktop hands a spawned subagent the parent's prompt_cache_key, so
+  // the key alone cannot tell two live conversations apart. Its turn metadata
+  // can: the thread id is the subagent's own.
+  const clientMetadata = (thread: string, source: string) => ({
+    "x-codex-turn-metadata": JSON.stringify({
+      session_id: parentKey,
+      thread_id: thread,
+      turn_id: "01a07829-00f7-7a71-82d6-6b3a2626ebc8",
+      request_kind: "turn",
+      thread_source: source,
+    }),
+  })
+
+  it("gives the subagent its own SDK session and leaves the parent's resumable", async () => {
+    const app = createTestApp()
+    const parentTurn = (input: unknown) => postResponses(app, {
+      model: "claude-sonnet-5",
+      input,
+      stream: false,
+      prompt_cache_key: parentKey,
+      client_metadata: clientMetadata(parentKey, "user"),
+    })
+
+    expect((await parentTurn([userItem])).status).toBe(200)
+    const subagent = await postResponses(app, {
+      model: "claude-sonnet-5",
+      input: [userItem],
+      stream: false,
+      prompt_cache_key: parentKey,
+      client_metadata: clientMetadata(childThread, "subagent"),
+    })
+    expect(subagent.status).toBe(200)
+    expect((await parentTurn(loopTurnInput)).status).toBe(200)
+
+    expect(capturedOptions).toHaveLength(3)
+    // The subagent starts its own conversation rather than rebinding the key…
+    expect(capturedOptions[1].resume).toBeUndefined()
+    expect(capturedOptions[1].sessionId).not.toBe(capturedOptions[0].sessionId)
+    // …so the parent's next turn still resumes the session it left.
+    expect(capturedOptions[2].resume).toBe(capturedOptions[0].sessionId)
+  })
+
+  it("keeps resuming a user thread that sends turn metadata", async () => {
+    const app = createTestApp()
+    const body = (input: unknown) => ({
+      model: "claude-sonnet-5",
+      input,
+      stream: false,
+      prompt_cache_key: parentKey,
+      client_metadata: clientMetadata(parentKey, "user"),
+    })
+    await postResponses(app, body([userItem]))
+    await postResponses(app, body(loopTurnInput))
+    expect(capturedOptions[1].resume).toBe(capturedOptions[0].sessionId)
   })
 })

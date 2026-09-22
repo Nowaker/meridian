@@ -234,19 +234,11 @@ window.meridianReorder = (function () {
     if (live) live.textContent = message;
   }
 
-  // There are two reasons to withhold the handles and naming the wrong one is
-  // worse than saying nothing: the env var is a config change made in a shell,
-  // the view sort is one click away on the page being read.
-  function noteHtml(reorderable, lockedBy) {
-    if (reorderable) {
-      return '<div class="order-note">Drag a card by its handle to reorder, or focus a handle and press \\u2191 / \\u2193. '
-        + 'The order is saved, and drives <a href="/settings" style="color:var(--accent)">Priority routing</a> \\u2014 the pool drains from the top.</div>';
-    }
-    if (lockedBy === 'view-sort') {
-      return '<div class="order-note locked">Reordering is off while the cards are ranked by spend \\u2014 a drag saves the sequence on screen, '
-        + 'so it would write that ranking into the pool order. Switch back to <strong>Order</strong> to rearrange.</div>';
-    }
-    return '<div class="order-note locked">Order is pinned by the <code>MERIDIAN_PROFILE_ORDER</code> environment variable. Unset it to reorder from here.</div>';
+  function noteHtml(reorderable) {
+    return reorderable
+      ? '<div class="order-note">Drag a card by its handle to reorder, or focus a handle and press \\u2191 / \\u2193. '
+        + 'The order is saved, and drives <a href="/settings" style="color:var(--accent)">Priority routing</a> \\u2014 the pool drains from the top.</div>'
+      : '<div class="order-note locked">Order is pinned by the <code>MERIDIAN_PROFILE_ORDER</code> environment variable. Unset it to reorder from here.</div>';
   }
 
   function handleHtml(id, index, total) {

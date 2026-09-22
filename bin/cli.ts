@@ -19,16 +19,28 @@ if (args.includes("--version") || args.includes("-v")) {
 if (args.includes("--help") || args.includes("-h")) {
   console.log(`meridian v${version}
 
-Local Anthropic API powered by your Claude Max subscription.
+Local API bridge for Claude and Antigravity subscriptions.
 
 Usage: meridian [command] [options]
 
 Commands:
   (default)        Start the proxy server
   status           Show what a running instance is doing (the / page, in the terminal)
-  setup            Configure the OpenCode plugin (run once after install)
+  setup            Configure client integrations (run once after install)
   profile          Manage Claude account profiles (add, list, switch, remove)
   refresh-token    Refresh the Claude Code OAuth token
+
+Setup options:
+  --antigravity                Configure Pi or OpenCode V1 for Antigravity
+  --client <pi|opencode>       Client to configure with --antigravity
+  --url <base URL>             Antigravity URL (include /antigravity in combined mode)
+  --model <account slug>      Account model to add
+  --config-dir <directory>    Optional client configuration directory
+  --api-key-env <variable>    Reference a local Meridian API key from the environment
+  --set-default              Also select Antigravity for the client
+  --v1                         Install the OpenCode V1 plugin
+  --v2                         Install the pinned OpenCode V2 beta plugin
+  --opencode-bin <executable>  Probe this OpenCode executable
 
 Options:
   -v, --version   Show version
@@ -37,6 +49,19 @@ Options:
 Environment variables:
   MERIDIAN_PORT                     Port to listen on (default: 3456)
   MERIDIAN_HOST                     Host to bind to (default: 127.0.0.1)
+  MERIDIAN_BACKEND                  claude (default), antigravity, or combined
+  MERIDIAN_AGY_STATE_PATH           Optional bounded persistent state file
+  MERIDIAN_AGY_TURN_TIMEOUT_MS      Active CLI turn deadline (default: 300000)
+  MERIDIAN_AGY_TOOL_TIMEOUT_MS      Idle client-tool wait (default: 60000)
+  MERIDIAN_AGY_MAX_CONCURRENT       Maximum CLI processes (default: 4)
+  MERIDIAN_AGY_PLUGIN_PATHS         JSON array of Antigravity plugin modules
+  MERIDIAN_AGY_GRAMMAR_PYTHON       Local Python with Lark for custom grammars
+  MERIDIAN_AGY_PATH                 Official agy executable (default: agy)
+  MERIDIAN_AGY_ALLOW_TOOL_BRIDGE     Opt into Antigravity client-owned tools (1)
+  MERIDIAN_AGY_ADAPT_THINKING_BUDGETS Map numeric budgets to Gemini effort (1)
+  MERIDIAN_AGY_ALLOW_NATIVE_BROWSER  Opt into native browser actions (1)
+  MERIDIAN_AGY_BROWSER_MCP_PATH    Installed chrome-devtools-mcp 1.9.0 executable
+  MERIDIAN_AGY_ALLOW_NATIVE_SUBAGENTS Opt into native subagents (1)
   MERIDIAN_PASSTHROUGH              Enable passthrough mode (tools forwarded to client)
   MERIDIAN_IDLE_TIMEOUT_SECONDS     Idle timeout in seconds (default: 120)
   MERIDIAN_PLUGIN_DIR               Plugin auto-discovery directory (default: ~/.config/meridian/plugins)
@@ -70,12 +95,85 @@ if (args[0] === "profile") {
   process.exit(0)
 }
 
+if (args[0] === "setup" && args.includes("--antigravity")) {
+  const { parseAntigravitySetupArgs, setupAntigravityClient } = await import("../src/proxy/antigravitySetup")
+  try {
+    const result = setupAntigravityClient(parseAntigravitySetupArgs(args.slice(1)), import.meta.url)
+    console.log(`${result.changed.length ? "Configured" : "Already configured"} ${result.client} for Antigravity`)
+    console.log(`  Config: ${result.configPath}`)
+    console.log(`  Integration: ${result.integrationPath}`)
+    for (const backup of result.backups) console.log(`  Backup: ${backup}`)
+    console.log(`Restart ${result.client}, then select meridian-agy/${result.model}. Tool permissions remain in the client.`)
+    process.exit(0)
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exit(1)
+  }
+}
+
 if (args[0] === "setup") {
-  const { findPluginPath, runSetup, UnparseableConfigError } = await import("../src/proxy/setup")
-  const pluginPath = findPluginPath(import.meta.url)
+  const {
+    detectOpenCodeGeneration,
+    DuplicateMeridianConfigError,
+    MissingV2PluginError,
+    pluginPathForGeneration,
+    runSetup,
+    SUPPORTED_OPENCODE_V2_VERSIONS,
+    UnparseableConfigError,
+  } = await import("../src/proxy/setup")
+
+  const forceV1 = args.includes("--v1")
+  const forceV2 = args.includes("--v2")
+  if (forceV1 && forceV2) {
+    console.error("Choose only one OpenCode generation: --v1 or --v2")
+    process.exit(1)
+  }
+
+  const binaryIndex = args.indexOf("--opencode-bin")
+  const binary = binaryIndex >= 0 ? args[binaryIndex + 1] : undefined
+  if (binaryIndex >= 0 && (!binary || binary.startsWith("--"))) {
+    console.error("--opencode-bin requires an executable path")
+    process.exit(1)
+  }
+
+  const environmentBinary = process.env.OPENCODE_BIN
+  const commands = binary
+    ? [binary]
+    : environmentBinary ? [environmentBinary]
+    : forceV2 ? ["opencode2", "opencode"] : undefined
+  const detected = forceV1
+    ? { generation: "v1" as const }
+    : detectOpenCodeGeneration(commands)
+
+  if (!forceV1 && (binary || environmentBinary) && !detected.version) {
+    console.error(`Could not read a supported OpenCode version from ${binary ?? environmentBinary}.`)
+    process.exit(1)
+  }
+  if (forceV2 && detected.generation !== "v2") {
+    console.error("Could not find an OpenCode V2 beta. Install the pinned beta or pass --opencode-bin <path>.")
+    process.exit(1)
+  }
+  if (detected.generation === "v2" && !SUPPORTED_OPENCODE_V2_VERSIONS.has(detected.version ?? "")) {
+    console.error(`OpenCode V2 ${detected.version ?? "unknown"} is not supported by this Meridian build.`)
+    console.error(`Install a supported OpenCode beta (${[...SUPPORTED_OPENCODE_V2_VERSIONS].join(", ")}), then re-run meridian setup --v2.`)
+    process.exit(1)
+  }
+
+  let pluginPath: string
+  try {
+    pluginPath = pluginPathForGeneration(import.meta.url, detected.generation)
+  } catch (err) {
+    if (err instanceof MissingV2PluginError) {
+      console.error(`OpenCode V2 plugin bundle is missing: ${err.expectedPath}`)
+      console.error("Reinstall Meridian, then re-run meridian setup --v2.")
+      process.exit(1)
+    }
+    throw err
+  }
+
   let result
   try {
-    result = runSetup(pluginPath)
+    result = runSetup(pluginPath, undefined, detected.generation)
   } catch (err) {
     if (err instanceof UnparseableConfigError) {
       console.error(`\x1b[31m✗ Could not parse ${err.configPath}\x1b[0m`)
@@ -84,17 +182,25 @@ if (args[0] === "setup") {
       console.error(`    "plugin": ["${pluginPath}"]`)
       process.exit(1)
     }
+    if (err instanceof DuplicateMeridianConfigError) {
+      console.error("\x1b[31m✗ Meridian is already present in the other OpenCode config file\x1b[0m")
+      console.error(`  OpenCode loads both ${err.configPath} and ${err.siblingPath}.`)
+      console.error(`  Remove the Meridian entry from ${err.siblingPath}, then re-run 'meridian setup'.`)
+      console.error("  Both files were left untouched.")
+      process.exit(1)
+    }
     throw err
   }
 
+  const generationLabel = detected.generation === "v2" ? "OpenCode V2" : "OpenCode V1"
   if (result.alreadyConfigured) {
-    console.log(`\x1b[32m✓ Meridian plugin already configured\x1b[0m`)
+    console.log(`\x1b[32m✓ Meridian plugin already configured for ${generationLabel}\x1b[0m`)
     console.log(`  ${result.configPath}`)
   } else {
     if (result.removedStale.length > 0) {
       console.log(`  Removed ${result.removedStale.length} stale plugin entr${result.removedStale.length === 1 ? "y" : "ies"}`)
     }
-    console.log(`\x1b[32m✓ Meridian plugin configured\x1b[0m`)
+    console.log(`\x1b[32m✓ Meridian plugin configured for ${generationLabel}\x1b[0m`)
     console.log(`  Config: ${result.configPath}`)
     console.log(`  Plugin: ${result.pluginPath}`)
     if (!result.created) {
@@ -195,41 +301,43 @@ export async function runCli(
     return execFile(claudePath, ["auth", "status"], { timeout: 5000 })
   }
 ) {
-  // Plugin check — warn if OpenCode config exists but meridian plugin is missing
-  try {
-    const { findOpencodeConfigPath, checkPluginConfigured, findPluginPath } = await import("../src/proxy/setup")
-    const configPath = findOpencodeConfigPath()
-    const { existsSync } = await import("fs")
-    if (existsSync(configPath) && !checkPluginConfigured(configPath)) {
-      const pluginPath = findPluginPath(import.meta.url)
-      console.error("\x1b[33m⚠ Meridian plugin not found in OpenCode config.\x1b[0m")
-      console.error("  Session tracking and subagent model selection won\'t work.")
-      console.error(`  Fix: meridian setup`)
-      console.error("")
-    }
-  } catch { /* non-fatal */ }
+  if (process.env.MERIDIAN_BACKEND !== "antigravity") {
+    // Plugin check — warn if OpenCode config exists but meridian plugin is missing
+    try {
+      const { findOpencodeConfigPath, checkPluginConfigured, findPluginPath } = await import("../src/proxy/setup")
+      const configPath = findOpencodeConfigPath()
+      const { existsSync } = await import("fs")
+      if (existsSync(configPath) && !checkPluginConfigured(configPath)) {
+        const pluginPath = findPluginPath(import.meta.url)
+        console.error("\x1b[33m⚠ Meridian plugin not found in OpenCode config.\x1b[0m")
+        console.error("  Session tracking and subagent model selection won\'t work.")
+        console.error(`  Fix: meridian setup`)
+        console.error("")
+      }
+    } catch { /* non-fatal */ }
 
-  // Pre-flight auth check — runs the resolved Claude binary's auth-status
-  // subcommand. Independent of whether `claude` is on PATH (#478).
-  try {
-    const { stdout } = await runAuthCheck()
-    const auth = JSON.parse(stdout)
-    if (!auth.loggedIn) {
-      console.error("\x1b[31m✗ Not logged in to Claude.\x1b[0m Run: claude login")
-      process.exit(1)
+    // Pre-flight auth check — runs the resolved Claude binary's auth-status
+    // subcommand. Independent of whether `claude` is on PATH (#478).
+    try {
+      const { stdout } = await runAuthCheck()
+      const auth = JSON.parse(stdout)
+      if (!auth.loggedIn) {
+        console.error("\x1b[31m✗ Not logged in to Claude.\x1b[0m Run: claude login")
+        process.exit(1)
+      }
+      if (auth.subscriptionType !== "max") {
+        console.error(`\x1b[33m⚠ Claude subscription: ${auth.subscriptionType || "unknown"} (Max recommended)\x1b[0m`)
+      }
+    } catch {
+      console.error("\x1b[33m⚠ Could not verify Claude auth status. If requests fail, run: claude login\x1b[0m")
     }
-    if (auth.subscriptionType !== "max") {
-      console.error(`\x1b[33m⚠ Claude subscription: ${auth.subscriptionType || "unknown"} (Max recommended)\x1b[0m`)
-    }
-  } catch {
-    console.error("\x1b[33m⚠ Could not verify Claude auth status. If requests fail, run: claude login\x1b[0m")
-  }
 
-  // Enable disk auto-discovery when no MERIDIAN_PROFILES env var is set.
-  // This lets `meridian profile add` work without restarting the server.
-  if (!profiles) {
-    const { enableDiskProfileDiscovery } = await import("../src/proxy/profiles")
-    enableDiskProfileDiscovery()
+    // Enable disk auto-discovery when no MERIDIAN_PROFILES env var is set.
+    // This lets `meridian profile add` work without restarting the server.
+    if (!profiles) {
+      const { enableDiskProfileDiscovery } = await import("../src/proxy/profiles")
+      enableDiskProfileDiscovery()
+    }
   }
 
   const { enableOrganizationLookup } = await import("../src/proxy/organizationName")
@@ -243,6 +351,33 @@ export async function runCli(
       process.exit(1)
     }
   })
+
+  // Graceful shutdown: close() itself drains in-flight requests (bounded by
+  // MERIDIAN_SHUTDOWN_GRACE_MS) before releasing the port — see close() in
+  // startProxyServer. This handler just owns the process-exit decision, since
+  // only the CLI (not a library consumer embedding startProxyServer) should
+  // ever call process.exit() on a signal.
+  let shuttingDown = false
+  const handleShutdownSignal = (signal: NodeJS.Signals) => {
+    if (shuttingDown) {
+      // Second signal = force. The drain window is up to 30s and a wedged
+      // stream can hold it open for all of it; swallowing every later signal
+      // made the process unkillable by Ctrl-C or a supervisor's retry, short
+      // of SIGKILL. First signal drains, second one gives up.
+      console.log(`\n[meridian] Received ${signal} again, exiting immediately.`)
+      process.exit(130)
+    }
+    shuttingDown = true
+    console.log(`\n[meridian] Received ${signal}, shutting down gracefully...`)
+    proxy.close()
+      .then(() => process.exit(0))
+      .catch((err) => {
+        console.error(`[meridian] Error during shutdown: ${err instanceof Error ? err.message : err}`)
+        process.exit(1)
+      })
+  }
+  process.on("SIGTERM", handleShutdownSignal)
+  process.on("SIGINT", handleShutdownSignal)
 }
 
 if (import.meta.main) {

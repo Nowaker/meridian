@@ -75,12 +75,13 @@ export const HASH_SERIALIZED_BLOCK_TYPES = new Set([
 ])
 
 /**
- * Normalize message content to a string for hashing and comparison.
+ * Legacy content rendering used for adapter compatibility and diagnostics.
  * Handles both string content and array content (Anthropic content blocks).
- * Strips cache_control metadata to ensure hash stability across requests.
+ * Omits cache_control metadata and opaque thinking blocks.
  *
- * Used only for lineage hashing — see {@link HASH_IGNORED_BLOCK_TYPES}, which
- * drops content a display-oriented normalizer would need to keep.
+ * This representation is ambiguous across block types and boundaries. Never
+ * use it to prove lineage: session/lineage.ts uses structured domain-separated
+ * hashes instead.
  *
  * NOTE: OpenCode sends content as a string on the first request but as
  * an array on subsequent ones. This normalizer handles both formats.
@@ -162,6 +163,13 @@ export function getLastUserMessage(messages: Array<{ role: string; content: any 
  * and histories that don't end with a user turn are returned as a plain
  * join (nothing to separate).
  */
+export const REPLAY_CONTEXT_OPEN = `<conversation_history>\n`
+export const REPLAY_CONTEXT_CLOSE = `\n</conversation_history>\n\n` +
+  `The above is a replay of your prior conversation with this user — the original session could not be resumed. ` +
+  `It is context only: do not continue or imitate its transcript format, do not write "[Assistant: ...]" markers, ` +
+  `and never invent tool output — use your actual tools when action is needed. ` +
+  `Respond only as the assistant to the user's message below.\n\n`
+
 export function frameReplayTurns(turns: Array<{ role: string; text: string }>): string {
   const nonEmpty = turns.filter((t) => t.text)
   const joined = nonEmpty.map((t) => t.text).join("\n\n")
@@ -169,14 +177,7 @@ export function frameReplayTurns(turns: Array<{ role: string; text: string }>): 
   const last = nonEmpty[nonEmpty.length - 1]!
   if (last.role !== "user") return joined
   const history = nonEmpty.slice(0, -1).map((t) => t.text).join("\n\n")
-  return (
-    `<conversation_history>\n${history}\n</conversation_history>\n\n` +
-    `The above is a replay of your prior conversation with this user — the original session could not be resumed. ` +
-    `It is context only: do not continue or imitate its transcript format, do not write "[Assistant: ...]" markers, ` +
-    `and never invent tool output — use your actual tools when action is needed. ` +
-    `Respond only as the assistant to the user's message below.\n\n` +
-    last.text
-  )
+  return REPLAY_CONTEXT_OPEN + history + REPLAY_CONTEXT_CLOSE + last.text
 }
 
 /**
@@ -291,11 +292,44 @@ export interface ToolCallInfo {
   contentSummary: string | undefined
 }
 
-/** Input keys that identify what a tool call operated on, in priority order. */
-const TOOL_TARGET_KEYS = ["filePath", "file_path", "path", "command", "pattern", "query", "url"] as const
+/**
+ * Input keys that identify what a tool call operated on, in priority order.
+ *
+ * `code` covers tools whose whole payload is a program rather than a path or a
+ * shell line — Prime Agent's `ipython`, and notebook/REPL tools generally. Its
+ * omission was not cosmetic: with no matching key the target is undefined and
+ * `extractContentSummary` has no case either, so EVERY call from such a tool
+ * replayed as the same bare `[your ipython]`. The model could not tell which
+ * cell produced which result, nor that it had already run one, and re-ran the
+ * first cell indefinitely (observed: `2+2` seven times in one turn).
+ */
+const TOOL_TARGET_KEYS = ["filePath", "file_path", "path", "command", "code", "pattern", "query", "url"] as const
+
+/** Max length of a replayed target label, including the "..." marker. */
+const TOOL_TARGET_MAX = 80
 
 /** Max length of a replayed content summary (before the "..." marker). */
 const CONTENT_SUMMARY_MAX = 120
+
+/**
+ * Normalize a tool-call target for the single-line `[your bash …]` label.
+ *
+ * Collapsing whitespace is what keeps the attribution on one line. A
+ * multi-line value — a heredoc, a `&&` chain split across lines, an `ipython`
+ * cell — previously embedded raw newlines straight into the replayed prompt,
+ * breaking the compact bracketed shape that #111/#386 depend on for the model
+ * to read it as context rather than as tool syntax to imitate.
+ *
+ * Truncation math is unchanged from the original inline slice (77 + "..." =
+ * 80), so labels that were already single-line render byte-identically.
+ */
+function normalizeTarget(value: string): string | undefined {
+  const collapsed = value.replace(/\s+/g, " ").trim()
+  if (!collapsed) return undefined
+  return collapsed.length > TOOL_TARGET_MAX
+    ? collapsed.slice(0, TOOL_TARGET_MAX - 3) + "..."
+    : collapsed
+}
 
 /** Collapse whitespace runs to single spaces and truncate. */
 function summarizeContent(value: unknown): string | undefined {
@@ -303,6 +337,24 @@ function summarizeContent(value: unknown): string | undefined {
   const collapsed = value.replace(/\s+/g, " ").trim()
   if (!collapsed) return undefined
   return collapsed.length > CONTENT_SUMMARY_MAX ? collapsed.slice(0, CONTENT_SUMMARY_MAX) + "..." : collapsed
+}
+
+/**
+ * The replacement text of an edit, under any of the spellings harnesses use.
+ *
+ * Harnesses disagree on this field name and the disagreement is silent: a
+ * miss yields no summary at all, and the replay then tells the model THAT it
+ * edited a file but not WHAT it wrote — the #496 failure where it re-derives
+ * near-duplicate edits and confabulates a parallel editor.
+ *
+ * `new_string` is Claude Code's; `newText` is Pi's — confirmed from a real
+ * `~/.pi` session transcript (`edit: path, oldText, newText`), which matched
+ * neither existing key, so every Pi edit replayed summary-less. Both casings of
+ * both nouns are accepted rather than adding them one incident at a time.
+ */
+function editReplacementText(rec: Record<string, unknown> | null | undefined): unknown {
+  if (!rec) return undefined
+  return rec.new_string ?? rec.newString ?? rec.new_text ?? rec.newText
 }
 
 /**
@@ -314,14 +366,14 @@ function extractContentSummary(name: string, input: unknown): string | undefined
   const rec = input as Record<string, unknown>
   switch (name.toLowerCase()) {
     case "edit":
-      return summarizeContent(rec.newString ?? rec.new_string)
+      return summarizeContent(editReplacementText(rec))
     case "write":
       return summarizeContent(rec.content)
     case "multiedit": {
       const edits = rec.edits
       if (!Array.isArray(edits) || edits.length === 0) return undefined
       const first = edits[0] as Record<string, unknown> | null | undefined
-      const firstSummary = summarizeContent(first?.newString ?? first?.new_string)
+      const firstSummary = summarizeContent(editReplacementText(first))
       if (!firstSummary) return undefined
       return edits.length > 1 ? `${edits.length} edits; first: ${firstSummary}` : firstSummary
     }
@@ -354,8 +406,8 @@ export function buildToolUseIndex(
         for (const key of TOOL_TARGET_KEYS) {
           const v = (input as Record<string, unknown>)[key]
           if (typeof v === "string" && v) {
-            target = v.length > 80 ? v.slice(0, 77) + "..." : v
-            break
+            target = normalizeTarget(v)
+            if (target) break
           }
         }
       }

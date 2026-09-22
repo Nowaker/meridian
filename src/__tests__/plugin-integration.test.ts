@@ -12,10 +12,12 @@
  */
 
 import { afterAll, beforeEach, describe, expect, it, mock } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
-import { assistantMessage } from "./helpers"
+import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
 
 type MockSdkMessage = Record<string, unknown>
 type TestApp = { fetch: (req: Request, ...rest: any[]) => Response | Promise<Response> }
@@ -28,20 +30,23 @@ interface CapturedParams {
 let capturedParams: CapturedParams | null = null
 function getCaptured(): CapturedParams | null { return capturedParams }
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: unknown) => {
     capturedParams = params as CapturedParams
     return (async function* () {
       for (const msg of mockMessages) {
-        yield { ...msg, session_id: "sdk-integ-1" }
+        yield {
+          ...msg,
+          session_id: resolveMockSdkSessionId((params as CapturedParams).options, "sdk-integ-1"),
+        }
       }
     })()
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "plugin-integration.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: unknown, fn: () => Promise<Response> | Response) => fn(),
 }))

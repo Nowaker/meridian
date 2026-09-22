@@ -7,35 +7,39 @@
  * error. Asserts the two things that distinguish it from `priority` - the
  * active profile outranks a session's existing assignment, and switching it
  * moves conversations already under way - plus the refusal surfaces that make
- * a refusing account visible in EVERY mode.
+ * a spent account visible in EVERY mode.
  */
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
-import { assistantMessage } from "./helpers"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
+import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
 
 let capturedEnvs: string[] = []
 let failingDirs = new Set<string>()
 const DEFAULT_FAILURE = "Claude Code returned an error result: You've hit your session limit · resets 12:30am (America/Chicago)"
 let failureMessage = DEFAULT_FAILURE
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: any) => {
     const dir = params.options?.env?.CLAUDE_CONFIG_DIR ?? "default"
     capturedEnvs.push(dir)
+    const sessionId = resolveMockSdkSessionId(params.options, "test-session")
     return (async function* () {
       if ([...failingDirs].some((f) => dir.includes(f))) throw new Error(failureMessage)
-      yield assistantMessage([{ type: "text", text: "ok from " + dir }])
+      yield { ...assistantMessage([{ type: "text", text: "ok from " + dir }]), session_id: sessionId }
     })()
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "active-priority-integration.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: unknown, fn: () => unknown) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -43,6 +47,8 @@ const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 const { resetActiveProfile } = await import("../proxy/profiles")
 const { __setFetchOAuthUsageOverride } = await import("../proxy/oauthUsage")
 const { rateLimitStore } = await import("../proxy/rateLimitStore")
+const { telemetryStore } = await import("../telemetry")
+type TelemetryRow = import("../telemetry").RequestMetric
 
 const PROFILES = [
   { id: "work", claudeConfigDir: "/tmp/meridian-ap-work" },
@@ -83,9 +89,20 @@ async function profilesList(app: TestApp) {
   const res = await app.fetch(new Request("http://localhost/profiles/list"))
   return await res.json() as {
     routing: string
-    refusals?: Array<{ profileId: string; until: number | null; diagnosis: { bucket: string | null; reported: boolean; source: string } }>
+    spent?: Array<{ profileId: string; until: number | null; diagnosis: { bucket: string | null; reported: boolean; source: string } }>
     exhausted?: Array<{ id: string }>
     profileOrder?: string[]
+  }
+}
+
+async function health(app: TestApp) {
+  const res = await app.fetch(new Request("http://localhost/profiles/health"))
+  expect(res.status).toBe(200)
+  return await res.json() as {
+    routing: string
+    activeProfile?: string
+    spent: Array<{ profileId: string; until: number | null; diagnosis: { bucket: string | null } }>
+    exhausted: Array<{ id: string; until: number; reason: string }>
   }
 }
 
@@ -218,11 +235,11 @@ describe("refusal reporting", () => {
     await post(app)
 
     const list = await profilesList(app)
-    const refusal = list.refusals?.find(s => s.profileId === "work")
-    expect(refusal).toBeDefined()
-    expect(refusal!.diagnosis.bucket).toBe("five_hour")
-    expect(refusal!.diagnosis.reported).toBe(true)
-    expect(refusal!.diagnosis.source).toBe("error_message")
+    const spent = list.spent?.find(s => s.profileId === "work")
+    expect(spent).toBeDefined()
+    expect(spent!.diagnosis.bucket).toBe("five_hour")
+    expect(spent!.diagnosis.reported).toBe(true)
+    expect(spent!.diagnosis.source).toBe("error_message")
   }, 20_000)
 
   it("guesses the bucket from cached windows when the wording names none, and says it is a guess", async () => {
@@ -239,9 +256,9 @@ describe("refusal reporting", () => {
     failingDirs.add("ap-work")
     await post(app)
 
-    const refusal = (await profilesList(app)).refusals?.find(s => s.profileId === "work")
-    expect(refusal).toBeDefined()
-    expect(refusal!.diagnosis.reported).toBe(false)
+    const spent = (await profilesList(app)).spent?.find(s => s.profileId === "work")
+    expect(spent).toBeDefined()
+    expect(spent!.diagnosis.reported).toBe(false)
   }, 20_000)
 
   it("reports a refusal in plain ACTIVE mode, where nothing fails over", async () => {
@@ -256,12 +273,48 @@ describe("refusal reporting", () => {
 
     const list = await profilesList(app)
     expect(list.routing).toBe("active")
-    expect(list.refusals?.map(s => s.profileId)).toContain("work")
+    expect(list.spent?.map(s => s.profileId)).toContain("work")
 
     const page = await events(app)
     expect(page.events.map(e => e.kind)).toContain("refused")
     expect(page.events[0]!.profile).toBe("work")
   }, 20_000)
+
+  it("names the refused allowance on the /telemetry row, in a mode that never fails over", async () => {
+    process.env.MERIDIAN_ROUTING = "active"
+    telemetryStore.clear()
+    const app = createTestApp()
+    failingDirs.add("ap-work")
+    expect((await post(app, {}, "telemetry refusal bucket unique message")).status).toBe(429)
+
+    const rows = await (await app.fetch(new Request("http://localhost/telemetry/requests"))).json() as TelemetryRow[]
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.profileId).toBe("work")
+    expect(rows[0]!.routeKind).toBe("active")
+    expect(rows[0]!.routeRefusedBucket).toBe("five_hour")
+    expect(rows[0]!.routeChain).toBeUndefined()
+  }, 20_000)
+})
+
+describe("GET /profiles/health", () => {
+  it("reports which accounts are refusing and which are benched", async () => {
+    const app = createTestApp()
+    await setActive(app, "work")
+    failingDirs.add("ap-work")
+    expect((await post(app)).status).toBe(200)
+
+    const page = await health(app)
+    expect(page.routing).toBe("active+priority")
+    expect(page.spent.map(s => s.profileId)).toContain("work")
+    expect(page.spent.find(s => s.profileId === "work")!.diagnosis.bucket).toBe("five_hour")
+    expect(page.exhausted.map(e => e.id)).toContain("work")
+  }, 20_000)
+
+  it("is empty and harmless before anything has gone wrong", async () => {
+    const page = await health(createTestApp())
+    expect(page.spent).toEqual([])
+    expect(page.exhausted).toEqual([])
+  })
 })
 
 describe("GET /profiles/events", () => {
@@ -325,7 +378,7 @@ describe("routing settings", () => {
   // but it is shared by every test file in this process, and the sticky/priority
   // suites fall back to getSetting("routing") when MERIDIAN_ROUTING is unset.
   afterEach(() => {
-    const { setSetting } = require("../proxy/settings") as typeof import("../proxy/settings")
+    const { setSetting } = require("../settings") as typeof import("../settings")
     setSetting("routing", undefined)
   })
 

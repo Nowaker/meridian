@@ -13,34 +13,36 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { neutralSdkWorkingDirectory } from "../proxy/cwd"
-import { assistantMessage } from "./helpers"
+import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
 
 let capturedQueryParams: any = null
 let mockMessages: any[] = []
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: any) => {
     capturedQueryParams = params
     return (async function* () {
       for (const msg of mockMessages) {
-        yield { ...msg, session_id: "sdk-test" }
+        yield { ...msg, session_id: resolveMockSdkSessionId(params.options, "sdk-test") }
       }
     })()
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "proxy-tool-blocking.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -220,8 +222,7 @@ describe("SDK cwd for a claude-code client (#744)", () => {
     // would fail the SDK spawn with a misleading error.
     return postAs(systemFor("/definitely/not/here/meridian-744")).then((params) => {
       expect(params?.options?.cwd).not.toBe("/definitely/not/here/meridian-744")
-      expect(params?.options?.cwd).not.toBe(process.cwd())
-      expect(params?.options?.cwd).toBe(neutralSdkWorkingDirectory())
+      expect(params?.options?.cwd).toBe(process.cwd())
     })
   })
 })

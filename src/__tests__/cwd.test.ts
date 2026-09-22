@@ -1,16 +1,12 @@
 /**
- * Unit tests for resolveSdkWorkingDirectory and neutralSdkWorkingDirectory.
+ * Unit tests for resolveSdkWorkingDirectory.
  *
- * Verifies the precedence chain (env > adapter > fallback), the
- * existsSync-based fallback that fixes the remote-host issue (#381), and
- * that the directory it falls back to carries no repository for the
- * claude_code preset to describe.
+ * Verifies the precedence chain (env > adapter > fallback) and the
+ * existsSync-based fallback that fixes the remote-host issue (#381).
  */
 
 import { describe, it, expect } from "bun:test"
-import { existsSync } from "node:fs"
-import { dirname, join } from "node:path"
-import { neutralSdkWorkingDirectory, resolveSdkWorkingDirectory } from "../proxy/cwd"
+import { resolveSdkWorkingDirectory } from "../proxy/cwd"
 
 describe("resolveSdkWorkingDirectory", () => {
   it("uses env override when set and exists", () => {
@@ -97,67 +93,15 @@ describe("resolveSdkWorkingDirectory", () => {
     expect(r.workingDirectory).toBe("/adapter/path")
   })
 
-  it("lands in neutralFallback when the claimed path is absent here", () => {
-    const r = resolveSdkWorkingDirectory({
-      envOverride: undefined,
-      adapterCwd: "/Users/clientmachine/proj",
-      fallback: "/home/proxy/checkout",
-      neutralFallback: "/home/proxy/.config/meridian/sdk-cwd",
-      exists: (p) => p !== "/Users/clientmachine/proj",
-    })
-    expect(r.workingDirectory).toBe("/home/proxy/.config/meridian/sdk-cwd")
-    // The claim keys fingerprint bucketing, so it stays the client's own path
-    // rather than wherever the subprocess had to land instead.
-    expect(r.claimedWorkingDirectory).toBe("/Users/clientmachine/proj")
-    expect(r.fellBack).toBe(true)
-  })
-
-  it("claims fallback rather than neutralFallback when nothing is supplied", () => {
-    const r = resolveSdkWorkingDirectory({
-      envOverride: undefined,
+  it("normalizes relative SDK directories to absolute paths", () => {
+    const result = resolveSdkWorkingDirectory({
+      envOverride: ".",
       adapterCwd: undefined,
-      fallback: "/home/proxy/checkout",
-      neutralFallback: "/home/proxy/.config/meridian/sdk-cwd",
+      fallback: ".",
       exists: () => true,
     })
-    expect(r.workingDirectory).toBe("/home/proxy/checkout")
-    expect(r.claimedWorkingDirectory).toBe("/home/proxy/checkout")
-    expect(r.fellBack).toBe(false)
-  })
-})
-
-describe("neutralSdkWorkingDirectory", () => {
-  it("creates the directory it hands to the SDK", () => {
-    const made: string[] = []
-    const dir = neutralSdkWorkingDirectory({ root: "/neutral", mkdir: (p) => { made.push(p) } })
-    expect(dir).toBe("/neutral")
-    expect(made).toEqual(["/neutral"])
+    expect(result.workingDirectory.startsWith("/")).toBe(true)
+    expect(result.claimedWorkingDirectory.startsWith("/")).toBe(true)
   })
 
-  it("defaults to meridian's own config root, not the OS temp dir", () => {
-    const dir = neutralSdkWorkingDirectory({ mkdir: () => {} })
-    expect(dir.endsWith(join(".config", "meridian", "sdk-cwd"))).toBe(true)
-  })
-
-  // The whole point of the directory: the claude_code preset builds its
-  // gitStatus block from the SDK's cwd, so a fallback anywhere inside a
-  // repository reports that repository to a remote client as the client's own.
-  it("does not sit inside a git repository", () => {
-    let dir = neutralSdkWorkingDirectory({ mkdir: () => {} })
-    const checked: string[] = []
-    for (let prev = ""; dir !== prev; prev = dir, dir = dirname(dir)) {
-      checked.push(dir)
-      expect(existsSync(join(dir, ".git"))).toBe(false)
-    }
-    expect(checked.length).toBeGreaterThan(1)
-  })
-
-  it("falls back to a usable directory when the neutral one cannot be created", () => {
-    const dir = neutralSdkWorkingDirectory({
-      root: "/unwritable",
-      mkdir: () => { throw new Error("EACCES") },
-      fallback: "/home/proxy",
-    })
-    expect(dir).toBe("/home/proxy")
-  })
 })

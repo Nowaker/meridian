@@ -41,6 +41,24 @@ describe("claudeCodeAdapter.getSessionId", () => {
     expect(claudeCodeAdapter.getSessionId(ctx as any, body)).toBe("object-session")
   })
 
+  it("keeps the key equal to session_id when parent linkage is present", () => {
+    // parent_session_id is additive (#902): it must never change the key a
+    // client's cached mappings are already stored under.
+    const ctx = { req: { header: () => undefined } }
+    const body = {
+      metadata: { user_id: JSON.stringify({ session_id: "child", parent_session_id: "parent" }) },
+    }
+    expect(claudeCodeAdapter.getSessionId(ctx as any, body)).toBe("child")
+    expect(claudeCodeAdapter.getParentSessionId!(ctx as any, body)).toBe("parent")
+  })
+
+  it("reports no parent for a root session", () => {
+    const ctx = { req: { header: () => undefined } }
+    expect(claudeCodeAdapter.getParentSessionId!(ctx as any, {
+      metadata: { user_id: JSON.stringify({ session_id: "root" }) },
+    })).toBeUndefined()
+  })
+
   it("falls back to fingerprinting when metadata is absent or malformed", () => {
     const ctx = { req: { header: () => undefined } }
     expect(claudeCodeAdapter.getSessionId(ctx as any, {})).toBeUndefined()
@@ -215,6 +233,12 @@ describe("claudeCodeAdapter — basic configuration surface", () => {
 
   it("skips meridian's synthetic file-change tracker (Claude Code shows its own edits)", () => {
     expect(claudeCodeAdapter.shouldTrackFileChanges!()).toBe(false)
+  })
+
+  it("declares concurrent turns per session key (#1043)", () => {
+    // Headless Claude Code fires a session-start side request and the primary
+    // turn concurrently under the same session id without per-flow headers.
+    expect(claudeCodeAdapter.runsConcurrentTurnsPerSessionKey).toBe(true)
   })
 })
 

@@ -12,11 +12,16 @@
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
 
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 // Track how many times createOpencodeMcpServer is called and what's passed to query
 let mcpServerCreateCount = 0
 let capturedMcpServers: any[] = []
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+import { resolveMockSdkSessionId } from "./helpers"
+
+installSdkMock(() => ({
   query: (params: any) => {
     if (params.options?.mcpServers) {
       capturedMcpServers.push(params.options.mcpServers)
@@ -33,21 +38,21 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
           stop_reason: "end_turn",
           usage: { input_tokens: 10, output_tokens: 5 },
         },
-        session_id: `sess-${Date.now()}`,
+        session_id: resolveMockSdkSessionId(params.options, `sess-${Date.now()}`),
       }
     })()
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "proxy-mcp-server-per-request.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
 // Each call returns a unique object so we can verify they're different instances
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => {
     mcpServerCreateCount++
     return { type: "sdk", name: "opencode", instance: {}, _id: mcpServerCreateCount }
@@ -162,7 +167,8 @@ describe("MCP server per-request lifecycle", () => {
 
     // All should succeed
     for (const res of results) {
-      expect(res.status).toBe(200)
+      expect({ status: res.status, body: res.status === 200 ? undefined : await res.clone().text() })
+        .toEqual({ status: 200, body: undefined })
     }
 
     // Each should have its own MCP server

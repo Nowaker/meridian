@@ -1,22 +1,36 @@
 import { describe, expect, it, mock, beforeEach, afterEach } from "bun:test"
 
+import { installSdkMock } from "./sdkMock"
 // Provide a minimal SDK mock so createPassthroughMcpServer can register tools
 // without hitting the real SDK (which may not be available in CI or may have
 // been mocked differently by a sibling test file).
 let registeredTools: Array<{ name: string; config: any }> = []
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
-  createSdkMcpServer: () => ({
-    type: "sdk",
-    name: "test",
-    instance: {
-      tool: () => {},
-      registerTool: (name: string, config: any, _handler: any) => {
-        registeredTools.push({ name, config })
-        return {}
-      },
-    },
-  }),
-}))
+installSdkMock(() => ({
+  createSdkMcpServer: (options: {
+    tools?: Array<{
+      name: string
+      description: string
+      inputSchema: unknown
+      _meta?: Record<string, unknown>
+    }>
+  }) => {
+    for (const definition of options.tools ?? []) {
+      registeredTools.push({
+        name: definition.name,
+        config: {
+          description: definition.description,
+          inputSchema: definition.inputSchema,
+          _meta: definition._meta,
+        },
+      })
+    }
+    return {
+      type: "sdk",
+      name: "test",
+      instance: { tool: () => {}, registerTool: () => ({}) },
+    }
+  },
+}), "passthrough-tool-sort.test.ts")
 
 import { createPassthroughMcpServer, getAutoDeferThreshold } from "../proxy/passthroughTools"
 

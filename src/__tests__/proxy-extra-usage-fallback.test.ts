@@ -8,6 +8,13 @@
  */
 
 import { describe, it, expect, mock, beforeEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
+import { readFileSync } from "node:fs"
+import { join } from "node:path"
+import { getSessionStoreDir, readSessionStoreSnapshot } from "../proxy/sessionStore"
+import { reconcile, type TranscriptLocator } from "../proxy/sessionLifecycle"
 import {
   messageStart,
   textBlockStart,
@@ -16,11 +23,63 @@ import {
   messageDelta,
   messageStop,
   parseSSE,
+  resolveMockSdkSessionId,
 } from "./helpers"
 
 // Track query calls to verify retry behavior
-let queryCalls: Array<{ model: string; callIndex: number; resume?: string }> = []
+interface LifecycleResourceSnapshot {
+  locator: TranscriptLocator
+  generation: string
+  state: string
+  activeLeases?: Record<string, { purpose?: "publication"; owner: { pid: number } }>
+}
+
+let queryCalls: Array<{ model: string; callIndex: number; resume?: string; sessionId?: string }> = []
 let queryCallCount = 0
+/** Benches recorded when a [1m] model is stripped after a rate limit (#862),
+ *  with the session scope they were recorded against (#901). */
+let rateLimitBenches: Array<{ profileId: string | undefined; until: number; sessionKey?: string }> = []
+let lifecycleAtQuery: Array<LifecycleResourceSnapshot | undefined> = []
+let lifecycleBeforeSdkEvents: Array<LifecycleResourceSnapshot | undefined> = []
+let reconcileBeforeSdkEvents = false
+
+function readLifecycleResource(sessionId: string): LifecycleResourceSnapshot | undefined {
+  const sidecar = JSON.parse(readFileSync(join(getSessionStoreDir(), "session-gc.json"), "utf8")) as {
+    resources: Record<string, LifecycleResourceSnapshot>
+  }
+  return Object.values(sidecar.resources).find((resource) => resource.locator.sessionId === sessionId)
+}
+
+/** Check ownership and publication, not a transient GC state label (#917/#933). */
+function expectSafeFallbackTargets(reconciled: boolean) {
+  expect(queryCalls.map((call) => call.model)).toEqual(["sonnet[1m]", "sonnet"])
+  expect(lifecycleAtQuery).toHaveLength(2)
+  expect(lifecycleBeforeSdkEvents).toHaveLength(2)
+  const expectedIds = queryCalls.map((call) => call.sessionId)
+  expect(expectedIds.every((id) => typeof id === "string" && id.length > 0)).toBe(true)
+  expect(new Set(expectedIds).size).toBe(2)
+  for (const snapshots of [lifecycleAtQuery, lifecycleBeforeSdkEvents]) {
+    expect(snapshots.map((resource) => resource?.locator.sessionId)).toEqual(expectedIds)
+    for (const resource of snapshots) {
+      expect(resource).toBeDefined()
+      // The same proxy's sweep rescues pinned prepared targets to live before
+      // SDK startup. Both states are safe only with their ownership still intact.
+      expect(["prepared", "live"]).toContain(resource?.state ?? "missing")
+      expect(resource?.generation).toMatch(/^r:[0-9a-f]{64}:[1-9][0-9]*$/)
+      const leases = Object.values(resource?.activeLeases ?? {})
+      expect(leases.some((lease) => lease.purpose === "publication" && lease.owner.pid === process.pid)).toBe(true)
+      expect(leases.some((lease) => lease.purpose === undefined && lease.owner.pid === process.pid)).toBe(true)
+    }
+  }
+  expect(lifecycleBeforeSdkEvents.map((resource) => resource?.generation))
+    .toEqual(lifecycleAtQuery.map((resource) => resource?.generation))
+  if (reconciled) {
+    expect(lifecycleBeforeSdkEvents.map((resource) => resource?.state)).toEqual(["live", "live"])
+  }
+  const publishedIds = Object.values(readSessionStoreSnapshot()).map((entry) => entry.claudeSessionId)
+  expect(publishedIds).toContain(expectedIds[1] ?? "missing")
+  expect(publishedIds).not.toContain(expectedIds[0] ?? "missing")
+}
 
 // Control what the mock does
 let mockBehavior: "extra_usage_then_succeed" | "always_extra_usage" | "out_of_extra_usage_then_succeed" | "resume_extra_usage_then_succeed" | "succeed" | "error_assistant_then_ratelimit" = "succeed"
@@ -42,19 +101,38 @@ mock.module("../proxy/models", () => ({
   stripExtendedContext: (model: string) => model.replace("[1m]", ""),
   isClosedControllerError: () => false,
   recordExtendedContextUnavailable: () => {},
+  recordExtendedContextRateLimited: (profileId: string | undefined, until: number, sessionKey?: string) => {
+    rateLimitBenches.push({ profileId, until, sessionKey })
+  },
   isExtendedContextKnownUnavailable: () => false,
   getAuthCacheInfo: () => ({ lastCheckedAt: 0, lastSuccessAt: 0, isFailure: false }),
 }))
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (opts: any) => {
     queryCallCount++
       const callIndex = queryCallCount
       const model = opts.options?.model || "sonnet"
-      queryCalls.push({ model, callIndex, resume: opts.options?.resume })
+      const sessionId = opts.options?.sessionId
+      queryCalls.push({ model, callIndex, resume: opts.options?.resume, sessionId })
+      const returnedSessionId = resolveMockSdkSessionId(opts.options, `sdk-session-${callIndex}`)
+      if (sessionId) lifecycleAtQuery.push(readLifecycleResource(sessionId))
       const isStreaming = opts.options?.includePartialMessages === true
 
     return (async function* () {
+      if (sessionId) {
+        if (reconcileBeforeSdkEvents) {
+          const resource = readLifecycleResource(sessionId)
+          if (!resource) throw new Error(`SDK target ${sessionId} was not journaled`)
+          // Force the same legal transition as the background sweep between
+          // target preparation and the first SDK event, without relying on timing.
+          await reconcile([{ ...resource.locator, lifecycleGeneration: resource.generation }], {
+            maxPending: 1_000_000,
+          })
+        }
+        const resource = readLifecycleResource(sessionId)
+        lifecycleBeforeSdkEvents.push(resource)
+      }
       if (mockBehavior === "always_extra_usage") {
         throw new Error(EXTRA_USAGE_ERROR)
       }
@@ -69,7 +147,7 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 
       if (
         mockBehavior === "resume_extra_usage_then_succeed" &&
-        opts.options?.resume === "sdk-session-1" &&
+        opts.options?.resume === queryCalls[0]?.sessionId &&
         (model === "sonnet[1m]" || model === "sonnet")
       ) {
         throw new Error(OUT_OF_EXTRA_USAGE_ERROR)
@@ -93,19 +171,19 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
             stop_reason: "stop_sequence",
             usage: { input_tokens: 0, output_tokens: 0 },
           },
-          session_id: `sdk-session-${callIndex}`,
+          session_id: returnedSessionId,
         }
         throw new Error("429 rate limit exceeded for 1m context")
       }
 
       // Success path
       if (isStreaming) {
-        yield messageStart(`msg-${callIndex}`)
-        yield textBlockStart(0)
-        yield textDelta(0, `response-${callIndex}`)
-        yield blockStop(0)
-        yield messageDelta("end_turn")
-        yield messageStop()
+        yield { ...messageStart(`msg-${callIndex}`), session_id: returnedSessionId }
+        yield { ...textBlockStart(0), session_id: returnedSessionId }
+        yield { ...textDelta(0, `response-${callIndex}`), session_id: returnedSessionId }
+        yield { ...blockStop(0), session_id: returnedSessionId }
+        yield { ...messageDelta("end_turn"), session_id: returnedSessionId }
+        yield { ...messageStop(), session_id: returnedSessionId }
       }
       yield {
         type: "assistant",
@@ -119,24 +197,25 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
           stop_reason: "end_turn",
           usage: { input_tokens: 10, output_tokens: 5 },
         },
-        session_id: `sdk-session-${callIndex}`,
+        session_id: returnedSessionId,
       }
     })()
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "proxy-extra-usage-fallback.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
+const { lookupSharedSession } = await import("../proxy/sessionStore")
 
 function createTestApp() {
   const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
@@ -157,12 +236,17 @@ describe("Extra usage required fallback", () => {
   beforeEach(() => {
     clearSessionCache()
     queryCalls = []
+    rateLimitBenches = []
+    lifecycleAtQuery = []
+    lifecycleBeforeSdkEvents = []
+    reconcileBeforeSdkEvents = false
     queryCallCount = 0
     mockBehavior = "succeed"
   })
 
   describe("Non-streaming", () => {
-    it("falls back from [1m] to base model on extra usage error", async () => {
+    it.each([false, true])("falls back from [1m] to base model on extra usage error (reconcile=%s)", async (reconcileFirst) => {
+      reconcileBeforeSdkEvents = reconcileFirst
       mockBehavior = "extra_usage_then_succeed"
       const app = createTestApp()
 
@@ -175,7 +259,8 @@ describe("Extra usage required fallback", () => {
       // Should succeed after fallback (no backoff delay)
       expect(response.status).toBe(200)
       const body = await response.json()
-      expect(body.content).toBeDefined()
+      expect(body.content).toEqual([{ type: "text", text: "response-2" }])
+      expectSafeFallbackTargets(reconcileFirst)
     })
 
     it("propagates error when model is already base (no [1m] to strip)", async () => {
@@ -211,7 +296,8 @@ describe("Extra usage required fallback", () => {
   })
 
   describe("Streaming", () => {
-    it("falls back from [1m] to base model on extra usage error", async () => {
+    it.each([false, true])("falls back from [1m] to base model on extra usage error (reconcile=%s)", async (reconcileFirst) => {
+      reconcileBeforeSdkEvents = reconcileFirst
       mockBehavior = "extra_usage_then_succeed"
       const app = createTestApp()
 
@@ -225,6 +311,10 @@ describe("Extra usage required fallback", () => {
       const text = await response.text()
       // Should contain successful stream content after fallback
       expect(text).toContain("event: message_start")
+      expect(text).toContain("response-2")
+      expect(text).toContain("event: message_stop")
+      expect(parseSSE(text).some((event) => event.event === "error")).toBe(false)
+      expectSafeFallbackTargets(reconcileFirst)
     })
 
     it("returns error event when model is already base", async () => {
@@ -270,12 +360,22 @@ describe("Extra usage required fallback", () => {
       }, { "x-opencode-session": "sess-1" })
 
       expect(response.status).toBe(200)
+      expect(response.headers.get("x-claude-session-id")).toBeNull()
       const text = await response.text()
       expect(text).toContain("event: message_start")
+      const initialSessionId = queryCalls[0]?.sessionId
+      const extendedForkSessionId = queryCalls[1]?.sessionId
+      const baseForkSessionId = queryCalls[2]?.sessionId
+      const freshFallbackSessionId = queryCalls[3]?.sessionId
+      for (const sessionId of [initialSessionId, extendedForkSessionId, baseForkSessionId, freshFallbackSessionId]) {
+        expect(sessionId).toMatch(/^[0-9a-f-]{36}$/)
+      }
+      expect(new Set([initialSessionId, extendedForkSessionId, baseForkSessionId, freshFallbackSessionId]).size).toBe(4)
+      expect(lookupSharedSession("sess-1")?.claudeSessionId).toBe(freshFallbackSessionId)
       expect(queryCalls.slice(-3)).toEqual([
-        { model: "sonnet[1m]", callIndex: 2, resume: "sdk-session-1" },
-        { model: "sonnet", callIndex: 3, resume: "sdk-session-1" },
-        { model: "sonnet", callIndex: 4, resume: undefined },
+        { model: "sonnet[1m]", callIndex: 2, resume: initialSessionId, sessionId: extendedForkSessionId },
+        { model: "sonnet", callIndex: 3, resume: initialSessionId, sessionId: baseForkSessionId },
+        { model: "sonnet", callIndex: 4, resume: undefined, sessionId: freshFallbackSessionId },
       ])
     })
   })
@@ -283,19 +383,37 @@ describe("Extra usage required fallback", () => {
   describe("No backoff needed", () => {
     it("does not use exponential backoff for extra usage errors", async () => {
       mockBehavior = "extra_usage_then_succeed"
-      const app = createTestApp()
 
-      const start = Date.now()
-      await post(app, {
-        model: "sonnet",
-        stream: false,
-        messages: [{ role: "user", content: "hello" }],
-      })
-      const elapsed = Date.now() - start
-
-      // Should complete nearly instantly (no 1s+ backoff delay)
-      // Rate limit retry uses 1000ms minimum — extra usage should be <500ms
-      expect(elapsed).toBeLessThan(500)
+      // AMPLIFY the signal rather than tighten the threshold.
+      //
+      // This asserted `elapsed < 500` against a real backoff floor of 1000ms,
+      // leaving 500ms of headroom for the whole request — and it failed on CI
+      // at 756ms, which is BELOW the backoff floor. No backoff had happened; the
+      // test measured a contended runner (#917/#933). Nudging the bound to 1000
+      // would only move the coin-flip.
+      //
+      // Making the backoff enormous instead turns a ~500ms judgement call into
+      // an unmissable one: a rate-limit path would now sleep 10s, so anything
+      // near-instant proves the extra-usage path took no backoff at all, and no
+      // amount of runner noise closes that gap.
+      const priorDelay = process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS
+      process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS = "10000"
+      try {
+        const app = createTestApp()
+        const start = Date.now()
+        await post(app, {
+          model: "sonnet",
+          stream: false,
+          messages: [{ role: "user", content: "hello" }],
+        })
+        const elapsed = Date.now() - start
+        // Generous for the request itself, still an order of magnitude under
+        // the 10s a single backoff would now cost.
+        expect(elapsed).toBeLessThan(5_000)
+      } finally {
+        if (priorDelay === undefined) delete process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS
+        else process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS = priorDelay
+      }
     })
   })
 
@@ -322,6 +440,57 @@ describe("Extra usage required fallback", () => {
       expect(queryCalls.length).toBe(2)
       expect(queryCalls[0]!.model).toBe("sonnet[1m]")
       expect(queryCalls[1]!.model).toBe("sonnet")
+    })
+
+    it("benches [1m] after a rate-limit strip so the next request does not flap back (#862)", async () => {
+      // Stripping [1m] without recording anything means the NEXT request maps
+      // straight back to [1m] — two model switches, and a cold prompt cache in
+      // both directions, for one rate-limit event.
+      mockBehavior = "error_assistant_then_ratelimit"
+      const app = createTestApp()
+
+      const response = await post(app, {
+        model: "sonnet",
+        stream: false,
+        messages: [{ role: "user", content: "hello" }],
+      })
+      expect(response.status).toBe(200)
+
+      expect(rateLimitBenches.length).toBe(1)
+      expect(rateLimitBenches[0]!.until).toBeGreaterThan(Date.now())
+    })
+
+    it("scopes the rate-limit bench to the requesting session (#901)", async () => {
+      // A profile-wide bench downgrades every concurrent sibling of an RLM
+      // harness the instant one child is limited, and the model switch cold-
+      // caches all of them. The bench has to name the session that earned it.
+      mockBehavior = "error_assistant_then_ratelimit"
+      const app = createTestApp()
+
+      const response = await post(app, {
+        model: "sonnet",
+        stream: false,
+        messages: [{ role: "user", content: "hello" }],
+      }, { "x-opencode-session": "rlm-child-7" })
+      expect(response.status).toBe(200)
+
+      expect(rateLimitBenches.length).toBe(1)
+      expect(rateLimitBenches[0]!.sessionKey).toBe("rlm-child-7")
+    })
+
+    it("falls back to a profile-wide bench when the client has no session id (#901)", async () => {
+      mockBehavior = "error_assistant_then_ratelimit"
+      const app = createTestApp()
+
+      const response = await post(app, {
+        model: "sonnet",
+        stream: false,
+        messages: [{ role: "user", content: "hello" }],
+      })
+      expect(response.status).toBe(200)
+
+      expect(rateLimitBenches.length).toBe(1)
+      expect(rateLimitBenches[0]!.sessionKey).toBeUndefined()
     })
   })
 })

@@ -15,8 +15,6 @@ meridian profile add personal
 meridian profile add work
 ```
 
-Or add one from the Profiles page without a terminal at all — see [From the web UI: add a profile](#from-the-web-ui-add-a-profile).
-
 > **⚠ Important:** Claude's OAuth reuses your browser session. Before adding a second account, sign out of claude.ai and sign into the other account first.
 
 #### Headless / SSH: complete Claude OAuth with a pasted code
@@ -33,89 +31,9 @@ Open the printed URL in a browser, sign in to the target Claude account, then pa
 meridian profile login work --headless
 ```
 
-Every login also records the account's plan (`subscriptionType`, `rateLimitTier`), read from Anthropic's OAuth profile endpoint — the token exchange itself returns no plan information. That is what lets `meridian profile list`, `/profiles/list`, `/health` and the dashboard tell a Max account from a Team one, and what makes `/v1/models` advertise the larger context window Max accounts actually have. If the lookup fails the login still succeeds and the plan simply stays unknown. It applies to every route into a credential file — the headless CLI login and both web-UI flows below — because all three go through one exchange.
+The same login also records the account's plan (`subscriptionType`, `rateLimitTier`), read from Anthropic's OAuth profile endpoint — the token exchange itself returns no plan information. That is what lets `meridian profile list`, `/profiles/list`, `/health` and the dashboard tell a Max account from a Team one, and what makes `/v1/models` advertise the larger context window Max accounts actually have. If the lookup fails the login still succeeds and the plan simply stays unknown.
 
-> **⚠ A profile created by an older Meridian has no plan recorded, and a token refresh cannot backfill it** — the value is only ever written at login, and Anthropic's usage endpoint does not carry it. Re-run `meridian profile login <name> --headless`, or **Log in from browser**, to repair such a profile.
-
-#### From the web UI: re-authenticate a profile without a terminal
-
-A profile whose credentials expired can be logged in again from the Profiles page, with no shell on the Meridian host. Click **Log in from browser** on the profile's card, sign in to that profile's Claude account, and you are done — Claude sends you back to Meridian, which finishes the login and updates the card. There is nothing to copy and paste.
-
-**It is an ordinary link, and that is deliberate.** If you are signed into several Claude accounts, the session your main browser offers is often the wrong one for the profile you are re-authenticating. Because the control is a real `<a href>` carrying the authorize URL, the browser's own context menu applies: **Open Link in Incognito Window**, **Open Link in New Private Window**, or **Copy Link Address** to paste into a different browser or browser profile. The login still lands on the profile it was started for — the PKCE verifier and `state` live on the server, keyed by `state`, so the browser that finishes the sign-in does not have to be the one that started it, and the page you started from notices and updates itself. Nothing secret is in the link: the authorize URL is public by design, and the verifier never leaves the server.
-
-That works whenever the **browser** is on the machine Meridian runs on — including through an SSH port-forward, and including when you reached the UI by some other name such as a LAN or tailnet hostname. What matters is the browser's position, not the URL in its address bar, so the page settles it by measurement: before opening the sign-in tab it asks the browser to reach Meridian on loopback, and takes the redirect flow only if that answers.
-
-A browser on a *different* machine cannot reach it, the check fails in under two seconds, and the panel asks for the code instead. Either form is accepted: the **bare code** Claude shows you, or the **whole callback URL** from the address bar (`https://platform.claude.com/oauth/code/callback?code=…&state=…`), which is usually easier to copy. The redirect flow also offers **Paste a code instead** as a manual fallback, which does not restart anything — both sign-in URLs belong to the same login.
-
-**Why the browser sometimes has to be on the same host.** Anthropic publishes the Claude Code client's registration at [`https://claude.ai/oauth/claude-code-client-metadata`](https://claude.ai/oauth/claude-code-client-metadata), and it declares exactly three ways back:
-
-```json
-"redirect_uris": ["http://localhost/callback", "http://127.0.0.1/callback"]
-```
-
-plus the hosted code-display page, `https://platform.claude.com/oauth/code/callback`. The loopback pair is the [RFC 8252 §7.3](https://datatracker.ietf.org/doc/html/rfc8252#section-7.3) convention, where the port is not part of the match — which is why Meridian can use whichever port you reached it on. A redirect URI belonging to *your* hostname cannot be added to Anthropic's registration, so it would be rejected at the authorize step; the paste flow is what remains for that case.
-
-For scripting, the same login is three routes:
-
-```bash
-# mode is "redirect" when the Host you call with is a loopback address, else "paste".
-# In "paste" mode the reply also carries loopbackAuthorizeUrl + loopbackProbeUrl:
-# fetch the probe, and if it answers {"status":"waiting"} you can use the
-# loopback URL after all — that is exactly what the web UI does.
-# → {"loginId":"…","mode":"redirect","authorizeUrl":"…","pasteAuthorizeUrl":"…","expiresAt":…,"profile":"work"}
-curl -X POST http://127.0.0.1:3456/profiles/login/start \
-  -H 'Content-Type: application/json' -d '{"profile":"work"}'
-
-# → {"status":"waiting"|"completed"|"failed", "profileId":"work", …}
-curl 'http://127.0.0.1:3456/profiles/login/status?loginId=…'
-
-# only needed for the paste path; `code` accepts the bare code or the full callback URL
-curl -X POST http://127.0.0.1:3456/profiles/login/complete \
-  -H 'Content-Type: application/json' -d '{"loginId":"…","code":"…"}'
-```
-
-Details worth knowing:
-
-- The PKCE verifier never leaves the server. The browser only ever holds an opaque login id.
-- The loopback check the page runs is that login's own `/profiles/login/status` URL, so a reply proves both that the browser can reach loopback *and* that what answered is the instance holding this login. Anything else listening on the port answers 410 and the paste flow stands.
-- A login is **single-use** and expires **10 minutes** after it starts. `state` must match the login it was started with, exactly as the CLI requires; on the redirect path that `state` is what identifies the login at all.
-- `GET /callback` is deliberately **not** behind `MERIDIAN_API_KEY` — Anthropic's redirect carries no key. It acts only on an unguessable, single-use `state` minted by `/profiles/login/start`, which *is* gated, and answers 410 to anything else.
-- Only **claude-max** profiles have this flow. `api` and `oauth-token` profiles are refused with the reason — replace an OAuth token with `meridian profile remove <name> && meridian profile add <name> --oauth-token`.
-- An unknown profile name is refused here rather than created — a typo in a re-authentication must not quietly produce a second account slot. Creating one is a separate, explicit act: see [Add a profile from the web UI](#from-the-web-ui-add-a-profile) below.
-- An instance told not to write credential files (`MERIDIAN_CREDENTIALS_READONLY=1` — set on a second instance that shares another's credentials) refuses **before** opening the sign-in tab, and names where the login can be completed instead. Refusing after sign-in would have burned a one-time code for nothing.
-
-#### From the web UI: add a profile
-
-A new Claude account can be added from the Profiles page without a shell on the Meridian host. Under **Add a profile**, type a name and click **Add profile**:
-
-1. Meridian validates the name, refuses it if anything is wrong, then mints the PKCE login and opens Claude's sign-in in a new tab.
-2. Sign in to the Claude account this profile should use. Claude shows you a code.
-3. Paste it back — the **bare code** or the **whole callback URL**, exactly as for a re-login.
-
-The profile appears in the list, with its own config directory under `~/.config/meridian/profiles/<name>/`, ready to use with no restart.
-
-```bash
-# → {"addId":"…","authorizeUrl":"https://claude.com/cai/oauth/authorize?…","expiresAt":…,"profile":"work"}
-curl -X POST http://127.0.0.1:3456/profiles/add/start \
-  -H 'Content-Type: application/json' -d '{"profile":"work"}'
-
-# `code` accepts the bare code or the full callback URL
-curl -X POST http://127.0.0.1:3456/profiles/add/complete \
-  -H 'Content-Type: application/json' -d '{"addId":"…","code":"…"}'
-```
-
-**Nothing is written until the credentials are in hand.** The exchange with Anthropic happens first; the `profiles.json` entry is written only once it succeeds. A sign-in that is abandoned, rejected or never finished therefore leaves no profile behind at all — there is no half-made account slot stuck at "not logged in" to notice and clean up. Just add it again with the same name.
-
-**Who can do this.** These routes inherit `/profiles/*`'s `requireAuth`, so they are behind `MERIDIAN_API_KEY` **when that key is set**. When it is not set — the default — the only thing standing between this page and a new profile is whatever reaches the port: bind Meridian to loopback, or to a private network you trust. Adding a profile is the most privileged thing the Profiles page does, so treat an unauthenticated instance on a shared network accordingly. There is deliberately no delete, rename or edit here; removal stays `meridian profile remove <name>` on the host.
-
-Details worth knowing:
-
-- Names may use only letters, numbers, hyphens and underscores. The name becomes a directory, and the check is the same one `meridian profile add` applies.
-- An existing name is refused and points you at **Log in from browser** on that profile's card — re-authenticating an account is what that button is for.
-- One open sign-in per name at a time, so two people cannot both be part-way through creating the same one. Starting another for the same name **replaces** the first rather than being refused — cancelling the panel, reloading the page and closing the tab all abandon a sign-in without telling the server, and a name you could not retry until the 10-minute expiry would be worse than the race it prevents. Only the most recently started sign-in can be completed.
-- `MERIDIAN_CREDENTIALS_READONLY=1` refuses **before** the sign-in tab opens, and names `meridian profile add <name>` as the alternative.
-- Only **claude-max** profiles are created this way. `api` and `oauth-token` profiles are CLI-only — neither has an OAuth flow to drive from a page.
-- **The `~/.claude` import offer is CLI-only.** `meridian profile add` on a host whose default config dir is already signed in offers to adopt those credentials as the new profile. The UI never does: clicking **Add profile** always signs in fresh. Silently claiming the account you happen to be logged in as on that machine is not something a button press should be able to do.
+> **⚠ A profile created by an older Meridian has no plan recorded, and a token refresh cannot backfill it** — the value is only ever written at login, and Anthropic's usage endpoint does not carry it. Re-run `meridian profile login <name> --headless` to repair such a profile.
 
 #### Headless / CI: register an OAuth token
 
@@ -145,14 +63,14 @@ You can also switch profiles from the web UI — click an account card on the ho
 
 ### Sticky session routing
 
-With multiple profiles (e.g. two Claude Max subscriptions), Meridian can distribute sessions across profiles automatically while preserving **session affinity** — Anthropic's prompt caching is per-account, so a session must stay on one account to keep its ~99% cache hit rate:
+With multiple profiles (e.g. two Claude Max subscriptions), Meridian can distribute sessions across profiles automatically while preserving **session affinity** — Anthropic's prompt caching is per-account, so keeping a session on one account helps preserve its cache:
 
 ```bash
 MERIDIAN_ROUTING=sticky meridian     # or set "routing": "sticky" in ~/.config/meridian/settings.json
 ```
 
 - Each session is assigned to a profile by rendezvous hashing of its session id — **deterministic and stateless**, so assignments survive proxy restarts with no state to lose
-- Adding/removing a profile only reassigns the sessions belonging to the changed arm — everything else keeps its warm cache
+- Removing a profile reassigns its sessions; adding one moves only sessions for which the new profile wins the hash. Other assignments stay unchanged
 - A session's subagent/fork requests share its assignment (same session id → same account)
 - The `x-meridian-profile` header still overrides everything, per request
 - Default is `active` (all traffic to the active profile — the pre-existing behavior); sticky is opt-in
@@ -161,18 +79,22 @@ Request logs show the assignment (`profile=work(sticky)`), and `GET /profiles/li
 
 ### Priority failover routing
 
-**Opt-in.** With multiple profiles, `routing = "priority"` drains an ordered account pool: unpinned requests prefer the highest-priority account, and when it runs out (rate-limit/quota errors), the request **fails over automatically** to the next account in the order — usually before the client sees any error:
+**Opt-in.** With multiple profiles, `routing = "priority"` drains an ordered account pool: unpinned requests prefer the highest-priority account, and when it can no longer serve (a spent quota window, or a subscription the account can't bill), the request **fails over automatically** to the next account in the order — usually before the client sees any error:
 
 ```bash
 MERIDIAN_ROUTING=priority MERIDIAN_PROFILE_ORDER=work,personal meridian
 # or set "routing": "priority" and "profileOrder": ["work","personal"] in
 # ~/.config/meridian/settings.json — both editable live at /settings
+# Set "priorityFailback": "next-user-turn" in the settings file to change
+# failback behavior. MERIDIAN_PRIORITY_FAILBACK overrides the settings value.
 ```
 
 - **Conversations keep their account** while it's healthy — a session never flips accounts just because the pool preference changed (protects per-account prompt caches). A session on an exhausted account fails over and then stays on its new account. A conversation is identified by its session header when the client sends one, and otherwise by a fingerprint of its opening message and project directory — so keyless clients get the same affinity.
-- **Drain-back is new-sessions-only**: when the preferred account's window resets, new sessions prefer it again immediately; existing conversations finish where they are.
-- **Exhaustion is tracked in-memory** using that account's own reported reset time (conservative 10-minute default when unknown), refined shortly after by an authoritative check against the usage API that can extend — never shorten — the cooldown once that account's five-hour window is confirmed exhausted. The home page shows `#n in pool` and `exhausted · resets in …` badges per account.
-- When **every** account is exhausted, the last-tried account's error is surfaced unchanged.
+- **Failback policy**: `new-conversation` is the default and current behavior. When the preferred account recovers, new conversations use it while existing conversations stay on their fallback. With `next-user-turn`, Meridian switches an existing OpenCode conversation only on a fresh HMAC-attested, visible primary human turn, using a full-history fresh backing session on the preferred account. Hidden/title/summary/compaction, fork, subagent, keyless, malformed, replayed, and explicitly pinned requests cannot promote. Tool-loop continuations retain and atomically refresh the current route. If the preferred account refuses before content, the fallback session is retained. After assistant content, structured output, or a tool side effect, Meridian never replays the turn on another account. Other adapters retain `new-conversation` behavior.
+- **One-time setup for `next-user-turn`**: rerun `meridian setup` after upgrading. Setup creates `~/.config/meridian/opencode-turn.key` as a 32-byte key with mode `0600` and configures the matching V1 or V2 plugin. Missing or invalid keys fail closed: requests still work, but they cannot promote. If OpenCode and Meridian run in separate hosts or config homes, set the same 32-byte base64url `MERIDIAN_OPENCODE_ATTESTATION_KEY` in both environments instead of relying on the shared file. Attestations bind the immutable OpenCode user-message creation time and are accepted only for the short freshness window; an old A-B-A replay keeps A's old time even after a restart and cannot cross B's durable high-water mark.
+- **Exposed turns are replay-fenced durably.** Meridian records an exact attempt claim before SDK work starts and clears it only with terminal route/session finalization or a proven pre-exposure account failure. A crash, cancellation, assistant output, structured output, or tool execution leaves the claim fail-closed. Retrying the same, older, missing, or invalid attestation then returns `503` before any SDK call; only a strictly newer trusted human turn can supersede the uncertain attempt.
+- **Exhaustion is tracked in-memory.** A quota refusal uses that account's own reported reset time (conservative 10-minute default when unknown), refined shortly after by an authoritative check against the usage API that can extend — never shorten — the cooldown once that account's five-hour window is confirmed exhausted. A billing refusal has no reset to wait for, so it takes the conservative default unrefined — the account is simply re-probed later, since only a human can fix a subscription. The home page shows `#n in pool` and `exhausted · resets in …` badges per account.
+- When **every** account is exhausted, the last-tried account's error is surfaced unchanged, with its own status — a pool that ran out of billing is not reported as a rate limit.
 - An explicit `x-meridian-profile` header always bypasses the pool (per-session pinning keeps working).
 - Failovers are logged (`profile.failover` in the diagnostic stream; `profile=<id>(priority)` in request lines).
 
@@ -215,7 +137,7 @@ Profile shapes:
 
 - `claudeConfigDir` — points at a `~/.claude`-style directory; uses Claude Max OAuth from that dir
 - `apiKey` (with optional `baseUrl`) — direct Anthropic API access; sets `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`
-- `oauthToken` — long-lived token from `claude setup-token`; sets `CLAUDE_CODE_OAUTH_TOKEN`, no config dir needed
+- `oauthToken` — long-lived token from `claude setup-token`; sets `CLAUDE_CODE_OAUTH_TOKEN`. Meridian creates an isolated SDK state directory automatically; no credential mount is needed
 
 When `MERIDIAN_PROFILES` is set, it takes precedence over disk-configured profiles. When unset, Meridian auto-discovers profiles from `~/.config/meridian/profiles.json` on each request. `MERIDIAN_CONFIG_DIR` moves that file and the `profiles/` directory beside it, so a second instance can keep its own accounts — see [Relocating the config directory](configuration.md#relocating-the-config-directory).
 

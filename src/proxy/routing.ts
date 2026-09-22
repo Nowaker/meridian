@@ -23,6 +23,7 @@
  */
 
 import { createHash } from "node:crypto"
+import type { RouteKind } from "../telemetry/types"
 
 export type RoutingMode = "active" | "sticky" | "priority" | "active+priority"
 
@@ -35,6 +36,20 @@ export const ACTIVE_PRIORITY = "active+priority" as const
  * new mode parsed correctly and still could not be selected.
  */
 export const ROUTING_MODES: readonly RoutingMode[] = ["active", "sticky", "priority", ACTIVE_PRIORITY]
+
+export type PriorityFailbackPolicy = "new-conversation" | "next-user-turn"
+
+export type PriorityAssignment = {
+  readonly profileId: string
+  readonly requestId: string | undefined
+}
+
+export type PriorityPromotionInput = {
+  readonly policy: PriorityFailbackPolicy
+  readonly assignment: PriorityAssignment
+  readonly requestId: string | undefined
+  readonly requestKind: string | undefined
+}
 
 /**
  * Parse a routing mode string (from settings or MERIDIAN_ROUTING).
@@ -58,6 +73,49 @@ export function getRoutingMode(raw: string | undefined): RoutingMode {
 
 export function isPoolRouting(mode: RoutingMode): boolean {
   return mode === "priority" || mode === ACTIVE_PRIORITY
+}
+
+export function getPriorityFailbackPolicy(raw: string | undefined): PriorityFailbackPolicy {
+  return raw?.toLowerCase() === "next-user-turn" ? "next-user-turn" : "new-conversation"
+}
+
+export function shouldPromotePriorityAssignment(input: PriorityPromotionInput): boolean {
+  // Request ID equality, not kind alone, keeps same-turn tool continuations on fallback.
+  return input.policy === "next-user-turn"
+    && input.requestKind === "human"
+    && input.requestId !== undefined
+    && input.requestId !== input.assignment.requestId
+}
+
+/**
+ * Classify how the serving profile was chosen, from values the caller already
+ * holds. Runs per request, so it may never do I/O or read settings of its own.
+ *
+ * Undefined when the routing mode isn't known (the outer catch records before
+ * routing resolves): the pin and the hop flag still prove
+ * `pinned`/`priority-hop`, but "active" would be a guess, and a guess on an
+ * attribution dashboard is worse than a blank.
+ */
+export function classifyRouteKind(input: {
+  pinnedProfileHeader?: string | undefined
+  /**
+   * One internal hop of a pool dispatch. A flag rather than a header because
+   * the failover re-enters the handler directly, so there is no second HTTP
+   * request for a header to travel on.
+   */
+  priorityHop?: boolean | undefined
+  routingMode?: RoutingMode | undefined
+}): RouteKind | undefined {
+  // Checked before the pin, even though every hop carries one: a hop IS pinned,
+  // so testing the header first would report the mechanism instead of the
+  // reason and make every failover attempt read as a deliberate pin.
+  if (input.priorityHop) return input.routingMode === ACTIVE_PRIORITY ? "active+priority-hop" : "priority-hop"
+  if (input.pinnedProfileHeader) return "pinned"
+  if (input.routingMode === "sticky") return "sticky"
+  if (input.routingMode === "priority") return "priority"
+  if (input.routingMode === ACTIVE_PRIORITY) return ACTIVE_PRIORITY
+  if (input.routingMode === "active") return "active"
+  return undefined
 }
 
 /**
@@ -142,11 +200,12 @@ export function choosePriorityProfile(
   order: readonly string[],
   isExhausted: (id: string) => boolean,
 ): { id: string; allExhausted: boolean } | undefined {
-  if (order.length === 0) return undefined
+  const preferred = order[0]
+  if (preferred === undefined) return undefined
   for (const id of order) {
     if (!isExhausted(id)) return { id, allExhausted: false }
   }
-  return { id: order[0]!, allExhausted: true }
+  return { id: preferred, allExhausted: true }
 }
 
 /**
@@ -246,12 +305,12 @@ export class ProfileExhaustion {
  * After a restart the next request re-establishes the assignment.
  */
 export class AssignmentStore {
-  private readonly entries = new Map<string, string>()
+  private readonly entries = new Map<string, PriorityAssignment>()
 
   constructor(private readonly max: number) {}
 
   /** Read an assignment, marking it most-recently-used. */
-  get(key: string): string | undefined {
+  get(key: string): PriorityAssignment | undefined {
     const value = this.entries.get(key)
     if (value === undefined) return undefined
     this.entries.delete(key)
@@ -260,7 +319,7 @@ export class AssignmentStore {
   }
 
   /** Write an assignment, marking it most-recently-used and evicting if over capacity. */
-  set(key: string, value: string): void {
+  set(key: string, value: PriorityAssignment): void {
     this.entries.delete(key)
     this.entries.set(key, value)
     if (this.entries.size > this.max) {
@@ -269,7 +328,112 @@ export class AssignmentStore {
     }
   }
 
+  compareAndSet(
+    key: string,
+    expected: PriorityAssignment | undefined,
+    value: PriorityAssignment,
+  ): boolean {
+    if (this.entries.get(key) !== expected) return false
+    this.set(key, value)
+    return true
+  }
+
   get size(): number {
     return this.entries.size
   }
+}
+
+/**
+ * How long a profile stays benched when a usage window is exhausted (#790).
+ *
+ * Meridian benches a failing profile until its quota window resets. Reading
+ * that reset only from the `five_hour` window meant a weekly-capped profile
+ * matched nothing and fell through to the 10-minute default — so it was
+ * re-probed every 10 minutes, with a real failing upstream request on the
+ * request path, for however many days the weekly window had left.
+ *
+ * Only the ACCOUNT-WIDE windows bench a profile. Anthropic also reports
+ * per-model weekly budgets (`seven_day_opus`, `seven_day_fable`, …), and an
+ * exhausted one of those does not mean the account is unusable — sidelining a
+ * profile for days because a single model's budget ran out would be worse than
+ * the bug this fixes. Those cases keep the old default and are called out as a
+ * known remainder rather than silently mishandled.
+ */
+export type CooldownWindowType = "five_hour" | "seven_day"
+
+/** Account-wide windows, longest first — the order preference relies on it. */
+const COOLDOWN_WINDOWS: readonly CooldownWindowType[] = ["seven_day", "five_hour"]
+
+/**
+ * Upper bound on a reset for each window, guarding against a garbage value
+ * from upstream.
+ *
+ * This is per-window rather than one constant precisely because a single
+ * constant is how the fix fails silently: a 6-hour cap applied to a weekly
+ * reset flattens "resets in three days" to "resets in six hours" and quietly
+ * recreates the re-probe loop at a slower interval. A `five_hour` window
+ * cannot legitimately reset more than ~5h out; a `seven_day` one can reset up
+ * to 7 days out, so 8 days covers it with room for clock skew.
+ */
+const COOLDOWN_CAP_MS: Record<CooldownWindowType, number> = {
+  five_hour: 6 * 60 * 60_000,
+  seven_day: 8 * 24 * 60 * 60_000,
+}
+
+export function cooldownCapMs(type: CooldownWindowType): number {
+  return COOLDOWN_CAP_MS[type]
+}
+
+/** A usage window, normalized from either the rate-limit store or the OAuth snapshot. */
+export interface CooldownWindow {
+  type: string
+  resetsAt: number | null | undefined
+  /**
+   * Whether this window is actually spent. Presence proves nothing — a healthy
+   * account always carries both windows with future resets — so only genuine
+   * exhaustion may set this.
+   */
+  exhausted: boolean
+}
+
+/**
+ * The timestamp to bench a profile until, given its usage windows.
+ *
+ * Prefers the LONGEST exhausted account-wide window: a profile inside its
+ * weekly cap stays unusable even once the five-hour window rolls over, so
+ * benching only to the five-hour reset would resume probing a still-capped
+ * account. Falls back to `now + defaultMs` when nothing is exhausted, which
+ * keeps the conservative self-healing default for a mis-mark.
+ *
+ * Pure. Never returns a time in the past.
+ */
+export function resolveCooldownUntil(
+  windows: readonly CooldownWindow[],
+  now: number,
+  defaultMs: number,
+): number {
+  return findCooldownReset(windows, now) ?? now + defaultMs
+}
+
+/**
+ * The capped reset of the longest genuinely exhausted window, or null when
+ * nothing here proves a window is spent.
+ *
+ * Split out of `resolveCooldownUntil` so a caller can tell "the account told us
+ * when it frees up" from "we invented a conservative default" — a distinction
+ * `resolveCooldownUntil` erases by design. `Retry-After` needs it (#901): a
+ * real reset is worth sending, a fabricated one dressed as an observation is
+ * not.
+ */
+export function findCooldownReset(
+  windows: readonly CooldownWindow[],
+  now: number,
+): number | null {
+  for (const type of COOLDOWN_WINDOWS) {
+    const match = windows.find(w => w.type === type && w.exhausted && (w.resetsAt ?? 0) > now)
+    if (match?.resetsAt) {
+      return Math.min(match.resetsAt, now + cooldownCapMs(type))
+    }
+  }
+  return null
 }

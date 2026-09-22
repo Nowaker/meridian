@@ -2,9 +2,9 @@
  * Profile renaming.
  *
  * A rename has to move everything that names a profile: its entry in
- * profiles.json and, when its credentials live under the config directory's
- * own profiles/<id>, the credential directory itself. Renaming the entry alone
- * would leave the profile pointing at a directory that is no
+ * profiles.json and, when its credentials live under
+ * ~/.config/meridian/profiles/<id>, the credential directory itself. Renaming
+ * the entry alone would leave the profile pointing at a directory that is no
  * longer its own — an account logged out by a cosmetic change — so both are
  * planned together and applied as one step that either happens or does not.
  *
@@ -23,7 +23,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { configPath } from "../configDir"
-import { getSetting, setSetting } from "./settings"
+import { getSetting, setSetting } from "../settings"
 import type { ProfileConfig } from "./profiles"
 
 /** Profile names are restricted to exactly what `meridian profile add` accepts. */
@@ -33,18 +33,6 @@ export function isValidProfileId(id: string): boolean {
   return id.length > 0 && !INVALID_PROFILE_ID.test(id)
 }
 
-/**
- * Where a caller that names no paths of its own operates.
- *
- * Resolved through the config directory, per call, because MERIDIAN_CONFIG_DIR
- * moves it and a second instance on this machine really does run from a
- * different one. Hardcoding ~/.config/meridian here read as a harmless default
- * and was not: POST /profiles/remove named no paths, so on the instance that
- * owns the credentials it searched the OTHER instance's profiles.json —
- * reporting "not found" for a profile the page had just listed, and lining up
- * to delete a credential directory belonging to an account it was not asked
- * about, for any of the eleven ids the two files happen to share.
- */
 export function defaultProfilesDir(): string {
   return configPath("profiles")
 }

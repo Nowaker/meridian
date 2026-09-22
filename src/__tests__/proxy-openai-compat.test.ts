@@ -12,6 +12,9 @@
  */
 
 import { describe, it, expect, mock, beforeEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import {
   messageStart,
   textBlockStart,
@@ -23,18 +26,20 @@ import {
   parseSSE,
   toolUseBlockStart,
   inputJsonDelta,
+  resolveMockSdkSessionId,
+  streamEvent,
 } from "./helpers"
 
 let mockMessages: unknown[] = []
-let mockSdkSessionId: string | undefined
 let capturedPromptMessages: unknown[] = []
 let capturedOptions: Record<string, unknown> | null = null
 let capturedOptionHistory: Array<Record<string, unknown>> = []
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: ({ prompt, options }: { prompt: string | AsyncIterable<unknown>; options?: Record<string, unknown> }) => {
     capturedOptions = options ?? null
     capturedOptionHistory.push(options ?? {})
+    const sessionId = resolveMockSdkSessionId(options)
     return (async function* () {
       capturedPromptMessages = []
       if (typeof prompt === "string") {
@@ -45,8 +50,8 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
         }
       }
       for (const msg of mockMessages) {
-        if (mockSdkSessionId && msg !== null && typeof msg === "object") {
-          yield { ...msg, session_id: mockSdkSessionId }
+        if (typeof sessionId === "string" && msg !== null && typeof msg === "object") {
+          yield { ...msg, session_id: sessionId }
         } else {
           yield msg
         }
@@ -55,18 +60,19 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "proxy-openai-compat.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: unknown, fn: () => unknown) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
+const { REPLAY_PROVENANCE_NOTE, SCRATCHPAD_COUNTER_INSTRUCTION } = await import("../proxy/query")
 
 function createTestApp() {
   const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
@@ -193,7 +199,134 @@ describe("POST /v1/chat/completions — non-streaming", () => {
     expect(capturedOptions?.effort).toBe("high")
   })
 
-  it("sends the client system prompt verbatim, without the claude_code preset", async () => {
+  it("carries response_format json_schema through to the SDK outputFormat", async () => {
+    // Structured output is enforced by the SDK on the internal /v1/messages
+    // hop. Without this the field is dropped at the endpoint boundary and the
+    // client silently gets prose back instead of schema-valid JSON.
+    const schema = {
+      type: "object",
+      properties: { answer: { type: "string" } },
+      required: ["answer"],
+      additionalProperties: false,
+    }
+    mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
+    const app = createTestApp()
+
+    await postChatCompletion(app, {
+      stream: false,
+      response_format: { type: "json_schema", json_schema: { name: "answer", schema } },
+      messages: [{ role: "user", content: "Hi" }],
+    })
+
+    expect(capturedOptions?.outputFormat).toEqual({ type: "json_schema", schema })
+  })
+
+  // The test above pins what reaches the SDK, but its request actually ends in
+  // a 500: the mock yields no `result` carrying structured_output, so nothing
+  // downstream of the SDK boundary is exercised. These two supply that result
+  // and assert the bytes the client receives — otherwise the whole point of the
+  // feature (schema-valid JSON in the response) has no coverage.
+  it("returns the validated JSON as the message content", async () => {
+    const schema = {
+      type: "object",
+      properties: { answer: { type: "string" } },
+      required: ["answer"],
+      additionalProperties: false,
+    }
+    mockMessages = [
+      assistantMessage([{ type: "text", text: "ignored prose" }]),
+      { type: "result", subtype: "success", is_error: false, structured_output: { answer: "42" } },
+    ]
+    const app = createTestApp()
+
+    const res = await postChatCompletion(app, {
+      stream: false,
+      response_format: { type: "json_schema", json_schema: { name: "answer", schema } },
+      messages: [{ role: "user", content: "Hi" }],
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as { choices: Array<{ message: { content: string } }> }
+    expect(JSON.parse(body.choices[0]!.message.content)).toEqual({ answer: "42" })
+  })
+
+  it("serves a request whose response_format is an explicit null", async () => {
+    // Many OpenAI-compatible clients emit `"response_format": null` for an
+    // unset optional instead of omitting the key. Reading `.type` off it threw
+    // out of this handler, which has no try/catch — so a plain chat request
+    // that worked before structured output existed came back 500.
+    mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
+    const app = createTestApp()
+
+    const res = await postChatCompletion(app, {
+      stream: false,
+      response_format: null,
+      messages: [{ role: "user", content: "Hi" }],
+    })
+
+    expect(res.status).toBe(200)
+    expect(capturedOptions?.outputFormat).toBeUndefined()
+  })
+
+  it("rejects response_format json_object instead of silently ignoring it", async () => {
+    // Anthropic has no schema-less JSON mode, so the request cannot be honored.
+    // Failing loudly beats returning prose to a client expecting JSON.
+    mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
+    const app = createTestApp()
+
+    const res = await postChatCompletion(app, {
+      stream: false,
+      response_format: { type: "json_object" },
+      messages: [{ role: "user", content: "Hi" }],
+    })
+
+    expect(res.status).toBe(400)
+  })
+
+  it("keeps tool calling and drops the schema when both are sent", async () => {
+    // OpenAI permits tools + response_format; structured-output mode cannot
+    // honour both, because it replaces the content and swallows the tool_use
+    // turn. This endpoint dropped response_format entirely before structured
+    // output existed, so tool calling worked and clients depend on it — a 400
+    // delivers neither capability, dropping the schema delivers the larger one.
+    mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
+    const app = createTestApp()
+
+    const res = await postChatCompletion(app, {
+      stream: false,
+      response_format: {
+        type: "json_schema",
+        json_schema: { schema: { type: "object", properties: {} } },
+      },
+      tools: [{ type: "function", function: { name: "fn", parameters: {} } }],
+      messages: [{ role: "user", content: "Hi" }],
+    })
+
+    expect(res.status).toBe(200)
+    // The tools still reach the SDK; only the unsatisfiable schema is dropped.
+    expect(capturedOptions?.outputFormat).toBeUndefined()
+  })
+
+  // Same rule applied to json_object: on its own it is a 400, because nothing
+  // can be honoured (see "rejects response_format json_object" above, and note
+  // Anthropic has no schema-less JSON mode). Sent alongside tools there IS
+  // something to honour, so it degrades rather than failing the whole request.
+  it("keeps tool calling when json_object is sent alongside tools", async () => {
+    mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
+    const app = createTestApp()
+
+    const res = await postChatCompletion(app, {
+      stream: false,
+      response_format: { type: "json_object" },
+      tools: [{ type: "function", function: { name: "fn", parameters: {} } }],
+      messages: [{ role: "user", content: "Hi" }],
+    })
+
+    expect(res.status).toBe(200)
+    expect(capturedOptions?.outputFormat).toBeUndefined()
+  })
+
+  it("keeps client instructions intact with transport provenance and no claude_code preset", async () => {
     // The OpenAI endpoint serves generic chat clients (Open WebUI, curl).
     // Their system prompt must reach the SDK as a plain string — NOT wrapped
     // under the 28KB claude_code preset, which would hijack their intent with
@@ -209,7 +342,7 @@ describe("POST /v1/chat/completions — non-streaming", () => {
       ],
     })
 
-    expect(capturedOptions?.systemPrompt).toBe("You are TestBot. Reply with exactly: ZEBRA-7")
+    expect(capturedOptions?.systemPrompt).toBe("You are TestBot. Reply with exactly: ZEBRA-7" + REPLAY_PROVENANCE_NOTE + SCRATCHPAD_COUNTER_INSTRUCTION)
   })
 
   it("response has Content-Type application/json", async () => {
@@ -274,7 +407,6 @@ describe("POST /v1/chat/completions — Jcode session continuity", () => {
 
   beforeEach(() => {
     mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
-    mockSdkSessionId = "sdk-1"
     capturedPromptMessages = []
     capturedOptions = null
     capturedOptionHistory = []
@@ -293,8 +425,9 @@ describe("POST /v1/chat/completions — Jcode session continuity", () => {
 
     expect(capturedOptionHistory).toHaveLength(2)
     expect(capturedOptionHistory[0]?.resume).toBeUndefined()
-    expect(capturedOptionHistory[1]?.resume).toBe("sdk-1")
-    expect(capturedOptionHistory[1]?.systemPrompt).toBe("stable system")
+    expect(capturedOptionHistory[0]?.sessionId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(capturedOptionHistory[1]?.resume).toBe(capturedOptionHistory[0]?.sessionId)
+    expect(capturedOptionHistory[1]?.systemPrompt).toBe("stable system" + REPLAY_PROVENANCE_NOTE + SCRATCHPAD_COUNTER_INSTRUCTION)
   })
 
   it("keeps distinct Jcode session keys isolated", async () => {
@@ -341,6 +474,169 @@ describe("POST /v1/chat/completions — Jcode session continuity", () => {
   })
 })
 
+// Tool turns are not exercised here: this file's SDK mock never yields the
+// canonical result the passthrough checkpoint store waits for, so a keyed
+// tool loop is pinned in passthrough-early-stop-integration.test.ts instead.
+describe("POST /v1/chat/completions — session-keyed continuity for the generic adapter", () => {
+  const firstTurn = {
+    stream: false,
+    messages: [
+      { role: "system", content: "stable system" },
+      { role: "user", content: "Turn 1" },
+    ],
+  }
+  const secondTurn = {
+    stream: false,
+    messages: [
+      { role: "system", content: "stable system" },
+      { role: "user", content: "Turn 1" },
+      { role: "assistant", content: "Answer 1" },
+      { role: "user", content: "Turn 2" },
+    ],
+  }
+
+  type InnerRequest = {
+    url: string
+    clone(): InnerRequest
+    json(): Promise<unknown>
+    headers: { get(name: string): string | null }
+  }
+
+  // Capture the inner /v1/messages hop (cloned so the handler still reads the
+  // original body) — same seam as the keepalive test below.
+  function captureInnerRequests(app: ReturnType<typeof createTestApp>): InnerRequest[] {
+    const innerRequests: InnerRequest[] = []
+    const originalFetch = app.fetch.bind(app)
+    app.fetch = (req, env, executionCtx) => {
+      if (req.url === "http://internal/v1/messages") innerRequests.push(req.clone())
+      return originalFetch(req, env, executionCtx)
+    }
+    return innerRequests
+  }
+
+  beforeEach(() => {
+    mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
+    capturedPromptMessages = []
+    capturedOptions = null
+    capturedOptionHistory = []
+    clearSessionCache()
+  })
+
+  for (const [headerName, keyValue] of [
+    ["x-session-affinity", "affinity-session-a"],
+    ["x-opencode-session", "opencode-session-a"],
+  ] as const) {
+    it(`keeps the real messages and resumes across turns keyed by ${headerName}`, async () => {
+      const app = createTestApp()
+      const innerRequests = captureInnerRequests(app)
+      const headers = { [headerName]: keyValue }
+
+      expect((await postChatCompletion(app, firstTurn, headers)).status).toBe(200)
+      expect((await postChatCompletion(app, secondTurn, headers)).status).toBe(200)
+
+      expect(capturedOptionHistory).toHaveLength(2)
+      expect(capturedOptionHistory[0]?.resume).toBeUndefined()
+      expect(capturedOptionHistory[0]?.sessionId).toMatch(/^[0-9a-f-]{36}$/)
+      // Turn 2 is a continuation of turn 1's SDK session, so the key reached
+      // the inner hop and its lineage verified the full history.
+      expect(capturedOptionHistory[1]?.resume).toBe(capturedOptionHistory[0]?.sessionId)
+      expect(capturedOptionHistory[1]?.systemPrompt).toBe("stable system" + REPLAY_PROVENANCE_NOTE + SCRATCHPAD_COUNTER_INSTRUCTION)
+
+      // The inner body carried the full messages array, unpacked, and the key
+      // itself was forwarded on the inner hop. The adapter tag stays `openai`.
+      expect(innerRequests).toHaveLength(2)
+      const innerBody = await innerRequests[1]!.json() as {
+        messages: Array<Record<string, unknown>>
+        system?: string
+      }
+      expect(innerBody.messages).toHaveLength(3)
+      expect(JSON.stringify(innerBody.messages)).not.toContain("<conversation_history>")
+      expect(innerBody.system).not.toContain("<conversation_history>")
+      expect(innerRequests[1]!.headers.get(headerName)).toBe(keyValue)
+      expect(innerRequests[1]!.headers.get("x-meridian-agent")).toBe("openai")
+    })
+  }
+
+  it("keeps distinct generic session keys isolated", async () => {
+    const app = createTestApp()
+
+    await postChatCompletion(app, firstTurn, { "x-session-affinity": "session-a" })
+    await postChatCompletion(app, secondTurn, { "x-session-affinity": "session-b" })
+
+    expect(capturedOptionHistory).toHaveLength(2)
+    expect(capturedOptionHistory[1]?.resume).toBeUndefined()
+  })
+
+  it("packs history for an unkeyed generic request", async () => {
+    const app = createTestApp()
+
+    await postChatCompletion(app, firstTurn)
+    await postChatCompletion(app, secondTurn)
+
+    expect(capturedOptionHistory).toHaveLength(2)
+    expect(capturedOptionHistory[1]?.resume).toBeUndefined()
+    expect(capturedOptionHistory[1]?.systemPrompt).toContain("<conversation_history>")
+  })
+
+  it("forwards the caller's user-agent on the inner hop only for a keyed request", async () => {
+    // An OpenCode client keying its chat-completions traffic needs its UA on
+    // the inner hop: the pluginless-OpenCode degradation (#1024) reads it
+    // there. An unkeyed request is packed and headerless on the inner hop —
+    // exactly as before.
+    const keyedApp = createTestApp()
+    const keyedInner = captureInnerRequests(keyedApp)
+    await postChatCompletion(keyedApp, firstTurn, {
+      "x-session-affinity": "ua-key",
+      "user-agent": "opencode/1.0.0",
+    })
+    expect(keyedInner[0]?.headers.get("user-agent")).toBe("opencode/1.0.0")
+
+    const unkeyedApp = createTestApp()
+    const unkeyedInner = captureInnerRequests(unkeyedApp)
+    await postChatCompletion(unkeyedApp, firstTurn, { "user-agent": "opencode/1.0.0" })
+    expect(unkeyedInner[0]?.headers.get("user-agent")).toBeNull()
+    expect(unkeyedInner[0]?.headers.get("x-opencode-agent-mode")).toBeNull()
+  })
+
+  it("scopes a subagent turn to its own key and forwards the agent headers", async () => {
+    const app = createTestApp()
+    const innerRequests = captureInnerRequests(app)
+    const subagentHeaders = {
+      "x-session-affinity": "base-key",
+      "x-opencode-agent-mode": "subagent",
+      "x-opencode-agent-name": "title",
+    }
+
+    await postChatCompletion(app, firstTurn, subagentHeaders)
+    await postChatCompletion(app, secondTurn, subagentHeaders)
+
+    expect(capturedOptionHistory).toHaveLength(2)
+    expect(capturedOptionHistory[1]?.resume).toBe(capturedOptionHistory[0]?.sessionId)
+    expect(innerRequests[1]?.headers.get("x-opencode-agent-mode")).toBe("subagent")
+    expect(innerRequests[1]?.headers.get("x-opencode-agent-name")).toBe("title")
+
+    // Without the agent headers the key is the plain affinity value, not the
+    // scoped `base-key#title` the subagent turns resolved — a separate lineage.
+    await postChatCompletion(app, secondTurn, { "x-session-affinity": "base-key" })
+    expect(capturedOptionHistory[2]?.resume).toBeUndefined()
+  })
+
+  // Guards the contract, not the change: a retry must never resume and
+  // double-append the same turn onto the stored session.
+  it("replays fresh when a keyed turn is retried with an identical body", async () => {
+    const app = createTestApp()
+    const headers = { "x-session-affinity": "retry-key" }
+
+    await postChatCompletion(app, firstTurn, headers)
+    await postChatCompletion(app, secondTurn, headers)
+    const retry = await postChatCompletion(app, secondTurn, headers)
+
+    expect(retry.status).toBe(200)
+    expect(capturedOptionHistory).toHaveLength(3)
+    expect(capturedOptionHistory[2]?.resume).toBeUndefined()
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Streaming
 // ---------------------------------------------------------------------------
@@ -378,6 +674,12 @@ describe("POST /v1/chat/completions — streaming", () => {
 
     expect(res.status).toBe(200)
     expect(res.headers.get("content-type")).toContain("text/event-stream")
+    // Drain the stream: leaving the SSE producer pending lets it outlive this
+    // file and invoke a LATER file's process-global SDK mock (same leak class
+    // as the proxy-streaming-message drain fix). Consume fully and require a
+    // clean terminal frame.
+    const body = await readStream(res)
+    expect(body).toContain("data: [DONE]")
   })
 
   it("emits OpenAI SSE chunks with correct shape", async () => {
@@ -477,6 +779,55 @@ describe("POST /v1/chat/completions — streaming", () => {
     expect(text).toContain("data: [DONE]")
   })
 
+  it("emits complete cached usage immediately before [DONE] when requested", async () => {
+    mockMessages = [
+      streamEvent({
+        type: "message_start",
+        message: {
+          id: "msg_usage",
+          type: "message",
+          role: "assistant",
+          content: [],
+          model: "claude-sonnet-4-5-20250929",
+          stop_reason: null,
+          usage: {
+            input_tokens: 23,
+            output_tokens: 0,
+            cache_read_input_tokens: 900,
+            cache_creation_input_tokens: 77,
+          },
+        },
+      }),
+      textBlockStart(0),
+      textDelta(0, "cached"),
+      blockStop(0),
+      streamEvent({
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+        usage: { output_tokens: 41 },
+      }),
+      messageStop(),
+    ]
+    const app = createTestApp()
+
+    const res = await postChatCompletion(app, {
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [{ role: "user", content: "Use the cached prompt" }],
+    })
+
+    const frames = (await readStream(res)).split("\n").filter(line => line.startsWith("data: "))
+    expect(frames.at(-1)).toBe("data: [DONE]")
+    const usageChunk = JSON.parse(frames.at(-2)!.slice(6)) as Record<string, unknown>
+    expect(usageChunk.choices).toEqual([])
+    expect(usageChunk.usage).toEqual({
+      prompt_tokens: 1000,
+      completion_tokens: 41,
+      total_tokens: 1041,
+      prompt_tokens_details: { cached_tokens: 900, cache_write_tokens: 77 },
+    })
+  })
+
   it("all chunks share the same completion id", async () => {
     mockMessages = [
       messageStart("msg_1"), textBlockStart(0),
@@ -498,6 +849,50 @@ describe("POST /v1/chat/completions — streaming", () => {
     const uniqueIds = new Set(ids)
     expect(uniqueIds.size).toBe(1)
     expect([...uniqueIds][0]).toMatch(/^chatcmpl-/)
+  })
+
+  it("forwards internal SSE keepalive comments to the client", async () => {
+    const app = createTestApp()
+    const originalFetch = app.fetch.bind(app)
+    const internalFrames = [
+      `data: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", content: [], model: "claude-sonnet-5", stop_reason: null, usage: { input_tokens: 10, output_tokens: 0 } } })}`,
+      ": ping",
+      `data: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}`,
+      `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hello" } })}`,
+      ": ping",
+      `data: ${JSON.stringify({ type: "content_block_stop", index: 0 })}`,
+      `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } })}`,
+      `data: ${JSON.stringify({ type: "message_stop" })}`,
+    ]
+    app.fetch = (req, env, executionCtx) => {
+      if (req.url === "http://internal/v1/messages") {
+        return Promise.resolve(new Response(`${internalFrames.join("\n\n")}\n\n`, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        }))
+      }
+      return originalFetch(req, env, executionCtx)
+    }
+
+    const res = await postChatCompletion(app, {
+      stream: true,
+      messages: [{ role: "user", content: "Hi" }],
+    })
+
+    const text = await readStream(res)
+    const pingLines = text.split("\n").filter(l => l === ": ping")
+    expect(pingLines).toHaveLength(2)
+
+    const contentChunks = text.split("\n")
+      .filter(l => l.startsWith("data: ") && l !== "data: [DONE]")
+      .map(l => JSON.parse(l.slice(6)) as Record<string, unknown>)
+      .map(c => {
+        const choices = c.choices as Array<Record<string, unknown>>
+        return (choices[0]!.delta as Record<string, unknown>).content
+      })
+      .filter((content): content is string => typeof content === "string" && content.length > 0)
+    expect(contentChunks.join("")).toBe("Hello")
+    expect(text).toContain("data: [DONE]")
   })
 
   // --- tool_call_counter increment behavior ---
@@ -621,6 +1016,36 @@ describe("POST /v1/chat/completions — streaming", () => {
       .find((tc): tc is DeltaToolCall => !!tc && tc.type === "function" && typeof tc.id === "string")
       ?.index
     expect(startIndex).toBe(0)
+  })
+
+  it("streams the validated JSON as a single content delta", async () => {
+    const schema = {
+      type: "object",
+      properties: { answer: { type: "string" } },
+      required: ["answer"],
+      additionalProperties: false,
+    }
+    mockMessages = [
+      messageStart("msg_1"), textBlockStart(0), textDelta(0, "ignored prose"),
+      blockStop(0), messageDelta("end_turn"), messageStop(),
+      { type: "result", subtype: "success", is_error: false, structured_output: { answer: "42" } },
+    ]
+    const app = createTestApp()
+
+    const res = await postChatCompletion(app, {
+      stream: true,
+      response_format: { type: "json_schema", json_schema: { name: "answer", schema } },
+      messages: [{ role: "user", content: "Hi" }],
+    })
+
+    expect(res.status).toBe(200)
+    const text = await readStream(res)
+    const content = text.split("\n")
+      .filter(l => l.startsWith("data: ") && l !== "data: [DONE]")
+      .map(l => JSON.parse(l.slice(6)) as { choices?: Array<{ delta?: { content?: string } }> })
+      .map(c => c.choices?.[0]?.delta?.content ?? "")
+      .join("")
+    expect(JSON.parse(content)).toEqual({ answer: "42" })
   })
 })
 

@@ -2,7 +2,7 @@
  * Unit tests for classifyError — pure function, no mocks needed.
  */
 import { describe, it, expect } from "bun:test"
-import { classifyError, extendedContextHint, isStaleSessionError, isBusySessionError, isExtraUsageRequiredError, extractSdkTermination, formatSdkTermination } from "../proxy/errors"
+import { canRecoverCapturedToolUses, classifyError, extendedContextHint, classifyResumeRefusal, isBusySessionError, isExtraUsageRequiredError, extractSdkTermination, formatSdkTermination, isAccountFailoverError, isQuotaRefusal, isRateLimitError } from "../proxy/errors"
 
 describe("classifyError", () => {
   describe("authentication errors", () => {
@@ -150,6 +150,251 @@ describe("classifyError", () => {
       const result = classifyError("subscription expired")
       expect(result.status).toBe(402)
     })
+
+    it("detects a lapsed subscription with a payment-method prompt", () => {
+      const r = classifyError("Claude Code returned an error result: Your Claude Max subscription is inactive — update your payment method to continue.")
+      expect(r.status).toBe(402)
+      expect(r.type).toBe("billing_error")
+    })
+
+    it("detects an exhausted extra-usage refusal", () => {
+      const r = classifyError("API Error: 400 You're out of extra usage. Add more at claude.ai/settings/usage")
+      expect(r.type).toBe("billing_error")
+    })
+
+    it("detects a third-party app extra-usage refusal (#1045)", () => {
+      const r = classifyError("Claude Code returned an error result: API Error: 400 Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going.")
+      expect(r.status).toBe(402)
+      expect(r.type).toBe("billing_error")
+    })
+
+    // These used to classify as billing because the branch matched bare
+    // substrings anywhere in the text, and it runs before the crash/max-turns
+    // branches so it won. Harmless as a wrong status code; not harmless once
+    // isAccountFailoverError keys on the type (#796), where an incidental
+    // filename could mark every profile in the pool exhausted.
+    it.each([
+      ["a filename", "Claude Code returned an error result: Reached maximum number of turns (3) while editing subscription.ts"],
+      ["a path", "Error: ENOENT: no such file or directory, open '/repo/src/billing/index.ts'"],
+      ["a URL", "fetch failed: https://api.example.com/payment/status returned 500"],
+      ["a stack frame line number", "TypeError: undefined is not a function\n    at handler.js:402:15"],
+    ])("does not read %s as a billing error", (_label, msg) => {
+      const r = classifyError(msg)
+      expect(r.type).not.toBe("billing_error")
+      expect(isAccountFailoverError(r.type)).toBe(false)
+    })
+  })
+
+  // #770: guardUpstreamIdle is meridian's own termination, not the SDK's. Its
+  // message matched none of the needles, so it landed on "unknown" — which
+  // excludes it from canRecoverAsToolUse and discards tool calls the hook had
+  // already captured.
+  describe("upstream idle termination", () => {
+    it("recognises the idle guard's own error and reads the idle window", () => {
+      const t = extractSdkTermination("upstream idle for 90001ms (limit 90000ms)")
+      expect(t.reason).toBe("upstream_idle")
+      expect(t.idleMs).toBe(90001)
+    })
+
+    it("recognises it when wrapped by the SDK error text", () => {
+      const t = extractSdkTermination("Error: upstream idle for 90001ms (limit 90000ms)\n    at guard.ts:1")
+      expect(t.reason).toBe("upstream_idle")
+    })
+
+    it("leaves the client-facing classification untouched", () => {
+      // The 504 upstream_timeout the client sees comes from an
+      // `instanceof UpstreamIdleError` branch in server.ts, NOT from
+      // classifyError — which still reads this as a generic api_error. #770 is
+      // about the termination reason only, so this pins that the wire status
+      // did not move with it.
+      const r = classifyError("upstream idle for 90001ms (limit 90000ms)")
+      expect(r.status).toBe(500)
+      expect(r.type).toBe("api_error")
+    })
+
+    it("does not swallow a max_turns error that mentions idling", () => {
+      const t = extractSdkTermination("Reached maximum number of turns (3) while waiting for an idle upstream")
+      expect(t.reason).toBe("max_turns")
+    })
+  })
+
+  describe("canRecoverCapturedToolUses", () => {
+    const base = { passthrough: true, capturedToolUses: 2, abortIsOurs: true } as const
+
+    it("recovers a turn-cap termination", () => {
+      expect(canRecoverCapturedToolUses({ ...base, reason: "max_turns" })).toBe(true)
+    })
+
+    // #770: the stall killed the stream, not the work already captured.
+    it("recovers an idle-guard termination", () => {
+      expect(canRecoverCapturedToolUses({ ...base, reason: "upstream_idle" })).toBe(true)
+    })
+
+    it("recovers our own abort but not a client disconnect", () => {
+      expect(canRecoverCapturedToolUses({ ...base, reason: "aborted", abortIsOurs: true })).toBe(true)
+      expect(canRecoverCapturedToolUses({ ...base, reason: "aborted", abortIsOurs: false })).toBe(false)
+    })
+
+    it("does not recover an unrecognised termination", () => {
+      expect(canRecoverCapturedToolUses({ ...base, reason: "unknown" })).toBe(false)
+    })
+
+    it("does not recover a process crash", () => {
+      expect(canRecoverCapturedToolUses({ ...base, reason: "process_exit" })).toBe(false)
+    })
+
+    // An overflow is rejected before generation, so there is nothing captured
+    // to deliver — and replaying the same oversized prompt cannot succeed.
+    it("does not recover a context overflow", () => {
+      expect(canRecoverCapturedToolUses({ ...base, reason: "context_overflow" })).toBe(false)
+    })
+
+    // Without captured calls there is nothing to deliver, and outside
+    // passthrough the client does not execute tools at all.
+    it("requires captured tool calls", () => {
+      expect(canRecoverCapturedToolUses({ ...base, reason: "max_turns", capturedToolUses: 0 })).toBe(false)
+    })
+
+    it("requires passthrough", () => {
+      expect(canRecoverCapturedToolUses({ ...base, reason: "max_turns", passthrough: false })).toBe(false)
+    })
+  })
+
+  describe("context overflow", () => {
+    it("classifies the CLI's bare wording", () => {
+      const r = classifyError("Claude Code returned an error result: Prompt is too long")
+      expect(r.status).toBe(400)
+      expect(r.type).toBe("invalid_request_error")
+    })
+
+    it("classifies the API's token-count wording", () => {
+      const r = classifyError('API Error: 400 {"type":"invalid_request_error","message":"prompt is too long: 215843 tokens > 200000 maximum"}')
+      expect(r.status).toBe(400)
+    })
+
+    it("classifies the max_tokens phrasing", () => {
+      const r = classifyError("input length and `max_tokens` exceed context limit: 197000 + 8192 > 200000")
+      expect(r.status).toBe(400)
+    })
+
+    it("classifies the OpenAI-compatible code", () => {
+      const r = classifyError("context_length_exceeded")
+      expect(r.status).toBe(400)
+    })
+
+    // The whole reason this branch sits above the crash branch. Without it the
+    // code-1 path returns 401 and tells the operator to run `claude login` —
+    // advice that cannot work here, for a cause it has hidden.
+    it("wins over a process exit carrying the overflow in stderr", () => {
+      const r = classifyError("Claude Code process exited with code 1\nSubprocess stderr: Prompt is too long")
+      expect(r.status).toBe(400)
+      expect(r.type).toBe("invalid_request_error")
+      expect(r.message).not.toContain("claude login")
+    })
+
+    // A 5xx reads as "transient, try again" to every client retry policy, which
+    // is what replays an unfixable request at full upstream cost.
+    it.each([
+      ["the CLI wording", "Prompt is too long"],
+      ["the OpenAI code", "context_length_exceeded"],
+    ])("never classifies %s as retryable", (_label, msg) => {
+      expect(classifyError(msg).status).toBeLessThan(500)
+    })
+
+    // Mirrors #796: the phrase is word-separated, so an identifier carrying the
+    // same words cannot steal the branch from the real cause.
+    it("ignores an incidental identifier", () => {
+      const r = classifyError("Error: ENOENT: no such file or directory, open '/repo/src/prompt-is-too-long.ts'")
+      expect(r.status).not.toBe(400)
+    })
+
+    // A false 400 is the expensive direction: it tells the client the request is
+    // unfixable, so the retry is abandoned and legitimate work is silently
+    // dropped. Every case below classified as 400 before the pattern was
+    // anchored. Asserting the concrete status, not `not.toBe(400)` — the weaker
+    // form is what let an equivalent regression hide in #908.
+    it.each([
+      ["a negated sentence", "The prompt is too long check did not trigger; this is a network failure"],
+      ["the phrase quoted in prose", 'The assistant replied: "prompt is too long" is a common error message users see'],
+      ["the phrase quoted inside stderr", 'Subprocess stderr: user asked "why does it say prompt is too long?"'],
+      ["a tool_result echoing a grep hit", "tool_result: grep found 'context_length_exceeded' in errors.ts:114"],
+    ])("does not classify %s as an overflow", (_label, msg) => {
+      const r = classifyError(msg)
+      expect(r.status).toBe(500)
+      expect(r.type).toBe("api_error")
+    })
+
+    // The API envelope is the one non-line-anchored shape that must still match,
+    // so the phrase is accepted when it opens a `message` value. That is narrow
+    // on purpose: the same words inside any other field, or partway through the
+    // message, are prose rather than the error itself.
+    //
+    // Known boundary: a tool_result echoing a genuine overflow envelope verbatim
+    // still classifies as 400. Distinguishing it would mean parsing the message
+    // to see whose error it is, and an echoed envelope is a real overflow report
+    // either way — so it is left as the accepted edge rather than widened around.
+    it.each([
+      ["opens the message value", '{"message":"prompt is too long: 215843 tokens > 200000 maximum"}', 400],
+      ["sits in another field", '{"note":"prompt is too long is a common error users hit"}', 500],
+      ["sits partway through the message", '{"message":"the user asked why prompt is too long appears"}', 500],
+    ])("%s", (_label, msg, status) => {
+      expect(classifyError(msg).status).toBe(status)
+    })
+
+    // The overflow branch runs before the process-crash branch but after the
+    // HTTP-status branches, so a real refusal that merely mentions the phrase
+    // keeps its own classification rather than being downgraded to a 400.
+    it.each([
+      ["a rate limit", "429 rate limit exceeded — note: context length exceeded is a different error", 429],
+      ["an auth failure", "401 unauthorized. Docs mention context_length_exceeded elsewhere.", 401],
+    ])("lets %s keep its status", (_label, msg, status) => {
+      expect(classifyError(msg).status).toBe(status)
+    })
+  })
+
+  // The CLI rejects a model it is too old to know about. Captured verbatim from
+  // claude-code 2.1.198 asked for claude-fable-5-1 (#932). This is reachable via
+  // MERIDIAN_CLAUDE_PATH, which outranks the bundled binary the package.json
+  // floor governs, so the floor alone does not prevent it.
+  describe("CLI too old for the requested model (#932)", () => {
+    const REAL = "API Error: 400 Claude Code 2.1.198 does not support this model; version 2.1.251 or newer is required. Run 'claude update', or update the Claude desktop app, then try again."
+
+    it("classifies the CLI's verbatim wording as a client error", () => {
+      const r = classifyError(REAL)
+      expect(r.status).toBe(400)
+      expect(r.type).toBe("invalid_request_error")
+    })
+
+    // The whole point: a 500 reads as "transient" to every client retry policy,
+    // so an upgrade-or-nothing failure gets replayed forever at upstream cost.
+    it("is never retryable", () => {
+      expect(classifyError(REAL).status).toBeLessThan(500)
+    })
+
+    // The CLI names both the installed and required versions. Dropping them for
+    // generic prose would discard the only actionable part of the message.
+    it("preserves the version detail the CLI reported", () => {
+      const r = classifyError(REAL)
+      expect(r.message).toContain("2.1.198")
+      expect(r.message).toContain("2.1.251")
+    })
+
+    it("matches the shape, not one hardcoded version pair", () => {
+      const r = classifyError("API Error: 400 Claude Code 2.0.5 does not support this model; version 3.0.0 or newer is required.")
+      expect(r.status).toBe(400)
+    })
+
+    // Must not steal a genuine quota failure that happens to mention a model.
+    it("leaves a rate limit alone", () => {
+      expect(classifyError("You've hit your usage limit for claude-fable-5-1").status).toBe(429)
+    })
+
+    // "does not support" alone is too broad — an unsupported tool or flag is a
+    // different failure with a different remedy.
+    it("does not fire on an unrelated unsupported-feature error", () => {
+      const r = classifyError("Error: this tool does not support streaming input")
+      expect(r.status).not.toBe(400)
+    })
   })
 
   describe("process crashes", () => {
@@ -184,6 +429,37 @@ describe("classifyError", () => {
     })
   })
 
+  describe("session bookkeeping saturation", () => {
+    it("classifies the lifecycle lock wait as proxy load, not a request timeout", () => {
+      const result = classifyError("timed out waiting for /var/lib/meridian/.cache/meridian/session-gc.json.lock")
+      expect(result.status).toBe(503)
+      expect(result.type).toBe("overloaded_error")
+      expect(result.message).toContain("a bookkeeping lock is busy")
+      // The raw message carries absolute host paths; the client sees none.
+      expect(result.message).not.toContain("/var/lib")
+      expect(result.message).not.toContain(".lock")
+    })
+
+    it("classifies the ownership backlog limit as proxy load", () => {
+      const result = classifyError("session transcript ownership backlog is full")
+      expect(result.status).toBe(503)
+      expect(result.type).toBe("overloaded_error")
+      expect(result.message).toContain("the retirement backlog is full")
+    })
+
+    it("classifies the ownership capacity limit as proxy load", () => {
+      const result = classifyError("session transcript ownership capacity is full")
+      expect(result.status).toBe(503)
+      expect(result.type).toBe("overloaded_error")
+    })
+
+    it("still classifies an unrelated timeout as a request timeout", () => {
+      const result = classifyError("connection timed out")
+      expect(result.status).toBe(504)
+      expect(result.type).toBe("timeout_error")
+    })
+  })
+
   describe("server errors", () => {
     it("detects 500 status codes", () => {
       const result = classifyError("HTTP 500 from API")
@@ -207,6 +483,15 @@ describe("classifyError", () => {
     it("detects 'overloaded' keyword", () => {
       const result = classifyError("service overloaded")
       expect(result.status).toBe(503)
+    })
+
+    it("does not treat status-code digits embedded in UUIDs as HTTP signals", () => {
+      for (const code of ["401", "429", "500", "503"]) {
+        const message = `Managed SDK fork returned 00000000-0000-4${code}-8000-000000000000`
+        const result = classifyError(message)
+        expect(result.status).toBe(500)
+        expect(result.message).toBe(message)
+      }
     })
   })
 
@@ -232,37 +517,50 @@ describe("classifyError", () => {
     })
   })
 
-  describe("stale session detection", () => {
-    it("detects 'No message found with message.uuid' errors", () => {
-      expect(isStaleSessionError(new Error("No message found with message.uuid of: e663b687-6d08-4cc4-b9a9-5245ce8f1e07"))).toBe(true)
+  describe("resume refusal classification", () => {
+    const busyRefusal =
+      "Error: Session 3cff857d-114e-4be3-8a12-99842ad2326e is currently running as a background agent (bg). Use `claude agents` to find and attach to it, or add --fork-session to branch off a copy."
+
+    it("a lost message names itself, so an identical attempt is pointless", () => {
+      expect(classifyResumeRefusal(new Error("No message found with message.uuid of: e663b687-6d08-4cc4-b9a9-5245ce8f1e07"))).toBe("missing-message")
     })
 
-    it("detects the error embedded in longer messages", () => {
-      expect(isStaleSessionError(new Error("claude code returned an error result: No message found with message.uuid of: abc123"))).toBe(true)
+    it("reads the refusal out of a longer message", () => {
+      expect(classifyResumeRefusal(new Error("claude code returned an error result: No message found with message.uuid of: abc123"))).toBe("missing-message")
     })
 
-    it("detects 'No conversation found with session ID' errors", () => {
-      expect(isStaleSessionError(new Error("No conversation found with session ID: 2e9e868c-ab59-482c-ae28-3b60ec9cb95b"))).toBe(true)
+    it("a session that would not open is unresumable, not proven gone", () => {
+      expect(classifyResumeRefusal(new Error("No conversation found with session ID: 2e9e868c-ab59-482c-ae28-3b60ec9cb95b"))).toBe("unresumable")
+      expect(classifyResumeRefusal(new Error("No conversation found to continue"))).toBe("unresumable")
+      expect(classifyResumeRefusal(new Error("No conversations found to resume"))).toBe("unresumable")
+      expect(classifyResumeRefusal(new Error("No conversations found to resume."))).toBe("unresumable")
     })
 
-    it("detects 'No conversation found to continue' errors", () => {
-      expect(isStaleSessionError(new Error("No conversation found to continue"))).toBe(true)
+    it("a session held by a running agent is busy, so it can be branched", () => {
+      expect(classifyResumeRefusal(new Error(busyRefusal))).toBe("busy")
     })
 
-    it("detects 'No conversations found to resume' errors", () => {
-      expect(isStaleSessionError(new Error("No conversations found to resume"))).toBe(true)
-      expect(isStaleSessionError(new Error("No conversations found to resume."))).toBe(true)
+    it("finds the busy refusal on stderr when the error only carries the exit code", () => {
+      expect(classifyResumeRefusal(new Error("Claude Code process exited with code 1"), busyRefusal)).toBe("busy")
     })
 
-    it("returns false for unrelated errors", () => {
-      expect(isStaleSessionError(new Error("rate limit exceeded"))).toBe(false)
-      expect(isStaleSessionError(new Error("authentication failed"))).toBe(false)
+    it("leaves failures that are not about the resume unclassified", () => {
+      expect(classifyResumeRefusal(new Error("rate limit exceeded"))).toBeUndefined()
+      expect(classifyResumeRefusal(new Error("authentication failed"))).toBeUndefined()
+      expect(classifyResumeRefusal(new Error("Claude Code process exited with code 1"))).toBeUndefined()
     })
 
-    it("returns false for non-Error values", () => {
-      expect(isStaleSessionError("No message found with message.uuid")).toBe(false)
-      expect(isStaleSessionError(null)).toBe(false)
-      expect(isStaleSessionError(undefined)).toBe(false)
+    it("reads no wording off the value of a non-Error failure", () => {
+      expect(classifyResumeRefusal("No message found with message.uuid")).toBeUndefined()
+      expect(classifyResumeRefusal(null)).toBeUndefined()
+      expect(classifyResumeRefusal(undefined)).toBeUndefined()
+    })
+
+    it("still finds the busy refusal on stderr, whatever the failure value is", () => {
+      // The busy wording travels on stderr precisely because the failure often
+      // carries nothing but an exit code, so this one is not value-bound.
+      expect(classifyResumeRefusal("exit 1", busyRefusal)).toBe("busy")
+      expect(classifyResumeRefusal(null, busyRefusal)).toBe("busy")
     })
   })
 
@@ -347,6 +645,26 @@ describe("extractSdkTermination", () => {
       expect(t.reason).toBe("max_turns")
       expect(t.turns).toBe(3)
       expect(t.stderrTail).toContain("Custom betas")
+    })
+  })
+
+  describe("context_overflow", () => {
+    it("names an oversized prompt", () => {
+      const t = extractSdkTermination("Claude Code returned an error result: Prompt is too long")
+      expect(t.reason).toBe("context_overflow")
+    })
+
+    // Ordering guard: the overflow arrives as a process exit often enough that
+    // reading the exit first points the diagnostic log at the wrong thing.
+    it("wins over a process exit carrying the overflow in stderr", () => {
+      const t = extractSdkTermination("process exited with code 1\nSubprocess stderr: Prompt is too long")
+      expect(t.reason).toBe("context_overflow")
+      expect(t.stderrTail).toContain("Prompt is too long")
+    })
+
+    it("survives the round trip into a diagnostic log line", () => {
+      const t = extractSdkTermination("Prompt is too long")
+      expect(formatSdkTermination(t, { model: "sonnet" })).toContain("reason=context_overflow")
     })
   })
 
@@ -481,6 +799,30 @@ describe("formatSdkTermination", () => {
     expect(line).toContain("source=main")
     expect(line).toContain('raw="Some weird upstream failure"')
   })
+
+  it("appends abort=none when the cause snapshot says no Meridian-linked abort fired", () => {
+    const line = formatSdkTermination(
+      { reason: "max_turns", turns: 1 },
+      { model: "sonnet", abort: { cause: "none", aborted: false } },
+    )
+    expect(line).toContain("reason=max_turns")
+    expect(line).toContain("turns=1")
+    expect(line).toContain("abort=none")
+  })
+
+  it("appends the classified abort cause when one fired", () => {
+    const line = formatSdkTermination(
+      { reason: "aborted" },
+      { abort: { cause: "session_watchdog", aborted: true, elapsedMs: 600_012 } },
+    )
+    expect(line).toContain("abort=session_watchdog")
+    expect(line).not.toContain("elapsed")
+  })
+
+  it("omits the abort field entirely when no snapshot is provided", () => {
+    const line = formatSdkTermination({ reason: "max_turns", turns: 1 }, { model: "sonnet" })
+    expect(line).not.toContain("abort=")
+  })
 })
 
 describe("classifyError: session/usage limit phrasings (live-observed)", () => {
@@ -500,6 +842,273 @@ describe("classifyError: session/usage limit phrasings (live-observed)", () => {
     const r = classifyError("Claude Code returned an error result: You've hit your weekly limit \u00b7 resets 2pm (Asia/Jerusalem)")
     expect(r.type).toBe("rate_limit_error")
     expect(r.status).toBe(429)
+  })
+
+  it("maps the CLI's 'You've hit your org's monthly spend limit' to rate_limit_error", () => {
+    const r = classifyError("Claude Code returned an error result: You've hit your org's monthly spend limit · ask your admin to raise it at claude.ai/settings/usage")
+    expect(r.type).toBe("rate_limit_error")
+    expect(r.status).toBe(429)
+  })
+
+  it("maps the CLI's 'You've hit your monthly spend limit' to rate_limit_error", () => {
+    const r = classifyError("You've hit your monthly spend limit · raise it at claude.ai/settings/usage · your session limit resets 5pm (Europe/Warsaw)")
+    expect(r.type).toBe("rate_limit_error")
+    expect(r.status).toBe(429)
+  })
+
+  // The spend-limit pattern allows four qualifier words, which is a much wider
+  // net than the single-word HIT_YOUR_LIMIT. Unanchored it matched all three of
+  // these. Each would mark a healthy account exhausted and drop it out of a
+  // priority pool — the same outage this fix prevents, from the other side.
+  it("does not treat a negated spend-limit sentence as a rate limit", () => {
+    const r = classifyError("You have not hit your monthly spend limit yet, so this is unrelated.")
+    expect(r.type).not.toBe("rate_limit_error")
+    expect(isAccountFailoverError(r.type)).toBe(false)
+  })
+
+  it("does not treat a quoted spend-limit phrase as a rate limit", () => {
+    const r = classifyError("The docs say: when you've hit your monthly spend limit, ask your admin to raise it.")
+    expect(r.type).not.toBe("rate_limit_error")
+    expect(isAccountFailoverError(r.type)).toBe(false)
+  })
+
+  it("does not treat a spend-limit phrase quoted inside tool stderr as a rate limit", () => {
+    const r = classifyError("Subprocess stderr: helper printed \"You've hit your org's monthly spend limit\" and exited")
+    expect(r.type).not.toBe("rate_limit_error")
+    expect(isAccountFailoverError(r.type)).toBe(false)
+  })
+
+  // The CLI surfaces a limit banner by exiting and appending it to stderr. A
+  // whole-message anchor missed that shape, and the fall-through was a 401
+  // telling the operator to run `claude login` for a quota refusal — while the
+  // session-limit banner in the identical shape classified correctly.
+  it("maps a spend-limit banner appended to subprocess stderr to rate_limit_error", () => {
+    const r = classifyError("Claude Code process exited with code 1\nSubprocess stderr: You've hit your org's monthly spend limit \u00b7 ask your admin to raise it")
+    expect(r.type).toBe("rate_limit_error")
+    expect(r.status).toBe(429)
+    expect(r.message).not.toContain("claude login")
+  })
+
+  it("classifies the stderr-appended spend and session banners the same way", () => {
+    const spend = classifyError("Claude Code process exited with code 1\nSubprocess stderr: You've hit your monthly spend limit")
+    const session = classifyError("Claude Code process exited with code 1\nSubprocess stderr: You've hit your session limit")
+    expect(spend.type).toBe(session.type)
+    expect(spend.status).toBe(session.status)
+  })
+
+  // Typographic apostrophes: the CLI renders these in some terminals.
+  it("maps the curly-apostrophe spend-limit wording to rate_limit_error", () => {
+    const r = classifyError("You\u2019ve hit your org\u2019s monthly spend limit \u00b7 ask your admin to raise it")
+    expect(r.type).toBe("rate_limit_error")
+    expect(r.status).toBe(429)
+  })
+
+  it("maps the CLI's 'You're out of usage credits' to rate_limit_error without a same-profile retry", () => {
+    const msg = "Claude Code returned an error result: You're out of usage credits. /model to switch models."
+    const r = classifyError(msg)
+    expect(r.type).toBe("rate_limit_error")
+    expect(r.status).toBe(429)
+    expect(isRateLimitError(msg)).toBe(false)
+  })
+
+  it.each([
+    ["bare banner", "You're out of usage credits"],
+    ["nested SDK wrappers", "Error: API Error: You’re out of usage credits! /model to switch models."],
+  ])("maps the canonical usage-credit %s to rate_limit_error", (_label, msg) => {
+    const r = classifyError(msg)
+    expect(r.type).toBe("rate_limit_error")
+    expect(r.status).toBe(429)
+  })
+
+  it.each([
+    ["incidental prose", "The MCP docs say users may be out of usage credits"],
+    ["quoted banner", "Claude Code returned an error result: The docs say ‘You're out of usage credits.’"],
+    ["negated banner", "Claude Code returned an error result: You're not out of usage credits."],
+    ["filename prefix", "Claude Code returned an error result: usage-credits.ts says You're out of usage credits."],
+    ["unfinished quotation", "Claude Code returned an error result: You're out of usage credits is a test string"],
+    ["punctuated documentation suffix", "Error: You're out of usage credits. This is only a documentation example, account healthy."],
+    ["punctuated MCP suffix", "Claude Code returned an error result: You're out of usage credits. (quoted by an MCP error, not account state)"],
+  ])("does not classify usage-credit %s as a rate limit", (_label, msg) => {
+    expect(classifyError(msg).type).not.toBe("rate_limit_error")
+  })
+
+  it("maps the CLI's per-tier limit refusal to rate_limit_error without a same-profile retry", () => {
+    const msg = "Claude Code returned an error result: You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model."
+    const r = classifyError(msg)
+    expect(r.type).toBe("rate_limit_error")
+    expect(r.status).toBe(429)
+    expect(isRateLimitError(msg)).toBe(false)
+    expect(isAccountFailoverError(r.type)).toBe(true)
+  })
+
+  it("maps the live per-tier refusal with appended beta-warning stderr to rate_limit_error", () => {
+    const msg = "Claude Code returned an error result: You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.\nSubprocess stderr: Warning: Custom betas are only available for API key users. Ignoring provided betas."
+    const r = classifyError(msg)
+    expect(r.type).toBe("rate_limit_error")
+    expect(r.status).toBe(429)
+  })
+
+  it.each([
+    ["bare banner", "You've reached your Fable 5 limit."],
+    ["nested SDK wrappers", "Error: API Error: You’ve reached your Fable 5 limit! /model to switch models."],
+    ["Opus tier", "You've reached your Opus limit"],
+    ["versioned Sonnet tier", "You've reached your Sonnet 4.6 limit"],
+    ["Claude-prefixed tier", "You've reached your Claude Opus 4.6 limit"],
+    ["space-separated model command", "You've reached your Fable 5 limit /model to switch models."],
+    ["multiline subprocess stderr", "Claude Code process exited with code 1\nSubprocess stderr: You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model."],
+    // server.ts appends captured stderr to Error.message before classification,
+    // so the banner is routinely NOT the last thing in the message. These are
+    // the shapes that reach classifyError in production; each returned 500
+    // api_error (or, with nothing else to go on, a 401 telling the operator to
+    // run `claude login`) until the bound became the line rather than the
+    // message. See REACHED_YOUR_TIER_LIMIT.
+    ["banner then unrelated appended stderr", "You've reached your Fable 5 limit.\nSubprocess stderr: unrelated tool output"],
+    // stderrLines.join("\n") labels only the first line, and on Team plans the
+    // harmless betas warning is always emitted first — so the real banner
+    // arrives on an unlabelled second line.
+    ["beta warning first, banner on an unlabelled line", "Claude Code process exited with code 1\nSubprocess stderr: Warning: Custom betas are only available for API key users. Ignoring provided betas.\nYou've reached your Fable 5 limit."],
+    ["generic error newline", "Error:\nYou've reached your Fable 5 limit."],
+    ["SDK wrapper newline", "Claude Code returned an error result:\nYou've reached your Fable 5 limit."],
+    ["trailing newline", "You've reached your Fable 5 limit.\n"],
+    ["CRLF line ending", "You've reached your Fable 5 limit.\r\n"],
+    // The prose suffix, not a slash command. Observed live on 1.66.0 through a
+    // gateway fronting a Claude Max pool: every Fable turn came back in this
+    // exact shape, classified api_error, and failed nothing over while three
+    // other profiles in the pool had Fable window left.
+    ["prose switch suffix", "Claude Code returned an error result: You've reached your Fable limit. Switch to another model to continue."],
+    ["prose switch suffix, bare banner", "You've reached your Fable 5 limit. Switch to another model to continue."],
+    ["prose switch suffix without the trailing clause", "You've reached your Opus limit. Switch to another model."],
+    // An API-key or gateway profile gets the upstream status spliced in ahead of
+    // the banner. Found by driving the real failover path: the classifier said
+    // rate_limit_error for the bare string while the live request still 500'd,
+    // because this is the shape that actually arrives. It defeated every suffix,
+    // including the two that already worked.
+    ["status-prefixed prose suffix", "Claude Code returned an error result: API Error: 400 You've reached your Fable limit. Switch to another model to continue."],
+    ["status-prefixed slash suffix", "Claude Code returned an error result: API Error: 429 You've reached your Fable 5 limit. /model to switch models."],
+    ["status-prefixed bare banner", "API Error: 400 You've reached your Opus limit."],
+  ])("maps the credits-era per-tier %s to rate_limit_error", (_label, msg) => {
+    const r = classifyError(msg)
+    expect(r.type).toBe("rate_limit_error")
+    expect(r.status).toBe(429)
+  })
+
+  it.each([
+    ["specified limit", "You've reached your specified limit"],
+    ["quoted banner", "The docs say ‘You've reached your Fable 5 limit.’"],
+    ["negated banner", "You've not reached your Fable 5 limit"],
+    ["filename prefix", "Claude Code returned an error result: usage-credits.ts says You've reached your Fable 5 limit."],
+    ["configured tool qualifier", "You've reached your Fable configured tool limit"],
+    ["limitations suffix", "You've reached your Fable 5 limitations"],
+    ["unlabelled multiline quote", "MCP server failed:\nYou've reached your Fable 5 limit (quoted from docs)"],
+    ["parenthetical documentation suffix", "You've reached your Fable 5 limit (quoted from docs, account healthy)"],
+    ["documentation sentence suffix", "Error: You've reached your Fable 5 limit. This is only a documentation example"],
+    ["false assertion suffix", "You've reached your Fable 5 limit is false"],
+    ["possessive threshold suffix", "You've reached your Fable 5 limit's configured warning threshold"],
+    ["joined run command", "You've reached your Fable 5 limitRun /usage-credits"],
+    ["joined usage command", "You've reached your Fable 5 limit/usage-credits"],
+    ["unspaced punctuated command", "You've reached your Fable 5 limit.Run /usage-credits"],
+    // The prose suffix is enumerated, not a licence for any tail: a sentence
+    // that merely starts like it must still fall through.
+    ["prose switch suffix continuing into documentation", "You've reached your Fable 5 limit. Switch to another model to continue, the docs say, but the account is healthy"],
+    // The status allowance is exactly three digits immediately before the
+    // banner, so neither a longer number nor an arbitrary numeric preamble
+    // opens the line up.
+    ["four-digit lookalike before the banner", "API Error: 4000 You've reached your Fable limit."],
+    ["numeric preamble that is not a status", "Retried 3 times: you've reached your Fable limit before, but not now"],
+    ["status prefix on a non-quota qualifier", "API Error: 400 You've reached your configured limit."],
+  ])("does not classify credits-era per-tier %s as a rate limit", (_label, msg) => {
+    expect(classifyError(msg).type).toBe("api_error")
+  })
+
+  // The second refusal in #909. An entitlement cap, not a spent window, so it
+  // is billing_error: it still fails over via ACCOUNT_FAILOVER_ERROR_TYPES,
+  // but without isQuotaRefusal sending the cooldown to wait out a five-hour
+  // reset that will never arrive.
+  it.each([
+    ["group", "Your group's usage limit is set to $0 · run /usage-credits to request more"],
+    ["organization", "Your organization's usage limit is set to $250 · run /usage-credits to request more"],
+    ["typographic apostrophe", "Your group’s usage limit is set to $0"],
+    ["behind an SDK wrapper", "Claude Code returned an error result: Your group's usage limit is set to $0 · run /usage-credits to request more"],
+    ["on an unlabelled stderr line", "Claude Code process exited with code 1\nSubprocess stderr: Warning: ignoring provided betas.\nYour group's usage limit is set to $0"],
+  ])("maps the %s entitlement cap to a failover-eligible billing_error", (_label, msg) => {
+    const r = classifyError(msg)
+    expect(r.type).toBe("billing_error")
+    expect(r.status).toBe(402)
+    expect(isAccountFailoverError(r.type)).toBe(true)
+    expect(isQuotaRefusal(r.type)).toBe(false)
+  })
+
+  it.each([
+    ["quoted mid-line", "The docs say your group's usage limit is set to $0"],
+    ["no amount", "Your group's usage limit is set to whatever the admin picked"],
+  ])("does not treat %s as an entitlement cap", (_label, msg) => {
+    expect(classifyError(msg).type).not.toBe("billing_error")
+  })
+
+  // Verbatim from the refusal builder in the shipped CLI
+  // (@anthropic-ai/claude-code 2.1.198). It emits exactly these two suffixes —
+  // one per interactive/non-interactive copy branch — so these two strings are
+  // what actually reaches classifyError. Pinned so a copy change in a future
+  // CLI shows up here rather than as another silent 500 in a priority pool.
+  it.each([
+    ["interactive copy", "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model."],
+    ["non-interactive copy", "You've reached your Fable 5 limit. /model to switch models."],
+  ])("maps the shipped CLI's %s to rate_limit_error", (_label, msg) => {
+    const r = classifyError(msg)
+    expect(r.type).toBe("rate_limit_error")
+    expect(r.status).toBe(429)
+    expect(isAccountFailoverError(r.type)).toBe(true)
+  })
+
+  it("classifies the verbatim group entitlement cap as a failover-eligible billing_error", () => {
+    const r = classifyError("Your group's usage limit is set to $0 \u00b7 run /usage-credits to ask your admin for a higher limit")
+    expect(r.type).toBe("billing_error")
+    expect(isAccountFailoverError(r.type)).toBe(true)
+    expect(isQuotaRefusal(r.type)).toBe(false)
+  })
+
+  // The org-admin switch, observed live on a Max profile: every request came
+  // back 500 while a Pro profile in the same priority pool served the identical
+  // request. The refusal names no limit and no payment method, so nothing
+  // matched it, isAccountFailoverError said no, and the pool sat on an account
+  // that could not serve any request until an admin re-enabled it.
+  //
+  // billing_error rather than rate_limit_error, for the same reason as the
+  // entitlement cap above: an access switch an admin has to flip is not a spent
+  // window, so isQuotaRefusal must not send the cooldown looking up a five-hour
+  // reset that will never arrive.
+  it.each([
+    ["verbatim CLI refusal", "Claude Code returned an error result: Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access"],
+    ["short 'org' spelling", "Your org has disabled Claude subscription access for Claude Code"],
+    ["behind an API status prefix", "API Error: 403 Your organization has disabled Claude subscription access for Claude Code"],
+    ["on an unlabelled stderr line", "Claude Code process exited with code 1\nSubprocess stderr: Your organization has disabled Claude subscription access for Claude Code"],
+    // The shape the CLI actually emits on the API-key/gateway path: a bare
+    // "Failed to authenticate." sits between its own wrapper and the upstream
+    // status. Captured from a real refusal driven through the error-telemetry
+    // failover harness; the hand-written "API Error: 403 ..." case above does
+    // not exercise it, and the entitlement fell through to api_error without it.
+    ["behind the CLI's own authenticate notice", "Claude Code returned an error result: Failed to authenticate. API Error: 403 Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access"],
+  ])("maps the %s of a disabled subscription entitlement to a failover-eligible billing_error", (_label, msg) => {
+    const r = classifyError(msg)
+    expect(r.type).toBe("billing_error")
+    expect(r.status).toBe(402)
+    expect(isAccountFailoverError(r.type)).toBe(true)
+    expect(isQuotaRefusal(r.type)).toBe(false)
+  })
+
+  it.each([
+    ["quoted mid-line", "The runbook says your organization has disabled Claude subscription access when a seat is revoked"],
+    ["a different capability", "Your organization has disabled MCP servers for Claude Code"],
+    // The authenticate notice is only allowed to PREFIX the entitlement string,
+    // never to stand in for it: a plain auth failure must keep its own
+    // classification, and a different disabled capability must not fail over
+    // just because the notice precedes it.
+    ["the authenticate notice alone", "Claude Code returned an error result: Failed to authenticate."],
+    ["the notice before a different capability", "Claude Code returned an error result: Failed to authenticate. API Error: 403 Your organization has disabled MCP servers for Claude Code"],
+  ])("does not read %s as a disabled subscription entitlement", (_label, msg) => {
+    const r = classifyError(msg)
+    expect(r.type).not.toBe("billing_error")
+    expect(isAccountFailoverError(r.type)).toBe(false)
   })
 
   // #764 and #787 were the same bug twice: a new qualifier, a 500 instead of
@@ -525,5 +1134,51 @@ describe("classifyError: session/usage limit phrasings (live-observed)", () => {
     const r = classifyError("usage limit reached | resets at 5pm")
     expect(r.type).toBe("rate_limit_error")
     expect(r.status).toBe(429)
+  })
+})
+
+describe("isAccountFailoverError", () => {
+  it("accepts the types that exhaust one account and leave the pool viable", () => {
+    expect(isAccountFailoverError("rate_limit_error")).toBe(true)
+    expect(isAccountFailoverError("billing_error")).toBe(true)
+  })
+
+  it("rejects failures that say nothing about the account", () => {
+    // Failing over on these would spend every account on one upstream hiccup
+    // and mark them all exhausted for something none of them did.
+    expect(isAccountFailoverError("api_error")).toBe(false)
+    expect(isAccountFailoverError("overloaded_error")).toBe(false)
+    expect(isAccountFailoverError("timeout_error")).toBe(false)
+    expect(isAccountFailoverError("upstream_timeout")).toBe(false)
+  })
+
+  it("rejects authentication_error, which the token refresh recovers in place", () => {
+    expect(isAccountFailoverError("authentication_error")).toBe(false)
+  })
+
+  it("rejects a missing or malformed type rather than guessing", () => {
+    expect(isAccountFailoverError(undefined)).toBe(false)
+    expect(isAccountFailoverError(null)).toBe(false)
+    expect(isAccountFailoverError("")).toBe(false)
+  })
+
+  it("agrees with classifyError on a subscription refusal", () => {
+    const classified = classifyError("Your Claude Max subscription is inactive - update your payment method")
+    expect(classified.type).toBe("billing_error")
+    expect(classified.status).toBe(402)
+    expect(isAccountFailoverError(classified.type)).toBe(true)
+  })
+})
+
+describe("isQuotaRefusal", () => {
+  it("separates the refusal that names its own reset from the one that does not", () => {
+    expect(isQuotaRefusal("rate_limit_error")).toBe(true)
+    expect(isQuotaRefusal("billing_error")).toBe(false)
+    expect(isQuotaRefusal(undefined)).toBe(false)
+  })
+
+  it("is a strict subset of the failover set", () => {
+    expect(isAccountFailoverError("rate_limit_error") && isQuotaRefusal("rate_limit_error")).toBe(true)
+    expect(isAccountFailoverError("billing_error") && !isQuotaRefusal("billing_error")).toBe(true)
   })
 })

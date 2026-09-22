@@ -11,10 +11,12 @@
  */
 
 import { afterAll, beforeEach, describe, expect, it, mock } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { assistantMessage } from "./helpers"
+import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
 
 type MockSdkMessage = Record<string, unknown>
 type TestApp = { fetch: (req: Request) => Promise<Response> }
@@ -22,16 +24,18 @@ type TestApp = { fetch: (req: Request) => Promise<Response> }
 let mockMessages: MockSdkMessage[] = []
 interface CapturedParams {
   prompt?: unknown
-  options?: { resume?: string; forkSession?: boolean }
+  options?: { resume?: string; forkSession?: boolean; sessionId?: string }
 }
 let capturedParams: CapturedParams | null = null
 let queuedSessionIds: string[] = []
 function getCaptured(): CapturedParams | null { return capturedParams }
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: unknown) => {
-    capturedParams = params as any
-    const sessionId = queuedSessionIds.shift() || "sdk-session-default"
+    capturedParams = params as CapturedParams
+    const options = (params as CapturedParams).options
+    const queuedSessionId = queuedSessionIds.shift() || "sdk-session-default"
+    const sessionId = resolveMockSdkSessionId(options, queuedSessionId)
     return (async function* () {
       for (const msg of mockMessages) {
         yield { ...msg, session_id: sessionId }
@@ -40,9 +44,9 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "proxy-tool-flattening-regression.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: unknown, fn: () => Promise<Response> | Response) => fn(),
 }))
@@ -136,13 +140,15 @@ describe("Issue #386 — tool_use blocks must not leak into SDK prompt as text",
     await postWithSession(app, "sess-continue", [
       { role: "user", content: "write a hello.txt file" },
     ], "sdk-continue")
+    const initialSessionId = getCaptured()?.options?.sessionId
+    expect(initialSessionId).toMatch(/^[0-9a-f-]{36}$/)
 
     // Turn 2 — continuation with full history including tool_use/tool_result blocks
     capturedParams = null
     await postWithSession(app, "sess-continue", history, "sdk-continue")
 
     // Must resume (lineage=continuation) and must not have flattened tool blocks into text
-    expect(getCaptured()?.options?.resume).toBe("sdk-continue")
+    expect(getCaptured()?.options?.resume).toBe(initialSessionId)
     assertNoFlattenedToolBlocks(getCaptured()?.prompt)
   })
 
@@ -320,6 +326,8 @@ describe("transcript-format imitation (#496 self-talk regression)", () => {
     await postWithSession(app, "sess-selftalk", [
       { role: "user", content: "edit the config file" },
     ], "sdk-selftalk")
+    const initialSessionId = getCaptured()?.options?.sessionId
+    expect(initialSessionId).toMatch(/^[0-9a-f-]{36}$/)
 
     // Turn 2 — client returns the executed tool round-trip
     capturedParams = null
@@ -334,7 +342,7 @@ describe("transcript-format imitation (#496 self-talk regression)", () => {
       ]},
     ], "sdk-selftalk")
 
-    expect(getCaptured()?.options?.resume).toBe("sdk-selftalk")
+    expect(getCaptured()?.options?.resume).toBe(initialSessionId)
     const prompt = promptToString(getCaptured()?.prompt)
     expect(prompt).not.toMatch(transcriptMarker)
     // The assistant's delta text must NOT be replayed — the resumed SDK

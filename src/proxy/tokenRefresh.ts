@@ -22,9 +22,7 @@ import { dirname, join, resolve } from "node:path"
 import { promisify } from "node:util"
 import { claudeLog } from "../logger"
 import { isCredentialsReadOnly, refuseCredentialWrite } from "./credentialsMode"
-import { readOAuthPlanUpdate } from "./oauthPlan"
-import type { OAuthPlanUpdate } from "./oauthPlan"
-import { createStoreInflight, runStoreOperationOnce } from "./storeInflight"
+import { fetchOAuthPlanFields, planFieldsMissing } from "./oauthPlan" 
 
 const execFile = promisify(execFileCb)
 
@@ -80,12 +78,6 @@ export interface OAuthCredentials {
    * which names no published allotment at all.
    */
   seatTier?: string
-  /**
-   * When the three fields above were last read from Anthropic, so a plan that
-   * CHANGES is noticed. Absent on a credential written before readings were
-   * dated, which reads as due rather than as fresh.
-   */
-  planCheckedAt?: number
 }
 
 export interface CredentialsFile {
@@ -306,8 +298,9 @@ export async function readStoredCredentialPresence(
 // OAuth refresh
 // ---------------------------------------------------------------------------
 
-let tokenRefreshInflight = createStoreInflight<CredentialStore, boolean>()
-let planRefreshInflight = createStoreInflight<CredentialStore, boolean>()
+/** In-flight refresh promises — deduplicates concurrent callers per credential store. */
+const inflightRefreshByKey = new Map<string, Promise<boolean>>()
+const inflightRefreshByStore = new WeakMap<CredentialStore, Promise<boolean>>()
 
 /**
  * Refresh the Claude Code OAuth access token.
@@ -335,38 +328,26 @@ export async function refreshOAuthToken(store?: CredentialStore): Promise<boolea
     return refuseCredentialWrite("oauth-refresh", s.refreshKey ?? "unknown-store")
   }
 
-  return runStoreOperationOnce(s, tokenRefreshInflight, () => doRefresh(s))
-}
+  const refreshKey = s.refreshKey
+  if (refreshKey) {
+    const inflight = inflightRefreshByKey.get(refreshKey)
+    if (inflight) return inflight
 
-function recordOAuthPlanUpdate(update: OAuthPlanUpdate<OAuthCredentials>): void {
-  resetAuthRenewalCache()
-  if (update.changed.length > 0) {
-    claudeLog("auth.plan_changed", { changed: update.changed, plan: update.fields })
+    const refresh = doRefresh(s).finally(() => {
+      inflightRefreshByKey.delete(refreshKey)
+    })
+    inflightRefreshByKey.set(refreshKey, refresh)
+    return refresh
   }
-}
 
-async function refreshStoredPlan(
-  store: CredentialStore,
-  credentials: CredentialsFile,
-): Promise<boolean> {
-  const accessToken = credentials.claudeAiOauth.accessToken
-  if (!accessToken) return false
+  const inflight = inflightRefreshByStore.get(s)
+  if (inflight) return inflight
 
-  const update = await readOAuthPlanUpdate(credentials.claudeAiOauth, accessToken)
-  if (!update) return true
-  credentials.claudeAiOauth = update.state
-  const written = await store.write(credentials)
-  if (!written) return false
-  recordOAuthPlanUpdate(update)
-  return true
-}
-
-async function refreshStoredPlanOnce(
-  store: CredentialStore,
-  credentials: CredentialsFile,
-): Promise<boolean> {
-  if (isCredentialsReadOnly()) return false
-  return runStoreOperationOnce(store, planRefreshInflight, () => refreshStoredPlan(store, credentials))
+  const refresh = doRefresh(s).finally(() => {
+    inflightRefreshByStore.delete(s)
+  })
+  inflightRefreshByStore.set(s, refresh)
+  return refresh
 }
 
 async function doRefresh(store: CredentialStore): Promise<boolean> {
@@ -450,16 +431,26 @@ async function doRefresh(store: CredentialStore): Promise<boolean> {
     ...(refreshTokenExpiresAt ? { refreshTokenExpiresAt } : {}),
   }
 
-  // Merge a due plan reading into the same credential-store write as the token
-  // rotation. The independent profile scheduler below uses the same update
-  // builder when the access token still has hours left.
-  const planUpdate = await readOAuthPlanUpdate(credentials.claudeAiOauth, tokenData.access_token)
-  if (planUpdate) credentials.claudeAiOauth = planUpdate.state
+  // The plan is only ever written at login, so a credential file created before
+  // Meridian persisted it stays plan-blind forever — nothing else in the
+  // lifecycle ever asks. A refresh is the one other moment that holds a valid
+  // access token, which is what the profile endpoint requires, so it is the
+  // only place a backfill can happen without forcing an interactive re-login.
+  //
+  // Gated on the fields being absent, so this costs one extra GET once per
+  // profile rather than on every ~8h refresh: the next refresh reads the value
+  // this one wrote and skips. Merged before the write so the whole thing is
+  // still a single store write, and spread UNDER the existing fields so a
+  // value already on disk always wins over a freshly fetched one.
+  const backfilled = planFieldsMissing(credentials.claudeAiOauth)
+    ? await fetchOAuthPlanFields(tokenData.access_token)
+    : {}
+  if (backfilled.subscriptionType || backfilled.rateLimitTier) {
+    credentials.claudeAiOauth = { ...backfilled, ...credentials.claudeAiOauth }
+  }
 
   const written = await store.write(credentials)
   if (!written) return false
-
-  if (planUpdate) recordOAuthPlanUpdate(planUpdate)
 
   // Logged so it is observable whether Anthropic ever rolls the refresh-token
   // window — undefined here means the renewal countdown stays anchored to the
@@ -467,8 +458,7 @@ async function doRefresh(store: CredentialStore): Promise<boolean> {
   claudeLog("token_refresh.success", {
     expiresAt,
     refreshTokenExpiresAt,
-    planChecked: planUpdate !== null,
-    planChanged: planUpdate?.changed ?? [],
+    backfilledPlan: Object.keys(backfilled),
   })
   return true
 }
@@ -495,13 +485,7 @@ export async function ensureFreshToken(
   const credentials = await s.read()
   const expiresAt = credentials?.claudeAiOauth?.expiresAt
   if (!expiresAt) return false
-  if (expiresAt - Date.now() > bufferMs) {
-    // The profile scheduler calls this every 45 seconds for every account. A
-    // due plan check must run here rather than wait behind the ~8h token
-    // rotation; otherwise an upgrade stays invisible until access-token expiry.
-    await refreshStoredPlanOnce(s, credentials)
-    return true
-  }
+  if (expiresAt - Date.now() > bufferMs) return true
   // Read-only instances report the token as they found it instead of routing
   // into a refusal. This runs before every SDK request, so the refusal log
   // would repeat per request for the whole buffer window; the refusal belongs
@@ -823,6 +807,5 @@ export function isBackgroundRefreshActive(): boolean {
 
 /** Reset in-flight state — for testing only. */
 export function resetInflightRefresh(): void {
-  tokenRefreshInflight = createStoreInflight<CredentialStore, boolean>()
-  planRefreshInflight = createStoreInflight<CredentialStore, boolean>()
+  inflightRefreshByKey.clear()
 }

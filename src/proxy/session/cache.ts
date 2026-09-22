@@ -9,14 +9,23 @@ import { LRUMap } from "../../utils/lruMap"
 import { diagnosticLog } from "../../telemetry"
 import {
   lookupSharedSession,
-  lookupSharedSessionByClaudeId,
+  lookupSharedSessionResult,
+  lookupSharedSessionByClaudeIdResult,
   storeSharedSession,
+  storeSharedSessionAndPriorityAssignment,
+  rollbackSharedSessionAndPriorityAssignment,
+  finalizeSharedSessionAndPriorityAssignment,
   clearSharedSessions,
   evictSharedSession,
+  type DurablePriorityAssignment,
+  type PriorityAssignmentGeneration,
+  type StoredSession,
+  type StoredSessionGeneration,
 } from "../sessionStore"
 import { getConversationFingerprint } from "./fingerprint"
 import {
   computeLineageHash,
+  formatLineageMismatch,
   computeMessageBlockHashes,
   computeMessageHashes,
   verifyLineage,
@@ -24,6 +33,23 @@ import {
   type TokenUsage,
   type LineageResult,
 } from "./lineage"
+
+export interface PrioritySessionPublication {
+  readonly routeKey: string
+  readonly profileId: string
+  readonly lastHumanTurnDigest: string
+  readonly lastHumanTurnIssuedAt: number
+  /** Exact durable pre-SDK attempt claim. */
+  readonly attemptOwnerToken: string
+  expectedAssignmentGeneration: PriorityAssignmentGeneration
+  rollback?: {
+    readonly key: string
+    readonly previousMapping: StoredSession | null
+    readonly previousAssignment: DurablePriorityAssignment | null
+    publishedMappingGeneration: StoredSessionGeneration
+    publishedAssignmentGeneration: PriorityAssignmentGeneration
+  }
+}
 
 // --- Cache setup ---
 
@@ -98,15 +124,21 @@ export function clearSessionCache() {
 export function evictSession(
   sessionId: string | undefined,
   workingDirectory?: string,
-  messages?: Array<{ role: string; content: any }>
-): void {
+  messages?: Array<{ role: string; content: any }>,
+  expectedGeneration?: StoredSessionGeneration,
+): boolean {
   if (sessionId) {
     const cached = sessionCache.get(sessionId)
     if (cached) {
       removeFingerprintEntriesByClaudeSessionId(cached.claudeSessionId)
       sessionCache.delete(sessionId)
     }
-    try { evictSharedSession(sessionId) } catch {}
+    // Store failures are safety-significant: callers must not release a turn
+    // after claiming cleanup succeeded while the durable mapping remains.
+    const evicted = evictSharedSession(sessionId, expectedGeneration)
+    // Header-keyed and fingerprint-keyed conversations are independent durable
+    // keys. Never apply one key's generation token to the other key.
+    return evicted
   }
   if (messages) {
     const fp = getConversationFingerprint(messages, workingDirectory)
@@ -116,9 +148,10 @@ export function evictSession(
         removeSessionEntriesByClaudeSessionId(cached.claudeSessionId)
         fingerprintCache.delete(fp)
       }
-      try { evictSharedSession(fp) } catch {}
+      return evictSharedSession(fp, expectedGeneration)
     }
   }
+  return false
 }
 
 // --- Session operations ---
@@ -127,6 +160,81 @@ export function evictSession(
 function touchSession(state: SessionState): SessionState {
   state.lastAccess = Date.now()
   return state
+}
+
+function stateFromSharedSession(
+  shared: NonNullable<ReturnType<typeof lookupSharedSession>>,
+): SessionState {
+  return {
+    claudeSessionId: shared.claudeSessionId,
+    lastAccess: Date.now(),
+    messageCount: shared.messageCount || 0,
+    lineageHash: shared.lineageHash || "",
+    messageHashes: shared.messageHashes,
+    messageBlockHashes: shared.messageBlockHashes,
+    sdkMessageUuids: shared.sdkMessageUuids,
+    passthroughToolCallAssistantUuid: shared.passthroughToolCallAssistantUuid,
+    passthroughToolCallIds: shared.passthroughToolCallIds,
+    contextUsage: shared.contextUsage,
+    currentTranscript: shared.currentTranscript,
+    previousTranscript: shared.previousTranscript,
+  }
+}
+
+/** Drop rollback authority only after the response terminal is irrevocable. */
+export function finalizePrioritySessionPublication(
+  publication: PrioritySessionPublication,
+): boolean {
+  const rollback = publication.rollback
+  if (!rollback) return true
+  const finalized = finalizeSharedSessionAndPriorityAssignment({
+    key: rollback.key,
+    routeKey: publication.routeKey,
+    expectedMappingGeneration: rollback.publishedMappingGeneration,
+    expectedAssignmentGeneration: rollback.publishedAssignmentGeneration,
+    rollbackMappingKey: rollback.previousAssignment?.mappingKey === rollback.key
+      ? undefined
+      : rollback.previousAssignment?.mappingKey,
+    attemptOwnerToken: publication.attemptOwnerToken,
+  })
+  if (!finalized) return false
+  publication.rollback = undefined
+  return true
+}
+
+/** Revoke a late atomic route+mapping publication and restore pre-request authority. */
+export function rollbackPrioritySessionPublication(
+  sessionId: string | undefined,
+  messages: Array<{ role: string; content: unknown }>,
+  workingDirectory: string | undefined,
+  publication: PrioritySessionPublication,
+): StoredSessionGeneration | false {
+  const rollback = publication.rollback
+  if (!rollback) return false
+  const restored = rollbackSharedSessionAndPriorityAssignment({
+    key: rollback.key,
+    routeKey: publication.routeKey,
+    expectedMappingGeneration: rollback.publishedMappingGeneration,
+    expectedAssignmentGeneration: rollback.publishedAssignmentGeneration,
+    previousMapping: rollback.previousMapping,
+    previousAssignment: rollback.previousAssignment,
+    attemptOwnerToken: publication.attemptOwnerToken,
+  })
+  if (!restored) return false
+
+  publication.expectedAssignmentGeneration = restored.assignmentGeneration
+  publication.rollback = undefined
+  if (sessionId) {
+    if (restored.restoredMapping) sessionCache.set(sessionId, stateFromSharedSession(restored.restoredMapping))
+    else sessionCache.delete(sessionId)
+  } else {
+    const fingerprint = getConversationFingerprint(messages, workingDirectory)
+    if (fingerprint) {
+      if (restored.restoredMapping) fingerprintCache.set(fingerprint, stateFromSharedSession(restored.restoredMapping))
+      else fingerprintCache.delete(fingerprint)
+    }
+  }
+  return restored.mappingGeneration
 }
 
 function classifyLineage(
@@ -148,8 +256,27 @@ function classifyLineage(
     const msg = `Undo detected (key=${cacheKey.slice(0, 8)}…): prefix overlap ${result.prefixOverlap}/${state.messageCount}, rollback UUID: ${result.rollbackUuid || "none (legacy session)"}.`
     console.error(`[PROXY] ${msg}`)
     diagnosticLog.lineage(msg)
-  } else if (result.type === "diverged" && result.reason === "modified-history") {
+  } else if (result.type === "diverged" && (result.reason === "modified-history" || result.reason === "undo-gap")) {
+    // The overlap count alone is not actionable — name the message that broke,
+    // which verifyLineage already worked out to reach this branch.
+    const detail = result.mismatch ? formatLineageMismatch(result.mismatch) : undefined
     const msg = `Stale session detected (key=${cacheKey.slice(0, 8)}…): prefix overlap ${result.prefixOverlap || 0}/${state.messageCount}, incoming ${messages.length} msgs. Starting fresh replay.`
+      + (result.reason === "undo-gap" ? " reason=undo-gap (rollback would omit supplied history)." : "")
+      + (detail ? `\n  ${detail}` : "")
+    console.error(`[PROXY] ${msg}`)
+    diagnosticLog.lineage(msg)
+  } else if (result.type === "diverged") {
+    // Every remaining rejection was silent. A stored session existed under
+    // this key and was refused, but the request line renders all of them as
+    // the same `lineage=new`, so `unverifiable`, `replayed-request` and
+    // `unrelated-history` were indistinguishable from a key that never
+    // resolved (#820).
+    //
+    // `not-found` never reaches here: `lookupSession` returns it before
+    // classifying, which is right — it is the first turn of every
+    // conversation, so it belongs on the request line that is printed anyway
+    // rather than on a diagnostic line of its own.
+    const msg = `Session not resumable (key=${cacheKey.slice(0, 8)}…): reason=${result.reason}, prefix overlap ${result.prefixOverlap || 0}/${state.messageCount}, incoming ${messages.length} msgs. Starting fresh replay.`
     console.error(`[PROXY] ${msg}`)
     diagnosticLog.lineage(msg)
   }
@@ -160,65 +287,126 @@ function classifyLineage(
 /** Look up a cached session by header or fingerprint.
  *  Returns a LineageResult that classifies the mutation and includes the
  *  session state needed for the correct SDK action. */
+let warnedDegradedFingerprint = false
+
+/** Reset between tests; the warning is one-shot per process by design. */
+export function resetDegradedFingerprintWarningForTests(): void {
+  warnedDegradedFingerprint = false
+}
+
+function warnDegradedFingerprintOnce(): void {
+  if (warnedDegradedFingerprint) return
+  warnedDegradedFingerprint = true
+  const msg =
+    "[PROXY] Session fingerprint has no working directory, so it hashes only the opening "
+    + "user message — two conversations in different directories that start with the same text "
+    + "will share a session. The directory is read from the <env> block of the system prompt; a "
+    + "plugin implementing experimental.chat.system.transform (for example opencode-scrub) may "
+    + "have removed it. Send a session header (meridian setup) to key conversations explicitly."
+  console.warn(msg)
+  diagnosticLog.lineage(msg)
+}
+
+let warnedHeaderlessToolLoop = false
+
+/** Reset between tests; the warning is one-shot per process by design. */
+export function resetHeaderlessToolLoopWarningForTests(): void {
+  warnedHeaderlessToolLoop = false
+}
+
+/**
+ * Say once that a client's tool loop is not resuming.
+ *
+ * The headerless tool-result bypass is the most expensive lineage outcome in
+ * the field and the only one that printed nothing at all: #820 measured 99.8%
+ * of 1000+-message pi requests skipping resume, and two reporters
+ * independently drained a Max window before finding it — one measured ~280k
+ * cache-write tokens per turn against ~214 with a session key. Every request
+ * still returns 200, so nothing in the proxy's own success metrics moves.
+ *
+ * Warned once per process, matching the degraded-fingerprint warning above:
+ * it is a property of how the client is wired, not of a turn, and one line per
+ * tool round would bury it. The per-request detail rides on the request line
+ * as `diverged=independent-request:headerless-tool-result`.
+ */
+export function warnHeaderlessToolLoopOnce(adapterName: string): void {
+  if (warnedHeaderlessToolLoop) return
+  warnedHeaderlessToolLoop = true
+  const msg =
+    `[PROXY] Client-driven tool loop with no session identity (adapter=${adapterName}): `
+    + "the request ends in a tool_result and carries no session key, so this and every "
+    + "following tool round starts a fresh SDK session. The conversation does not resume, "
+    + "and the model sees none of its own earlier turns. This is correct for concurrent "
+    + "headless workflow loops, which must not share one conversation fingerprint; an "
+    + "interactive client should send a session header instead — see \"Session identity\" "
+    + "in docs/configuration.md."
+  console.warn(msg)
+  diagnosticLog.lineage(msg)
+}
+
 export function lookupSession(
   sessionId: string | undefined,
   messages: Array<{ role: string; content: any }>,
   workingDirectory?: string
 ): LineageResult {
   if (sessionId) {
+    // A durable absence is an authoritative eviction. Only an actual store
+    // read error may use the local fallback; otherwise another proxy's abort
+    // could be resurrected from stale memory.
+    const shared = lookupSharedSessionResult(sessionId)
     const cached = sessionCache.get(sessionId)
-    if (cached) {
-      const result = classifyLineage(cached, messages, sessionId)
-      if (result.type === "continuation" || result.type === "compaction") touchSession(result.session)
-      return result
-    }
-    const shared = lookupSharedSession(sessionId)
-    if (shared) {
-      const state: SessionState = {
-        claudeSessionId: shared.claudeSessionId,
-        lastAccess: Date.now(),
-        messageCount: shared.messageCount || 0,
-        lineageHash: shared.lineageHash || "",
-        messageHashes: shared.messageHashes,
-        messageBlockHashes: shared.messageBlockHashes,
-        sdkMessageUuids: shared.sdkMessageUuids,
-        contextUsage: shared.contextUsage,
+    const state = shared.status === "found"
+      ? stateFromSharedSession(shared.session)
+      : shared.status === "error" ? cached : undefined
+    if (shared.status === "missing") {
+      sessionCache.delete(sessionId)
+      if (cached) {
+        removeSessionEntriesByClaudeSessionId(cached.claudeSessionId)
+        removeFingerprintEntriesByClaudeSessionId(cached.claudeSessionId)
       }
-      const result = classifyLineage(state, messages, sessionId)
-      if (result.type === "continuation" || result.type === "compaction") {
-        sessionCache.set(sessionId, state)
-      }
-      return result
     }
-    return { type: "diverged", reason: "not-found" }
+    if (!state) return { type: "diverged", reason: "not-found" }
+    const result = classifyLineage(state, messages, sessionId)
+    if (result.type === "continuation" || result.type === "compaction") {
+      sessionCache.set(sessionId, touchSession(state))
+    }
+    return result
   }
 
+  // A fingerprint keyed WITHOUT a working directory is a degraded key: it is a
+  // hash of the opening user message alone, so two conversations in different
+  // repositories that begin with the same text collide onto one session (#889).
+  //
+  // The directory is regexed out of the `<env>` block in the system prompt, and
+  // any plugin implementing `experimental.chat.system.transform` may legally
+  // remove that block — `opencode-scrub` deletes it deliberately, and #769
+  // tracks an official equivalent. Nothing said so, which is the actual
+  // problem: the reporter observed no misbehaviour precisely because the
+  // opencode adapter's session header keeps this path unreached.
+  //
+  // Warned once per process rather than per request: it is a property of the
+  // deployment, not of a turn, and per-request would bury it.
+  if (!workingDirectory) warnDegradedFingerprintOnce()
   const fp = getConversationFingerprint(messages, workingDirectory)
   if (fp) {
+    const shared = lookupSharedSessionResult(fp)
     const cached = fingerprintCache.get(fp)
-    if (cached) {
-      const result = classifyLineage(cached, messages, fp)
-      if (result.type === "continuation" || result.type === "compaction") touchSession(result.session)
-      return result
-    }
-    const shared = lookupSharedSession(fp)
-    if (shared) {
-      const state: SessionState = {
-        claudeSessionId: shared.claudeSessionId,
-        lastAccess: Date.now(),
-        messageCount: shared.messageCount || 0,
-        lineageHash: shared.lineageHash || "",
-        messageHashes: shared.messageHashes,
-        messageBlockHashes: shared.messageBlockHashes,
-        sdkMessageUuids: shared.sdkMessageUuids,
-        contextUsage: shared.contextUsage,
+    const state = shared.status === "found"
+      ? stateFromSharedSession(shared.session)
+      : shared.status === "error" ? cached : undefined
+    if (shared.status === "missing") {
+      fingerprintCache.delete(fp)
+      if (cached) {
+        removeSessionEntriesByClaudeSessionId(cached.claudeSessionId)
+        removeFingerprintEntriesByClaudeSessionId(cached.claudeSessionId)
       }
-      const result = classifyLineage(state, messages, fp)
-      if (result.type === "continuation" || result.type === "compaction") {
-        fingerprintCache.set(fp, state)
-      }
-      return result
     }
+    if (!state) return { type: "diverged", reason: "not-found" }
+    const result = classifyLineage(state, messages, fp)
+    if (result.type === "continuation" || result.type === "compaction") {
+      fingerprintCache.set(fp, touchSession(state))
+    }
+    return result
   }
   return { type: "diverged", reason: "not-found" }
 }
@@ -227,33 +415,16 @@ export function lookupSession(
  *  Searches both in-memory caches and the shared file store, returning the
  *  freshest matching state if multiple cache keys point to the same Claude session. */
 export function getSessionByClaudeId(claudeSessionId: string): SessionState | undefined {
-  let newest: SessionState | undefined
-
-  const consider = (state: SessionState | undefined) => {
-    if (!state || state.claudeSessionId !== claudeSessionId) return
-    if (!newest || state.lastAccess > newest.lastAccess) {
-      newest = state
-    }
+  const shared = lookupSharedSessionByClaudeIdResult(claudeSessionId)
+  if (shared.status === "error") {
+    throw new Error(`Shared session store is unavailable: ${shared.error.message}`)
   }
-
-  for (const state of sessionCache.values()) consider(state)
-  for (const state of fingerprintCache.values()) consider(state)
-
-  const shared = lookupSharedSessionByClaudeId(claudeSessionId)
-  if (shared) {
-    consider({
-      claudeSessionId: shared.claudeSessionId,
-      lastAccess: shared.lastUsedAt,
-      messageCount: shared.messageCount || 0,
-      lineageHash: shared.lineageHash || "",
-      messageHashes: shared.messageHashes,
-      messageBlockHashes: shared.messageBlockHashes,
-      sdkMessageUuids: shared.sdkMessageUuids,
-      contextUsage: shared.contextUsage,
-    })
+  if (shared.status === "missing") {
+    removeSessionEntriesByClaudeSessionId(claudeSessionId)
+    removeFingerprintEntriesByClaudeSessionId(claudeSessionId)
+    return undefined
   }
-
-  return newest
+  return stateFromSharedSession(shared.session)
 }
 
 /** Store a session mapping with lineage hash and SDK UUIDs for divergence detection.
@@ -266,9 +437,15 @@ export function storeSession(
   claudeSessionId: string,
   workingDirectory?: string,
   sdkMessageUuids?: Array<string | null>,
-  contextUsage?: TokenUsage
-) {
-  if (!claudeSessionId) return
+  contextUsage?: TokenUsage,
+  passthroughToolCallAssistantUuid?: string | null,
+  passthroughToolCallIds?: string[] | null,
+  currentTranscript?: { sessionId: string; configDir: string; projectDir?: string },
+  sourceTranscript?: { sessionId: string; configDir: string; projectDir?: string },
+  expectedGeneration?: StoredSessionGeneration | null,
+  priorityPublication?: PrioritySessionPublication,
+): StoredSessionGeneration | false {
+  if (!claudeSessionId) return false
   const lineageHash = computeLineageHash(messages)
   const messageHashes = computeMessageHashes(messages)
   const messageBlockHashes = computeMessageBlockHashes(messages)
@@ -280,21 +457,60 @@ export function storeSession(
     messageHashes,
     messageBlockHashes,
     sdkMessageUuids,
+    ...(passthroughToolCallAssistantUuid ? { passthroughToolCallAssistantUuid } : {}),
+    ...(passthroughToolCallIds ? { passthroughToolCallIds } : {}),
     ...(contextUsage ? { contextUsage } : {}),
+    ...(currentTranscript ? { currentTranscript } : {}),
+    ...(sourceTranscript ? { previousTranscript: sourceTranscript } : {}),
   }
-  // In-memory cache
-  if (sessionId) sessionCache.set(sessionId, state)
   const fp = getConversationFingerprint(messages, workingDirectory)
-  // Only populate the fingerprint cache for headerless requests. When a
-  // session header is present the session is already tracked by ID; writing
-  // to the fingerprint cache too causes cross-session collisions when a
-  // later headerless request (e.g. OpenCode category-dispatched or title
-  // generation) happens to share the same first-message fingerprint.
-  if (fp && !sessionId) fingerprintCache.set(fp, state)
-  // Shared file store (cross-proxy resume)
   const key = sessionId || fp
-  if (key) {
-    storeSharedSession(
+  if (!key) return false
+  let storedGeneration: StoredSessionGeneration | false
+  if (priorityPublication) {
+    if (expectedGeneration === undefined || expectedGeneration === null) {
+      throw new Error("priority publication requires an exact mapping generation")
+    }
+    const rollback = priorityPublication.rollback
+    if (rollback && rollback.key !== key) {
+      throw new Error("priority publication changed mapping keys within one request")
+    }
+    const published = storeSharedSessionAndPriorityAssignment({
+      key,
+      claudeSessionId,
+      messageCount: state.messageCount,
+      lineageHash,
+      messageHashes,
+      sdkMessageUuids,
+      contextUsage,
+      messageBlockHashes,
+      passthroughToolCallAssistantUuid: passthroughToolCallAssistantUuid ?? null,
+      passthroughToolCallIds: passthroughToolCallIds ?? null,
+      currentTranscript,
+      sourceTranscript,
+      expectedMappingGeneration: expectedGeneration,
+      rollbackMappingKey: rollback?.previousAssignment?.mappingKey,
+      attemptOwnerToken: priorityPublication.attemptOwnerToken,
+      priority: {
+        routeKey: priorityPublication.routeKey,
+        profileId: priorityPublication.profileId,
+        lastHumanTurnDigest: priorityPublication.lastHumanTurnDigest,
+        lastHumanTurnIssuedAt: priorityPublication.lastHumanTurnIssuedAt,
+        expectedAssignmentGeneration: priorityPublication.expectedAssignmentGeneration,
+      },
+    })
+    if (!published) return false
+    priorityPublication.rollback = {
+      key,
+      previousMapping: rollback?.previousMapping ?? published.previousMapping,
+      previousAssignment: rollback?.previousAssignment ?? published.previousAssignment,
+      publishedMappingGeneration: published.mappingGeneration,
+      publishedAssignmentGeneration: published.assignmentGeneration,
+    }
+    priorityPublication.expectedAssignmentGeneration = published.assignmentGeneration
+    storedGeneration = published.mappingGeneration
+  } else {
+    storedGeneration = storeSharedSession(
       key,
       claudeSessionId,
       state.messageCount,
@@ -302,7 +518,19 @@ export function storeSession(
       messageHashes,
       sdkMessageUuids,
       contextUsage,
-      messageBlockHashes
+      messageBlockHashes,
+      // undefined would preserve the stored checkpoint; a full store must rewrite it.
+      passthroughToolCallAssistantUuid ?? null,
+      passthroughToolCallIds ?? null,
+      currentTranscript,
+      sourceTranscript,
+      expectedGeneration,
     )
   }
+  if (!storedGeneration) return false
+
+  // Publish to memory only after the durable CAS succeeds.
+  if (sessionId) sessionCache.set(sessionId, state)
+  if (fp && !sessionId) fingerprintCache.set(fp, state)
+  return storedGeneration
 }

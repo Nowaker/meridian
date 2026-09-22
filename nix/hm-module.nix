@@ -144,10 +144,10 @@ in
 
     opencode.pluginPath = mkOption {
       type = str;
-      default = "${cfg.package}/lib/meridian/plugin/meridian.ts";
+      default = "${cfg.package}/lib/meridian/dist/meridian";
       readOnly = true;
       description = ''
-        Nix store path to the OpenCode plugin file.
+        Nix store path to the OpenCode plugin package.
         Use this to reference the plugin in your OpenCode config.
       '';
     };
@@ -155,7 +155,7 @@ in
 
   config = mkIf cfg.enable {
     systemd.user.services.meridian = {
-      Unit.Description = "Meridian - Local Anthropic API proxy";
+      Unit.Description = "Meridian - Claude and Antigravity bridge";
 
       Service = {
         Type = "exec";

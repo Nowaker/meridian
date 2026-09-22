@@ -8,7 +8,7 @@
  * cannot tell "nothing happened" from "it scrolled past between polls".
  */
 import { describe, it, expect } from "bun:test"
-import { RefusalStore, FailoverEventLog, type FailoverEvent } from "../proxy/profileHealth"
+import { SpentStore, FailoverEventLog, type FailoverEvent } from "../proxy/profileHealth"
 import type { LimitDiagnosis } from "../proxy/limitDetection"
 
 function diagnosis(over: Partial<LimitDiagnosis> = {}): LimitDiagnosis {
@@ -22,10 +22,10 @@ function diagnosis(over: Partial<LimitDiagnosis> = {}): LimitDiagnosis {
   }
 }
 
-describe("RefusalStore", () => {
+describe("SpentStore", () => {
   it("holds a refusal and reports it back", () => {
     let now = 1_000_000
-    const store = new RefusalStore(() => now)
+    const store = new SpentStore(() => now)
     store.record("corp4", diagnosis({ resetsAt: now + 60_000 }), "You've hit your session limit")
     const record = store.get("corp4")
     expect(record?.profileId).toBe("corp4")
@@ -35,7 +35,7 @@ describe("RefusalStore", () => {
 
   it("expires on read once the window is expected back", () => {
     let now = 1_000_000
-    const store = new RefusalStore(() => now)
+    const store = new SpentStore(() => now)
     store.record("corp4", diagnosis({ resetsAt: now + 60_000 }), "msg")
     now += 59_000
     expect(store.get("corp4")).toBeDefined()
@@ -46,21 +46,21 @@ describe("RefusalStore", () => {
 
   it("falls back to a bounded default when nothing said when the window reopens", () => {
     let now = 1_000_000
-    const store = new RefusalStore(() => now)
+    const store = new SpentStore(() => now)
     store.record("corp4", diagnosis({ resetsAt: null }), "msg")
     expect(store.get("corp4")!.until).toBe(now + 10 * 60_000)
   })
 
   it("caps an implausibly distant reset rather than hiding an account for a day", () => {
     let now = 1_000_000
-    const store = new RefusalStore(() => now)
+    const store = new SpentStore(() => now)
     store.record("corp4", diagnosis({ resetsAt: now + 48 * 60 * 60_000 }), "msg")
     expect(store.get("corp4")!.until).toBe(now + 6 * 60 * 60_000)
   })
 
   it("lets the newest refusal replace an older one, unlike an exhaustion mark", () => {
     let now = 1_000_000
-    const store = new RefusalStore(() => now)
+    const store = new SpentStore(() => now)
     store.record("corp4", diagnosis({ bucket: "seven_day", resetsAt: now + 60 * 60_000 }), "weekly")
     now += 1_000
     store.record("corp4", diagnosis({ bucket: "five_hour", resetsAt: now + 60_000 }), "session")
@@ -69,14 +69,14 @@ describe("RefusalStore", () => {
   })
 
   it("keeps accounts apart", () => {
-    const store = new RefusalStore()
+    const store = new SpentStore()
     store.record("corp4", diagnosis(), "msg")
     expect(store.get("corp5")).toBeUndefined()
     expect(store.snapshot().map(r => r.profileId)).toEqual(["corp4"])
   })
 
   it("truncates the raw message so a huge SDK dump cannot bloat the payload", () => {
-    const store = new RefusalStore()
+    const store = new SpentStore()
     store.record("corp4", diagnosis(), "x".repeat(5000))
     expect(store.get("corp4")!.message.length).toBeLessThanOrEqual(301)
   })

@@ -22,15 +22,17 @@ import { resolveClaudeExecutableSync } from "./models"
 import { fetchOAuthPlanFields, type OAuthPlanFields } from "./oauthPlan"
 import type { ProfileConfig } from "./profiles"
 import { applyProfileRemove } from "./profileRemove"
+export { dirsToRemoveOnProfileRemove } from "./profileRemove"
 import {
   applyProfileRename,
+  defaultProfilesConfigFile,
+  defaultProfilesDir,
   loadProfileConfigFrom,
   reclaimAlias,
   saveProfileConfigTo,
 } from "./profileRename"
-import { getSetting, setSetting } from "./settings"
+import { getSetting, setSetting } from "../settings"
 import { createPlatformCredentialStore, type CredentialsFile } from "./tokenRefresh"
-
 
 const OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
 export const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
@@ -729,6 +731,7 @@ export function profileRemove(id: string): void {
   }
 }
 
+
 export function profileRename(from: string, to: string): void {
   if (envBool("CREDENTIALS_READONLY")) {
     console.error("\x1b[31m✗ MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials.\x1b[0m")
@@ -737,7 +740,7 @@ export function profileRename(from: string, to: string): void {
   }
 
   const wasActive = getSetting("activeProfile") === from
-  const result = applyProfileRename(from, to)
+  const result = applyProfileRename(from, to, { profilesDir: defaultProfilesDir(), configFile: defaultProfilesConfigFile() })
   if (!result.ok) {
     console.error(`\x1b[31m✗ ${result.error}\x1b[0m`)
     if (result.hint) console.error(`  ${result.hint}`)

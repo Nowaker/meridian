@@ -8,6 +8,10 @@ describe("proxy async ops", () => {
     const proxyA = await startProxyServer({ port: 0, host: "127.0.0.1" })
     const proxyB = await startProxyServer({ port: 0, host: "127.0.0.1" })
 
+    const firstClose = proxyA.close()
+    const repeatedClose = proxyA.close()
+    expect(repeatedClose).toBe(firstClose)
+    await Promise.all([firstClose, repeatedClose])
     await proxyA.close()
     await proxyB.close()
 
@@ -21,6 +25,7 @@ describe("proxy async ops", () => {
     const body = await response.json() as any
 
     expect(typeof body.status).toBe("string")
+    expect(body.backend).toBe("claude")
     expect(typeof body.version).toBe("string")
     expect(typeof body.mode).toBe("string")
     expect(["healthy", "degraded", "unhealthy"]).toContain(body.status)
@@ -35,7 +40,7 @@ describe("proxy async ops", () => {
       // got picked"). Accept either shape so this test is independent of
       // whether a sibling test already triggered resolution in the same
       // process.
-      const expectedKeys = ["auth", "mode", "plugin", "status", "version"]
+      const expectedKeys = ["auth", "backend", "build", "mode", "plugin", "status", "version"]
       if (body.claudeExecutable !== undefined) {
         expect(typeof body.claudeExecutable.path).toBe("string")
         expect([
@@ -53,12 +58,12 @@ describe("proxy async ops", () => {
     if (body.status === "unhealthy") {
       expect(typeof body.error).toBe("string")
       expect(body.auth.loggedIn).toBe(false)
-      expect(Object.keys(body).sort()).toEqual(["auth", "error", "status", "version"])
+      expect(Object.keys(body).sort()).toEqual(["auth", "backend", "build", "error", "status", "version"])
     }
 
     if (body.status === "degraded") {
       expect(typeof body.error).toBe("string")
-      expect(Object.keys(body).sort()).toEqual(["error", "mode", "status", "version"])
+      expect(Object.keys(body).sort()).toEqual(["backend", "build", "error", "mode", "status", "version"])
     }
 
     expect(response.status).toBe(body.status === "unhealthy" ? 503 : 200)

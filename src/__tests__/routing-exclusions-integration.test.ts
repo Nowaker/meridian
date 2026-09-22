@@ -87,7 +87,7 @@ const {
   setActiveProfile,
 } = await import("../proxy/profiles")
 const { resetFollowActive, setFollowStateForTesting } = await import("../proxy/followActive")
-const { setSetting } = await import("../proxy/settings")
+const { setSetting } = await import("../settings")
 
 const PROFILES: Array<{ readonly id: string; readonly type: "oauth-token"; readonly oauthToken: string }> = [
   { id: "work", type: "oauth-token", oauthToken: "token-work" },

@@ -8,7 +8,10 @@
  * 4. No retry happens after partial output has been sent
  */
 
-import { describe, it, expect, mock, beforeEach } from "bun:test"
+import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 import {
   messageStart,
   textBlockStart,
@@ -17,6 +20,7 @@ import {
   messageDelta,
   messageStop,
   parseSSE,
+  resolveMockSdkSessionId,
 } from "./helpers"
 
 // Track query calls to verify retry behavior
@@ -26,13 +30,17 @@ let queryCallCount = 0
 // Control what the mock does
 let mockBehavior: "rate_limit_then_succeed" | "always_rate_limit" | "rate_limit_base_then_succeed" | "succeed" = "succeed"
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (opts: any) => {
     queryCallCount++
     const callIndex = queryCallCount
     const model = opts.options?.model || "sonnet"
     queryCalls.push({ model, callIndex })
     const isStreaming = opts.options?.includePartialMessages === true
+    const returnedSessionId = resolveMockSdkSessionId(opts.options)
+    const withReturnedSessionId = (message: any) => returnedSessionId
+      ? { ...message, session_id: returnedSessionId }
+      : message
 
     return (async function* () {
       if (mockBehavior === "always_rate_limit") {
@@ -54,12 +62,12 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 
       // Success path
       if (isStreaming) {
-        yield messageStart(`msg-${callIndex}`)
-        yield textBlockStart(0)
-        yield textDelta(0, `response-${callIndex}`)
-        yield blockStop(0)
-        yield messageDelta("end_turn")
-        yield messageStop()
+        yield withReturnedSessionId(messageStart(`msg-${callIndex}`))
+        yield withReturnedSessionId(textBlockStart(0))
+        yield withReturnedSessionId(textDelta(0, `response-${callIndex}`))
+        yield withReturnedSessionId(blockStop(0))
+        yield withReturnedSessionId(messageDelta("end_turn"))
+        yield withReturnedSessionId(messageStop())
       }
       yield {
         type: "assistant",
@@ -73,20 +81,20 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
           stop_reason: "end_turn",
           usage: { input_tokens: 10, output_tokens: 5 },
         },
-        session_id: `sdk-session-${callIndex}`,
+        session_id: resolveMockSdkSessionId(opts.options, `sdk-session-${callIndex}`),
       }
     })()
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "proxy-rate-limit-retry.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
@@ -113,6 +121,17 @@ describe("Rate-limit retry with backoff", () => {
     queryCalls = []
     queryCallCount = 0
     mockBehavior = "succeed"
+    // The backoff sleeps for real. At the production default (1s + 2s) these
+    // seven tests spend ~18s asleep, and the exhaust-all-retries cases land at
+    // ~3.1s against bun's 5s per-test timeout — ~1.5s of headroom, which a
+    // loaded CI runner eats. That is what made this file the single largest
+    // source of intermittent CI failures. The delay is behaviour under test
+    // only in its *ordering*, not its duration, so collapse it here.
+    process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS = "1"
+  })
+
+  afterEach(() => {
+    delete process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS
   })
 
   describe("Non-streaming", () => {

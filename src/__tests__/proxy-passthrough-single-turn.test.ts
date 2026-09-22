@@ -25,7 +25,10 @@
  */
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
-import { makeRequest } from "./helpers"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
+import { makeRequest, withMockSdkSessionId } from "./helpers"
 
 const PASSTHROUGH_PREFIX = "mcp__oc__"
 
@@ -52,12 +55,12 @@ function toolTurn(toolId: string, toolName: string, input: Record<string, unknow
   }
 }
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (opts: any) =>
     (async function* () {
       const preHook = opts?.options?.hooks?.PreToolUse?.[0]?.hooks?.[0]
       for (const turn of mockTurns) {
-        yield turn
+        yield withMockSdkSessionId(turn, opts.options)
         // Simulate the SDK executing this turn's tool call: the passthrough
         // PreToolUse hook fires (captures + blocks) BEFORE the next turn is
         // produced. If the consumer has already broken, this never runs for
@@ -76,14 +79,14 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
     name: "test",
     instance: { tool: () => {}, registerTool: () => ({}) },
   }),
-}))
+}), "proxy-passthrough-single-turn.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: any, fn: any) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 

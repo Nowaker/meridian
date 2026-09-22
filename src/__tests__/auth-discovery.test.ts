@@ -82,6 +82,8 @@ describe("describeAuthFields allow-list", () => {
 
     expect(org.organization_type).toBe("claude_max")
     expect(org.rate_limit_tier).toBe("default_claude_max_20x")
+    expect(SAFE_AUTH_STRING_KEYS.has("seat_tier")).toBe(true)
+    expect(SAFE_AUTH_STRING_KEYS.has("seatTier")).toBe(true)
   })
 
   it("prints scopes and token type, which carry no secret", () => {

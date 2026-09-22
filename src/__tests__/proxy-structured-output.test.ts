@@ -1,31 +1,45 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
 
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 let capturedOptions: Record<string, unknown> = {}
 let mockMessages: unknown[] = []
 let queryCalls = 0
+let waitBeforeMessages: Promise<void> | undefined
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+import { withMockSdkSessionId } from "./helpers"
+
+installSdkMock(() => ({
   query: (params: { options?: Record<string, unknown> }) => {
     queryCalls += 1
     capturedOptions = params.options ?? {}
     return (async function* () {
-      for (const message of mockMessages) yield message
+      if (waitBeforeMessages) await waitBeforeMessages
+      for (const message of mockMessages) {
+        yield withMockSdkSessionId(message, params.options)
+      }
     })()
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: { tool: () => {}, registerTool: () => ({}) } }),
   tool: () => ({}),
-}))
+}), "proxy-structured-output.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_ctx: unknown, fn: () => unknown) => fn(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
+const {
+  clearSharedSessions,
+  evictSharedSession,
+  lookupSharedSessionResult,
+} = await import("../proxy/sessionStore")
 
 const schema = {
   type: "object",
@@ -58,11 +72,15 @@ function resultMessage(structuredOutput: unknown) {
 function request(
   stream: boolean,
   outputConfig: unknown = { format: { type: "json_schema", schema } },
-  extra: Record<string, unknown> = {}
+  extra: Record<string, unknown> = {},
+  sessionId?: string,
 ) {
   return new Request("http://localhost/v1/messages", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(sessionId ? { "x-opencode-session": sessionId } : {}),
+    },
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
       max_tokens: 512,
@@ -83,13 +101,48 @@ describe("native structured output", () => {
     capturedOptions = {}
     mockMessages = []
     queryCalls = 0
+    waitBeforeMessages = undefined
     clearSessionCache()
+    clearSharedSessions()
   })
 
   afterEach(() => {
     if (originalPassthrough === undefined) delete process.env.MERIDIAN_PASSTHROUGH
     else process.env.MERIDIAN_PASSTHROUGH = originalPassthrough
   })
+
+  for (const stream of [false, true]) {
+    it(`internal StructuredOutput cannot leave a passthrough checkpoint (stream=${stream})`, async () => {
+      const key = crypto.randomUUID()
+      mockMessages = [
+        { type: "assistant", uuid: crypto.randomUUID(), session_id: "structured-session", message: {
+          role: "assistant", content: [{ type: "tool_use", id: "internal-format", name: "StructuredOutput", input: { answer: "grounded" } }],
+        } },
+        { type: "user", uuid: crypto.randomUUID(), session_id: "structured-session", message: {
+          role: "user", content: [{ type: "tool_result", tool_use_id: "internal-format", content: "Structured output provided successfully" }],
+        } },
+        resultMessage({ answer: "grounded" }),
+      ]
+      const app = createProxyServer({ port: 0, host: "127.0.0.1" }).app
+      const first = await app.fetch(request(stream, undefined, {}, key))
+      expect(first.status).toBe(200)
+      await first.text()
+      const stored = lookupSharedSessionResult(key)
+      if (stored.status !== "found") throw new Error("Structured result was not published")
+      expect(stored.session.passthroughToolCallAssistantUuid).toBeUndefined()
+      expect(stored.session.passthroughToolCallIds?.length ?? 0).toBe(0)
+      mockMessages = [resultMessage({ answer: "grounded" })]
+      const next = await app.fetch(request(stream, undefined, { messages: [
+        { role: "user", content: "Return an answer." },
+        { role: "assistant", content: '{"answer":"grounded"}' },
+        { role: "user", content: "Repeat the answer." },
+      ] }, key))
+      expect(next.status).toBe(200)
+      await next.text()
+      expect(capturedOptions.resume).toBe(stored.session.claudeSessionId)
+      expect(capturedOptions.resumeSessionAt).toBeUndefined()
+    })
+  }
 
   it("maps output_config.format to the Agent SDK and returns authoritative JSON", async () => {
     mockMessages = [resultMessage({ answer: "grounded" })]
@@ -119,6 +172,77 @@ describe("native structured output", () => {
     expect(body).toContain('"text":"{\\"answer\\":\\"streamed\\"}"')
     expect(body).toContain('"stop_reason":"end_turn"')
     expect(body).toContain("event: message_stop")
+  })
+
+  it("withholds resumed structured success when exact publication loses its CAS", async () => {
+    const app = createProxyServer({ port: 0, host: "127.0.0.1" }).app
+    const sessionId = "structured-publication-order"
+    mockMessages = [resultMessage({ answer: "seed" })]
+    const seed = await app.fetch(request(false, undefined, {}, sessionId))
+    expect(seed.status).toBe(200)
+    await seed.text()
+
+    const source = lookupSharedSessionResult(sessionId)
+    expect(source.status).toBe("found")
+    if (source.status !== "found") throw new Error("seed mapping was not stored")
+    expect(source.generation).toBeDefined()
+
+    let releaseResult = () => {}
+    waitBeforeMessages = new Promise<void>((resolve) => { releaseResult = resolve })
+    mockMessages = [resultMessage({ answer: "must-not-finalize" })]
+    const responsePromise = app.fetch(request(true, undefined, {
+      messages: [
+        { role: "user", content: "Return an answer." },
+        { role: "assistant", content: '{"answer":"seed"}' },
+        { role: "user", content: "Return another answer." },
+      ],
+    }, sessionId))
+
+    for (let index = 0; index < 1_000 && queryCalls < 2; index++) await Bun.sleep(1)
+    expect(queryCalls).toBe(2)
+    expect(evictSharedSession(sessionId, source.generation)).toBe(true)
+    releaseResult()
+
+    const response = await responsePromise
+    const body = await response.text()
+    expect(body).toContain("event: error")
+    expect(body).not.toContain('"stop_reason":"end_turn"')
+    expect(body).not.toContain("must-not-finalize")
+  })
+
+  it("never publishes a resumed structured target canceled before its buffered envelope", async () => {
+    const app = createProxyServer({ port: 0, host: "127.0.0.1" }).app
+    const sessionId = "structured-cancel-order"
+    mockMessages = [resultMessage({ answer: "seed" })]
+    const seed = await app.fetch(request(false, undefined, {}, sessionId))
+    await seed.text()
+    const source = lookupSharedSessionResult(sessionId)
+    if (source.status !== "found") throw new Error("seed mapping was not stored")
+
+    let releaseResult = () => {}
+    waitBeforeMessages = new Promise<void>((resolve) => { releaseResult = resolve })
+    mockMessages = [resultMessage({ answer: "canceled-hidden-turn" })]
+    const response = await app.fetch(request(true, undefined, {
+      messages: [
+        { role: "user", content: "Return an answer." },
+        { role: "assistant", content: '{"answer":"seed"}' },
+        { role: "user", content: "Return another answer." },
+      ],
+    }, sessionId))
+    for (let index = 0; index < 1_000 && queryCalls < 2; index++) await Bun.sleep(1)
+    expect(queryCalls).toBe(2)
+    const canceledTarget = capturedOptions.sessionId
+    expect(canceledTarget).not.toBe(source.session.claudeSessionId)
+
+    await response.body!.cancel("structured test cancellation")
+    releaseResult()
+    await Bun.sleep(100)
+
+    const durable = lookupSharedSessionResult(sessionId)
+    expect(durable.status).toBe("found")
+    if (durable.status !== "found") throw new Error("source mapping was not preserved")
+    expect(durable.session.claudeSessionId).toBe(source.session.claudeSessionId)
+    expect(durable.session.claudeSessionId).not.toBe(canceledTarget)
   })
 
   it("rejects requests that combine tools with output_config.format", async () => {

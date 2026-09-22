@@ -5,15 +5,15 @@
  * (usage + est. cost, click to switch the active profile), and a compact
  * 24h traffic strip. Site chrome (logo, nav, status) lives in the shared
  * header from profileBar.ts. Fetches /health, /telemetry/summary,
- * /v1/usage/quota/all and /profiles/list client-side for live data.
+ * /v1/usage/quota/all, /profiles/list and /settings/api/routing client-side for live data.
  */
 
 import { profileBarCss, profileBarHtml, profileBarJs, themeCss } from "./profileBar"
 import { profileFactsJs } from "./profileFacts"
 import { reorderClientJs, reorderCss, reorderLiveRegionHtml } from "./profileOrder"
-import { selectionHoldJs } from "./selectionHold"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "./profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT } from "./profileSpent"
+import { selectionHoldJs } from "./selectionHold"
 
 export const landingHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -86,7 +86,6 @@ export const landingHtml = `<!DOCTYPE html>
   .profile-card.switchable:hover .switch-hint { opacity: 1; }
   .profile-cost { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text); }
 
-
   /* Account details on hover. Drawn rather than a title attribute: the native
      tooltip cannot show a label/value list, and this one has to match the grid
      on /profiles row for row. */
@@ -112,15 +111,7 @@ export const landingHtml = `<!DOCTYPE html>
   .prof-pop-value { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; word-break: break-word; }
   .prof-pop-value.status-ok { color: var(--green); }
   .prof-pop-value.status-err { color: var(--red); }
-  .cached-tag { color: var(--muted); font-size: 10px; font-style: italic; margin-left: 6px; white-space: nowrap; }
-  .detail-unknown { color: var(--muted); font-style: italic; }
-  .profile-sub { display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    font-size: 11px; color: var(--muted); margin-bottom: 12px; }
-  .owner-select { background: var(--bg); color: var(--muted); border: 1px solid var(--border);
-    border-radius: 6px; padding: 2px 6px; font-family: inherit; font-size: 11px; cursor: pointer; }
-  .owner-select:hover { border-color: var(--accent); color: var(--text); }
-  .owner-select:focus { outline: none; border-color: var(--accent); }
-  .owner-select.is-set { color: var(--accent2); }
+  .profile-sub { font-size: 11px; color: var(--muted); text-align: right; margin-bottom: 12px; }
   .usage-row { display: flex; align-items: center; gap: 10px; font-size: 12px; padding: 4px 0; }
   .usage-row .w-label { color: var(--muted); width: 64px; flex-shrink: 0; }
   .usage-row .w-bar { flex: 1; height: 6px; background: var(--surface2); border-radius: 3px; overflow: hidden; }
@@ -133,10 +124,10 @@ export const landingHtml = `<!DOCTYPE html>
   .pool-chip.exhausted { color: var(--red); background: rgba(248,81,73,0.12); }
   .plan-chip { font-size: 10px; padding: 2px 8px; border-radius: 10px; background: var(--surface2);
     color: var(--accent2); margin-left: 6px; vertical-align: middle; font-variant-numeric: tabular-nums; }
-  .refusal-banner { font-size: 12px; line-height: 1.45; color: var(--text); margin-bottom: 10px;
+  .spent-banner { font-size: 12px; line-height: 1.45; color: var(--text); margin-bottom: 10px;
     padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(248,81,73,0.35); background: rgba(248,81,73,0.1); }
-  .refusal-banner strong { color: var(--red); }
-  .refusal-banner-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .spent-banner strong { color: var(--red); }
+  .spent-banner-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .usage-row .w-pct { width: 38px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
   .usage-row .w-reset { color: var(--muted); font-size: 11px; width: 76px; text-align: right; }
   .no-usage { font-size: 12px; color: var(--muted); padding: 4px 0; }
@@ -185,11 +176,11 @@ export const landingHtml = `<!DOCTYPE html>
 <script>
 ` + profileFactsJs + `
 function ms(v){if(v==null||v===0)return '—';return v<1000?v+'ms':(v/1000).toFixed(1)+'s'}
-function esc(s){return String(s).replace(/[&<>"']/g,function(ch){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]})}
+function esc(s){return String(s).replace(/[&<>"']/g,function(ch){return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[ch]})}
 function usd(v){if(v==null)return '—';if(v>0&&v<0.01)return '$'+v.toFixed(4);if(v<100)return '$'+v.toFixed(2);return '$'+Math.round(v).toLocaleString()}
 
 var WIN_LABELS={five_hour:'5h',seven_day:'7d',seven_day_opus:'7d Opus',seven_day_sonnet:'7d Sonnet',seven_day_fable:'7d Fable',seven_day_oauth_apps:'7d Apps',seven_day_cowork:'7d Cowork',seven_day_omelette:'7d Omelette'};
-function winLabel(t){if(WIN_LABELS[t])return WIN_LABELS[t];return t.replace(/^seven_day_/,'7d ').replace(/_/g,' ').replace(/\b\w/g,function(c){return c.toUpperCase()})}
+function winLabel(t){if(WIN_LABELS[t])return WIN_LABELS[t];return t.replace(/^seven_day_/,'7d ').replace(/_/g,' ').replace(/\\b\\w/g,function(c){return c.toUpperCase()})}
 function utilColor(u){return u>=0.85?'var(--red)':u>=0.6?'var(--yellow)':'var(--green)'}
 // Mirrors computeWeeklyPace in src/telemetry/profileUsage.ts (unit-tested
 // there): actual vs expected (even) consumption at this point in the 7-day
@@ -235,7 +226,6 @@ function generalUtilization(windows){
 }
 function computeProfileSpend(p){
   if(isUnusable(p))return {fraction:1,state:'spent',fade:0,reason:'unusable'};
-  if(p.refused)return {fraction:1,state:'spent',fade:1,reason:'refused'};
   var f=generalUtilization(p.windows);
   if(f==null)return {fraction:null,state:'unknown',fade:0,reason:null};
   if(f>=SPENT_AT)return {fraction:f,state:'spent',fade:1,reason:'usage'};
@@ -304,8 +294,8 @@ function introSection(h){
   meta.push(h.mode||'internal');
   meta.push('port '+location.port);
   return '<div class="intro">'
-    +'<h2>Harness Claude, your way.</h2>'
-    +'<p>Meridian bridges any Anthropic-API agent to your Claude subscription — point the agent’s <code>ANTHROPIC_BASE_URL</code> at <code>http://'+esc(location.host)+'</code> and every request routes through the active account below. Setup guides for each agent live in the <a href="https://github.com/rynfar/meridian/blob/main/docs/agents.md">Agent Setup guide</a>.</p>'
+    +'<h2>Claude &amp; Antigravity, in your tools.</h2>'
+    +'<p>This page manages Claude accounts. Use <a href="/providers">Providers</a> to connect Claude or Antigravity. For Claude, point your supported client’s <code>ANTHROPIC_BASE_URL</code> at <code>http://'+esc(location.host)+'</code> and every request routes through the active account below. Setup guides for each agent live in the <a href="https://github.com/rynfar/meridian/blob/main/docs/agents.md">Agent Setup guide</a>.</p>'
     +'<div class="intro-meta">'+meta.join(' · ')+'</div>'
     +'</div>';
 }
@@ -316,14 +306,8 @@ function infoIcon(entry,type){
   for(var i=0;i<facts.length;i++){
     var f=facts[i];
     var tone=f.tone==='ok'?' status-ok':f.tone==='err'?' status-err':'';
-    var hint=f.hint?' title="'+esc(f.hint)+'"':'';
-    var note=f.note?' <span style="color:var(--muted)">'+esc(f.note)+'</span>':'';
-    var prov=factProvenance(f.value,!!f.stale);
-    if(prov==='never'&&!f.stale)continue;
-    var cell=prov==='never'
-      ?'<span class="prof-pop-value detail-unknown">never read</span>'
-      :'<span class="prof-pop-value'+tone+'"'+hint+'>'+esc(f.value)+note+cachedTag(prov)+'</span>';
-    rows+='<span class="prof-pop-label">'+esc(f.label)+'</span>'+cell;
+    rows+='<span class="prof-pop-label">'+esc(f.label)+'</span>'
+      +'<span class="prof-pop-value'+tone+'">'+esc(f.value)+'</span>';
   }
   return '<span class="prof-info">'
     +'<span class="prof-info-dot" tabindex="0" role="button" aria-label="Details for '+esc(entry.id)+'">i</span>'
@@ -342,17 +326,17 @@ function infoPopOpen(){
 function profileSection(q,s,pl,h){
   var byProfile=(s&&s.costEstimate&&s.costEstimate.byProfile)||{};
   var quotaByProfile={};
-  if(q&&Array.isArray(q.profiles))for(var i=0;i<q.profiles.length;i++){var qid=q.profiles[i].id||q.profiles[i].profile||'default';quotaByProfile[qid]=q.profiles[i]}
+  var spentByProfile={};
+  if(q&&Array.isArray(q.profiles))for(var i=0;i<q.profiles.length;i++){var qid=q.profiles[i].id||q.profiles[i].profile||'default';quotaByProfile[qid]=q.profiles[i];if(q.profiles[i].spent)spentByProfile[qid]=q.profiles[i].spent}
   var profs=[];var seen={};
   var configured=(pl&&Array.isArray(pl.profiles))?pl.profiles:[];
   var multi=configured.length>1;
-  if(configured.length>0){
-    // Real profiles exist: show exactly those. Traffic that predates
+  if(configured.length>0){\n    // Real profiles exist: show exactly those. Traffic that predates
     // per-profile attribution (the synthetic "default" bucket) still
     // counts in the totals strip but doesn't render as a fake account.
     // The whole entry rides along so the details overlay reads it directly —
     // a copied field list here would have to grow every time profileFacts does.
-    for(var i=0;i<configured.length;i++){var p=configured[i];profs.push({id:p.id,label:p.id,type:p.type,isActive:!!p.isActive,loggedIn:p.loggedIn,configured:true,allowance:p.allowance,planLabel:p.planLabel,rateLimitTier:p.rateLimitTier,owner:p.owner,entry:p});seen[p.id]=1}
+    for(var i=0;i<configured.length;i++){var p=configured[i];profs.push({id:p.id,label:p.id,type:p.type,isActive:!!p.isActive,loggedIn:p.loggedIn,configured:true,allowance:p.allowance,planLabel:p.planLabel,rateLimitTier:p.rateLimitTier,entry:p});seen[p.id]=1}
   }else{
     // Single-account setup: one card, labeled with the logged-in email.
     var email=(h&&h.auth&&h.auth.loggedIn&&h.auth.email)||'';
@@ -360,28 +344,22 @@ function profileSection(q,s,pl,h){
     for(var k in byProfile){if(!seen[k])profs.push({id:k,label:k==='default'?(email||'account'):k,configured:false});seen[k]=1}
   }
   if(profs.length===0)return '';
-  function spentOf(p){
-    var quota=quotaByProfile[p.id]||{};
-    return computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn,refused:!!quota.refusal}).fraction;
-  }
   // The persisted order is the base order everywhere. /profiles writes it;
   // this page read config order instead, so the two disagreed after a drag.
-  // The view sort ranks on top of that base, so "configured" shows the pool
-  // order rather than whatever sequence /profiles/list happened to return.
-  profs=sortProfilesForView(meridianReorder.sortProfiles(profs),viewSort,spentOf);
-  // A drag persists whatever sequence the cards are currently in, so it is
-  // offered only while that sequence is the persisted one. Under a spent
-  // ranking a drag would write the ranking into the routing pool order - an
-  // order nobody chose, and which the page gives no sign of having chosen.
-  var envPinned=meridianReorder.envPinned();
-  var reorderable=multi&&!envPinned&&viewSort==='configured';
+  profs=meridianReorder.sortProfiles(profs);
+  function spentOf(p){
+    var quota=quotaByProfile[p.id]||{};
+    return computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn}).fraction;
+  }
+  profs=sortProfilesForView(profs,viewSort,spentOf);
+  var reorderable=multi&&!meridianReorder.envPinned()&&viewSort==='configured';
   var cards='';
   var pos=0;
   for(var i=0;i<profs.length;i++){
     var p=profs[i];var cost=byProfile[p.id];
     var quota=quotaByProfile[p.id]||{};
     var wins=(quota.windows||[]).filter(function(w){return w.utilization!=null});
-    var spend=computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn,refused:!!quota.refusal});
+    var spend=computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn});
     if(!p.configured&&wins.length===0&&!cost)continue;
     var rows='';
     for(var j=0;j<wins.length;j++){
@@ -394,11 +372,10 @@ function profileSection(q,s,pl,h){
     var weekly=null;
     for(var j=0;j<wins.length;j++){if(wins[j].type==='seven_day')weekly=wins[j]}
     var pc=weekly?weeklyPace(weekly.utilization,weekly.resetsAt):null;
-    if(pc){
-      // Visual actual-vs-expected: fill = actual usage (status-colored),
+    if(pc){\n      // Visual actual-vs-expected: fill = actual usage (status-colored),
       // tick marker = where even pace would be. The gap IS the pace.
-      var paceTip=paceText(pc)+' \u00b7 '+pc.actual+'% used vs '+pc.expected+'% expected'+(pc.proj!=null?' \u00b7 ~'+pc.proj+'% by reset':'');
-      var deltaLabel=pc.status==='over'?(pc.proj!=null?pc.proj+'%':'100%'):(pc.delta>=0?'+':'\u2212')+Math.abs(pc.delta)+'%';
+      var paceTip=paceText(pc)+' · '+pc.actual+'% used vs '+pc.expected+'% expected'+(pc.proj!=null?' · ~'+pc.proj+'% by reset':'');
+      var deltaLabel=pc.status==='over'?(pc.proj!=null?pc.proj+'%':'100%'):(pc.delta>=0?'+':'−')+Math.abs(pc.delta)+'%';
       rows+='<div class="usage-row pace-row" title="'+paceTip+'"><span class="w-label">pace</span>'
         +'<div class="w-bar"><div class="w-fill" style="width:'+Math.min(pc.actual,100)+'%;background:'+paceColor(pc)+'"></div>'
         +'<div class="pace-marker" style="left:'+Math.min(pc.expected,100)+'%" title="expected at even pace ('+pc.expected+'%)"></div></div>'
@@ -419,76 +396,51 @@ function profileSection(q,s,pl,h){
     if(p.allowance)badge+='<span class="plan-chip" title="'+esc((p.planLabel||'')+(p.rateLimitTier?' · '+p.rateLimitTier:''))+'">'+esc(p.allowance)+'</span>';
     if(isPriority||isActivePriority){
       var orderIdx=(pl.profileOrder||[]).indexOf(p.id);
-      if(orderIdx>=0)badge+='<span class="pool-chip">'+(isActivePriority?'#'+(orderIdx+1)+' fallback':'#'+(orderIdx+1)+' in pool')+'</span>';
-      var exh=(pl.exhausted||[]).filter(function(e){return e.id===p.id})[0];
+      if(orderIdx>=0)badge+='<span class="pool-chip">'+(isActivePriority?'#'+(orderIdx+1)+' fallback':'#'+(orderIdx+1)+' in pool')+'</span>';      var exh=(pl.exhausted||[]).filter(function(e){return e.id===p.id})[0];
       // Suppressed when a refusal is being reported below: both say the same
       // thing, and the banner says it better.
-      if(exh&&!quota.refusal)badge+=' <span class="pool-chip exhausted">exhausted · resets '+resetIn(exh.until)+'</span>';
+      if(exh&&!spentByProfile[p.id]){\n        // A billing refusal has no reset to wait for — the pool re-probes on the
+        // same timer, but nothing changes until a human fixes the account.
+        // Showing it as 'resets in 9m' promises a recovery that never comes.
+        badge+=exh.reason==='billing_error'
+          ?' <span class="pool-chip exhausted" title="Subscription or payment refused — this does not clear on its own">subscription refused</span>'
+          :' <span class="pool-chip exhausted">exhausted · resets '+resetIn(exh.until)+'</span>';
+      }
     }
-    var sp=quota.refusal;
-    var refusalBanner='';
-    if(sp){
-      var spBucket=(sp.diagnosis&&sp.diagnosis.bucket)?winLabel(sp.diagnosis.bucket):'its limit';
+    var sp=spentByProfile[p.id];
+    var spentBanner='';
+    if(sp){\n      var spBucket=(sp.diagnosis&&sp.diagnosis.bucket)?winLabel(sp.diagnosis.bucket):'its limit';
       var spGuess=(sp.diagnosis&&sp.diagnosis.reported)?'':' (guess)';
       badge+=' <span class="pool-chip exhausted">out of '+esc(spBucket+spGuess)+'</span>';
       // A full-width line immediately above the usage bars, not a chip beside
       // the name: measured in review, a 10px chip wraps to four lines in a
       // narrow card and loses to the large "67%" rendered right below it -
       // which is the exact misreading this whole feature exists to stop.
-      refusalBanner='<div class="refusal-banner" title="'+esc((sp.diagnosis&&sp.diagnosis.rationale)||'')+'">'
+      spentBanner='<div class="spent-banner" title="'+esc((sp.diagnosis&&sp.diagnosis.rationale)||'')+'">'
         +'<strong>⚠ Anthropic is refusing this account</strong> - out of '+esc(spBucket+spGuess)
         +(sp.until?', back '+resetIn(sp.until):'')
-        +'<div class="refusal-banner-sub">figures below are the last successful read, not live</div></div>';
+        +'<div class="spent-banner-sub">figures below are the last successful read, not live</div></div>';
     }
     if(spend.reason==='unusable')badge+=' <span class="spend-pill needs-login">needs login</span>';
-    // A refusal already carries its own chip and banner, which name the window
-    // and the way back. The generic pill and the "N% used" tooltip would only
-    // restate it less precisely, and the tooltip would quote the fraction of 1
-    // this branch assumes rather than the last read the card actually shows.
-    else if(spend.state==='spent'&&spend.reason!=='refused')badge+=' <span class="spend-pill">spent</span>';
+    else if(spend.state==='spent')badge+=' <span class="spend-pill">spent</span>';
     var spendClass=spend.reason==='unusable'?' needs-login':spend.fade>0?' spend-'+spend.state:'';
     var spendStyle=spend.fade>0?' style="--spend-fade:'+spend.fade.toFixed(2)+'"':'';
     var spendTip=spend.reason==='unusable'?' title="Cannot serve requests \u2014 run: meridian profile login '+esc(p.id)+'"'
-      :spend.reason==='refused'?''
       :spend.fraction!=null&&spend.fade>0?' title="'+Math.round(spend.fraction*100)+'% of this account\u2019s 5h / 7d allowance is used"':'';
     var draggable=reorderable&&p.configured;
     cards+='<div class="profile-card'+(p.isActive?' active':'')+(switchable?' switchable':'')+spendClass+'"'+spendStyle+spendTip
       +(p.configured?' data-id="'+esc(p.id)+'" data-index="'+pos+'"':'')
       +(switchable?' data-profile="'+esc(p.id)+'" role="button" tabindex="0"':'')+'>'
-      +'<div class="profile-head"><span class="profile-name">'+(draggable?meridianReorder.handleHtml(p.id,pos,profs.length):'')+'<span class="prof-dot"></span>'+(p.entry?infoIcon(p.entry,p.type):'')+esc(p.label||p.id)+' '+badge+'</span>'
+      +'<div class="profile-head"><span class="profile-name">'+(draggable?meridianReorder.handleHtml(p.id,pos,profs.length):'')+'<span class="prof-dot"></span>'+(p.entry?infoIcon(p.entry,p.type):'')+''+esc(p.label||p.id)+' '+badge+'</span>'
       +'<span class="profile-cost">'+usd(cost?cost.estimatedUsd:0)+'</span></div>'
-      +'<div class="profile-sub">'+(p.configured?ownerSelect(p.id,p.owner):'<span></span>')
-      +'<span>'+(cost?cost.requests+' request'+(cost.requests===1?'':'s')+' · est. API value · 24h':'no traffic · 24h')+'</span></div>'
-      +refusalBanner+rows+'</div>';
+      +'<div class="profile-sub">'+(cost?cost.requests+' request'+(cost.requests===1?'':'s')+' · est. API value · 24h':'no traffic · 24h')+'</div>'
+      +spentBanner+rows+'</div>';
     if(p.configured)pos++;
   }
   if(!cards)return '';
   return '<div class="section"><div class="section-head"><div class="section-title">'+(profs.length===1?'Account':'Accounts')+'</div>'+sortTabs(profs.length)+'</div>'
-    +(multi?meridianReorder.noteHtml(reorderable,envPinned?'env':'view-sort'):'')
+    +(multi?meridianReorder.noteHtml(reorderable):'')
     +'<div class="profile-grid">'+cards+'</div></div>';
-}
-
-function ownerSelect(id,owner){
-  var current=owner||'';
-  var opts='';
-  for(var i=0;i<OWNER_OPTIONS.length;i++){
-    var o=OWNER_OPTIONS[i];
-    opts+='<option value="'+o[0]+'"'+(o[0]===current?' selected':'')+'>'+o[1]+'</option>';
-  }
-  return '<select class="owner-select'+(current?' is-set':'')+'" data-owner-for="'+esc(id)+'"'
-    +' aria-label="Who the '+esc(id)+' account belongs to">'+opts+'</select>';
-}
-// An open <select> is the focused element, so this needs no state of its own
-// and cannot be left stuck by a change event that never arrives.
-function ownerMenuBusy(){
-  var el=document.activeElement;
-  return !!(el&&el.classList&&el.classList.contains('owner-select'));
-}
-function setOwner(id,value){
-  fetch('/profiles/owner',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile:id,owner:value||null})})
-    .then(function(r){return r.json().then(function(d){return {ok:r.ok,data:d}})})
-    .then(function(res){if(!res.ok&&res.data&&res.data.error)alert(res.data.error);refresh()})
-    .catch(function(){});
 }
 
 function strip(items){
@@ -528,8 +480,7 @@ function render(h,s,q,pl){
   // violations appear only when there is something to report.
   var tu=s.tokenUsage||{};
   var cache=tu.avgCacheHitRate!=null?Math.round(tu.avgCacheHitRate*100)+'%':'—';
-  var items=[
-    // The big number is the TOTAL — never error-colored (a red 1714 reads as
+  var items=[\n    // The big number is the TOTAL — never error-colored (a red 1714 reads as
     // 1714 failures). The error signal lives on the detail line only.
     ['Requests',String(s.totalRequests),'',s.errorCount>0?s.errorCount+' error'+(s.errorCount===1?'':'s'):'no errors',s.errorCount>0?'red':''],
     ['Tokens Out',tokens(tu.totalOutputTokens),'',tokens(tu.totalInputTokens)+' in'],
@@ -551,26 +502,19 @@ function switchProfile(id){
     .then(function(data){if(data.success){refresh();if(window.meridianHeaderRefresh)window.meridianHeaderRefresh()}else if(data.error)alert(data.error)})
     .catch(function(){});
 }
-document.getElementById('content').addEventListener('change',function(e){
-  var sel=e.target.closest('.owner-select');
-  if(sel)setOwner(sel.dataset.ownerFor,sel.value);
-});
 // The handle sits inside a card that is itself a switch button, so without
 // this every grab of the handle would also change the active account.
 function onHandle(e){return !!(e.target.closest&&e.target.closest('.drag-handle'))}
 document.getElementById('content').addEventListener('click',function(e){
-  // The card is itself a switch button, so a control inside one has to opt out
-  // of it or picking an owner (or reading the details) would also move all
-  // traffic to that account.
-  //
   // Releasing a drag-select dispatches a click too, and that one is the end of
   // a copy rather than a request to switch account. A plain click has already
   // collapsed whatever was selected by the time it fires, so this refuses only
   // the gesture that really was a selection.
   if(meridianSelection.live())return;
-  if(e.target.closest('.owner-select'))return;
-  if(e.target.closest('.prof-info'))return;
   if(onHandle(e))return;
+  // The card is itself the switch button, so the icon inside one has to opt
+  // out of it or reading an account would move all traffic to that account.
+  if(e.target.closest('.prof-info'))return;
   var tab=e.target.closest('.sort-tab');
   if(tab&&tab.dataset.sort){setViewSort(tab.dataset.sort);return}
   var card=e.target.closest('.profile-card.switchable');
@@ -578,16 +522,15 @@ document.getElementById('content').addEventListener('click',function(e){
 });
 document.getElementById('content').addEventListener('keydown',function(e){
   if(e.key!=='Enter'&&e.key!==' ')return;
-  if(e.target.closest('.owner-select'))return;
-  if(e.target.closest('.prof-info'))return;
   if(onHandle(e))return;
+  if(e.target.closest('.prof-info'))return;
   var card=e.target.closest('.profile-card.switchable');
   if(card&&card.dataset.profile){e.preventDefault();switchProfile(card.dataset.profile)}
 });
 viewSort=readStoredSort()||viewSort;
 meridianReorder.init({onSaved:refresh});
 refresh();
-setInterval(function(){if(!meridianReorder.dragging()&&!ownerMenuBusy()&&!infoPopOpen()&&!meridianSelection.holdsRedraw())refresh()},10000);
+setInterval(function(){if(!meridianReorder.dragging() && !infoPopOpen() && !meridianSelection.holdsRedraw())refresh()},10000);
 ` + profileBarJs + `
 </script>
 </body>

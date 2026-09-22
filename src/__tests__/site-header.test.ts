@@ -8,18 +8,18 @@
  */
 
 import { describe, expect, test } from "bun:test"
+import { providerPageHtml } from "../telemetry/providerPage"
 import { landingHtml } from "../telemetry/landing"
 import { dashboardHtml } from "../telemetry/dashboard"
 import { settingsPageHtml } from "../telemetry/settingsPage"
 import { profilePageHtml } from "../telemetry/profilePage"
 import { pluginPageHtml } from "../proxy/plugins/pluginPage"
-import { profileBarHtml, profileBarJs } from "../telemetry/profileBar"
-import { reorderClientJs } from "../telemetry/profileOrder"
+import { profileBarCss, profileBarHtml, profileBarJs } from "../telemetry/profileBar"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "../telemetry/profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT } from "../telemetry/profileSpent"
-import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
 
 const allPages: Array<[string, string]> = [
+  ["providers", providerPageHtml],
   ["landing", landingHtml],
   ["dashboard", dashboardHtml],
   ["settings", settingsPageHtml],
@@ -35,7 +35,7 @@ describe("shared site header", () => {
     expect(profileBarHtml).toContain("<svg")
     expect(profileBarHtml).toContain("Meridian")
     // Full site nav
-    for (const href of ["/telemetry", "/profiles", "/settings", "/plugins"]) {
+    for (const href of ["/providers", "/telemetry", "/profiles", "/settings", "/plugins"]) {
       expect(profileBarHtml).toContain(`href="${href}"`)
     }
   })
@@ -52,21 +52,39 @@ describe("shared site header", () => {
     expect(profileBarJs).toContain("/profiles/list")
   })
 
+  test("header shows a build chip fed by /health's build block", () => {
+    expect(profileBarHtml).toContain("mhBuild")
+    expect(profileBarJs).toContain("renderBuild")
+    expect(profileBarJs).toContain("updateAvailable")
+  })
+
+  test("build chip colours follow the DESIGN.md role split", () => {
+    // Blue = interactive: the update chip is a link to the releases page.
+    // Violet = meta: the provenance chip has no href and must not be blue.
+    // Swapping these is the single easiest way to break the design language,
+    // and it is invisible in a screenshot review.
+    expect(profileBarCss).toContain(".mh-build.update")
+    expect(profileBarCss).toContain(".mh-build.provenance")
+
+    const updateRule = profileBarCss.slice(
+      profileBarCss.indexOf(".meridian-header .mh-build.update"),
+      profileBarCss.indexOf(".meridian-header .mh-build.provenance"),
+    )
+    expect(updateRule).toContain("var(--accent, #58a6ff)")
+    expect(updateRule).not.toContain("--accent2")
+
+    const provenanceRule = profileBarCss.slice(profileBarCss.indexOf(".meridian-header .mh-build.provenance"))
+    expect(provenanceRule).toContain("var(--accent2, #bc8cff)")
+    // Non-interactive: no href is set for this state, so no pointer affordance.
+    expect(provenanceRule).toContain("cursor: default")
+    expect(profileBarJs).toContain("removeAttribute('href')")
+  })
+
   test("every page embeds the shared header exactly once", () => {
     for (const [name, html] of allPages) {
       const count = html.split("meridian-header").length - 1
       expect(count, `${name} page should embed the header once`).toBeGreaterThanOrEqual(1)
     }
-  })
-
-  test("the OAuth callback page is the deliberate exception", () => {
-    // /callback is reachable WITHOUT the API key — Anthropic's redirect carries
-    // none — while the header polls /health and /profiles/list, which are gated.
-    // Embedding it would render broken "offline" chrome on the one page a user
-    // sees mid-login. This pins that exception so it is not "fixed" by hand.
-    const html = renderLoginCallbackPage({ ok: true, profileId: "personal" })
-    expect(html).not.toContain("meridian-header")
-    expect(html).toContain("href=\"/profiles\"")
   })
 })
 
@@ -111,25 +129,6 @@ describe("landing page layout", () => {
     expect(landingHtml).toContain("needs login")
   })
 
-  test("accounts can be re-sorted for viewing without touching the saved order", () => {
-    // The page carries a copy of the comparator, so the modes it offers are
-    // interpolated from the tested module rather than retyped.
-    expect(landingHtml).toContain(`var PROFILE_SORT_MODES=${JSON.stringify(PROFILE_SORT_MODES)}`)
-    expect(landingHtml).toContain(`var viewSort=${JSON.stringify(DEFAULT_PROFILE_SORT)}`)
-    expect(landingHtml).toContain("sort-tab")
-    // The choice itself is never persisted server-side: it lives in
-    // localStorage and re-renders from the last payload.
-    expect(landingHtml).toContain("localStorage.setItem(SORT_STORAGE_KEY,mode)")
-    // The durable pool order still has exactly one writer, and it is the
-    // shared reorder gesture — the page's own code only ever reads it.
-    expect(landingHtml.split(reorderClientJs).join("")).not.toContain("PUT")
-    // ...and the gesture is offered only while the cards are in the persisted
-    // order. A drag saves whatever sequence is on screen, so under a spent
-    // ranking it would write that ranking into the routing pool — an order
-    // nobody chose and the page gives no sign of having chosen.
-    expect(landingHtml).toContain("viewSort==='configured'")
-  })
-
   test("the fade never reaches the card itself, so the active ring survives it", () => {
     // filter and opacity apply to an element's OWN border and box-shadow, so
     // fading .profile-card greys out the accent ring on .profile-card.active -
@@ -146,6 +145,16 @@ describe("landing page layout", () => {
     expect(landingHtml).not.toContain(".profile-card.spend-fading:hover, .profile-card.spend-spent:hover {")
   })
 
+  test("accounts can be re-sorted for viewing without touching the saved order", () => {
+    // The page carries a copy of the comparator, so the modes it offers are
+    // interpolated from the tested module rather than retyped.
+    expect(landingHtml).toContain(`var PROFILE_SORT_MODES=${JSON.stringify(PROFILE_SORT_MODES)}`)
+    expect(landingHtml).toContain(`var viewSort=${JSON.stringify(DEFAULT_PROFILE_SORT)}`)
+    expect(landingHtml).toContain("sort-tab")
+    // View tabs re-sort locally in the browser; profileOrder handles drag reordering.
+    expect(landingHtml).toContain("meridianReorder.init(")
+  })
+
   test("account cards come from configured profiles, not synthetic cost buckets", () => {
     // With profiles configured, only pl.profiles render (no "default" card);
     // the single-account fallback labels the card with the login email.
@@ -160,7 +169,6 @@ describe("design-system conformance (DESIGN.md)", () => {
     "src/telemetry/dashboard.ts",
     "src/telemetry/settingsPage.ts",
     "src/telemetry/profilePage.ts",
-    "src/telemetry/loginCallbackPage.ts",
     "src/proxy/plugins/pluginPage.ts",
   ]
 
@@ -178,47 +186,6 @@ describe("design-system conformance (DESIGN.md)", () => {
       const bodyRule = src.match(/body \{[^}]*\}/)?.[0] ?? ""
       expect(bodyRule.includes("background"), `${path} body rule must not set background`).toBe(false)
     }
-  })
-})
-
-describe("profiles page — the sign-in control is a real link", () => {
-  // Someone signed into several Claude accounts needs the browser's own
-  // context menu — "Open Link in Incognito Window", "Copy Link Address" — to
-  // choose which session answers the sign-in. Chrome and Firefox offer that
-  // for an anchor with an href and for nothing else, so these assertions are
-  // the feature, not decoration.
-  test("renders an anchor with an href, not a button", () => {
-    expect(profilePageHtml).toContain('<a class="login-btn login-link"')
-    expect(profilePageHtml).toContain("loginHrefFor(p.id)")
-    expect(profilePageHtml).toContain('rel="noopener noreferrer"')
-    expect(profilePageHtml).not.toContain('<button class="login-btn" onclick="startLogin')
-  })
-
-  test("nothing in the login flow opens a window from script", () => {
-    // A scripted window.open is exactly what denies the context menu, and it
-    // also ignores ctrl-click and middle-click. Scoped to the login section so
-    // this says something precise about THIS flow rather than policing every
-    // other feature on the page.
-    const start = profilePageHtml.indexOf("// --- Browser login ---")
-    expect(start).toBeGreaterThan(-1)
-    const next = profilePageHtml.indexOf("// --- ", start + 24)
-    const loginSection = next === -1 ? profilePageHtml.slice(start) : profilePageHtml.slice(start, next)
-    expect(loginSection).not.toContain("window.open(")
-  })
-
-  test("the fallback to pasting a code is also a real link", () => {
-    expect(profilePageHtml).toContain('onclick="switchToPaste();return true;"')
-    expect(profilePageHtml).not.toContain('href="#" onclick="switchToPaste()')
-  })
-
-  test("hrefs survive a re-render and are refreshed before they expire", () => {
-    expect(profilePageHtml).toContain("applyLoginHrefs()")
-    expect(profilePageHtml).toContain("ensureLoginLinks(profiles)")
-  })
-
-  test("no PKCE material is ever put in a link", () => {
-    expect(profilePageHtml).not.toContain("codeVerifier")
-    expect(profilePageHtml).not.toContain("code_verifier")
   })
 })
 

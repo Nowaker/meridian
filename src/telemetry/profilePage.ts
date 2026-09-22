@@ -6,8 +6,8 @@
 import { profileBarCss, profileBarHtml, profileBarJs, themeCss } from "./profileBar"
 import { profileFactsJs } from "./profileFacts"
 import { reorderClientJs, reorderCss, reorderLiveRegionHtml } from "./profileOrder"
-import { selectionHoldJs } from "./selectionHold"
 import { WINDOW_LABELS } from "./profileUsage"
+import { selectionHoldJs } from "./selectionHold"
 
 export const profilePageHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -71,10 +71,10 @@ export const profilePageHtml = `<!DOCTYPE html>
   }
   .badge-active { background: rgba(88,166,255,0.15); color: var(--accent); }
   .badge-type { background: var(--bg); color: var(--muted); border: 1px solid var(--border); }
-  .badge-refusing { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.35); }
-  .refusal-note { margin: 10px 0; padding: 10px 14px; border-radius: 8px; font-size: 12px; line-height: 1.5;
+  .badge-spent { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.35); }
+  .spent-note { margin: 10px 0; padding: 10px 14px; border-radius: 8px; font-size: 12px; line-height: 1.5;
     background: rgba(248,81,73,0.08); border: 1px solid rgba(248,81,73,0.3); color: var(--text); }
-  .refusal-note .refusal-why { color: var(--muted); }
+  .spent-note .spent-why { color: var(--muted); }
   .profile-details {
     display: grid; grid-template-columns: 120px 1fr; gap: 6px 16px; font-size: 13px;
   }
@@ -92,15 +92,6 @@ export const profilePageHtml = `<!DOCTYPE html>
   .switch-btn:hover { background: rgba(88,166,255,0.1); }
   .switch-btn:disabled { opacity: 0.4; cursor: default; }
   .switch-btn.current { border-color: var(--border); color: var(--muted); cursor: default; }
-
-  .owner-select {
-    background: var(--bg); color: var(--muted); border: 1px solid var(--border);
-    border-radius: 6px; padding: 2px 8px; font-family: inherit; font-size: 12px;
-    cursor: pointer; justify-self: start;
-  }
-  .owner-select:hover { border-color: var(--accent); color: var(--text); }
-  .owner-select:focus { outline: none; border-color: var(--accent); }
-  .owner-select.is-set { color: var(--accent2); }
 
   .empty-state {
     text-align: center; padding: 48px; color: var(--muted);
@@ -296,6 +287,7 @@ ${reorderLiveRegionHtml}
     <h3 style="margin-top:16px">Other commands</h3>
     <div style="font-size:13px;margin-top:8px">
       <code>meridian profile list</code> \u2014 show all profiles and auth status<br>
+      <code>meridian profile login &lt;name&gt;</code> \u2014 re-authenticate an expired profile<br>
       <code>meridian profile rename &lt;old&gt; &lt;new&gt;</code> \u2014 rename a profile (or use the pencil above)<br>
       <code>meridian profile remove &lt;name&gt;</code> \u2014 remove a profile
     </div>
@@ -496,87 +488,34 @@ async function refresh() {
 
 function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
-function ownerSelect(id, owner) {
-  var current = owner || '';
-  var opts = '';
-  for (var i = 0; i < OWNER_OPTIONS.length; i++) {
-    var o = OWNER_OPTIONS[i];
-    opts += '<option value="' + o[0] + '"' + (o[0] === current ? ' selected' : '') + '>' + o[1] + '</option>';
-  }
-  return '<select class="owner-select' + (current ? ' is-set' : '') + '"'
-    + ' aria-label="Who the ' + esc(id) + ' account belongs to"'
-    + ' onchange="setOwner(&quot;' + esc(id) + '&quot;, this.value)">' + opts + '</select>';
-}
-
-// An open <select> is the focused element, so this needs no state of its own
-// and cannot be left stuck by a change event that never arrives.
-function ownerMenuBusy() {
-  var el = document.activeElement;
-  return !!(el && el.classList && el.classList.contains('owner-select'));
-}
-
-// Owner is the one fact that is editable here, so its value cell is the live
-// control rather than the text the landing overlay shows for the same row.
-function factRows(facts, p) {
+function factRows(facts) {
   return facts.map(function (f) {
-    if (f.label === 'Owner') {
-      return '<span class="detail-label">Owner</span>' + ownerSelect(p.id, p.owner);
-    }
     var tone = f.tone === 'ok' ? ' status-ok' : f.tone === 'err' ? ' status-err' : '';
-    var hint = f.hint ? ' title="' + esc(f.hint) + '"' : '';
-    var note = f.note ? ' <span style="color:var(--muted);font-weight:400">' + esc(f.note) + '</span>' : '';
-    var provenance = factProvenance(f.value, !!f.stale);
-    // A fact absent from a check that SUCCEEDED is not applicable to this
-    // account rather than unread - an API-key profile has no plan - so its row
-    // goes entirely, which is what profileFacts already does by not pushing it.
-    if (provenance === 'never' && !f.stale) return '';
-    var label = '<span class="detail-label">' + esc(f.label) + '</span>';
-    if (provenance === 'never') {
-      return label + '<span class="detail-value detail-unknown">never read</span>';
-    }
-    return label
-      + '<span class="detail-value' + tone + '"' + hint + '>'
-      + esc(f.value) + note + cachedTag(provenance) + '</span>';
+    var title = f.title ? ' title="' + esc(f.title) + '"' : '';
+    var cached = f.cached ? ' <span class="cached-tag">(cached)</span>' : '';
+    return '<span class="detail-label">' + esc(f.label) + '</span>'
+      + '<span class="detail-value' + tone + '"' + title + '>' + esc(f.value) + cached + '</span>';
   }).join('');
 }
 
-// A refusal and the cached percentages are different kinds of fact, so they
-// are rendered as different things: the badge states what the API is doing
-// now, the bars below stay as the last successful read. Measured: an account
-// showed 5h 67% / 7d 7% while every request through it was refused.
-function refusalSummary(refusal) {
-  if (!refusal) return null;
-  var bucket = refusal.diagnosis && refusal.diagnosis.bucket
-    ? labelForWindow(refusal.diagnosis.bucket)
-    : 'unknown limit';
-  var reported = !!(refusal.diagnosis && refusal.diagnosis.reported);
-  var reset = formatResetCountdown(refusal.until);
-  return {
-    bucket: bucket,
-    reported: reported,
-    label: bucket + (reported ? '' : ' (guess)'),
-    reset: reset,
-    why: (refusal.diagnosis && refusal.diagnosis.rationale) || '',
-    at: refusal.at,
-  };
+// Mirrors src/telemetry/cachedFacts.ts (unit-tested there). Marked per value
+// rather than per card: a card mixes a live status with a remembered email, so
+// one banner across it would mislabel whichever half it doesn't apply to.
+function factProvenance(value, stale) {
+  if (value == null || value === '') return 'never';
+  return stale ? 'cached' : 'live';
 }
-
-function renderRefusalBadge(refusal) {
-  var s = refusalSummary(refusal);
-  if (!s) return '';
-  return '<span class="profile-badge badge-refusing" title="' + esc(s.why) + '">out of ' + esc(s.label) + '</span>';
+function cachedTag(provenance) {
+  return provenance === 'cached' ? '<span class="cached-tag">(cached)</span>' : '';
 }
-
-function renderRefusalNote(refusal) {
-  var s = refusalSummary(refusal);
-  if (!s) return '';
-  return '<div class="refusal-note">'
-    + '<strong style="color:var(--red)">\u26a0 Anthropic is refusing this account</strong> - '
-    + 'out of <strong>' + esc(s.label) + '</strong>'
-    + (s.reset ? ', expected back ' + esc(s.reset) : '')
-    + '. Refused ' + esc(timeAgo(s.at)) + '.'
-    + '<div class="refusal-why">' + esc(s.why) + '. The percentages below are the last successful read, not live.</div>'
-    + '</div>';
+function renderFactValue(value, stale, extraClass) {
+  var provenance = factProvenance(value, stale);
+  if (provenance === 'never' && !stale) return null;
+  var classes = 'detail-value' + (extraClass ? ' ' + extraClass : '');
+  if (provenance === 'never') {
+    return '<span class="' + classes + ' detail-unknown">never read</span>';
+  }
+  return '<span class="' + classes + '">' + esc(String(value)) + cachedTag(provenance) + '</span>';
 }
 
 // "last 4 checks failed (rate limited upstream)" — the run of failed checks
@@ -591,6 +530,45 @@ function describeFailedRun(failure) {
   var n = Math.floor(Number(failure.consecutiveFailures));
   if (!isFinite(n) || n < 1) n = 1;
   return (n > 1 ? 'last ' + n + ' checks failed' : 'last check failed') + ' (' + why + ')';
+}
+
+// A refusal and the cached percentages are different kinds of fact, so they
+// are rendered as different things: the badge states what the API is doing
+// now, the bars below stay as the last successful read. Measured: an account
+// showed 5h 67% / 7d 7% while every request through it was refused.
+function spentSummary(spent) {
+  if (!spent) return null;
+  var bucket = spent.diagnosis && spent.diagnosis.bucket
+    ? labelForWindow(spent.diagnosis.bucket)
+    : 'unknown limit';
+  var reported = !!(spent.diagnosis && spent.diagnosis.reported);
+  var reset = formatResetCountdown(spent.until);
+  return {
+    bucket: bucket,
+    reported: reported,
+    label: bucket + (reported ? '' : ' (guess)'),
+    reset: reset,
+    why: (spent.diagnosis && spent.diagnosis.rationale) || '',
+    at: spent.at,
+  };
+}
+
+function renderSpentBadge(spent) {
+  var s = spentSummary(spent);
+  if (!s) return '';
+  return '<span class="profile-badge badge-spent" title="' + esc(s.why) + '">out of ' + esc(s.label) + '</span>';
+}
+
+function renderSpentNote(spent) {
+  var s = spentSummary(spent);
+  if (!s) return '';
+  return '<div class="spent-note">'
+    + '<strong style="color:var(--red)">\u26a0 Anthropic is refusing this account</strong> - '
+    + 'out of <strong>' + esc(s.label) + '</strong>'
+    + (s.reset ? ', expected back ' + esc(s.reset) : '')
+    + '. Refused ' + esc(timeAgo(s.at)) + '.'
+    + '<div class="spent-why">' + esc(s.why) + '. The percentages below are the last successful read, not live.</div>'
+    + '</div>';
 }
 
 function renderUsageSection(profileQuota) {
@@ -701,7 +679,7 @@ function render(data, quotaData) {
   if (profiles.length === 0) {
     document.getElementById('content').innerHTML = '<div class="empty-state">'
       + '<h2>No profiles configured</h2>'
-      + '<p style="margin-top:8px">Add your first one below, or from a terminal:</p>'
+      + '<p style="margin-top:8px">Add your first one above, or from a terminal:</p>'
       + '<p style="margin-top:8px"><code class="mono" style="background:var(--bg);padding:8px 16px;border-radius:6px;display:inline-block">meridian profile add personal</code></p>'
       + '</div>';
     return;
@@ -717,31 +695,28 @@ function render(data, quotaData) {
     const isActive = p.id === active;
     html += '<div class="profile-card' + (isActive ? ' active' : '') + '" data-id="' + esc(p.id) + '" data-index="' + idx + '">';
     html += '<div class="profile-card-header">';
-    if (reorderable) html += meridianReorder.handleHtml(p.id, idx, profiles.length);
     if (editingProfile === p.id) {
       html += '<input class="rename-input" id="rename-input" value="' + esc(p.id) + '" spellcheck="false" autocomplete="off"'
         + ' onkeydown="if(event.key===&quot;Enter&quot;){event.preventDefault();commitRename(&quot;' + esc(p.id) + '&quot;)}'
         + 'else if(event.key===&quot;Escape&quot;){cancelRename()}">';
-      html += '<span class="rename-hint">Enter to save \u00b7 Esc to cancel</span>';
+      html += '<span class="rename-hint">Enter to save · Esc to cancel</span>';
       html += '<span class="profile-card-actions">';
       html += '<button class="icon-btn" title="Save new name" onclick="commitRename(&quot;'+esc(p.id)+'&quot;)">' + ICON_CHECK + '</button>';
       html += '<button class="icon-btn" title="Cancel" onclick="cancelRename()">' + ICON_X + '</button>';
       html += '</span>';
     } else {
+      if (reorderable) html += meridianReorder.handleHtml(p.id, idx, profiles.length);
       html += '<span class="profile-name">' + esc(p.id) + '</span>';
       if (isActive) html += '<span class="profile-badge badge-active">active</span>';
-      const planTitle = [p.planLabel, p.rateLimitTier].filter(Boolean).join(' · ');
-      html += p.allowance
-        ? '<span class="profile-badge badge-type" title="' + esc(planTitle) + '">' + esc(p.allowance) + '</span>'
-        : '<span class="profile-badge badge-type">' + esc(p.type || 'claude-max') + '</span>';
-      html += renderRefusalBadge((quotaById[p.id] || {}).refusal);
+      html += '<span class="profile-badge badge-type">' + esc(p.type || 'claude-max') + '</span>';
+      html += renderSpentBadge((quotaById[p.id] || {}).spent);
       html += '<span class="profile-card-actions">';
       html += '<button class="icon-btn" title="Rename profile" onclick="startRename(&quot;'+esc(p.id)+'&quot;)">' + ICON_PENCIL + '</button>';
       html += '<button class="icon-btn danger" title="Remove profile" onclick="startRemove(&quot;'+esc(p.id)+'&quot;)">' + ICON_TRASH + '</button>';
       html += '</span>';
     }
     html += '</div>';
-    html += renderRefusalNote((quotaById[p.id] || {}).refusal);
+    html += renderSpentNote((quotaById[p.id] || {}).spent);
 
     if (editingProfile === p.id && renameError) {
       html += '<div class="rename-error">' + esc(renameError) + '</div>';
@@ -757,7 +732,7 @@ function render(data, quotaData) {
       html += '</div></div>';
     }
 
-    html += '<div class="profile-details">' + factRows(profileFacts(p), p) + '</div>';
+    html += '<div class="profile-details">' + factRows(profileFacts(p)) + '</div>';
 
     if (!p.loggedIn) {
       html += '<div style="margin-top:12px;padding:10px 14px;background:rgba(210,153,34,0.1);border:1px solid rgba(210,153,34,0.3);border-radius:8px;font-size:12px">';
@@ -812,7 +787,6 @@ function render(data, quotaData) {
   meridianReorder.restoreFocus(refocusId);
 }
 
-
 function copyCmd(btn) {
   var cmd = btn.getAttribute('data-cmd');
   navigator.clipboard.writeText(cmd);
@@ -833,17 +807,6 @@ async function switchProfile(id) {
   const data = await res.json();
   if (data.success) refresh();
   else if (data.error) alert(data.error);
-}
-
-async function setOwner(id, value) {
-  var res = await fetch('/profiles/owner', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ profile: id, owner: value || null })
-  }).catch(function () { return null; });
-  var data = res ? await res.json().catch(function () { return null; }) : null;
-  if (!res || !res.ok) alert((data && data.error) || 'Could not save the owner.');
-  refresh();
 }
 
 // --- Browser login ---
@@ -1345,7 +1308,7 @@ resetAddForm('');
 // keeps its own state, so each needs its own term - resetAddForm nulls
 // activeAdd, which is the addId the paste is about to be sent with.
 setInterval(function () {
-  if (!meridianReorder.dragging() && !activeLogin && !activeAdd && !ownerMenuBusy()
+  if (!meridianReorder.dragging() && !activeLogin && !activeAdd
     && !meridianSelection.holdsRedraw()) refresh();
 }, 10000);
 ` + profileBarJs + `

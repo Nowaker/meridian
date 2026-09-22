@@ -7,7 +7,7 @@
  * already imports tokenRefresh for the credential store, so the refresh path
  * importing back would close a cycle.
  *
- * This is a leaf module — one authenticated GET, and the logger.
+ * This is a leaf module — one authenticated GET, no imports.
  */
 
 import { claudeLog } from "../logger"
@@ -93,87 +93,7 @@ export function extractPlanFields(profile: OAuthProfileResponse | null | undefin
  * completed.
  */
 export function planFieldsMissing(fields: OAuthPlanFields | null | undefined): boolean {
-  if (!fields?.subscriptionType || !fields.rateLimitTier) return true
-  // A Team account is not described until its SEAT is known, and it is the one
-  // family where the two fields already present cannot finish the job: every
-  // Team seat reports `team` here, and `rate_limit_tier` reads
-  // `default_claude_max_5x` on a Premium seat and `default_raven` on a
-  // Standard one. Without this clause a credential written before seat_tier
-  // was captured looks complete for ever and is never backfilled - which is
-  // exactly the state four Premium seats on this fleet were in.
-  return fields.subscriptionType === "team" && !fields.seatTier
-}
-
-/**
- * How long a plan reading is trusted before Anthropic is asked again.
- *
- * A plan is not immutable, and nothing in the lifecycle used to notice: an
- * account upgraded from Max 5x to Max 20x keeps the same credential file, the
- * only writer was gated on the field being ABSENT, and one account on this
- * fleet was reported 5x for days after it had been upgraded. So the reading
- * expires. Six hours is under the ~8h access-token lifetime, which makes this
- * one extra GET per token refresh in practice, while still bounding the rate
- * when a burst of 401s drives several refreshes inside one day.
- */
-export const PLAN_RECHECK_MS = 6 * 60 * 60_000
-
-export interface StoredPlanState extends OAuthPlanFields {
-  /**
-   * When the plan was last read from Anthropic. Absent on a credential written
-   * before readings were dated, which reads as due — that is what makes an
-   * existing fleet pick its upgrades up rather than only new logins.
-   */
-  planCheckedAt?: number
-}
-
-export function planNeedsCheck(
-  fields: StoredPlanState | null | undefined,
-  now = Date.now(),
-): boolean {
-  if (planFieldsMissing(fields)) return true
-  const checkedAt = fields?.planCheckedAt
-  if (typeof checkedAt !== "number" || !Number.isFinite(checkedAt)) return true
-  return now - checkedAt >= PLAN_RECHECK_MS
-}
-
-/**
- * Which plan fields a fresh reading disagrees with the stored one about.
- *
- * Only keys the reading actually CARRIES are compared: `extractPlanFields`
- * omits whatever Anthropic did not send, and an absent key means "not
- * reported" rather than "no longer set" — so counting it as a change would
- * erase a good stored value every time a response came back partial.
- */
-export function changedPlanFields(
-  stored: OAuthPlanFields | null | undefined,
-  fetched: OAuthPlanFields,
-): (keyof OAuthPlanFields)[] {
-  const keys: (keyof OAuthPlanFields)[] = ["subscriptionType", "rateLimitTier", "seatTier"]
-  return keys.filter((key) => fetched[key] !== undefined && stored?.[key] !== fetched[key])
-}
-
-export interface OAuthPlanUpdate<T extends StoredPlanState> {
-  readonly fields: OAuthPlanFields
-  readonly changed: (keyof OAuthPlanFields)[]
-  readonly state: T & { readonly planCheckedAt: number }
-}
-
-export async function readOAuthPlanUpdate<T extends StoredPlanState>(
-  state: T,
-  accessToken: string,
-): Promise<OAuthPlanUpdate<T> | null> {
-  if (!planNeedsCheck(state)) return null
-  const fields = await fetchOAuthPlanFields(accessToken)
-  if (Object.keys(fields).length === 0) return null
-  return {
-    fields,
-    changed: changedPlanFields(state, fields),
-    state: {
-      ...state,
-      ...fields,
-      planCheckedAt: Date.now(),
-    },
-  }
+  return !fields?.subscriptionType || (!fields?.rateLimitTier && !fields?.seatTier)
 }
 
 /**
@@ -217,11 +137,6 @@ export async function fetchOAuthPlanFields(
   }
 
   const plan = extractPlanFields(profile)
-  // Both halves are logged because they answer different questions. The paths
-  // say what Anthropic sent; the plan says what Meridian kept. A profile that
-  // ends up `unknown` is otherwise indistinguishable between "the field was
-  // never in the response" and "it arrived and we dropped it on the way to
-  // disk", and that distinction is the whole of the diagnosis.
   claudeLog("auth.profile_discovered", {
     fields: authFieldPaths(profile),
     payload: describeAuthFields(profile),
