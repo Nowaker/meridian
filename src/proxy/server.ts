@@ -134,7 +134,7 @@ import {
   retryAfterBodyFields,
   OVERLOADED_RETRY_AFTER_SECONDS,
 } from "./retryAfter"
-import { getSetting, setSetting, TELEMETRY_SETTING_LIMITS } from "../settings" 
+import { getSetting, setSetting, saveSettings, TELEMETRY_SETTING_LIMITS, type MeridianSettings } from "../settings" 
 import { filterBetasForProfile, getBetaPolicyFromEnv } from "./betas"
 import { createFileChangeHook, extractFileChangesFromMessages, formatFileChangeSummary, type FileChange } from "./fileChanges"
 import { detectTokenAnomalies, formatAnomalyAlerts, type TokenSnapshot } from "./tokenHealth"
@@ -2547,6 +2547,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // only explanation lived in this file, and a label computed separately
         // from the decision would drift away from it.
         const independentCause = independentRequestCause({
+          warmHop: warmProfileId !== undefined,
           hasSessionKey: Boolean(agentSessionId),
           forkSource: Boolean(requestSource?.startsWith("fork-")),
           isSubagent: isSubagentRequest,
@@ -7742,11 +7743,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       routingManagedExcludedProfiles?: unknown
     }
     try { body = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
+    // One form submits routing, order and exclusions together, so a later
+    // field failing validation must not leave an earlier one already written.
+    const updates: Partial<MeridianSettings> = {}
     if (body.routing !== undefined) {
       if (typeof body.routing !== "string" || !ROUTING_MODES.includes(body.routing as RoutingMode)) {
         return c.json({ error: `routing must be one of: ${ROUTING_MODES.join(", ")}` }, 400)
       }
-      setSetting("routing", body.routing)
+      updates.routing = body.routing
     }
     if (body.profileOrder !== undefined) {
       if (!Array.isArray(body.profileOrder) || body.profileOrder.some(x => typeof x !== "string")) {
@@ -7755,20 +7759,21 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       const known = new Set(listProfiles(finalConfig.profiles, finalConfig.defaultProfile).map(p => p.id))
       const unknown = (body.profileOrder as string[]).filter(id => !known.has(id))
       if (unknown.length > 0) return c.json({ error: `Unknown profiles: ${unknown.join(", ")}` }, 400)
-      setSetting("profileOrder", body.profileOrder as string[])
+      updates.profileOrder = body.profileOrder as string[]
     }
     if (body.routingExcludedProfiles !== undefined) {
       if (!Array.isArray(body.routingExcludedProfiles) || body.routingExcludedProfiles.some(profileId => typeof profileId !== "string")) {
         return c.json({ error: "routingExcludedProfiles must be an array of profile ids" }, 400)
       }
-      setSetting("routingExcludedProfiles", parseRoutingExcludedProfiles(body.routingExcludedProfiles))
+      updates.routingExcludedProfiles = parseRoutingExcludedProfiles(body.routingExcludedProfiles)
     }
     if (body.routingManagedExcludedProfiles !== undefined) {
       if (!Array.isArray(body.routingManagedExcludedProfiles) || body.routingManagedExcludedProfiles.some(profileId => typeof profileId !== "string")) {
         return c.json({ error: "routingManagedExcludedProfiles must be an array of profile ids" }, 400)
       }
-      setSetting("routingManagedExcludedProfiles", parseRoutingExcludedProfiles(body.routingManagedExcludedProfiles))
+      updates.routingManagedExcludedProfiles = parseRoutingExcludedProfiles(body.routingManagedExcludedProfiles)
     }
+    if (Object.keys(updates).length > 0) saveSettings(updates)
     if (body.routingExcludedProfiles !== undefined || body.routingManagedExcludedProfiles !== undefined) {
       reconcileActiveProfileWithExclusions()
     }
@@ -9324,11 +9329,37 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // auth resolved by the design module (design token first, then profile
   // credentials).
   app.post("/v1/design/*", async (c) => {
-    const profile = resolveProfile(
+    const requestedProfileId = c.req.header("x-meridian-profile") || undefined
+    const routingAccess = evaluateRoutingProfileAccess({
+      profiles: getEffectiveProfiles(finalConfig.profiles),
+      defaultProfile: finalConfig.defaultProfile,
+      purpose: "work",
+      explicitProfileId: requestedProfileId,
+      excludedProfileIds: routingExcludedProfileIds(),
+    })
+    switch (routingAccess.access.kind) {
+      case "explicit_excluded":
+        return profileExcludedResponse(routingAccess.access.profileId)
+      case "no_eligible_profiles":
+        return noEligibleProfilesResponse()
+      case "allowed":
+        break
+      default: {
+        const exhaustive: never = routingAccess.access
+        return exhaustive
+      }
+    }
+    const resolved = resolveProfile(
       finalConfig.profiles,
-      finalConfig.defaultProfile,
-      c.req.header("x-meridian-profile") || undefined
+      routingAccess.defaultProfile ?? finalConfig.defaultProfile,
+      requestedProfileId
     )
+    // An unpinned request resolves through the active profile, which the
+    // exclusion list may name; send it to an eligible account rather than the
+    // one the operator took out of service.
+    const profile = routingAccess.excludedProfileIds.includes(resolved.id)
+      ? resolveProfile(finalConfig.profiles, undefined, routingAccess.profiles[0]?.id)
+      : resolved
     const url = new URL(c.req.url)
     const upstreamUrl = `${DESIGN_UPSTREAM_ORIGIN}${url.pathname}${url.search}`
 

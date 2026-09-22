@@ -107,7 +107,20 @@ describe("auth audit: every registered prefix is protected when MERIDIAN_API_KEY
   //                   unhealthy the moment MERIDIAN_API_KEY is set, so an auth
   //                   setting would become a total outage of whatever sits in
   //                   front - the failure this pair exists to prevent.
-  const PUBLIC_PREFIXES = new Set(["/", "/health", "/livez", "/readyz"])
+  //
+  // The review for `/callback`:
+  //
+  //   what it is      the OAuth loopback redirect. Anthropic sends the user's
+  //                   BROWSER here with `code` and `state` after sign-in.
+  //   why not gated   a browser redirect carries no `x-api-key`, so gating it
+  //                   would make web sign-in impossible on exactly the
+  //                   instances that set MERIDIAN_API_KEY.
+  //   what guards it  the 256-bit `state` minted when that login started is the
+  //                   only way to reach a login id (`loginIdByState` in
+  //                   profileLogin.ts), and redeeming the code additionally
+  //                   needs the PKCE verifier, which never leaves this process.
+  //                   A caller without both gets a rejection, not a login.
+  const PUBLIC_PREFIXES = new Set(["/", "/health", "/livez", "/readyz", "/callback"])
 
   it("rejects unauthenticated requests to every non-public route prefix", async () => {
     const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })

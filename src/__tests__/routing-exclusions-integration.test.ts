@@ -2,7 +2,10 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { assistantMessage } from "./helpers"
+import { assistantMessage, withMockSdkSessionId } from "./helpers"
+import { installSdkMock } from "./sdkMock"
+import { installLoggerMock } from "./loggerMock"
+import { installMcpToolsMock } from "./mcpToolsMock"
 
 type QueryCall = {
   readonly oauthToken?: string
@@ -13,7 +16,7 @@ type QueryCall = {
 
 let queryCalls: QueryCall[] = []
 
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+installSdkMock(() => ({
   query: (params: { prompt: string | AsyncIterable<unknown>; options?: { env?: Record<string, string>; model?: string; resume?: string } }) => {
     const call: QueryCall = {
       oauthToken: params.options?.env?.CLAUDE_CODE_OAUTH_TOKEN,
@@ -35,43 +38,30 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
           }
         }
       }
-      yield assistantMessage([{ type: "text", text: "ok" }])
+      yield withMockSdkSessionId(assistantMessage([{ type: "text", text: "ok" }]), params.options)
     })()
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
-}))
+}), "routing-exclusions-integration.test.ts")
 
-mock.module("../logger", () => ({
+installLoggerMock(() => ({
   claudeLog: () => {},
   withClaudeLogContext: (_context: unknown, run: () => unknown) => run(),
 }))
 
-mock.module("../mcpTools", () => ({
+installMcpToolsMock(() => ({
   createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }),
 }))
 
+// mock.module is process-global and runs during the load phase, so a partial
+// module here becomes every other file's models module for the whole run.
+// Spread the real one and override only what must not reach the host: the auth
+// probe and the `claude` executable lookup.
+const actualModels = await import("../proxy/models")
 mock.module("../proxy/models", () => ({
-  CANONICAL_SONNET_MODEL: "claude-sonnet-4-6",
-  expireAuthStatusCache: () => {},
-  explicitModelPin: () => ({}),
-  getAuthCacheInfo: () => ({ lastCheckedAt: 0, lastSuccessAt: 0, isFailure: false }),
+  ...actualModels,
   getClaudeAuthStatusAsync: async () => ({ loggedIn: true, subscriptionType: "max" }),
-  getResolvedClaudeExecutableInfo: () => null,
-  hasExtendedContext: () => false,
-  isClosedControllerError: () => false,
-  mapModelToClaudeModel: (model: string) => model,
-  recordExtendedContextUnavailable: () => {},
-  resolveClaudeExecutableAsync: async () => "claude",
-  resolveClaudeExecutableSync: () => ({ path: "claude", source: "path" }),
-  resolveSdkModelDefaults: () => ({
-    ANTHROPIC_DEFAULT_FABLE_MODEL: "fable",
-    ANTHROPIC_DEFAULT_OPUS_MODEL: "opus",
-    ANTHROPIC_DEFAULT_SONNET_MODEL: "sonnet",
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: "haiku",
-  }),
-  stripExtendedContext: (model: string) => model,
-  subscriptionIncludesExtendedContext: () => false,
 }))
 
 const designDir = mkdtempSync(join(tmpdir(), "meridian-routing-exclusions-"))
@@ -589,7 +579,7 @@ describe("Design and warm routing", () => {
     expect(response.status).toBe(200)
     expect(queryCalls).toHaveLength(1)
     expect(queryCalls[0]?.oauthToken).toBe("token-work")
-    expect(queryCalls[0]?.model).toBe("claude-haiku-4-5")
+    expect(queryCalls[0]?.model).toBe("haiku")
     expect(queryCalls[0]?.promptTexts).toEqual(["hi"])
   })
 

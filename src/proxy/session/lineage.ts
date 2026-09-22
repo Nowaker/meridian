@@ -404,6 +404,7 @@ export function formatLineageMismatch(mismatch: LineageMismatch): string | undef
  * unaffected.
  */
 export type IndependentRequestCause =
+  | "warm-hop"
   | "fork-source"
   | "subagent"
   | "headerless-tool-result"
@@ -417,6 +418,10 @@ export type IndependentRequestCause =
  * decision it explains. Evaluation order mirrors the guards' own precedence.
  */
 export function independentRequestCause(input: {
+  /** A server-owned warm hop. It exists only to keep an account's prompt cache
+   *  alive, so it must neither resume a session nor leave one for real work to
+   *  resume — its fixed two-token prompt would become that work's history. */
+  warmHop?: boolean
   /** An explicit session key. Distinct flows carry distinct keys, so a keyed
    *  request cannot collide and never needs the independence guard. */
   hasSessionKey: boolean
@@ -430,6 +435,7 @@ export function independentRequestCause(input: {
    *  Image-only and otherwise text-free headerless requests have neither. */
   hasDurableKey: boolean
 }): IndependentRequestCause | undefined {
+  if (input.warmHop) return "warm-hop"
   if (!input.hasSessionKey && input.forkSource) return "fork-source"
   if (!input.hasSessionKey && input.isSubagent) return "subagent"
   if (input.clientDrivenLoop) return "headerless-tool-result"
