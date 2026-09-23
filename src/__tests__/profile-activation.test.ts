@@ -3,27 +3,24 @@ import { activateProfile, type ProfileActivationDeps } from "../proxy/profileAct
 
 function rig(activeProfile: string | undefined) {
   let active = activeProfile
-  let cacheClears = 0
   const events: Array<{ event: string; fields: Record<string, unknown> }> = []
   const lines: string[] = []
   const deps: ProfileActivationDeps = {
     getActiveProfileId: () => active,
     setActiveProfile: profileId => { active = profileId },
     clearActiveProfile: () => { active = undefined },
-    clearSessionCache: () => { cacheClears += 1 },
     logEvent: (event, fields) => { events.push({ event, fields }) },
     logLine: message => { lines.push(message) },
   }
-  return { deps, active: () => active, cacheClears: () => cacheClears, events, lines }
+  return { deps, active: () => active, events, lines }
 }
 
 describe("activateProfile", () => {
-  it("sets the profile, clears cached sessions, and attributes the transition", () => {
+  it("sets the profile and attributes the transition", () => {
     const r = rig("old")
     activateProfile("new", { source: "profiles-api", userAgent: "client" }, r.deps)
 
     expect(r.active()).toBe("new")
-    expect(r.cacheClears()).toBe(1)
     expect(r.events).toEqual([{
       event: "profile.switched",
       fields: {
@@ -42,7 +39,6 @@ describe("activateProfile", () => {
     activateProfile(undefined, { source: "routing-exclusions" }, r.deps)
 
     expect(r.active()).toBeUndefined()
-    expect(r.cacheClears()).toBe(1)
     expect(r.events[0]?.fields.to).toBeNull()
   })
 })
