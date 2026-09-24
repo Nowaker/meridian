@@ -911,11 +911,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     let activeTranscriptLease: Awaited<ReturnType<typeof acquireActiveTranscriptLease>> | undefined
     let processGate: Awaited<ReturnType<typeof createSdkProcessGate>> | undefined
     let writerJoined = true
+    const admissionLifecycleOptions = { ...sessionGcOptions, admissionSignal: signal }
     try {
       for (const locator of activeLocators) {
-        await ensureTranscriptJournaled(locator, sessionGcOptions)
+        await ensureTranscriptJournaled(locator, admissionLifecycleOptions)
       }
-      activeTranscriptLease = await acquireActiveTranscriptLease(activeLocators, sessionGcOptions)
+      activeTranscriptLease = await acquireActiveTranscriptLease(activeLocators, admissionLifecycleOptions)
+      signal.throwIfAborted()
       // Unit SDK doubles never create an OS child. Production and real E2E runs
       // always use the gated exact-incarnation writer path.
       if (process.env.MERIDIAN_TEST_DISABLE_SDK_PROCESS_GATE !== "1") {
@@ -924,7 +926,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           (executor, recoverableAfterCrash) => attachActiveTranscriptExecutor(
             activeTranscriptLease!,
             executor,
-            sessionGcOptions,
+            admissionLifecycleOptions,
             recoverableAfterCrash,
           ),
           params.options?.stderr,
@@ -932,6 +934,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         params.options ??= {}
         params.options.spawnClaudeCodeProcess = processGate.spawnClaudeCodeProcess
       }
+      signal.throwIfAborted()
       sdkQuery = query(params)
       yield* guardUpstreamIdle(sdkQuery, UPSTREAM_IDLE_MS, (sinceLastMs) =>
         claudeLog("upstream.stalled", { mode, sinceLastMs }))
@@ -1493,6 +1496,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     // spans queue retries and profile-failover re-entries; create one only
     // when no outer link exists (direct in-process callers).
     const requestAbort = options.requestAbortLink ?? linkRequestAbort(requestSignal)
+    const admissionLifecycleOptions = { ...sessionGcOptions, admissionSignal: requestAbort.controller.signal }
     let streamOwnsAbortLink = false
 
     return withClaudeLogContext({ requestId: requestMeta.requestId, endpoint: requestMeta.endpoint }, async () => {
@@ -1654,7 +1658,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // Promote under the lifecycle lock before publishing the mapping. A
         // crash here leaves an unpinned live resource that reconciliation can
         // retire; the reverse order could expose a mapping to a deleted target.
-        await commitFork(managedForkTarget, sessionGcOptions)
+        await commitFork(managedForkTarget, admissionLifecycleOptions)
         managedForkCommitted = true
       }
 
@@ -3036,7 +3040,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 mappingExpectedGeneration ?? undefined,
               )
             },
-            sessionGcOptions,
+            admissionLifecycleOptions,
           )
           : false
         if (!attachedGeneration) {
@@ -3046,8 +3050,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // Journal both ownership and the chosen target before query() can create
         // a fork file. This closes the crash window where the SDK file exists
         // but no emitted event or shared mapping names it yet.
-        managedForkSource = await registerLiveTranscript(managedForkSource, sessionGcOptions)
-        managedForkTarget = await prepareForkForPublication(managedForkTarget, sessionGcOptions)
+        managedForkSource = await registerLiveTranscript(managedForkSource, admissionLifecycleOptions)
+        managedForkTarget = await prepareForkForPublication(managedForkTarget, admissionLifecycleOptions)
         claudeLog("session.fork_prepared", {
           sourceSessionId: managedForkSource.sessionId,
           targetSessionId: managedForkTarget.sessionId,
@@ -3075,7 +3079,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         managedForkTarget = transcriptLocator(randomUUID())
         managedFreshTarget = true
         releaseManagedForkPins = pinActiveSessionGcLocators(managedForkTarget)
-        managedForkTarget = await prepareForkForPublication(managedForkTarget, sessionGcOptions)
+        managedForkTarget = await prepareForkForPublication(managedForkTarget, admissionLifecycleOptions)
         claudeLog("session.fresh_prepared", { targetSessionId: managedForkTarget.sessionId })
       }
 
@@ -4595,6 +4599,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   await commitManagedFork()
                   let mappingStored: false | StoredSessionGeneration
                   try {
+                    assertDurableWritesAllowed()
                     mappingStored = await publishPinnedTranscript(
                       publicationTranscriptLocator(currentSessionId!),
                       () => {
@@ -4625,7 +4630,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         }
                         return stored
                       },
-                      sessionGcOptions,
+                      admissionLifecycleOptions,
                     )
                   } catch (error) {
                     if (
@@ -5809,6 +5814,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 } else {
                   validateManagedForkResult(currentSessionId)
                   await commitManagedFork()
+                  assertDurableWritesAllowed()
                   const mappingStored = await publishPinnedTranscript(
                     publicationTranscriptLocator(currentSessionId!),
                     () => {
@@ -5839,7 +5845,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       }
                       return stored
                     },
-                    sessionGcOptions,
+                    admissionLifecycleOptions,
                   )
                   if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
                     if (
@@ -5982,7 +5988,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                           mappingExpectedGeneration ?? undefined,
                         )
                       },
-                      sessionGcOptions,
+                      admissionLifecycleOptions,
                     )
                     : false
                   if (!recoveryAttachedGeneration) {
@@ -5991,8 +5997,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   mappingExpectedGeneration = recoveryAttachedGeneration
                   recoveryForkTarget = transcriptLocator(randomUUID())
                   releaseRecoveryForkPins = pinActiveSessionGcLocators(recoveryForkSource, recoveryForkTarget)
-                  recoveryForkSource = await registerLiveTranscript(recoveryForkSource, sessionGcOptions)
-                  recoveryForkTarget = await prepareForkForPublication(recoveryForkTarget, sessionGcOptions)
+                  recoveryForkSource = await registerLiveTranscript(recoveryForkSource, admissionLifecycleOptions)
+                  recoveryForkTarget = await prepareForkForPublication(recoveryForkTarget, admissionLifecycleOptions)
                   try {
                   // Protect recovery parallel calls with the same deny hold as
                   // the main stream. Producer hooks can run before the first
@@ -6141,7 +6147,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   !isIndependentSession && !sawDuplicateToolUse
                 ) {
                   const recoverySdkUuidMap = allMessages.map(() => null)
-                  await commitFork(recoveryForkTarget, sessionGcOptions)
+                  await commitFork(recoveryForkTarget, admissionLifecycleOptions)
+                  assertDurableWritesAllowed()
                   const recoveryMappingStored = await publishPinnedTranscript(
                     recoveryForkTarget,
                     () => {
@@ -6167,7 +6174,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       }
                       return stored
                     },
-                    sessionGcOptions,
+                    admissionLifecycleOptions,
                   )
                   if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
                     if (
@@ -6878,6 +6885,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 if (recoverableCheckpoint) {
                   validateManagedForkResult(currentSessionId)
                   await commitManagedFork()
+                  assertDurableWritesAllowed()
                   const mappingStored = await publishPinnedTranscript(
                     publicationTranscriptLocator(currentSessionId!),
                     () => {
@@ -6908,7 +6916,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       }
                       return stored
                     },
-                    sessionGcOptions,
+                    admissionLifecycleOptions,
                   )
                   if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
                     if (
