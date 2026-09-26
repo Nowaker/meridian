@@ -478,6 +478,19 @@ E2E tests (`E2E.md`) should be run before releases or after major refactors.
 
 Publication leases use the existing unarmed active-lease representation with `purpose: "publication"`. Older collectors also retain them while the owner process is alive; exact process-incarnation death permits recovery. They do not count as exclusive SDK writers, and abandoning publication never removes an actual writer lease. Published transcripts are retained by their durable mappings and become collectible after eviction.
 
+An SDK writer lease is released once its writer has been joined. If the lifecycle lock is busy at that point, the next GC sweep, including the shutdown sweep, retries the release; the completed turn does not fail. On win32 an executor's death does not prove its descendants gone, so a writer lease left by a crashed proxy is recovered only after the host reboots.
+
+`session/lifecycleLockQueue.ts` admits lifecycle transactions in a per-lock-path
+FIFO with at most 256 waiting callers. Local waiting does not consume the
+two-second external-lock acquisition budget; only the head creates a durable
+candidate. A holder stalled for 60 seconds rejects queued/new callers without
+unlocking or abandoning its transaction. Capacity and stalled-holder errors are
+distinct, defined in the dependency-leaf `session/lifecycleErrors.ts`.
+Request admission signals remove queued work and cancel external acquisition,
+but a running durable callback always finishes before returning ownership.
+Cleanup never receives the canceled admission signal. Publication callbacks
+remain synchronous; same-context recursive acquisition is rejected explicitly.
+
 ## Lineage hash encoding
 
 `session/lineage.ts` hashes structured v2 records with separate history, message and block domains. Records preserve roles, block and message boundaries, tool call identity/arguments, and result identity/error status. JSON object keys are canonicalized; plain text and a single text block remain equivalent, and opaque thinking/cache hints remain excluded. Display-oriented `normalizeContent` is not a lineage proof.

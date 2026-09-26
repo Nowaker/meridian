@@ -696,24 +696,24 @@ function render(data, quotaData) {
     html += '<div class="profile-card' + (isActive ? ' active' : '') + '" data-id="' + esc(p.id) + '" data-index="' + idx + '">';
     html += '<div class="profile-card-header">';
     if (editingProfile === p.id) {
-      html += '<input class="rename-input" id="rename-input" value="' + esc(p.id) + '" spellcheck="false" autocomplete="off"'
-        + ' onkeydown="if(event.key===&quot;Enter&quot;){event.preventDefault();commitRename(&quot;' + esc(p.id) + '&quot;)}'
-        + 'else if(event.key===&quot;Escape&quot;){cancelRename()}">';
-      html += '<span class="rename-hint">Enter to save · Esc to cancel</span>';
-      html += '<span class="profile-card-actions">';
-      html += '<button class="icon-btn" title="Save new name" onclick="commitRename(&quot;'+esc(p.id)+'&quot;)">' + ICON_CHECK + '</button>';
-      html += '<button class="icon-btn" title="Cancel" onclick="cancelRename()">' + ICON_X + '</button>';
-      html += '</span>';
+      html += "<input class=\\"rename-input\\" id=\\"rename-input\\" value=\\"" + esc(p.id) + "\\" spellcheck=\\"false\\" autocomplete=\\"off\\""
+        + " onkeydown=\\"if(event.key===&quot;Enter&quot;){event.preventDefault();commitRename(&quot;" + esc(p.id) + "&quot;)}"
+        + "else if(event.key===&quot;Escape&quot;){cancelRename()}\\">";
+      html += "<span class=\\"rename-hint\\">Enter to save \u00b7 Esc to cancel</span>";
+      html += "<span class=\\"profile-card-actions\\">";
+      html += "<button class=\\"icon-btn\\" title=\\"Save new name\\" onclick=\\"commitRename(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_CHECK + "</button>";
+      html += "<button class=\\"icon-btn\\" title=\\"Cancel\\" onclick=\\"cancelRename()\\">" + ICON_X + "</button>";
+      html += "</span>";
     } else {
       if (reorderable) html += meridianReorder.handleHtml(p.id, idx, profiles.length);
-      html += '<span class="profile-name">' + esc(p.id) + '</span>';
-      if (isActive) html += '<span class="profile-badge badge-active">active</span>';
-      html += '<span class="profile-badge badge-type">' + esc(p.type || 'claude-max') + '</span>';
+      html += "<span class=\\"profile-name\\">" + esc(p.id) + "</span>";
+      if (isActive) html += "<span class=\\"profile-badge badge-active\\">active</span>";
+      html += "<span class=\\"profile-badge badge-type\\">" + esc(p.type || "claude-max") + "</span>";
       html += renderSpentBadge((quotaById[p.id] || {}).spent);
-      html += '<span class="profile-card-actions">';
-      html += '<button class="icon-btn" title="Rename profile" onclick="startRename(&quot;'+esc(p.id)+'&quot;)">' + ICON_PENCIL + '</button>';
-      html += '<button class="icon-btn danger" title="Remove profile" onclick="startRemove(&quot;'+esc(p.id)+'&quot;)">' + ICON_TRASH + '</button>';
-      html += '</span>';
+      html += "<span class=\\"profile-card-actions\\">";
+      html += "<button class=\\"icon-btn\\" title=\\"Rename profile\\" onclick=\\"startRename(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_PENCIL + "</button>";
+      html += "<button class=\\"icon-btn danger\\" title=\\"Remove profile\\" onclick=\\"startRemove(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_TRASH + "</button>";
+      html += "</span>";
     }
     html += '</div>';
     html += renderSpentNote((quotaById[p.id] || {}).spent);
