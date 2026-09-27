@@ -6,6 +6,32 @@ Live tests against the real proxy + Claude Max SDK. These verify the full reques
 
 > **Droid tests (D1–D10)** additionally require `droid` installed (`droid --version` ≥ 0.89.0) and a Factory AI account for BYOK configuration. Tests D1–D10 cover internal mode (the default). Passthrough mode for Droid is opt-in via `MERIDIAN_PASSTHROUGH=1` and requires `droid` ≥ 0.109 — see "Droid passthrough mode" below.
 
+## Local build provenance
+
+```sh
+npm run build
+node scripts/e2e-build-provenance.mjs
+```
+
+Run only in an isolated Git checkout, not the checkout of a running service:
+the harness rebuilds `dist` three times. It uses the bundled Node HTTP server
+on an ephemeral loopback port with temporary home state. No model calls or
+service restarts are needed. It verifies the bundled observation worker,
+`current`, three successful counter increments, `3 builds behind`, unchanged
+runtime identity and 30 concurrent cached status requests. Unit tests cover
+dirty/source state, failed certification, rollback, independent worktrees,
+unavailable metadata and safe provenance links. Browser fixture QA covers
+the shared header at 375, 768 and 1280 pixels and npm unchanged behavior.
+
+**Verified 2026-09-26:** Linux, Node bundled server: runtime build #8 remained
+immutable while actual builds #9, #10 and #11 completed. `/build-status` reported
+`behind` with `buildsBehind: 3`; all 30 concurrent requests returned 200.
+Typecheck and build passed. Full `npm test` timed out in session-lifecycle
+tests; an untouched upstream worktree also timed out, and targeted upstream
+retry tests reproduced four idle/busy/extra-usage timing failures. This is not
+a green full-suite claim. Deployment and browser verification on meridian-dev
+remain gated on its owner's source-versus-bundled runtime decision.
+
 ## Antigravity subscription CLI backend
 
 ```sh
