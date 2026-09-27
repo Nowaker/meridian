@@ -13,16 +13,17 @@ import { canCertifyBuild } from "../../scripts/build"
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
 
+function git(root: string, ...args: string[]): void {
+  const result = spawnSync("git", args, { cwd: root, encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_AUTHOR_NAME: "Test Fixture", GIT_AUTHOR_EMAIL: "fixture@example.invalid", GIT_COMMITTER_NAME: "Test Fixture", GIT_COMMITTER_EMAIL: "fixture@example.invalid" } })
+  if (result.status !== 0) throw new Error("Fixture Git command failed")
+}
 function fixture(): string {
   const root = mkdtempSync(join(tmpdir(), "meridian-build-test-"))
   roots.push(root)
   writeFileSync(join(root, "package.json"), '{"version":"1.2.3"}')
   writeFileSync(join(root, ".gitignore"), "dist/\n")
   writeFileSync(join(root, "input.ts"), "export const value = 1\n")
-  for (const args of [["init", "-b", "main"], ["add", "."], ["commit", "-m", "fixture"], ["tag", "meridian-v1.2.3"]]) {
-    const result = spawnSync("git", args, { cwd: root, encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_AUTHOR_NAME: "Test Fixture", GIT_AUTHOR_EMAIL: "fixture@example.invalid", GIT_COMMITTER_NAME: "Test Fixture", GIT_COMMITTER_EMAIL: "fixture@example.invalid" } })
-    if (result.status !== 0) throw new Error("Fixture Git command failed")
-  }
+  for (const args of [["init", "-b", "main"], ["add", "."], ["commit", "-m", "fixture"], ["tag", "meridian-v1.2.3"]]) git(root, ...args)
   return root
 }
 function output(root: string): void {
@@ -74,6 +75,16 @@ describe("certified local builds", () => {
     while (loaded.status().state === "unknown" && performance.now() < deadline) await new Promise<void>(resolve => setImmediate(resolve))
     expect(loaded.status().state).toBe("source-changed")
     expect(loaded.info()).toEqual(initial)
+  })
+  test("a reachable tag older than package.json is not reported as the release base", () => {
+    const root = fixture()
+    writeFileSync(join(root, "package.json"), '{"version":"1.3.0"}')
+    git(root, "commit", "-am", "release 1.3.0 without a fetched tag")
+    const info = runtime(root).info()
+    expect(info.releaseVersion).toBeUndefined()
+    expect(info.displayVersion).toBe("1.3.0+source")
+    git(root, "tag", "meridian-v1.3.0")
+    expect(runtime(root).info()).toMatchObject({ releaseVersion: "1.3.0", displayVersion: "1.3.0+source" })
   })
   test("reads do not create a store or adopt an unrelated parent worktree", () => {
     const root = fixture()
