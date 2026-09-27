@@ -11,7 +11,9 @@
  * that already satisfies the backend (Codex CLI's) passes with `applied` empty.
  *
  * Measured against the live backend on 2026-09-27: a request with no
- * `instructions` is served, so the client's system/developer text is NOT moved.
+ * `instructions` is served and `system` role input is accepted, so the
+ * client's system/developer text is NOT moved; `max_output_tokens` is refused
+ * with 400 "Unsupported parameter", so it is removed.
  *
  * Pure: no I/O, and the input object is not mutated.
  */
@@ -23,6 +25,8 @@ export type BodyAdaptation =
   | "stream=true"
   /** With store=false, reasoning survives across turns only as encrypted content the client carries back. */
   | "include+reasoning.encrypted_content"
+  /** The backend refuses it (400 "Unsupported parameter: max_output_tokens"); the cap cannot be honoured there. */
+  | "-max_output_tokens"
 
 export interface AdaptedBody {
   body: Record<string, unknown>
@@ -49,6 +53,10 @@ export function adaptResponsesBody(input: Record<string, unknown>): AdaptedBody 
   if (!include.includes(ENCRYPTED_REASONING)) {
     body.include = [...include, ENCRYPTED_REASONING]
     applied.push("include+reasoning.encrypted_content")
+  }
+  if ("max_output_tokens" in body) {
+    delete body.max_output_tokens
+    applied.push("-max_output_tokens")
   }
 
   return { body, clientWantsStream: input.stream === true, applied }
