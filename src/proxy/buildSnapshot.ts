@@ -3,6 +3,7 @@ import { createHash } from "node:crypto"
 import { readFileSync, lstatSync, readlinkSync } from "node:fs"
 import { join, resolve } from "node:path"
 import { z } from "zod"
+import { compareVersions } from "./buildInfo"
 import { repositoryLinks } from "./localBuildInfo"
 
 export class BuildProvenanceError extends Error {
@@ -44,8 +45,10 @@ export function snapshotSource(root: string) {
   catch (error) { if (!(error instanceof BuildProvenanceError)) throw error }
   try {
     const tag = gitOutput(root, ["describe", "--tags", "--abbrev=0", "--match", "meridian-v[0-9]*", "--match", "v[0-9]*"])
-    const parsed = /^(?:meridian-)?v(\d+\.\d+\.\d+(?:-[\w.-]+)?)$/.exec(tag)
-    releaseVersion = parsed?.[1]
+    const tagVersion = /^(?:meridian-)?v(\d+\.\d+\.\d+(?:-[\w.-]+)?)$/.exec(tag)?.[1]
+    // The release commit bumps package.json, so a reachable tag older than it
+    // means newer tags were never fetched, not that the tree descends from it.
+    if (tagVersion && compareVersions(tagVersion, version) >= 0) releaseVersion = tagVersion
   } catch (error) { if (!(error instanceof BuildProvenanceError)) throw error }
   return {
     version, sha, ...(branch !== "HEAD" ? { branch } : {}), dirty: status.length > 0,

@@ -324,7 +324,7 @@ indistinguishable from one serving the published version.
 | `version` | The `package.json` version. Proof of what is running **only** when `source` is `npm`. |
 | `sha`, `branch`, `dirty` | Captured from the local tree at build/startup, or from launcher stamps when no Git snapshot is available. `dirty` describes that captured tree, not later edits. |
 | `kind` | Local execution: `artifact` for bundled output, `source` for direct TypeScript execution. |
-| `releaseVersion` | Reachable release tag at build/startup, when available. Never an invented next release. |
+| `releaseVersion` | Reachable release tag at build/startup, when available and not older than `package.json` (an older one means newer tags were never fetched). Never an invented next release. |
 | `counter`, `counterScope` | Successful local build ordinal and its worktree-specific history ID. Absent for source runs or unverifiable artifacts. Compare counters only within the same scope. |
 | `attemptId`, `certification` | Embedded artifact identity and its verification result. A process never adopts a newer artifact's identity after startup. |
 | `branchUrl`, `commitUrl` | Public GitHub/GitLab links derived from the checkout's origin, without credentials, query strings or fragments. A dirty build links to its base commit, not its uncommitted edits. |
