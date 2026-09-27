@@ -803,6 +803,22 @@ ANTHROPIC_API_KEY=your-secret-key ANTHROPIC_BASE_URL=http://meridian-host:3456 o
 | `meridian profile login <name> [--headless]` | Re-authenticate an expired profile, adding it first if that name has no profile yet (browser-login profiles only); `--headless` uses the URL/code flow |
 | `meridian profile remove <name>` | Remove a profile and its credentials |
 | `meridian refresh-token` | Manually refresh the Claude OAuth token (exits 0/1) |
+| `meridian chatgpt-migrate [--dry-run] [--step <steps>]` | Move ChatGPT accounts from oc-codex-multi-auth and opencode's OpenAI login into Meridian's store. See [ChatGPT migration](#chatgpt-migration) |
+
+## ChatGPT migration
+
+`meridian chatgpt-migrate` hands ChatGPT subscription accounts from oc-codex-multi-auth (and opencode's own `openai` OAuth login in `auth.json`) to Meridian. Refresh tokens are single-use, so exactly one program may refresh each account; the command moves that authority rather than copying it.
+
+| Step | What it does |
+|------|--------------|
+| `processes` | Lists running opencode processes that still hold the tokens in memory: those whose effective config loads the plugin, and, while `auth.json` holds an OpenAI login, every opencode process. systemd units are named with the command that stops them. Nothing is killed |
+| `import` | Reads every copy of every account (global and per-project stores, flagged store, `backups/`, keychain entries with `CODEX_KEYCHAIN=1` or `--keychain`, `auth.json`) and writes the freshest token per seat into Meridian's store. Accounts found only in backups need `--include-backup-only` |
+| `strip` | Removes the refresh tokens from the plugin's stores under its own locks, removes the `openai` OAuth entry from `auth.json`, and moves `backups/` aside. Each original is kept as `<name>.meridian-backup` (mode 0600). A seat Meridian does not hold yet is refused |
+| `plugin` | Removes oc-codex-multi-auth from every opencode config that loads it, global and project-level, keeping comments |
+| `provider` | Sets `provider.<id>.options.baseURL` (default provider `openai`, `--provider` to change) to Meridian in the global config file that takes precedence |
+| `validate` | Checks through the running Meridian that each account reports its quota; `--test-prompt` also sends one short prompt on the cheapest model |
+
+Steps run in that order; `--step import,strip` runs a subset. `import` and `strip` refuse while a process holds the tokens unless `--force`. Run with `--dry-run` first: it reads everything, writes nothing, and never prints a token. After `import`, run Meridian with `MERIDIAN_CHATGPT_CREDENTIALS=owned` (or unset) so it refreshes the accounts, and restart opencode after `plugin` and `provider`.
 
 ## SDK Feature Toggles (Experimental)
 

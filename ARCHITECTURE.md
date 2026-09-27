@@ -75,6 +75,12 @@ server orchestration. The build packages self-contained retry integrations under
 `dist/antigravity-clients`; npm, Nix and Docker installations carry those assets.
 Setup prepares edits before writing, preserves unrelated settings, rejects malformed
 or conflicting input, creates private backups and uses per-file atomic replacement.
+`chatgpt/migrate/` implements `meridian chatgpt-migrate`: credential discovery
+(`sources.ts`), /proc scanning (`processes.ts`), opencode config resolution and
+jsonc editing (`opencodeConfig.ts`), stripping under oc-codex-multi-auth's own
+locks (`strip.ts`, `files.ts`) and the owned-store adapter (`ownedStore.ts`),
+which writes only through `chatgpt/credentials.ts` under the writer lease. The
+server never imports it.
 `telemetry/providerSetup.ts` shares pure command generation and setup presentation
 between the web provider page and desktop. Desktop clipboard requests contain
 choices rather than arbitrary text; the main process validates them against its

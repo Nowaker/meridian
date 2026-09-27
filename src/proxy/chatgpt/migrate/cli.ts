@@ -1,0 +1,175 @@
+/**
+ * Argument parsing for `meridian chatgpt-migrate`. Lives under `src/` so the
+ * typecheck and the tests cover it; `bin/cli.ts` only dispatches here.
+ */
+
+import { homedir } from "node:os"
+import { resolve } from "node:path"
+import { loadNativeKeychainBackend } from "./keychain"
+import { environmentFromProcess } from "./layout"
+import { createOwnedStoreAdapter } from "./ownedStore"
+import { chatGptStorePath } from "../paths"
+import {
+  MIGRATION_STEPS,
+  defaultOpencodeDatabasePath,
+  runMigration,
+  type MigrationOptions,
+  type MigrationStep,
+} from "./migrate"
+
+export const MIGRATE_USAGE = `Move ChatGPT subscription accounts from oc-codex-multi-auth (and opencode's
+own OpenAI login) into Meridian, step by step.
+
+  meridian chatgpt-migrate [--dry-run] [--step <steps>] [options]
+
+Steps, run in this order (default: all):
+  processes   List running opencode processes that still hold refresh tokens
+  import      Copy the freshest token of every account into Meridian's store
+  strip       Remove refresh tokens from the plugin and opencode's auth.json
+              (originals kept as <name>.meridian-backup, mode 0600)
+  plugin      Remove oc-codex-multi-auth from every opencode config
+  provider    Point an opencode provider at Meridian
+  validate    Check every imported account through the running Meridian
+
+Options:
+  --dry-run               Report what would change; write nothing
+  --step <a,b>            Run only these steps (repeatable)
+  --force                 Run import/strip although processes hold the tokens,
+                          or strip seats Meridian does not hold yet
+  --provider <id>         opencode provider to point at Meridian (default: openai)
+  --meridian-url <url>    Meridian's address (default: http://127.0.0.1:$MERIDIAN_PORT or :3456)
+  --base-url <url>        Exact provider baseURL (default: <meridian-url>/v1)
+  --api-key-env <VAR>     Write apiKey as {env:VAR} instead of a placeholder
+  --project <dir>         Also edit this project's opencode configs (repeatable)
+  --no-opencode-db        Do not read opencode's database for project directories
+  --store <path>          Meridian's ChatGPT store (default: $MERIDIAN_CHATGPT_STORE_PATH,
+                          else chatgpt-accounts.json in Meridian's config directory)
+  --include-backup-only   Import accounts found only in plugin backups
+  --keychain              Read the OS keychain even without CODEX_KEYCHAIN=1
+  --test-prompt           validate: also send one short prompt on the cheapest model
+  --test-model <id>       Model for --test-prompt (default: the cheapest one served)
+  -h, --help              This text
+
+No token value is ever printed.`
+
+export class MigrateUsageError extends Error {}
+
+export interface ParsedMigrateArgs {
+  help: boolean
+  steps: MigrationStep[]
+  dryRun: boolean
+  force: boolean
+  providerId: string
+  baseURL: string
+  meridianUrl: string
+  storePath: string | null
+  testModel: string | null
+  apiKey: string
+  projectDirs: string[]
+  useOpencodeDatabase: boolean
+  includeBackupOnly: boolean
+  keychain: boolean
+  testPrompt: boolean
+}
+
+function isStep(value: string): value is MigrationStep {
+  return (MIGRATION_STEPS as readonly string[]).includes(value)
+}
+
+export function parseMigrateArgs(argv: readonly string[], env: NodeJS.ProcessEnv): ParsedMigrateArgs {
+  const port = env.MERIDIAN_PORT ?? env.CLAUDE_PROXY_PORT ?? "3456"
+  let meridianUrl = `http://127.0.0.1:${port}`
+  let baseURL: string | undefined
+  let apiKeyEnv: string | undefined
+  const steps: MigrationStep[] = []
+  const parsed: ParsedMigrateArgs = {
+    help: false, steps, dryRun: false, force: false, providerId: "openai", baseURL: "", meridianUrl: "", storePath: null, testModel: null, apiKey: "meridian",
+    projectDirs: [], useOpencodeDatabase: true, includeBackupOnly: false, keychain: false, testPrompt: false,
+  }
+  const value = (index: number, flag: string): string => {
+    const next = argv[index + 1]
+    if (next === undefined || next.startsWith("--")) throw new MigrateUsageError(`${flag} needs a value`)
+    return next
+  }
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!
+    switch (arg) {
+      case "-h": case "--help": parsed.help = true; break
+      case "--dry-run": parsed.dryRun = true; break
+      case "--force": parsed.force = true; break
+      case "--include-backup-only": parsed.includeBackupOnly = true; break
+      case "--keychain": parsed.keychain = true; break
+      case "--test-prompt": parsed.testPrompt = true; break
+      case "--no-opencode-db": parsed.useOpencodeDatabase = false; break
+      case "--step":
+        for (const step of value(i, arg).split(",").map(part => part.trim()).filter(Boolean)) {
+          if (!isStep(step)) throw new MigrateUsageError(`unknown step "${step}" (steps: ${MIGRATION_STEPS.join(", ")})`)
+          steps.push(step)
+        }
+        i++
+        break
+      case "--provider": parsed.providerId = value(i, arg); i++; break
+      case "--meridian-url": meridianUrl = value(i, arg).replace(/\/+$/, ""); i++; break
+      case "--base-url": baseURL = value(i, arg); i++; break
+      case "--store": parsed.storePath = resolve(value(i, arg)); i++; break
+      case "--test-model": parsed.testModel = value(i, arg); i++; break
+      case "--api-key-env":
+        apiKeyEnv = value(i, arg)
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyEnv)) throw new MigrateUsageError(`--api-key-env needs a variable name, not "${apiKeyEnv}"`)
+        i++
+        break
+      case "--project": parsed.projectDirs.push(resolve(value(i, arg))); i++; break
+      default:
+        // A mistyped flag must not silently fall back to "run every step".
+        throw new MigrateUsageError(`unknown option "${arg}"`)
+    }
+  }
+  if (steps.length === 0) steps.push(...MIGRATION_STEPS)
+  parsed.meridianUrl = meridianUrl
+  parsed.baseURL = baseURL ?? `${meridianUrl}/v1`
+  if (!/^https?:\/\//.test(parsed.baseURL)) throw new MigrateUsageError(`the provider baseURL must be an http(s) URL, not "${parsed.baseURL}"`)
+  if (apiKeyEnv) parsed.apiKey = `{env:${apiKeyEnv}}`
+  return parsed
+}
+
+export async function runMigrateCli(argv: readonly string[]): Promise<number> {
+  let args: ParsedMigrateArgs
+  try {
+    args = parseMigrateArgs(argv, process.env)
+  } catch (error) {
+    if (!(error instanceof MigrateUsageError)) throw error
+    console.error(`chatgpt-migrate: ${error.message}\n\n${MIGRATE_USAGE}`)
+    return 2
+  }
+  if (args.help) {
+    console.log(MIGRATE_USAGE)
+    return 0
+  }
+  const env = environmentFromProcess(process.env, homedir())
+  const keychain = args.keychain || env.codexKeychain ? await loadNativeKeychainBackend() : null
+  if ((args.keychain || env.codexKeychain) && !keychain) {
+    console.log("The OS keychain could not be opened (@napi-rs/keyring is not installed); keychain entries were not checked.\n")
+  }
+  const options: MigrationOptions = {
+    env,
+    steps: args.steps,
+    dryRun: args.dryRun,
+    force: args.force,
+    providerId: args.providerId,
+    baseURL: args.baseURL,
+    apiKey: args.apiKey,
+    projectDirs: args.projectDirs,
+    opencodeDatabasePath: args.useOpencodeDatabase ? defaultOpencodeDatabasePath(env) : null,
+    includeBackupOnly: args.includeBackupOnly,
+    testPrompt: args.testPrompt,
+    store: createOwnedStoreAdapter({
+      storePath: args.storePath ?? chatGptStorePath(),
+      meridianUrl: args.meridianUrl,
+      apiKey: process.env.MERIDIAN_API_KEY || undefined,
+      ...(args.testModel ? { testModels: [args.testModel] } : {}),
+    }),
+    keychain,
+    log: line => console.log(line),
+  }
+  return (await runMigration(options)).exitCode
+}
