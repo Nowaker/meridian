@@ -1,14 +1,17 @@
 import { providerSetupHtml } from './providerSetup'
 /** Shared provider presentation for the web dashboard and native desktop renderer. */
+export type ProviderId = 'claude' | 'antigravity' | 'chatgpt'
+const PROVIDER_IDS: readonly ProviderId[] = ['claude', 'antigravity', 'chatgpt']
 export interface ProviderUsage {
-  id: 'claude' | 'antigravity'; name: string; enabled: boolean; status: string; endpoint: string;
+  id: ProviderId; name: string; enabled: boolean; status: string; endpoint: string;
   error?: string; models?: string[]; observedSince?: number;
   capabilities?: Array<{ name: string; status: string; detail: string }>;
   activity?: { requests: number; errors: number; inputTokens: number; outputTokens: number; cacheReadTokens: number };
   accounts: Array<{ id: string; active?: boolean; fetchedAt?: number; error?: string; windows: Array<{ type: string; group?: string; utilization: number; resetsAt: number }> }>;
 }
 export interface ProviderSnapshot { providers: ProviderUsage[]; fetchedAt: number }
-export type ProviderFilter = 'all' | 'claude' | 'antigravity'
+export type ProviderFilter = 'all' | ProviderId
+export function isProviderFilter(value: unknown): value is ProviderFilter { return value === 'all' || PROVIDER_IDS.includes(value as ProviderId) }
 /** Dependency-free validation: desktop builds independently of proxy packages. */
 export function parseProviderSnapshot(value: unknown): ProviderSnapshot {
   const fail = (): never => { throw new Error('Invalid provider response') }
@@ -23,9 +26,9 @@ export function parseProviderSnapshot(value: unknown): ProviderSnapshot {
   const input = object(value)
   return { fetchedAt: number(input.fetchedAt), providers: array(input.providers).map(value => {
     const p = object(value)
-    if (p.id !== 'claude' && p.id !== 'antigravity') return fail()
+    if (!PROVIDER_IDS.includes(p.id as ProviderId)) return fail()
     const activity = p.activity === undefined ? undefined : object(p.activity)
-    return { id: p.id, name: string(p.name), enabled: boolean(p.enabled), status: string(p.status), endpoint: string(p.endpoint), error: optionalString(p.error), models: p.models === undefined ? undefined : array(p.models).map(string), observedSince: optionalNumber(p.observedSince),
+    return { id: p.id as ProviderId, name: string(p.name), enabled: boolean(p.enabled), status: string(p.status), endpoint: string(p.endpoint), error: optionalString(p.error), models: p.models === undefined ? undefined : array(p.models).map(string), observedSince: optionalNumber(p.observedSince),
       capabilities: p.capabilities === undefined ? undefined : array(p.capabilities).map(value => { const capability = object(value); return { name: string(capability.name), status: string(capability.status), detail: string(capability.detail) } }),
       activity: activity && { requests: count(activity.requests), errors: count(activity.errors), inputTokens: count(activity.inputTokens), outputTokens: count(activity.outputTokens), cacheReadTokens: count(activity.cacheReadTokens) },
       accounts: array(p.accounts).map(value => {
@@ -40,16 +43,18 @@ export function parseProviderSnapshot(value: unknown): ProviderSnapshot {
 }
 export function providerOverview(data: ProviderSnapshot, filter: ProviderFilter = 'all'): string {
   const esc = (value: unknown) => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] ?? c)
-  const windowLabel = (value: string) => ({'gemini-weekly':'Weekly','3p-weekly':'Weekly','gemini-5h':'5 hours','3p-5h':'5 hours','five_hour':'5 hours','seven_day':'Weekly'})[value as 'gemini-weekly'] || value.replaceAll('_', ' ')
+  const windowLabel = (value: string) => ({'gemini-weekly':'Weekly','3p-weekly':'Weekly','gemini-5h':'5 hours','3p-5h':'5 hours','five_hour':'5 hours','seven_day':'Weekly','5h':'5 hours','7d':'Weekly','30d':'30 days'})[value as 'gemini-weekly'] || value.replaceAll('_', ' ')
+  const label = { claude: 'Claude', antigravity: 'Antigravity', chatgpt: 'ChatGPT' } as const
+  const eyebrow = { claude: 'Anthropic subscription', antigravity: 'Google subscription', chatgpt: 'OpenAI subscription' } as const
   const num = (value: number) => value.toLocaleString()
   const providers = data.providers.filter(p => filter === 'all' || p.id === filter)
   const active = providers.filter(p => p.enabled)
   const measured = active.filter(p => p.activity)
   const total = measured.reduce((sum, p) => ({ requests: sum.requests + p.activity!.requests, tokens: sum.tokens + p.activity!.inputTokens + p.activity!.outputTokens, errors: sum.errors + p.activity!.errors }), { requests: 0, tokens: 0, errors: 0 })
-  return `<div class="provider-tabs" role="group" aria-label="Provider filter">${(['all', 'claude', 'antigravity'] as const).map(id => `<button data-provider="${id}" aria-pressed="${filter === id}">${id === 'all' ? 'All providers' : id === 'claude' ? 'Claude' : 'Antigravity'}</button>`).join('')}</div>
+  return `<div class="provider-tabs" role="group" aria-label="Provider filter">${(['all', ...PROVIDER_IDS] as const).map(id => `<button data-provider="${id}" aria-pressed="${filter === id}">${id === 'all' ? 'All providers' : label[id]}</button>`).join('')}</div>
     <div class="provider-totals" aria-label="Observed activity"><div><span>Requests</span><strong>${measured.length ? num(total.requests) : '—'}</strong></div><div><span>Input + output tokens</span><strong>${measured.length ? num(total.tokens) : '—'}</strong></div><div><span>Errors</span><strong>${measured.length ? num(total.errors) : '—'}</strong></div></div>
     <p class="provider-caption">Observed activity over the past hour. Subscription allowances stay separate.${measured.length < active.length ? ' Some activity is unavailable; totals are partial.' : ''}</p>
-    <div class="provider-grid">${providers.map(p => `<article class="provider-card" data-provider-card="${p.id}"><header><div><span class="provider-eyebrow">${p.id === 'claude' ? 'Anthropic subscription' : 'Google subscription'}</span><h2>${esc(p.name)}</h2></div><span class="provider-state ${p.status === 'healthy' ? 'good' : ''}">${esc(p.enabled ? p.status : 'Not enabled')}</span></header>
+    <div class="provider-grid">${providers.map(p => `<article class="provider-card" data-provider-card="${p.id}"><header><div><span class="provider-eyebrow">${eyebrow[p.id]}</span><h2>${esc(p.name)}</h2></div><span class="provider-state ${p.status === 'healthy' ? 'good' : ''}">${esc(p.enabled ? p.status : 'Not enabled')}</span></header>
       ${p.enabled ? `<p class="provider-endpoint">${esc(p.endpoint)}</p>${p.error ? `<p class="provider-warning" role="status">${esc(p.error)}</p>` : ''}
       ${p.activity ? `<div class="provider-activity"><span><strong>${num(p.activity.requests)}</strong> requests</span><span><strong>${num(p.activity.inputTokens + p.activity.outputTokens)}</strong> tokens</span></div>` : '<p class="provider-caption">Activity unavailable</p>'}
       ${p.accounts.map(account => `<section class="provider-account"><h3>${esc(account.id)}${account.active ? ' <span class="provider-caption">· Current account</span>' : ''}</h3>${account.error ? `<p class="provider-warning">${esc(account.error)}${account.windows.length ? ' · Last known limits shown below.' : ''}</p>` : ''}${account.windows.map(w => {
@@ -60,7 +65,7 @@ export function providerOverview(data: ProviderSnapshot, filter: ProviderFilter 
       ${p.capabilities?.length ? `<details class="provider-capabilities"><summary>Capabilities and limits</summary><dl>${p.capabilities.map(capability => `<div><dt>${esc(capability.name)} <span>${esc(capability.status)}</span></dt><dd>${esc(capability.detail)}</dd></div>`).join('')}</dl></details>` : ''}
       ${p.models?.length ? `<details><summary>${p.models.length} account models</summary><ul class="provider-models">${p.models.map(m => `<li>${esc(m)}</li>`).join('')}</ul></details>` : ''}
       ${p.id === 'antigravity' ? providerSetupHtml(p.models, p.endpoint) : ''}
-      ${p.id === 'claude' ? '<a class="provider-link" href="/profiles" data-provider-page="/profiles">Manage Claude accounts →</a>' : '<p class="provider-caption">Uses the account signed in to Antigravity CLI. Client tools keep their own approval controls.</p>'}` : `<p class="provider-caption">${p.id === 'antigravity' ? 'Enable Antigravity alongside Claude in service settings.' : 'Claude is not enabled on this service.'}</p>`}</article>`).join('')}</div>`
+      ${p.id === 'claude' ? '<a class="provider-link" href="/profiles" data-provider-page="/profiles">Manage Claude accounts →</a>' : p.id === 'chatgpt' ? '<p class="provider-caption">Pass-through to the ChatGPT Codex backend via /v1/responses. Reasoning arrives only as ChatGPT\'s short summaries.</p>' : '<p class="provider-caption">Uses the account signed in to Antigravity CLI. Client tools keep their own approval controls.</p>'}` : `<p class="provider-caption">${p.id === 'antigravity' ? 'Enable Antigravity alongside Claude in service settings.' : p.id === 'chatgpt' ? 'Set MERIDIAN_CHATGPT_CREDENTIALS to enable ChatGPT on this service.' : 'Claude is not enabled on this service.'}</p>`}</article>`).join('')}</div>`
 }
 export const providerViewCss = `
 .provider-tabs{display:flex;gap:20px;border-bottom:1px solid var(--border);margin-bottom:24px}.provider-tabs button{border:0;border-radius:0;background:transparent;padding:12px 0;color:var(--muted);font:inherit;cursor:pointer}.provider-tabs button[aria-pressed="true"]{color:var(--accent);border-bottom:2px solid var(--accent)}

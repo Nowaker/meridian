@@ -1,4 +1,4 @@
-import type { ProviderUsage, ProviderSnapshot } from '../../telemetry/providerView'
+import type { ProviderId, ProviderUsage, ProviderSnapshot } from '../../telemetry/providerView'
 
 const object = (v: unknown): Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {}
 const rows = (v: unknown) => Array.isArray(v) ? v.map(object) : []
@@ -17,8 +17,10 @@ export function claudeProvider(healthValue: unknown, summaryValue: unknown, quot
   }
 }
 export function providerSnapshot(providers: ProviderUsage[]): ProviderSnapshot { return { providers, fetchedAt: Date.now() } }
-export function disabledProvider(id: 'claude' | 'antigravity'): ProviderUsage {
-  return { id, name: id === 'claude' ? 'Claude' : 'Antigravity', enabled: false, status: 'disabled', endpoint: id === 'claude' ? '/v1/messages' : '/antigravity/v1/messages', accounts: [] }
+export function disabledProvider(id: ProviderId): ProviderUsage {
+  const names = { claude: 'Claude', antigravity: 'Antigravity', chatgpt: 'ChatGPT' } as const
+  const endpoints = { claude: '/v1/messages', antigravity: '/antigravity/v1/messages', chatgpt: '/v1/responses' } as const
+  return { id, name: names[id], enabled: false, status: 'disabled', endpoint: endpoints[id], accounts: [] }
 }
 
 export { parseProviderSnapshot } from '../../telemetry/providerView'

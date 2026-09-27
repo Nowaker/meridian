@@ -62,6 +62,23 @@ export interface MeridianSettings {
   telemetrySize?: number
   /** Entries the in-memory diagnostic log ring holds. MERIDIAN_DIAGNOSTIC_LOG_SIZE wins. */
   diagnosticLogSize?: number
+
+  integrations?: MeridianIntegrationSettings
+}
+
+/**
+ * A type alias rather than an interface so it carries an implicit index
+ * signature: flags written by a newer build survive a round-trip through an
+ * older one.
+ */
+export type MeridianIntegrationSettings = {
+  /** ChatGPT account usage windows, read with the accounts' own access tokens. Never refreshes. */
+  codexUsage?: boolean
+}
+
+/** On unless the operator turned it off; off means no usage request at all. */
+export function isCodexUsageEnabled(settings: MeridianSettings): boolean {
+  return settings.integrations?.codexUsage ?? true
 }
 
 /**

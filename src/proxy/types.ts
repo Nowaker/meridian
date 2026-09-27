@@ -118,6 +118,18 @@ export interface ProxyServer {
   getInFlightCount?(): number
   /** Run one fail-closed transcript maintenance sweep. */
   sweepSessionGc?(): Promise<void>
+  /** Present only when this instance has a ChatGPT credential source. */
+  chatGpt?: ChatGptUpstreamControl
+}
+
+/** The ChatGPT credential source, as much of it as a host lifecycle needs. */
+export interface ChatGptUpstreamControl {
+  readonly mode: "owned" | "follow-external"
+  accounts(): number
+  isServing(): boolean
+  /** Take refresh authority (owned). Rejects rather than degrading. No-op for follow-external. */
+  acquire(): Promise<void>
+  release(): void
 }
 
 export const DEFAULT_PROXY_CONFIG: ProxyConfig = {

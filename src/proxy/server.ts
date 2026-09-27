@@ -1,6 +1,15 @@
 import { providerPageHtml } from '../telemetry/providerPage'
-import { providerOverview } from '../telemetry/providerView'
+import { providerOverview, isProviderFilter } from '../telemetry/providerView'
 import { ClaudeProviderFacts, disabledProvider, providerSnapshot } from './backends/providerStatus'
+import { chatGptProvider, CHATGPT_ADAPTER } from './backends/chatgptStatus'
+import { createChatGptBackend, type ChatGptTurnEvent } from './backends/chatgpt'
+import { resolveChatGptSource } from './chatgpt/config'
+import { getCodexUsage } from './codex/service'
+import type { CodexUsageResponse } from './codex/types'
+import { createUpstreamRegistry, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
+import { createClaudeBackend } from './upstream/claude'
+import { CHATGPT_MODELS, providerForModel } from './upstream/provider'
+import { completeUpstreamResponse } from './upstream/completion'
 import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { stream } from "hono/streaming"
@@ -630,6 +639,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   const finalConfig = resolveBackendConfig(config)
   const claudeProviderFacts = new ClaudeProviderFacts()
   const antigravity = finalConfig.backend === "combined" ? createAntigravityServer({ ...finalConfig, profiles: undefined, defaultProfile: undefined }) : undefined
+  // Decided once per instance. Absent means GPT model names keep meaning
+  // Claude, exactly as before ChatGPT support existed.
+  const chatGptSource = resolveChatGptSource()
   proxyLogSilent = finalConfig.silent
   const serverVersion = finalConfig.version ?? "unknown"
 
@@ -1066,10 +1078,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       catch (error) { return { error: String(error) } }
     }
     const [summary, google] = await Promise.all([read('/telemetry/summary'), antigravity?.providerStatus() ?? disabledProvider('antigravity')])
-    const data = providerSnapshot([claudeProviderFacts.snapshot(read, summary), google])
+    const data = providerSnapshot([claudeProviderFacts.snapshot(read, summary), google, chatGptStatus()])
     if (route.endsWith('/status')) return c.json(data)
     const filter = c.req.query('provider')
-    return c.html(providerOverview(data, filter === 'claude' || filter === 'antigravity' ? filter : 'all'))
+    return c.html(providerOverview(data, isProviderFilter(filter) ? filter : 'all'))
   })
 
   // --- Priority routing (opt-in, routing="priority") ---
@@ -7931,8 +7943,153 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     }
   }
 
-  app.post("/v1/messages", (c) => handleWithQueue(c, "/v1/messages"))
-  app.post("/messages", (c) => handleWithQueue(c, "/messages"))
+  // --- Model-routed upstream dispatch ---
+  // /v1/messages, /messages and /v1/responses reach a provider through one
+  // registry. Claude keeps its handlers unchanged, one call deeper. ChatGPT is
+  // registered only when this instance has a credential source, and only then
+  // is the model peeked, so an instance without ChatGPT reads no body it did
+  // not read before.
+  //
+  // NOTE: the ChatGPT path is a pass-through that never enters the Claude
+  // pipeline below: no adapter detection, no plugin onRequest/onResponse
+  // hooks (opencode-scrub is adapter-gated on `opencode` and would otherwise
+  // rewrite the system prompt), no SDK session. Telemetry is recorded here
+  // under adapter `chatgpt`.
+  const upstream = createUpstreamRegistry<Context>()
+  const upstreamSignals = new WeakMap<Context, AbortSignal>()
+
+  const recordChatGptTurn = (event: ChatGptTurnEvent): void => {
+    const usage = event.usage
+    const seat = event.seat ? chatGptSource?.seats().find(view => view.id === event.seat) : undefined
+    const profileId = event.seat ? `chatgpt:${seat?.email ?? event.seat.slice(-6)}` : undefined
+    // Claude's convention: inputTokens is the UNCACHED part, cache reads are
+    // separate. ChatGPT reports a total with cached_tokens inside it.
+    const uncached = usage ? Math.max(0, usage.inputTokens - usage.cachedInputTokens) : undefined
+    telemetryStore.record({
+      requestId: event.requestId,
+      timestamp: Date.now(),
+      adapter: CHATGPT_ADAPTER,
+      requestSource: event.requestSource,
+      model: event.model ?? event.requestModel ?? "unknown",
+      requestModel: event.requestModel ?? undefined,
+      profileId,
+      mode: event.stream ? "stream" : "non-stream",
+      isResume: false,
+      isPassthrough: true,
+      status: event.status,
+      queueWaitMs: 0,
+      proxyOverheadMs: 0,
+      ttfbMs: event.ttfbMs,
+      upstreamDurationMs: event.durationMs,
+      totalDurationMs: event.durationMs,
+      contentBlocks: 0,
+      textEvents: 0,
+      error: event.error,
+      inputTokens: uncached,
+      outputTokens: usage?.outputTokens,
+      cacheReadInputTokens: usage?.cachedInputTokens,
+      cacheCreationInputTokens: usage ? 0 : undefined,
+      cacheHitRate: usage && usage.inputTokens > 0 ? usage.cachedInputTokens / usage.inputTokens : undefined,
+    })
+    plog(`[PROXY] ${event.requestId} chatgpt model=${event.model ?? event.requestModel ?? "unknown"} seat=${profileId ?? "none"} status=${event.status} attempts=${event.attempts.length} adapted=${event.adaptations.join(",") || "none"}${usage ? ` in=${usage.inputTokens} cached=${usage.cachedInputTokens} out=${usage.outputTokens} reasoning=${usage.reasoningTokens}` : ""}${event.error ? ` error=${event.error}` : ""}`)
+  }
+
+  const chatGptBackend = chatGptSource ? createChatGptBackend<Context>({
+    source: chatGptSource,
+    // Rebuilt rather than forwarded: dispatch has already read this body to
+    // pick a provider. The bytes come back from Hono's memo, so the client's
+    // own body is what reaches the backend.
+    inboundRequest: async (c) => new Request(c.req.url, {
+      method: c.req.raw.method,
+      headers: c.req.raw.headers,
+      body: await c.req.text(),
+      signal: upstreamSignals.get(c) ?? c.req.raw.signal,
+    }),
+    // ChatGPT seats are benched in their own tracker, never Claude's.
+    exhaustion: new ProfileExhaustion(),
+    hooks: { onTurn: recordChatGptTurn },
+  }) : undefined
+  if (chatGptBackend) upstream.registerBackend(chatGptBackend)
+  upstream.registerBackend(createClaudeBackend<Context>({
+    messages: (request) => handleWithQueue(request.context, request.route),
+    responses: (request) => handleResponsesClaude(request.context),
+  }))
+
+  // Usage windows are fetched off the request path and served from the last
+  // result, so /providers never waits on chatgpt.com.
+  let chatGptUsage: CodexUsageResponse | null = null
+  let chatGptUsageAt = 0
+  let chatGptUsageRefresh: Promise<void> | undefined
+  const chatGptStatus = () => {
+    if (!chatGptSource || !chatGptBackend) return disabledProvider('chatgpt')
+    if (!chatGptUsageRefresh && Date.now() - chatGptUsageAt >= 30_000) {
+      chatGptUsageAt = Date.now()
+      chatGptUsageRefresh = getCodexUsage({ loadPool: () => chatGptSource.usagePool() })
+        .then(result => { chatGptUsage = result })
+        .catch(error => { plog(`[PROXY] ChatGPT usage refresh failed: ${error instanceof Error ? error.message : String(error)}`) })
+        .finally(() => { chatGptUsageRefresh = undefined })
+    }
+    return chatGptProvider({
+      source: chatGptSource,
+      observed: chatGptBackend.observedLimits(),
+      usage: chatGptUsage,
+      recent: telemetryStore.getRecent({ since: Date.now() - 60 * 60_000 }),
+      models: CHATGPT_MODELS,
+    })
+  }
+
+  // Read as TEXT rather than JSON: Hono memoizes either, so the Claude handler
+  // still parses normally, and only text round-trips byte for byte. A
+  // malformed body falls through to the handler's own 400.
+  const peekRequestedModel = async (c: Context): Promise<string | undefined> => {
+    try {
+      const body = JSON.parse(await c.req.text()) as { model?: unknown } | null
+      return typeof body?.model === "string" ? body.model : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  const dispatchUpstream = async (c: Context, endpoint: UpstreamEndpoint, route: string) => {
+    const model = chatGptBackend ? await peekRequestedModel(c) : undefined
+    const provider = chatGptBackend ? providerForModel(model) : "claude"
+    try {
+      if (provider !== "chatgpt") return await upstream.backendFor(provider).handle({ context: c, endpoint, route })
+      if (draining) return drainingResponse(endpoint === "responses" ? "openai" : "anthropic")
+      // Admitted work is counted and abortable exactly like a Claude request,
+      // so drain and forced shutdown cover it; the count is released when the
+      // client finishes or cancels the body, not when the headers go out.
+      const controller = new AbortController()
+      const abort = () => controller.abort(c.req.raw.signal.reason)
+      c.req.raw.signal.addEventListener("abort", abort, { once: true })
+      if (c.req.raw.signal.aborted) abort()
+      upstreamSignals.set(c, controller.signal)
+      activeRequestAborts.add(controller)
+      inFlightRequests++
+      const complete = () => {
+        c.req.raw.signal.removeEventListener("abort", abort)
+        upstreamSignals.delete(c)
+        activeRequestAborts.delete(controller)
+        inFlightRequests--
+      }
+      try {
+        const response = await upstream.backendFor(provider).handle({ context: c, endpoint, route })
+        return completeUpstreamResponse(response, controller.signal, complete)
+      } catch (error) {
+        complete()
+        throw error
+      }
+    } catch (error) {
+      if (!(error instanceof UnknownProviderError)) throw error
+      const message = `Model "${model ?? "unknown"}" is served by the "${provider}" provider, which this Meridian has no configured upstream for.`
+      return endpoint === "responses"
+        ? c.json({ error: { type: "not_found_error", message, code: null } }, 404)
+        : c.json({ type: "error", error: { type: "not_found_error", message } }, 404)
+    }
+  }
+
+  app.post("/v1/messages", (c) => dispatchUpstream(c, "messages", "/v1/messages"))
+  app.post("/messages", (c) => dispatchUpstream(c, "messages", "/messages"))
 
   /**
    * Cancel a session's live requests and everything live below it.
@@ -8334,6 +8491,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
         ...(claudeExecutableInfo ? { claudeExecutable: claudeExecutableInfo } : {}),
         plugin: { opencode: checkPluginConfigured() ? "configured" : "not-configured" },
+        ...(chatGptSource ? { chatgpt: { mode: chatGptSource.mode, serving: chatGptSource.isServing(), accounts: chatGptSource.seats().length } } : {}),
       })
     } catch {
       return c.json({
@@ -9208,7 +9366,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // loop — mirroring /v1/chat/completions. Tagged x-meridian-agent: codex so
   // the codex adapter is selected (forces passthrough; preset OFF).
   // See src/proxy/openaiResponses.ts for the translation logic.
-  app.post("/v1/responses", async (c) => {
+  const handleResponsesClaude = async (c: Context) => {
     if (draining) return drainingResponse("openai")
     const rawBody = await c.req.json() as ResponsesRequest
     const anthropicBody = translateResponsesToAnthropic(rawBody)
@@ -9330,7 +9488,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         "Connection": "keep-alive",
       },
     })
-  })
+  }
+  app.post("/v1/responses", (c) => dispatchUpstream(c, "responses", "/v1/responses"))
 
   // --- Model Discovery ---
   // Returns available Claude models in OpenAI-compatible format.
@@ -9765,6 +9924,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     },
     getInFlightCount: () => inFlightRequests + (antigravity?.getInFlightCount?.() ?? 0),
     sweepSessionGc,
+    ...(chatGptSource ? { chatGpt: {
+      mode: chatGptSource.mode,
+      accounts: () => chatGptSource.seats().length,
+      isServing: () => chatGptSource.isServing(),
+      acquire: () => chatGptSource.acquire(),
+      release: () => chatGptSource.release(),
+    } } : {}),
   }
 }
 
@@ -9867,8 +10033,12 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
     getInFlightCount,
     sweepSessionGc,
     closeBackend,
+    chatGpt,
   } = createProxyServer(config)
   if (initPlugins) await initPlugins()
+  // Fail startup rather than degrade: an instance that owns ChatGPT accounts
+  // and cannot take their refresh lease must not run beside whatever holds it.
+  if (chatGpt) await chatGpt.acquire()
 
   // Only the owned HTTP-server lifecycle starts a periodic sweep. Embedders
   // using createProxyServer().app still sweep opportunistically after managed
@@ -9908,6 +10078,9 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
       console.log(`Telemetry dashboard: http://${finalConfig.host}:${port}/telemetry`)
       const pins = resolveSdkModelDefaults()
       console.log(`Model pins: fable=${pins.ANTHROPIC_DEFAULT_FABLE_MODEL} opus=${pins.ANTHROPIC_DEFAULT_OPUS_MODEL} sonnet=${pins.ANTHROPIC_DEFAULT_SONNET_MODEL} haiku=${pins.ANTHROPIC_DEFAULT_HAIKU_MODEL}`)
+      console.log(chatGpt
+        ? `GPT models: chatgpt (${chatGpt.mode}, ${chatGpt.accounts()} account(s), ${chatGpt.isServing() ? "serving" : "NOT serving"})`
+        : "GPT models: claude (no ChatGPT credential source)")
       // Surface the resolved Claude executable + which step picked it.
       // When users hit "wrong claude got picked" failure modes (e.g. a
       // bun-shimmed `claude` on PATH, see #478), this single line is what
@@ -10057,6 +10230,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
         } finally {
           connectionTracker.dispose()
           await closeBackend?.()
+          chatGpt?.release()
         }
         // Give aborted SDK iterators one short bounded window to observe the
         // revocation and release their fencing leases. Durable callbacks also
