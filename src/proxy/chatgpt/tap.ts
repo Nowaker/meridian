@@ -150,13 +150,25 @@ export function tapResponsesStream(
   })
 }
 
-/** The terminal `response` object of a Responses stream, or null if the stream ended without one. */
+/**
+ * The terminal `response` object of a Responses stream, or null if the stream
+ * ended without one.
+ *
+ * The Codex backend's `response.completed` carries `output: []` (measured
+ * 2026-09-27); the items arrive only as `response.output_item.done` events.
+ * An empty terminal `output` is therefore rebuilt from those, in output_index
+ * order, so a non-streaming client receives the answer it asked for.
+ */
 export async function aggregateResponsesStream(body: ReadableStream<Uint8Array>): Promise<Record<string, unknown> | null> {
-  let final: Record<string, unknown> | null = null
+  const terminal: { response: Record<string, unknown> | null } = { response: null }
+  const items: Array<{ index: number; item: unknown }> = []
   const feed = frameSplitter(frame => {
     const event = eventOf(frame)
-    if (event && TERMINAL[event.type] && typeof event.data.response === "object" && event.data.response !== null) {
-      final = event.data.response as Record<string, unknown>
+    if (!event) return
+    if (event.type === "response.output_item.done" && event.data.item !== undefined) {
+      items.push({ index: typeof event.data.output_index === "number" ? event.data.output_index : items.length, item: event.data.item })
+    } else if (TERMINAL[event.type] && typeof event.data.response === "object" && event.data.response !== null) {
+      terminal.response = event.data.response as Record<string, unknown>
     }
   })
   const reader = body.getReader()
@@ -166,5 +178,9 @@ export async function aggregateResponsesStream(body: ReadableStream<Uint8Array>)
     feed(chunk.value)
   }
   feed(null)
-  return final
+  const response = terminal.response
+  if (response && (!Array.isArray(response.output) || response.output.length === 0) && items.length > 0) {
+    return { ...response, output: items.sort((a, b) => a.index - b.index).map(entry => entry.item) }
+  }
+  return response
 }

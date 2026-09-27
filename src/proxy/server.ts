@@ -8379,6 +8379,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return buildRuntime.local ? c.json(buildRuntime.status()) : c.notFound()
   })
 
+  // Reported on every verdict: a ChatGPT-only instance never has Claude auth
+  // and always answers "degraded", yet may be serving GPT models fine.
+  const chatGptHealth = () => chatGptSource
+    ? { chatgpt: { mode: chatGptSource.mode, serving: chatGptSource.isServing(), accounts: chatGptSource.seats().length } }
+    : {}
   app.get("/health", async (c) => {
     // Checked first and unconditionally: a fleet manager routing on this
     // endpoint (e.g. a gateway's account-pool scheduler) needs to learn
@@ -8423,6 +8428,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           build: currentBuild(),
           error: "Could not verify auth status",
           mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
+          ...chatGptHealth(),
         })
       }
       if (!auth.loggedIn) {
@@ -8491,7 +8497,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
         ...(claudeExecutableInfo ? { claudeExecutable: claudeExecutableInfo } : {}),
         plugin: { opencode: checkPluginConfigured() ? "configured" : "not-configured" },
-        ...(chatGptSource ? { chatgpt: { mode: chatGptSource.mode, serving: chatGptSource.isServing(), accounts: chatGptSource.seats().length } } : {}),
+        ...chatGptHealth(),
       })
     } catch {
       return c.json({
@@ -8501,6 +8507,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         build: currentBuild(),
         error: "Could not verify auth status",
         mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
+        ...chatGptHealth(),
       })
     }
   })
