@@ -4,6 +4,11 @@ import { ClaudeProviderFacts, disabledProvider, providerSnapshot } from './backe
 import { chatGptProvider, chatGptSeatLabel, CHATGPT_ADAPTER } from './backends/chatgptStatus'
 import { createChatGptBackend, type ChatGptTurnEvent } from './backends/chatgpt'
 import { resolveChatGptSource } from './chatgpt/config'
+import { ChatGptTurnLedger, chatGptTokenFields, createChatGptAdmission, createChatGptParityBackend, decorateChatGptTurn, type ChatGptTurnNotes } from './chatgpt/parity'
+import { chatGptFeatureCapabilities, getChatGptFeatures, resetChatGptFeatures, updateChatGptFeatures, validateChatGptFeatureUpdate } from './chatgpt/features'
+import { resolveModelPricing } from '../telemetry/pricing'
+import { getPricingOverrides } from '../telemetry/pricingStore'
+import { computeSummary } from '../telemetry/percentiles'
 import { getCodexUsage } from './codex/service'
 import type { CodexUsageResponse } from './codex/types'
 import { createUpstreamRegistry, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
@@ -1077,7 +1082,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       try { const response = await app.fetch(new Request(new URL(path, c.req.url).toString(), { headers: c.req.raw.headers })); return await response.json() }
       catch (error) { return { error: String(error) } }
     }
-    const [summary, google] = await Promise.all([read('/telemetry/summary'), antigravity?.providerStatus() ?? disabledProvider('antigravity')])
+    // With ChatGPT enabled the shared telemetry carries its turns too; the
+    // Claude card must count Claude traffic only, as it did before.
+    const claudeSummary = async () => chatGptSource
+      ? computeSummary(telemetryStore.getRecent({ limit: 100_000, since: Date.now() - 3_600_000 }).filter(metric => metric.adapter !== CHATGPT_ADAPTER), 3_600_000, getPricingOverrides())
+      : read('/telemetry/summary')
+    const [summary, google] = await Promise.all([claudeSummary(), antigravity?.providerStatus() ?? disabledProvider('antigravity')])
     const data = providerSnapshot([claudeProviderFacts.snapshot(read, summary), google, chatGptStatus()])
     if (route.endsWith('/status')) return c.json(data)
     const filter = c.req.query('provider')
@@ -7958,13 +7968,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   const upstream = createUpstreamRegistry<Context>()
   const upstreamSignals = new WeakMap<Context, AbortSignal>()
 
-  const recordChatGptTurn = (event: ChatGptTurnEvent): void => {
+  const chatGptPricing = (model: string) => resolveModelPricing(model, getPricingOverrides())
+  const chatGptLedger = new ChatGptTurnLedger<Context>()
+  const chatGptBodyOverrides = new WeakMap<Context, string>()
+  const chatGptExhaustion = new ProfileExhaustion()
+
+  const recordChatGptTurn = (event: ChatGptTurnEvent, notes: ChatGptTurnNotes | undefined): void => {
     const usage = event.usage
+    const decoration = decorateChatGptTurn(event, notes, chatGptPricing)
     const seat = event.seat ? chatGptSource?.seats().find(view => view.id === event.seat) : undefined
     const profileId = event.seat ? `chatgpt:${chatGptSeatLabel(event.seat, seat?.email ?? null)}` : undefined
-    // Claude's convention: inputTokens is the UNCACHED part, cache reads are
-    // separate. ChatGPT reports a total with cached_tokens inside it.
-    const uncached = usage ? Math.max(0, usage.inputTokens - usage.cachedInputTokens) : undefined
+    const tokens = usage ? chatGptTokenFields(usage) : undefined
     telemetryStore.record({
       requestId: event.requestId,
       timestamp: Date.now(),
@@ -7984,14 +7998,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       totalDurationMs: event.durationMs,
       contentBlocks: 0,
       textEvents: 0,
-      error: event.error,
-      inputTokens: uncached,
-      outputTokens: usage?.outputTokens,
-      cacheReadInputTokens: usage?.cachedInputTokens,
-      cacheCreationInputTokens: usage ? 0 : undefined,
+      error: decoration.error,
+      ...tokens,
       cacheHitRate: usage && usage.inputTokens > 0 ? usage.cachedInputTokens / usage.inputTokens : undefined,
+      ...(usage ? { reasoningOutputTokens: usage.reasoningTokens } : {}),
+      ...(decoration.fallbackFromModel ? { fallbackFromModel: decoration.fallbackFromModel } : {}),
     })
-    plog(`[PROXY] ${event.requestId} chatgpt model=${event.model ?? event.requestModel ?? "unknown"} seat=${profileId ?? "none"} status=${event.status} attempts=${event.attempts.length} adapted=${event.adaptations.join(",") || "none"}${usage ? ` in=${usage.inputTokens} cached=${usage.cachedInputTokens} out=${usage.outputTokens} reasoning=${usage.reasoningTokens}` : ""}${event.error ? ` error=${event.error}` : ""}`)
+    plog(`[PROXY] ${event.requestId} chatgpt model=${event.model ?? event.requestModel ?? "unknown"} seat=${profileId ?? "none"} status=${event.status} attempts=${event.attempts.length} adapted=${event.adaptations.join(",") || "none"}${usage ? ` in=${usage.inputTokens} cached=${usage.cachedInputTokens} out=${usage.outputTokens} reasoning=${usage.reasoningTokens}` : ""}${decoration.fallbackFromModel ? ` fallback_from=${decoration.fallbackFromModel}` : ""}${decoration.error ? ` error=${decoration.error}` : ""}`)
   }
 
   const chatGptBackend = chatGptSource ? createChatGptBackend<Context>({
@@ -7999,21 +8012,62 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     // Rebuilt rather than forwarded: dispatch has already read this body to
     // pick a provider. The bytes come back from Hono's memo, so the client's
     // own body is what reaches the backend.
-    inboundRequest: async (c) => new Request(c.req.url, {
-      method: c.req.raw.method,
-      headers: c.req.raw.headers,
-      body: await c.req.text(),
-      signal: upstreamSignals.get(c) ?? c.req.raw.signal,
-    }),
+    // A Fallback Model retry supplies the client's body with only `model`
+    // replaced (chatgpt/parity.ts); nothing else ever overrides it.
+    inboundRequest: async (c) => {
+      const request = new Request(c.req.url, {
+        method: c.req.raw.method,
+        headers: c.req.raw.headers,
+        body: chatGptBodyOverrides.get(c) ?? await c.req.text(),
+        signal: upstreamSignals.get(c) ?? c.req.raw.signal,
+      })
+      chatGptLedger.bindInbound(request, c)
+      return request
+    },
     // ChatGPT seats are benched in their own tracker, never Claude's.
-    exhaustion: new ProfileExhaustion(),
-    hooks: { onTurn: recordChatGptTurn },
+    exhaustion: chatGptExhaustion,
+    hooks: {
+      admit: createChatGptAdmission({ ledger: chatGptLedger, features: getChatGptFeatures, pricing: chatGptPricing }),
+      onTurn: (event) => recordChatGptTurn(event, chatGptLedger.settle(event.requestId)),
+    },
   }) : undefined
-  if (chatGptBackend) upstream.registerBackend(chatGptBackend)
+  if (chatGptBackend) {
+    upstream.registerBackend(createChatGptParityBackend<Context>({
+      inner: chatGptBackend,
+      ledger: chatGptLedger,
+      features: getChatGptFeatures,
+      readBody: (c) => c.req.text(),
+      overrideBody: (c, body) => { chatGptBodyOverrides.set(c, body) },
+      pricing: chatGptPricing,
+      earliestSeatReset: () => {
+        const marks = chatGptExhaustion.snapshot()
+        return marks.length > 0 ? Math.min(...marks.map(mark => mark.until)) : null
+      },
+      log: plog,
+    }))
+  }
   upstream.registerBackend(createClaudeBackend<Context>({
     messages: (request) => handleWithQueue(request.context, request.route),
     responses: (request) => handleResponsesClaude(request.context),
   }))
+
+  // /health: whether each followed seat can serve, and why not. Counts only -
+  // no seat identity and no credential field.
+  const chatGptSeatHealth = (source: NonNullable<typeof chatGptSource>) => {
+    const seats = source.seats()
+    const unavailable: Record<string, number> = {}
+    for (const seat of seats) if (seat.reason) unavailable[seat.reason] = (unavailable[seat.reason] ?? 0) + 1
+    const benched = chatGptExhaustion.snapshot()
+    return {
+      mode: source.mode,
+      serving: source.isServing(),
+      accounts: seats.length,
+      eligible: seats.filter(seat => seat.eligible).length,
+      unavailable,
+      benched: benched.length,
+      ...(benched.length > 0 ? { nextSeatFreeAt: new Date(Math.min(...benched.map(mark => mark.until))).toISOString() } : {}),
+    }
+  }
 
   // Usage windows are fetched off the request path and served from the last
   // result, so /providers never waits on chatgpt.com.
@@ -8029,13 +8083,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         .catch(error => { plog(`[PROXY] ChatGPT usage refresh failed: ${error instanceof Error ? error.message : String(error)}`) })
         .finally(() => { chatGptUsageRefresh = undefined })
     }
-    return chatGptProvider({
+    const provider = chatGptProvider({
       source: chatGptSource,
       observed: chatGptBackend.observedLimits(),
       usage: chatGptUsage,
-      recent: telemetryStore.getRecent({ since: Date.now() - 60 * 60_000 }),
+      recent: telemetryStore.getRecent({ limit: 100_000, since: Date.now() - 60 * 60_000 }),
       models: CHATGPT_MODELS,
     })
+    const featureRows = chatGptFeatureCapabilities(getChatGptFeatures())
+    const replaced = new Set(featureRows.map(row => row.name))
+    return { ...provider, capabilities: [...(provider.capabilities ?? []).filter(row => !replaced.has(row.name)), ...featureRows] }
   }
 
   // Read as TEXT rather than JSON: Hono memoizes either, so the Claude handler
@@ -8048,6 +8105,23 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     } catch {
       return undefined
     }
+  }
+
+  // The client session a ChatGPT turn belongs to: the adapter's own key when
+  // the client sends one (header-derived, read-only), else prompt_cache_key,
+  // which Responses clients set per conversation.
+  const chatGptSessionKey = async (c: Context): Promise<{ key: string; parent?: string } | undefined> => {
+    let body: Record<string, unknown> | undefined
+    try {
+      const parsed = JSON.parse(await c.req.text()) as unknown
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) body = parsed as Record<string, unknown>
+    } catch {
+      body = undefined
+    }
+    const adapter = detectAdapter(c)
+    const cacheKey = typeof body?.prompt_cache_key === "string" && body.prompt_cache_key ? body.prompt_cache_key : undefined
+    const key = adapter.getSessionId(c, body) ?? cacheKey
+    return key ? { key, parent: adapter.getParentSessionId?.(c, body) } : undefined
   }
 
   const dispatchUpstream = async (c: Context, endpoint: UpstreamEndpoint, route: string) => {
@@ -8066,10 +8140,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       upstreamSignals.set(c, controller.signal)
       activeRequestAborts.add(controller)
       inFlightRequests++
+      // Registered in the session tree like a Claude turn, so
+      // /v1/sessions/:key/cancel stops a ChatGPT turn of that session too.
+      const session = await chatGptSessionKey(c)
+      const treeEntry = session ? processSessionTree.register({
+        requestId: `chatgpt-${randomUUID()}`,
+        sessionKey: session.key,
+        parentKey: session.parent,
+        abort: (reason) => controller.abort(reason),
+      }) : undefined
       const complete = () => {
         c.req.raw.signal.removeEventListener("abort", abort)
         upstreamSignals.delete(c)
         activeRequestAborts.delete(controller)
+        treeEntry?.release()
         inFlightRequests--
       }
       try {
@@ -8310,6 +8394,22 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return c.json({ success: true, restartRequired: true, supervision: detectSupervision() })
   })
 
+  // ChatGPT gateway features (chatgpt/features.ts), re-read per request.
+  app.get("/settings/api/chatgpt", (c) => {
+    return c.json({ enabled: chatGptSource !== undefined, features: getChatGptFeatures(), models: CHATGPT_MODELS })
+  })
+  app.patch("/settings/api/chatgpt", async (c) => {
+    try {
+      const features = updateChatGptFeatures(validateChatGptFeatureUpdate(await c.req.json()))
+      return c.json({ ok: true, features })
+    } catch (e) {
+      return c.json({ error: (e as Error).message }, 400)
+    }
+  })
+  app.delete("/settings/api/chatgpt", (c) => {
+    return c.json({ ok: true, features: resetChatGptFeatures() })
+  })
+
   app.get("/settings/api/pricing", (c) => {
     const { BUILTIN_MODEL_PRICING } = require("../telemetry/pricing") as typeof import("../telemetry/pricing")
     const { getPricingOverrides } = require("../telemetry/pricingStore") as typeof import("../telemetry/pricingStore")
@@ -8382,7 +8482,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // Reported on every verdict: a ChatGPT-only instance never has Claude auth
   // and always answers "degraded", yet may be serving GPT models fine.
   const chatGptHealth = () => chatGptSource
-    ? { chatgpt: { mode: chatGptSource.mode, serving: chatGptSource.isServing(), accounts: chatGptSource.seats().length } }
+    ? { chatgpt: chatGptSeatHealth(chatGptSource) }
     : {}
   app.get("/health", async (c) => {
     // Checked first and unconditionally: a fleet manager routing on this

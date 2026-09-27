@@ -281,7 +281,7 @@ function setViewSort(mode){
   var refocus=!!(document.activeElement&&document.activeElement.closest&&document.activeElement.closest('.sort-tab'));
   viewSort=mode;
   try{localStorage.setItem(SORT_STORAGE_KEY,mode)}catch(_){/* a lost preference is not worth failing over */}
-  if(lastData)render(lastData[0],lastData[1],lastData[2],lastData[3]);
+  if(lastData)render(lastData[0],lastData[1],lastData[2],lastData[3],lastData[4]);
   if(refocus){var el=document.querySelector('.sort-tab[data-sort="'+mode+'"]');if(el)el.focus()}
 }
 
@@ -443,6 +443,23 @@ function profileSection(q,s,pl,h){
     +'<div class="profile-grid">'+cards+'</div></div>';
 }
 
+// ChatGPT seats, only on instances that serve ChatGPT (/health.chatgpt). The
+// same snapshot as /providers, so both pages agree; the busiest quota window
+// of each seat is its headline.
+function chatgptSection(pv){
+  var p=pv&&Array.isArray(pv.providers)?pv.providers.filter(function(x){return x.id==='chatgpt'})[0]:null;
+  if(!p||!p.enabled)return '';
+  var items=[];
+  for(var i=0;i<p.accounts.length;i++){var a=p.accounts[i];
+    var w=null;for(var j=0;j<a.windows.length;j++)if(!w||a.windows[j].utilization>w.utilization)w=a.windows[j];
+    var pct=w?Math.round(w.utilization*100):null;
+    items.push([esc(a.label||a.id)+(a.active?' · current':''),pct===null?'—':pct+'%',pct!==null&&pct>=85?'red':'',a.error?esc(a.error):w?esc(w.type)+' window':'no quota data',a.error?'red':'']);
+  }
+  if(p.activity)items.push(['Requests (1h)',String(p.activity.requests),'',p.activity.errors>0?p.activity.errors+' error'+(p.activity.errors===1?'':'s'):'no errors',p.activity.errors>0?'red':'']);
+  return '<div class="section"><div class="section-title">ChatGPT</div>'+strip(items)
+    +'<p class="intro-meta"><a href="/providers?provider=chatgpt">Quota windows and models on Providers</a></p></div>';
+}
+
 function strip(items){
   var o='<div class="strip">';
   for(var i=0;i<items.length;i++){var it=items[i];
@@ -461,20 +478,22 @@ async function refresh(){
       fetch('/settings/api/routing').then(r=>r.json()).catch(function(){return null})
     ]);
     meridianReorder.adopt(routing);
-    render(health,stats,quota,profiles);
+    const providers=health&&health.chatgpt?await fetch('/providers/status').then(r=>r.json()).catch(function(){return null}):null;
+    render(health,stats,quota,profiles,providers);
   }catch(e){document.getElementById('content').innerHTML='<div style="color:var(--red);padding:40px;text-align:center">Could not connect</div>'}
 }
 
 function tokens(v){if(v==null)return '—';if(v>=1e6)return (v/1e6).toFixed(1)+'M';if(v>=1e3)return (v/1e3).toFixed(1)+'k';return String(v)}
 
-function render(h,s,q,pl){
-  lastData=[h,s,q,pl];
+function render(h,s,q,pl,pv){
+  lastData=[h,s,q,pl,pv];
   var refocusId=meridianReorder.focusAnchor();
   let o='';
   o+=introSection(h);
 
   // Accounts — per-profile usage + est cost; click a card to switch
   o+=profileSection(q,s,pl,h);
+  o+=chatgptSection(pv);
 
   // Last 24 hours — meaningful signals only. Errors and envelope
   // violations appear only when there is something to report.

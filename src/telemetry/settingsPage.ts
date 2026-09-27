@@ -160,6 +160,22 @@ ${profileBarHtml}
   <div class="tabs" id="adapterTabs"></div>
   <div id="adapters"></div>
 
+  <div id="chatgpt-section" hidden>
+    <h1 style="margin-top:40px">ChatGPT</h1>
+    <p class="subtitle" style="max-width:720px;line-height:1.6">
+      GPT models are served from your ChatGPT subscription as a pass-through: Meridian adds no prompt and runs no
+      request plugins on them, and the SDK features above do not apply. These settings act only on the response
+      and on retries. Changes apply to the next request.
+    </p>
+    <div class="adapter-card">
+      <div class="adapter-header">
+        <span class="adapter-name">ChatGPT gateway</span>
+        <button class="reset-btn" onclick="resetChatGpt()">Reset</button>
+      </div>
+      <div class="feature-grid" id="chatgpt-grid"></div>
+    </div>
+  </div>
+
   <h1 style="margin-top:40px">Model Pricing</h1>
   <p class="subtitle" style="max-width:720px;line-height:1.6">
     Rates used by the telemetry cost estimate, in USD per million tokens. Edit a value to override the
@@ -220,6 +236,15 @@ const FEATURES = [
   { key: 'additionalDirectories', label: 'Additional Directories', desc: 'Comma-separated extra paths Claude can access (monorepo libs, etc.)', type: 'text' },
 ];
 
+// ChatGPT gateway settings (/settings/api/chatgpt). Rendered only when this
+// instance serves ChatGPT; descriptions state the provider's own limits.
+const CHATGPT_FEATURES = [
+  { key: 'thinkingPassthrough', label: 'Thinking Passthrough', desc: 'Forward ChatGPT reasoning summaries to the client. ChatGPT is secretive about reasoning: it never shows the raw chain of thought, only short reasoning summary headers, and only when the client asks for a summary. Off removes those summaries; the encrypted reasoning the client must send back is always kept', type: 'toggle' },
+  { key: 'maxBudgetUsd', label: 'Max Budget (USD)', desc: 'Per-request cost cap from OpenAI pricing (0 = disabled). Refused before sending when the input alone is over it, stopped mid-stream when the estimate passes it. Hidden reasoning tokens are only counted when the response ends', type: 'number' },
+  { key: 'fallbackModel', label: 'Fallback Model', desc: 'Retry once on this ChatGPT model when the requested one fails before any output was sent: a server error, every account rate limited, or the model refused. Never on a sign-in problem', type: 'select' },
+];
+let chatgptState = null;
+
 // Display names only — NOT the list of adapters to render. The page renders
 // whatever /settings/api/features returns, so a new adapter shows up here the
 // moment it exists, using its raw name until someone gives it a pretty one.
@@ -261,6 +286,93 @@ async function saveFeature(adapter, key, value) {
 async function resetAdapter(adapter) {
   await fetch('/settings/api/features/' + adapter, { method: 'DELETE' });
   await loadConfig();
+  showSaved();
+}
+
+async function loadChatGpt() {
+  const res = await fetch('/settings/api/chatgpt');
+  if (!res.ok) return;
+  chatgptState = await res.json();
+  document.getElementById('chatgpt-section').hidden = !chatgptState.enabled;
+  if (chatgptState.enabled) renderChatGpt();
+}
+
+function renderChatGpt() {
+  const grid = document.getElementById('chatgpt-grid');
+  grid.innerHTML = '';
+  const features = chatgptState.features;
+  for (const feat of CHATGPT_FEATURES) {
+    const row = document.createElement('div');
+    row.className = 'feature-row';
+    const info = document.createElement('div');
+    info.className = 'feature-info';
+    const label = document.createElement('span');
+    label.className = 'feature-label';
+    label.textContent = feat.label;
+    const desc = document.createElement('span');
+    desc.className = 'feature-desc';
+    desc.textContent = feat.desc;
+    info.append(label, desc);
+    row.appendChild(info);
+    if (feat.type === 'toggle') {
+      const toggle = document.createElement('label');
+      toggle.className = 'toggle';
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.checked = !!features[feat.key];
+      input.addEventListener('change', function () { saveChatGpt(feat.key, input.checked); });
+      const track = document.createElement('span');
+      track.className = 'toggle-track';
+      toggle.append(input, track);
+      row.appendChild(toggle);
+    } else if (feat.type === 'number') {
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.className = 'feature-select';
+      input.style.width = '80px';
+      input.style.textAlign = 'right';
+      input.min = '0';
+      input.step = '0.01';
+      input.value = String(features[feat.key] ?? 0);
+      input.addEventListener('change', function () { saveChatGpt(feat.key, parseFloat(input.value) || 0); });
+      row.appendChild(input);
+    } else {
+      const select = document.createElement('select');
+      select.className = 'feature-select';
+      [''].concat(chatgptState.models).forEach(function (model) {
+        const option = document.createElement('option');
+        option.value = model;
+        option.textContent = model === '' ? '(None)' : model;
+        option.selected = features[feat.key] === model;
+        select.appendChild(option);
+      });
+      select.addEventListener('change', function () { saveChatGpt(feat.key, select.value); });
+      row.appendChild(select);
+    }
+    grid.appendChild(row);
+  }
+}
+
+async function saveChatGpt(key, value) {
+  const patch = {};
+  patch[key] = value;
+  const res = await fetch('/settings/api/chatgpt', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(function () { return {}; });
+    alert(err.error || 'Failed to save ChatGPT settings');
+  } else {
+    showSaved();
+  }
+  await loadChatGpt();
+}
+
+async function resetChatGpt() {
+  await fetch('/settings/api/chatgpt', { method: 'DELETE' });
+  await loadChatGpt();
   showSaved();
 }
 
@@ -662,6 +774,7 @@ async function putTelemetry(body) {
 }
 
 loadConfig();
+loadChatGpt();
 loadPricing();
 loadRouting();
 loadTelemetry();

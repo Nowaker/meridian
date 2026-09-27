@@ -64,6 +64,16 @@ export interface MeridianSettings {
   diagnosticLogSize?: number
 
   integrations?: MeridianIntegrationSettings
+
+  /** ChatGPT gateway features. Re-read per request; resolved in proxy/chatgpt/features.ts. */
+  chatgpt?: ChatGptFeatureSettings
+}
+
+/** What the operator saved; absent keys take the defaults in proxy/chatgpt/features.ts. */
+export type ChatGptFeatureSettings = {
+  thinkingPassthrough?: boolean
+  maxBudgetUsd?: number
+  fallbackModel?: string
 }
 
 /**

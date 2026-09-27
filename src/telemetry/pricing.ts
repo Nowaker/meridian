@@ -137,7 +137,10 @@ export function resolveModelPricing(
 }
 
 /** Estimated USD for a single request's token usage at the given rates. */
-export function estimateRequestCostUsd(metric: RequestMetric, pricing: ModelPricing): number {
+export function estimateRequestCostUsd(
+  metric: Pick<RequestMetric, "inputTokens" | "outputTokens" | "cacheReadInputTokens" | "cacheCreationInputTokens">,
+  pricing: ModelPricing,
+): number {
   return (
     ((metric.inputTokens ?? 0) / 1e6) * pricing.inputPerMTok +
     ((metric.outputTokens ?? 0) / 1e6) * pricing.outputPerMTok +
