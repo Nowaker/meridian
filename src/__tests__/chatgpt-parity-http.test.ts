@@ -232,13 +232,13 @@ describe("Thinking Passthrough", () => {
 })
 
 describe("telemetry", () => {
-  it("records provider tokens with cached and reasoning tokens counted once, and values them from pricing", async () => {
-    setPricingOverride("gpt-5.6-sol", { inputPerMTok: 4, outputPerMTok: 20, cacheReadPerMTok: 0.4, cacheWritePerMTok: 0 })
+  it("records provider tokens with cached and reasoning tokens counted once, and values them at the built-in OpenAI rate", async () => {
     const { app } = makeServer()
     upstream = () => streamResponse(completedStream("gpt-5.6-sol"))
     await (await post(app, codexBody("gpt-5.6-sol"))).text()
     const [row] = telemetryStore.getRecent({ limit: 5 })
     expect(row?.adapter).toBe("chatgpt")
+    expect(row?.model).toBe("gpt-5.6-sol")
     expect(row?.requestModel).toBe("gpt-5.6-sol")
     expect(row?.inputTokens).toBe(600)
     expect(row?.cacheReadInputTokens).toBe(400)
@@ -246,7 +246,9 @@ describe("telemetry", () => {
     expect(row?.reasoningOutputTokens).toBe(50)
     expect(row?.profileId).toBe("chatgpt:a@example.test · id:user-a")
     const summary = telemetryStore.summarize(3_600_000)
+    // gpt-5.6-sol list price: $4 input, $0.40 cached input, $20 output per 1M.
     expect(summary.costEstimate?.totalUsd).toBeCloseTo((600 * 4 + 400 * 0.4 + 200 * 20) / 1e6, 9)
+    expect(summary.costEstimate?.unpricedRequestCount).toBe(0)
   })
 })
 
@@ -292,7 +294,13 @@ describe("Fallback Model", () => {
     const retried: Record<string, unknown> = { ...calls[1]!.body, model: "gpt-5.6-sol" }
     expect(retried).toEqual(calls[0]!.body)
     const rows = telemetryStore.getRecent({ limit: 5 })
-    expect(rows.find(row => row.requestModel === "gpt-5.4")?.fallbackFromModel).toBe("gpt-5.6-sol")
+    const served = rows.find(row => row.fallbackFromModel !== undefined)
+    expect(served?.model).toBe("gpt-5.4")
+    expect(served?.requestModel).toBe("gpt-5.6-sol")
+    expect(served?.fallbackFromModel).toBe("gpt-5.6-sol")
+    // Valued at the model that did the work: gpt-5.4 is $2.50 / $0.25 / $15 per 1M.
+    const summary = telemetryStore.summarize(3_600_000)
+    expect(summary.costEstimate?.totalUsd).toBeCloseTo((600 * 2.5 + 400 * 0.25 + 200 * 15) / 1e6, 9)
   })
 
   it("retries after the model is refused, but not after an unrelated 400", async () => {

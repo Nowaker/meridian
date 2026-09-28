@@ -7984,8 +7984,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       timestamp: Date.now(),
       adapter: CHATGPT_ADAPTER,
       requestSource: event.requestSource,
+      // `model` is what served the turn (the fallback when one ran) and is
+      // what the cost estimate prices a GPT row by; `requestModel` is the
+      // client's own id.
       model: event.model ?? event.requestModel ?? "unknown",
-      requestModel: event.requestModel ?? undefined,
+      requestModel: notes?.requestedModel ?? event.requestModel ?? undefined,
       profileId,
       mode: event.stream ? "stream" : "non-stream",
       isResume: false,

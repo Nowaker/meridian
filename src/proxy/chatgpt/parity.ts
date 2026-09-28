@@ -187,10 +187,13 @@ export function decorateChatGptTurn(
 ): ChatGptTurnDecoration {
   let error = event.error
   if (!notes) return { error }
+  // The model id this turn was sent with, and the one the provider says
+  // answered; the latter is what telemetry prices, so the budget does too.
   const servedModel = event.requestModel ?? undefined
+  const pricedModel = event.model ?? servedModel
   if (notes.budgetExceededFor !== undefined && notes.budgetExceededFor === servedModel) error = MAX_BUDGET_ERROR_CODE
-  else if (!error && event.usage && servedModel && notes.features.maxBudgetUsd > 0) {
-    const rates = pricing(servedModel)
+  else if (!error && event.usage && pricedModel && notes.features.maxBudgetUsd > 0) {
+    const rates = pricing(pricedModel)
     if (rates && chatGptCostUsd(event.usage, rates) > notes.features.maxBudgetUsd) error = MAX_BUDGET_ERROR_CODE
   }
   const fallbackFromModel = notes.fallbackFrom !== undefined && servedModel !== notes.fallbackFrom

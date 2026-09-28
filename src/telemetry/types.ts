@@ -196,7 +196,7 @@ export interface RequestMetric {
   reasoningOutputTokens?: number
 
   /** ChatGPT only: the model the client asked for, when a Fallback Model
-   *  retry served this request on `requestModel` instead. */
+   *  retry served this request on `model` instead. */
   fallbackFromModel?: string
 }
 

@@ -9,6 +9,7 @@ import {
   MAX_BUDGET_ERROR_CODE,
   stripReasoningSummaries,
   transformResponsesStream,
+  type ChatGptTurnNotes,
 } from "../proxy/chatgpt/parity"
 import {
   CHATGPT_FEATURE_DEFAULTS,
@@ -19,7 +20,7 @@ import {
   type ChatGptFeatures,
 } from "../proxy/chatgpt/features"
 import type { ChatGptTurnEvent } from "../proxy/backends/chatgpt"
-import { computeCostEstimate, type ModelPricing } from "../telemetry/pricing"
+import { computeCostEstimate, resolveModelPricing, type ModelPricing } from "../telemetry/pricing"
 import type { RequestMetric } from "../telemetry/types"
 
 const PRICING: ModelPricing = { inputPerMTok: 2, outputPerMTok: 10, cacheReadPerMTok: 0.2, cacheWritePerMTok: 0 }
@@ -199,6 +200,34 @@ describe("cached and reasoning tokens are valued exactly once", () => {
       contentBlocks: 0, textEvents: 0, error: null, ...chatGptTokenFields(usage), reasoningOutputTokens: usage.reasoningTokens } satisfies RequestMetric
     const estimate = computeCostEstimate([metric], { "gpt-5.6-sol": PRICING })
     expect(estimate.totalUsd).toBeCloseTo(expected, 12)
+  })
+
+  it("values a real gpt-5.6-sol turn once per token at its built-in list price", () => {
+    const rates = resolveModelPricing("gpt-5.6-sol")!
+    expect(rates).toMatchObject({ inputPerMTok: 4, cacheReadPerMTok: 0.4, outputPerMTok: 20 })
+    const listPrice = (600 * 4 + 400 * 0.4 + 200 * 20) / 1e6
+    expect(chatGptCostUsd(usage, rates)).toBeCloseTo(listPrice, 12)
+    const metric = { requestId: "r", timestamp: 0, model: "gpt-5.6-sol", requestModel: "gpt-5.6-sol", mode: "stream", isResume: false,
+      isPassthrough: true, status: 200, queueWaitMs: 0, proxyOverheadMs: 0, ttfbMs: null, upstreamDurationMs: 0, totalDurationMs: 0,
+      contentBlocks: 0, textEvents: 0, error: null, ...chatGptTokenFields(usage), reasoningOutputTokens: usage.reasoningTokens } satisfies RequestMetric
+    expect(computeCostEstimate([metric]).totalUsd).toBeCloseTo(listPrice, 12)
+    // Reasoning tokens are already inside output: recording them does not move the price.
+    const { reasoningOutputTokens: _, ...withoutReasoning } = metric
+    expect(computeCostEstimate([withoutReasoning]).totalUsd).toBeCloseTo(listPrice, 12)
+  })
+
+  it("prices a fallback turn at the model that served it, not the one the client asked for", () => {
+    const metric = { requestId: "r", timestamp: 0, model: "gpt-5.4", requestModel: "gpt-5.6-sol", fallbackFromModel: "gpt-5.6-sol",
+      mode: "stream", isResume: false, isPassthrough: true, status: 200, queueWaitMs: 0, proxyOverheadMs: 0, ttfbMs: null,
+      upstreamDurationMs: 0, totalDurationMs: 0, contentBlocks: 0, textEvents: 0, error: null, ...chatGptTokenFields(usage) } satisfies RequestMetric
+    expect(computeCostEstimate([metric]).totalUsd).toBeCloseTo((600 * 2.5 + 400 * 0.25 + 200 * 15) / 1e6, 12)
+  })
+
+  it("budgets a fallback turn at the served model's rate", () => {
+    const notes: ChatGptTurnNotes = { features: { ...CHATGPT_FEATURE_DEFAULTS, maxBudgetUsd: 0.005, fallbackModel: "gpt-5.4" }, fallbackFrom: "gpt-5.6-sol" }
+    const event = turnEvent({ requestModel: "gpt-5.4", model: "gpt-5.4", usage })
+    // $0.0046 at gpt-5.4 rates stays under $0.005; the $0.00656 gpt-5.6-sol price would not.
+    expect(decorateChatGptTurn(event, notes, resolveModelPricing).error).toBeNull()
   })
 })
 
