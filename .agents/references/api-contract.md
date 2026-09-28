@@ -18,6 +18,7 @@ External plugins depend on these interfaces. **Changes require project owner app
 | `/health` `build` block | `buildInfo.ts` | Version/provenance drift detection |
 | `POST /v1/messages` request/response format | `server.ts` | All agents (Anthropic API contract) |
 | `GET /profiles/list` response shape | `server.ts` | Profile management UI and CLI |
+| `GET /inflight` response shape and loopback-only access | `server.ts`, `inflight.ts` | Idle-gated restart supervisors |
 | `POST /profiles/active` request/response | `server.ts` | Profile switching from CLI and UI |
 If you need to modify any of these, open an issue first — breaking changes affect downstream plugin authors.
 
