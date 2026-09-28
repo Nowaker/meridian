@@ -123,29 +123,37 @@ export const profileBarCss = `
   .meridian-header .mh-profile .mh-profile-type {
     color: var(--muted, #8b949e); font-size: 10px;
   }
-  /* Build chip — two mutually exclusive states, and the colour is not a
+  /* Version chip, then the update badge beside it. The colours are not a
      style choice: "update available" is a link to the releases page, so it
-     is blue (interactive); "local/dev build" is a meta annotation with no
-     href, so it is violet. Swapping them would break the DESIGN.md rule. */
+     is blue (interactive); a local/dev build is a meta annotation with no
+     href, so it is violet. A current npm install is neither, so it is muted
+     chrome. Swapping these would break the DESIGN.md rule. */
   .meridian-header .mh-build {
     display: none; align-items: center; gap: 6px;
     font-size: 11px; font-weight: 500; white-space: nowrap;
-    padding: 3px 10px; border-radius: 20px; text-decoration: none;
-    transition: background 0.15s;
+    padding: 3px 10px; border-radius: 20px;
+    color: var(--muted, #8b949e);
+    background: var(--surface, #161b22);
+    border: 1px solid var(--border, #30363d);
+    cursor: default;
   }
   .meridian-header .mh-build.visible { display: inline-flex; }
-  .meridian-header .mh-build.update {
-    color: var(--accent, #58a6ff);
-    background: rgba(88,166,255,0.12);
-    border: 1px solid rgba(88,166,255,0.35);
-  }
-  .meridian-header .mh-build.update:hover { background: rgba(88,166,255,0.18); }
   .meridian-header .mh-build.provenance {
     color: var(--accent2, #bc8cff);
     background: rgba(188,140,255,0.12);
     border: 1px solid rgba(188,140,255,0.35);
-    cursor: default;
   }
+  .meridian-header .mh-update {
+    display: none; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 500; white-space: nowrap;
+    padding: 3px 10px; border-radius: 20px; text-decoration: none;
+    color: var(--accent, #58a6ff);
+    background: rgba(88,166,255,0.12);
+    border: 1px solid rgba(88,166,255,0.35);
+    transition: background 0.15s;
+  }
+  .meridian-header .mh-update.visible { display: inline-flex; }
+  .meridian-header .mh-update:hover { background: rgba(88,166,255,0.18); }
   .meridian-header .mh-profile.following { border-color: var(--accent2, #bc8cff); }
   .meridian-header .mh-profile .mh-profile-follow {
     color: var(--accent2, #bc8cff); font-size: 10px;
@@ -166,6 +174,7 @@ export const profileBarCss = `
     .meridian-header .mh-name { display: none; }
     .meridian-header .mh-nav { order: 3; flex-basis: 100%; min-width: 0; overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
     .meridian-header .mh-nav a { flex-shrink: 0; }
+    .meridian-header .mh-right { flex-wrap: wrap; justify-content: flex-end; gap: 6px 10px; min-width: 0; }
     .meridian-header .mh-status .mh-status-text { display: none; }
   }
 `
@@ -185,9 +194,10 @@ export const profileBarHtml = `
     <a href="/plugins" id="nav-plugins">Plugins</a>
   </nav>
   <div class="mh-right">
-    <a class="mh-build" id="mhBuild" target="_blank" rel="noopener"></a>
     <a class="mh-profile" id="mhProfile" href="/" title="Active profile — switch from the home page"></a>
     <span class="mh-status" id="mhStatus"><span class="mh-dot" id="mhDot"></span><span class="mh-status-text" id="mhStatusText"></span></span>
+    <span class="mh-build" id="mhBuild"></span>
+    <a class="mh-update" id="mhUpdate" href="https://github.com/rynfar/meridian/releases" target="_blank" rel="noopener"></a>
   </div>
 </header>
 `
@@ -196,6 +206,7 @@ export const profileBarJs = `
 (function() {
   var profileChip = document.getElementById('mhProfile');
   var buildChip = document.getElementById('mhBuild');
+  var updateChip = document.getElementById('mhUpdate');
   var statusDot = document.getElementById('mhDot');
   var statusText = document.getElementById('mhStatusText');
 
@@ -210,30 +221,41 @@ export const profileBarJs = `
 
   function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
-  // Build provenance chip. Hidden entirely for a current npm install, which
-  // is the case that needs no comment.
+  // Two chips answering two questions: what is running here, and is a newer
+  // release published. The version always shows; the badge only once an
+  // enabled update check has resolved a newer release. A checkout compares
+  // the release its tree descends from, so it is told too — with advice it
+  // can actually follow.
   function renderBuild(build) {
-    if (!buildChip) return;
-    if (!build) { buildChip.className = 'mh-build'; return; }
-    if (build.source !== 'npm') {
-      buildChip.textContent = (build.source === 'dev' ? 'dev build' : 'local build') + (build.dirty ? ' *' : '');
-      buildChip.removeAttribute('href');
+    if (!buildChip || !updateChip) return;
+    if (!build) { buildChip.className = 'mh-build'; updateChip.className = 'mh-update'; return; }
+
+    // An embedder that never passed a version reports "unknown"; say nothing
+    // about a version rather than print "vunknown".
+    var known = !!build.version && build.version !== 'unknown';
+    var kind = build.source === 'dev' ? 'dev' : 'local';
+    if (build.source === 'npm') {
+      buildChip.textContent = 'v' + build.version;
+      buildChip.title = 'Running Meridian ' + build.version;
+      buildChip.className = known ? 'mh-build visible' : 'mh-build';
+    } else {
+      buildChip.textContent = (known ? 'v' + build.version + ' ' + kind : kind + ' build') + (build.dirty ? ' *' : '');
       buildChip.title = 'Not an npm release — the reported version ' + build.version +
         ' is the tree\\'s last release, not proof of what is running' +
         (build.branch ? '\\nbranch: ' + build.branch : '') +
         (build.sha ? '\\ncommit: ' + build.sha.slice(0, 8) : '') +
         (build.dirty ? '\\nuncommitted changes present' : '');
       buildChip.className = 'mh-build provenance visible';
-      return;
     }
-    if (build.updateAvailable) {
-      buildChip.textContent = build.latest + ' available';
-      buildChip.href = 'https://github.com/rynfar/meridian/releases';
-      buildChip.title = 'Running ' + build.version + ' — update with:\\nnpm install -g @rynfar/meridian@latest';
-      buildChip.className = 'mh-build update visible';
-      return;
+
+    if (build.updateAvailable && build.latest) {
+      updateChip.textContent = 'update available';
+      updateChip.title = build.latest + ' is published, running ' + build.version + ' — ' +
+        (build.source === 'npm' ? 'update with:\\nnpm install -g @rynfar/meridian@latest' : 'pull and rebuild this checkout');
+      updateChip.className = 'mh-update visible';
+    } else {
+      updateChip.className = 'mh-update';
     }
-    buildChip.className = 'mh-build';
   }
 
   function loadHeader() {

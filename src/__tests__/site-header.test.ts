@@ -52,32 +52,62 @@ describe("shared site header", () => {
     expect(profileBarJs).toContain("/profiles/list")
   })
 
-  test("header shows a build chip fed by /health's build block", () => {
+  test("header shows the running version and an update badge, fed by /health's build block", () => {
     expect(profileBarHtml).toContain("mhBuild")
+    expect(profileBarHtml).toContain("mhUpdate")
     expect(profileBarJs).toContain("renderBuild")
     expect(profileBarJs).toContain("updateAvailable")
   })
 
-  test("build chip colours follow the DESIGN.md role split", () => {
-    // Blue = interactive: the update chip is a link to the releases page.
-    // Violet = meta: the provenance chip has no href and must not be blue.
-    // Swapping these is the single easiest way to break the design language,
-    // and it is invisible in a screenshot review.
-    expect(profileBarCss).toContain(".mh-build.update")
-    expect(profileBarCss).toContain(".mh-build.provenance")
+  test("the version sits right of the status pill, and the update badge right of that", () => {
+    const right = profileBarHtml.slice(profileBarHtml.indexOf('class="mh-right"'))
+    expect(right.indexOf("mhStatus")).toBeLessThan(right.indexOf("mhBuild"))
+    expect(right.indexOf("mhBuild")).toBeLessThan(right.indexOf("mhUpdate"))
+  })
 
-    const updateRule = profileBarCss.slice(
-      profileBarCss.indexOf(".meridian-header .mh-build.update"),
-      profileBarCss.indexOf(".meridian-header .mh-build.provenance"),
-    )
+  test("the update badge is not limited to npm installs", () => {
+    // A checkout compares the release its tree descends from, so it too is
+    // told when a newer one is out; only the advice in the tooltip differs.
+    expect(profileBarJs).toContain("if (build.updateAvailable && build.latest)")
+    expect(profileBarJs).toContain("pull and rebuild this checkout")
+  })
+
+  test("chip colours follow the DESIGN.md role split", () => {
+    // Blue = interactive: only the update badge is a link, to the releases page.
+    // Violet = meta: the provenance state annotates a non-npm build.
+    // The version itself is neither — it is always-on chrome, so it is muted
+    // and takes no accent at all. Swapping these is the single easiest way to
+    // break the design language, and it is invisible in a screenshot review.
+    const rule = (selector: string, until: string) =>
+      profileBarCss.slice(profileBarCss.indexOf(selector), profileBarCss.indexOf(until))
+
+    const versionRule = rule(".meridian-header .mh-build {", ".meridian-header .mh-build.visible")
+    expect(versionRule).toContain("var(--muted, #8b949e)")
+    expect(versionRule).not.toContain("--accent")
+    // Not a link in any state, so it must not offer a pointer affordance.
+    expect(versionRule).toContain("cursor: default")
+    expect(profileBarHtml).toContain('<span class="mh-build" id="mhBuild">')
+
+    const provenanceRule = rule(".meridian-header .mh-build.provenance", ".meridian-header .mh-update {")
+    expect(provenanceRule).toContain("var(--accent2, #bc8cff)")
+
+    const updateRule = rule(".meridian-header .mh-update {", ".meridian-header .mh-update.visible")
     expect(updateRule).toContain("var(--accent, #58a6ff)")
     expect(updateRule).not.toContain("--accent2")
+  })
 
-    const provenanceRule = profileBarCss.slice(profileBarCss.indexOf(".meridian-header .mh-build.provenance"))
-    expect(provenanceRule).toContain("var(--accent2, #bc8cff)")
-    // Non-interactive: no href is set for this state, so no pointer affordance.
-    expect(provenanceRule).toContain("cursor: default")
-    expect(profileBarJs).toContain("removeAttribute('href')")
+  test("header css is brace-balanced, so no rule swallows the ones below it", () => {
+    // An unclosed rule nests every rule after it and CSS drops them all,
+    // which neither review nor a screenshot of what still renders catches.
+    let depth = 0
+    let lowest = 0
+    for (const ch of profileBarCss) {
+      if (ch === "{") depth++
+      else if (ch === "}") depth--
+      lowest = Math.min(lowest, depth)
+    }
+    expect(lowest).toBe(0)
+    expect(depth).toBe(0)
   })
 
   test("every page embeds the shared header exactly once", () => {

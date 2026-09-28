@@ -195,7 +195,7 @@ src/
 │   ├── retryAfter.ts          ← Retry-After computation for 429/503/529 (PURE)
 │   ├── models.ts              ← Model mapping, Claude executable resolution
 │   ├── buildInfo.ts           ← Build provenance: source detection, semver compare (PURE)
-│   ├── updateCheck.ts         ← Cached npm registry lookup for the newest published version
+│   ├── updateCheck.ts         ← Opt-in (`checkForUpdates`) cached npm registry lookup for the newest published version
 │   ├── tools.ts               ← Tool blocking lists, MCP server name, allowed tools
 │   ├── messages.ts            ← Content normalization, message parsing
 │   ├── replay.ts              ← Pure rendering of assistant calls and tool results for SDK replay

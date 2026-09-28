@@ -78,7 +78,7 @@ import {
 } from "./design"
 import { checkPluginConfigured, isPluginlessOpenCodeRequest, notePluginlessOpenCodeRequest } from "./setup"
 import { describeBuildDrift, getBuildInfo } from "./buildInfo"
-import { getLatestVersion, startUpdateCheck, stopUpdateCheck } from "./updateCheck"
+import { getLatestVersion, isUpdateCheckEnabled, startUpdateCheck, stopUpdateCheck } from "./updateCheck"
 import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveClaudeExecutableSync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, subscriptionIncludesExtendedContext } from "./models"
 import { livenessReport, readinessReport, renderProbe } from "./probes"
 import type { AnthropicSseEvent } from "./openai"
@@ -616,6 +616,30 @@ type PriorityDispatchOptions = {
     /** The stored route no longer proves the current mapping generation. */
     readonly forceFreshReplay?: boolean
   }
+}
+
+/**
+ * Begin the daily registry check, if the operator has asked for one.
+ *
+ * Module scope because two callers need the same banner: the owned server
+ * lifecycle at startup, and the settings route when the toggle is switched on.
+ * Starting is idempotent, and a no-op while the setting is off.
+ */
+function beginUpdateCheck(config: { silent?: boolean; version?: string }): Promise<void> {
+  return startUpdateCheck({
+    onResolved: (latest) => {
+      if (config.silent) return
+      const build = getBuildInfo({
+        version: config.version ?? "unknown",
+        modulePath: import.meta.url,
+        latest,
+      })
+      if (!build.updateAvailable) return
+      console.log(`\n[meridian] Update available: ${build.version} → ${latest}`)
+      // A checkout cannot follow "npm install -g"; it pulls and rebuilds instead.
+      if (build.source === "npm") console.log(`  npm install -g @rynfar/meridian@latest`)
+    },
+  })
 }
 
 export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServer {
@@ -8020,6 +8044,38 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return c.json({ success: true, restartRequired: true, supervision: detectSupervision() })
   })
 
+  function updateSettingsState() {
+    return {
+      checkForUpdates: getSetting("checkForUpdates") === true,
+      envOptOut: envBool("NO_UPDATE_CHECK"),
+      enabled: isUpdateCheckEnabled(),
+      build: currentBuild(),
+    }
+  }
+
+  app.get("/settings/api/updates", (c) => c.json(updateSettingsState()))
+  app.put("/settings/api/updates", async (c) => {
+    let body: { checkForUpdates?: unknown }
+    try { body = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
+
+    if (body.checkForUpdates !== undefined) {
+      if (body.checkForUpdates !== null && typeof body.checkForUpdates !== "boolean") {
+        return c.json({ error: "checkForUpdates must be a boolean, or null to unset" }, 400)
+      }
+      setSetting("checkForUpdates", body.checkForUpdates ?? undefined)
+    }
+
+    // Takes effect now rather than on the next start: the checker is one
+    // unref'd timer with no store to swap out from under in-flight work, so
+    // there is nothing to justify making someone restart for it. Switching on
+    // waits for the first answer (bounded by the fetch timeout) so the reply
+    // already says whether an update exists.
+    if (isUpdateCheckEnabled()) await beginUpdateCheck(finalConfig)
+    else stopUpdateCheck()
+
+    return c.json(updateSettingsState())
+  })
+
   app.get("/settings/api/pricing", (c) => {
     const { BUILTIN_MODEL_PRICING } = require("../telemetry/pricing") as typeof import("../telemetry/pricing")
     const { getPricingOverrides } = require("../telemetry/pricingStore") as typeof import("../telemetry/pricingStore")
@@ -9404,22 +9460,10 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
   sessionGcInterval?.unref?.()
   if (sweepSessionGc) void sweepSessionGc()
 
-  // Cached, once a day, never on the request path. Opt out with
-  // MERIDIAN_NO_UPDATE_CHECK=1. The banner below reports build-source drift
+  // Cached, once a day, never on the request path, and only when the
+  // checkForUpdates setting is on. The banner below reports build-source drift
   // synchronously; this callback reports version drift whenever it resolves.
-  startUpdateCheck({
-    onResolved: (latest) => {
-      if (finalConfig.silent) return
-      const build = getBuildInfo({
-        version: finalConfig.version ?? "unknown",
-        modulePath: import.meta.url,
-        latest,
-      })
-      if (build.source !== "npm" || !build.updateAvailable) return
-      console.log(`\n[meridian] Update available: ${build.version} → ${latest}`)
-      console.log(`  npm install -g @rynfar/meridian@latest`)
-    },
-  })
+  void beginUpdateCheck(finalConfig)
 
   if (finalConfig.installProcessErrorHandlers) {
     installProxyProcessErrorHandlers()
