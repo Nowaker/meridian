@@ -699,8 +699,11 @@ bun scripts/e2e-retirement-admission.mjs --stream
 ```
 
 With a two-slot pending budget and a long retirement quarantine, seed two real
-sessions, switch profiles through HTTP, sweep GC and require a fresh request and
-its follow-up to answer correctly. Supported SDK history inspection verifies both
+sessions, switch profiles through HTTP, drop the old mappings, sweep GC and
+require a fresh request and its follow-up to answer correctly. The switch itself
+deliberately retains session mappings (`6ecfbaa7`): their keys are already
+profile-scoped, so the gate unpins them explicitly rather than assuming the
+switch did, which is what cache eviction and a proxy restart do in production. Supported SDK history inspection verifies both
 old histories remain unchanged and the new mapping contains the expected token.
 Both profile aliases use the existing authentication; this does not validate two
 distinct billing accounts. Meridian state and SDK working directory are isolated.
@@ -708,6 +711,28 @@ The one-slot configuration retains its existing behavior; reserving its only slo
 would disable passive cleanup. At limit two, passive retirement can pause while a
 publication is in flight, then resume after it completes. Capacity and cleanup
 progress are covered by the lifecycle tests.
+
+### Concurrent retirement admission (#1174)
+
+```bash
+bun scripts/e2e-retirement-concurrent-admission.mjs
+bun scripts/e2e-retirement-concurrent-admission.mjs --stream
+```
+
+The gate above is sequential and cannot reach the refusal this one covers: a turn
+holds its prepared publication slot across its whole SDK call, so the backlog only
+saturates when later turns arrive while an earlier one is still in the model. With
+a three-slot budget and a long quarantine, seed three real sessions, drop their
+mappings so the sweep parks two genuinely unpinned transcripts at the passive
+bound, then issue three concurrent real turns.
+
+Require zero refusals, each turn's own token in its own transcript and no other
+turn's token in it, one durable mapping per session, a pending count never above
+the budget, every parked transcript still tracked after the sweep, correct
+follow-up answers on each session and unchanged seeded histories. A refusal is
+reported with its response body rather than thrown, so the `overloaded_error`
+backlog message is recorded as evidence. Run both modes after any change to
+retirement admission or the pending budget.
 
 ### Fresh replay with completed tool calls (#888 / #858)
 
@@ -920,6 +945,7 @@ curl -s -X PUT -H 'Content-Type: application/json' -d '{"checkForUpdates":false}
 | E65 | [Historical media attribution on fresh replay](#e65-historical-media-attribution-on-fresh-replay) | **Real SDK/model and Oh My Pi client**: `bun scripts/e2e-replay-media-attribution.mjs [--current-image]` and `E2E_OMP_PACKAGE=/path/to/package bun scripts/e2e-omp-replay-media-attribution.mjs`. A historical image must stay inside replay context and receive a provenance note; a genuine current image remains current. The Oh My Pi gate checks its actual request has prior media and a text-only current turn. **Run before releases touching structured replay or multimodal input** | 2026-09-25 |
 | E66 | [Interrupted turn after a settled checkpoint](#e66-interrupted-turn-after-a-settled-checkpoint) | **Automated, real proxy + SDK + Claude Max**: `bun scripts/e2e-checkpoint-interrupted-turn.mjs`. An OpenCode-keyed tool round whose complete result is followed by a partial assistant turn (what a dropped stream leaves) must resume the stored session; a result for an unknown call is the negative control and must still take the fresh replay. **Run before releases touching the passthrough early-stop checkpoint or checkpoint replay** | 2026-09-26 |
 | E67 | [OpenCode V2 interrupted tool turn](#e67-opencode-v2-interrupted-tool-turn) | **Actual OpenCode 2.0.16 client and Meridian V2 plugin, real SDK/model**: `E2E_OPENCODE_BIN=/path/to/opencode E2E_PLUGIN_PATH=/path/to/opencode-scrub/dist/index.js bun scripts/e2e-opencode-checkpoint-fault.mjs`. Inject one partial SSE failure after the real client tool call; require the client's exact retry shape and SDK resume, plus a same-session recovery. **Run before releases touching keyed checkpoint recovery** | 2026-09-26 |
+| E68 | [OpenCode V2 user-invoked skill](#e68-opencode-v2-user-invoked-skill) | **Actual OpenCode V2 server, real SDK/model**: `E2E_OPENCODE_BIN=/path/to/opencode E2E_PLUGIN_PATH=/path/to/opencode-scrub/dist/index.js bun scripts/e2e-opencode-skill-content.mjs`. A skill invoked with no typed text must reach the SDK prompt inside `<skill_content>` and drive the reply. **Run before releases touching user-text sanitization** | 2026-09-27 |
 
 | P1 | [Profile: List & Auth Status](#p1-profile-list--auth-status) | `/profiles/list` returns profiles with emails, login status, auth timestamps | - |
 | P2 | [Profile: Switch via API](#p2-profile-switch-via-api) | `POST /profiles/active` switches profile; health endpoint reflects new email | - |
@@ -5711,6 +5737,89 @@ On 2026-09-26 (Linux x64, Bun 1.3.14, Agent SDK 0.2.141, Claude Code 2.1.280, Op
 Build Meridian, then run `E2E_OPENCODE_BIN=/path/to/opencode-2.0.16 E2E_PLUGIN_PATH=/path/to/independently-installed-opencode-scrub/dist/index.js bun scripts/e2e-opencode-checkpoint-fault.mjs` with Claude Max authentication. The gate runs the actual OpenCode 2.0.16 client with the Meridian V2 plugin installed through `meridian setup --v2` and an independently installed Meridian server scrub plugin. A real Opus 5.5 call makes one client tool call. The relay injects a single partial text SSE response followed by an error **without forwarding that response to Meridian**; the real client then retries with the saved `[tool_result, assistant text, user]` history. Require `lineage=continuation`, `isResume=true` for that exact retry, and an answered same-session follow-up. Raw client output stays in a private temporary directory; `summary.json` contains only the observed roles, block types, and gate outcomes. The injected fault establishes the client history shape; it is not a claim that the real SDK itself emitted the error.
 
 On 2026-09-26, macOS arm64, OpenCode 2.0.16, Meridian V2 plugin, OpenCode scrub 0.2.3, Agent SDK 0.2.141, Claude Code 2.1.280 and Opus 5.5 produced the exact retry shape on both unchanged `cd1ada9` and the reviewed integration. Unchanged main verified `lineage=continuation` but used `isResume=false`; the corrected integration used `isResume=true` and completed the next same-session client turn. A Linux x64 image with Node 24.21.0 and Bun 1.3.14 passed the same corrected client gate. The [sanitized result](docs/maintenance/evidence/1165-opencode-interrupted-checkpoint.json) is escrowed here.
+
+## E68: Client tool-change blocks in structured replay
+
+Run `bun scripts/e2e-replay-tool-change-blocks.mjs` and again with `--stream`
+using Claude Max authentication (`E2E_MODEL` overrides the default `haiku`).
+
+omp sends a mid-conversation `system` message whose content is
+`tool_addition`/`tool_removal` blocks when it activates a deferred tool. The API
+accepts those block types only inside a `mid_conv_system` message, while
+structured replay recasts every non-assistant message as a user turn, so a fresh
+rebuild after compaction, undo or `diverged=not-found` failed outright. The text
+replay path already drops unknown blocks, so only the structured path is
+affected; the gate therefore includes real media to force that path and uses an
+unused session key to force a fresh replay.
+
+Require status 200 and exactly `PONG`, both `name` and nested `tool.name`
+spellings rendered as `[Client added tool: grep]` / `[Client removed tool: bash]`
+in supported SDK history, no raw `tool_addition`/`tool_removal` block reaching the
+SDK, and `lineage=new`.
+
+On 2026-09-28 (macOS arm64, Bun 1.3.14, Agent SDK 0.2.141, Haiku), unchanged
+`8d4c88ce` returned `500` carrying `API Error: 400 messages.0.content.8: Input tag
+'tool_addition' found using 'type' does not match any of the expected tags`, and
+the fix answered `PONG` in both modes.
+## E69: OpenCode V2 user-invoked skill
+
+Build Meridian, then run `E2E_OPENCODE_BIN=/path/to/opencode E2E_PLUGIN_PATH=/path/to/independently-installed-opencode-scrub/dist/index.js bun scripts/e2e-opencode-skill-content.mjs` with Claude Max authentication. The gate starts an actual OpenCode V2 server with isolated config, data and home, and a project-level fixture skill whose body holds a random receipt. It admits the same prompt the V2 composer sends for `/skill` with nothing typed (`text: ""` plus a skill attachment), so the only model-visible content is the `<skill_content>` block. An observer on the real SDK query records only the prompt length and whether it holds the receipt and wrapper. Require both, and a reply containing the receipt. `--baseline` with `E2E_MERIDIAN_ROOT` pointing at an unchanged build asserts the original failure instead: an empty SDK prompt.
+
+On 2026-09-27, Windows 10 x64, Bun 1.4.2, OpenCode 2.0.18, OpenCode scrub 0.2.3, Agent SDK 0.2.141, Claude Code 2.1.141 and Opus 5.5: unchanged `8d4c88c` sent a 0-character prompt, and the model answered that the message came through with no request. The fix sent 477 characters including the wrapper, and the reply was exactly the receipt. The [sanitized result](docs/maintenance/evidence/opencode-v2-skill-content.json) is escrowed here.
+
+### Portable HTTP arm
+
+```bash
+bun scripts/e2e-skill-content-http.mjs            # bare /skill, nothing typed
+bun scripts/e2e-skill-content-http.mjs --stream
+bun scripts/e2e-skill-content-http.mjs --typed    # skill body plus a typed request
+bun scripts/e2e-skill-content-http.mjs --typed --stream
+```
+
+The client arm above needs an OpenCode V2 install. Sanitization is proxy-side, so
+this arm sends V2's exact composer shape over HTTP against the real SDK and needs
+no client binary, which keeps the case runnable where only V1 is installed.
+
+The deterministic assertion is structural: supported SDK history must contain the
+random receipt, the `<skill_content name=...>` wrapper and the nested
+`<skill_files>` list. Whether the model then acts on a bare invocation is its own
+choice and is recorded, never asserted. Haiku has been observed calling an
+unsolicited instruction block a prompt-injection attempt and declining it, while
+quoting the receipt in the refusal, so the result reports `complied` (the reply is
+the receipt alone) separately from `quotedReceipt`. Compare against extracted text, not `JSON.stringify` output,
+which escapes the quotes inside `name="..."`.
+
+On 2026-09-28 (macOS arm64, Bun 1.3.14, Agent SDK 0.2.141, Haiku), reverting only
+`sanitize.ts` on the same tree failed with "The skill body did not reach the SDK
+prompt" in both modes, and all four arms passed with the fix. Observed bare-arm
+replies were the receipt alone; one earlier run on a conditional fixture had the
+model acknowledge the skill and decline to run it, which is why the model's
+wording is not the gate.
+## E70: Fresh replay bounded to the context window
+
+```bash
+bun scripts/e2e-replay-budget.mjs
+bun scripts/e2e-replay-budget.mjs --stream
+```
+
+The production failure needs a six-figure-token conversation, which no gate can
+afford, so `MERIDIAN_REPLAY_BUDGET_TOKENS` (test-only, opt-in, ignored when
+unusable) drives the same code path from a handful of turns. `E2E_REPLAY_BUDGET`
+sets it, default 900. What this proves is the behaviour, not the constant.
+
+Require status 200, the oldest turn absent from supported SDK history, the live
+tail present, an `[Meridian: N earlier messages (~K tokens) were omitted …]`
+marker with a non-zero count, and an answer drawn from the surviving tail — so the
+turn is usable rather than merely admitted. Disabling the override so no trim
+occurs must fail the oldest-turn assertion; that control confirms the gate is
+sensitive to the trim rather than passing by construction.
+
+On 2026-09-28 (macOS arm64, Bun 1.3.14, Agent SDK 0.2.141, Haiku), both modes
+trimmed 12 messages (~3114 estimated tokens) and answered from the kept tail.
+
+**Not covered.** The original 400 (`context_overflow` on an oversized replay) was
+not reproduced live, and neither was the reactive retry, which needs a real
+overflow from the model. Those remain covered only by the mocked envelope tests.
 
 ## Concurrent transcript publication
 
