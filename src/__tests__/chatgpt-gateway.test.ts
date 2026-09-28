@@ -322,13 +322,41 @@ describe("/providers", () => {
     await (await app.fetch(responses(LUNA))).text()
     const res = await app.fetch(new Request("http://localhost/providers/status"))
     const text = await res.text()
-    const data = JSON.parse(text) as { providers: Array<{ id: string; enabled: boolean; activity?: { requests: number }; accounts: Array<{ id: string; error?: string }> }> }
+    const data = JSON.parse(text) as { providers: Array<{ id: string; enabled: boolean; activity?: { requests: number }; accounts: Array<{ id: string; label?: string; error?: string }> }> }
     const chatgpt = data.providers.find(p => p.id === "chatgpt")!
     expect(chatgpt.enabled).toBe(true)
     expect(chatgpt.activity?.requests).toBe(1)
-    expect(chatgpt.accounts.map(a => [a.id, a.error ?? null])).toEqual([["seat0@example.test", null], ["seat1@example.test", "Disabled by its credential owner."]])
+    expect(chatgpt.accounts.map(a => [a.id, a.label, a.error ?? null])).toEqual([
+      ["user-0__workspace-0", "seat0@example.test · id:pace-0", null],
+      ["user-1__workspace-1", "seat1@example.test · id:pace-1", "Disabled by its credential owner."],
+    ])
     expect(text).not.toMatch(/at-0|at-1|rt-0|rt-1/)
     const view = await (await app.fetch(new Request("http://localhost/providers/view?provider=chatgpt"))).text()
     expect(view).toContain("OpenAI subscription")
+  })
+
+  it("tells apart one person's seats in different workspaces, on the page and in telemetry", async () => {
+    const sameEmail = { email: "shared@example.test" }
+    writePool([
+      account(0, { ...sameEmail, accountId: "ws-aaaaaa", accountUserId: "user-shared__ws-aaaaaa", accessToken: "at-a" }),
+      account(1, { ...sameEmail, accountId: "ws-bbbbbb", accountUserId: "user-shared__ws-bbbbbb", accessToken: "at-b" }),
+    ])
+    respond = call => call.authorization === "Bearer at-a" ? refused() : completed()
+    const { app } = await server("follow-external")
+    await (await app.fetch(responses(LUNA))).text()
+
+    const text = await (await app.fetch(new Request("http://localhost/providers/status"))).text()
+    const chatgpt = (JSON.parse(text) as { providers: Array<{ id: string; accounts: Array<{ id: string; label?: string }> }> })
+      .providers.find(p => p.id === "chatgpt")!
+    expect(chatgpt.accounts.map(a => a.id)).toEqual(["user-shared__ws-aaaaaa", "user-shared__ws-bbbbbb"])
+    expect(chatgpt.accounts.map(a => a.label)).toEqual(["shared@example.test · id:aaaaaa", "shared@example.test · id:bbbbbb"])
+    expect(text).not.toMatch(/at-a|at-b|rt-0|rt-1/)
+
+    const view = await (await app.fetch(new Request("http://localhost/providers/view?provider=chatgpt"))).text()
+    expect(view).toContain("shared@example.test · id:aaaaaa")
+    expect(view).toContain("shared@example.test · id:bbbbbb")
+
+    const [metric] = telemetryStore.getRecent({ limit: 1 })
+    expect(metric!.profileId).toBe("chatgpt:shared@example.test · id:bbbbbb")
   })
 })

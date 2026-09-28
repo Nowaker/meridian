@@ -28,8 +28,15 @@ const REASON_TEXT: Record<SeatUnavailableReason, string> = {
 
 export const CHATGPT_ADAPTER = 'chatgpt'
 
-function seatLabel(id: string, email: string | null): string {
-  return email ?? `seat …${id.slice(-6)}`
+/**
+ * How a seat is named to people: `email · id:xxxxxx`, matching oc-codex's own
+ * `email, id:xxxxxx` surfaces. The email alone is not enough - one person holds
+ * seats in several workspaces, so it repeats. A seat id is
+ * `user-<user>__<workspace accountId>`, so its last six characters are the
+ * workspace suffix, which is what separates one person's seats.
+ */
+export function chatGptSeatLabel(seatId: string, email: string | null): string {
+  return `${email ?? 'seat'} · id:${seatId.slice(-6)}`
 }
 
 function headerWindows(observed: ObservedSeatLimits | undefined) {
@@ -83,7 +90,8 @@ export function chatGptProvider(input: {
         .map(w => ({ type: w.type, utilization: Math.min(1, Math.max(0, w.utilization!)), resetsAt: w.resetsAt! })) ?? []
       const fromHeaders = headerWindows(observed.get(seat.id))
       return {
-        id: seatLabel(seat.id, seat.email),
+        id: seat.id,
+        label: chatGptSeatLabel(seat.id, seat.email),
         active: seat.active,
         fetchedAt: entry?.fetchedAt ?? observed.get(seat.id)?.at,
         error: seat.reason ? REASON_TEXT[seat.reason] : undefined,

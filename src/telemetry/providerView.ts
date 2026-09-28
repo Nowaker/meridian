@@ -7,7 +7,7 @@ export interface ProviderUsage {
   error?: string; models?: string[]; observedSince?: number;
   capabilities?: Array<{ name: string; status: string; detail: string }>;
   activity?: { requests: number; errors: number; inputTokens: number; outputTokens: number; cacheReadTokens: number };
-  accounts: Array<{ id: string; active?: boolean; fetchedAt?: number; error?: string; windows: Array<{ type: string; group?: string; utilization: number; resetsAt: number }> }>;
+  accounts: Array<{ id: string; label?: string; active?: boolean; fetchedAt?: number; error?: string; windows: Array<{ type: string; group?: string; utilization: number; resetsAt: number }> }>;
 }
 export interface ProviderSnapshot { providers: ProviderUsage[]; fetchedAt: number }
 export type ProviderFilter = 'all' | ProviderId
@@ -33,7 +33,7 @@ export function parseProviderSnapshot(value: unknown): ProviderSnapshot {
       activity: activity && { requests: count(activity.requests), errors: count(activity.errors), inputTokens: count(activity.inputTokens), outputTokens: count(activity.outputTokens), cacheReadTokens: count(activity.cacheReadTokens) },
       accounts: array(p.accounts).map(value => {
         const a = object(value)
-        return { id: string(a.id), active: a.active === undefined ? undefined : boolean(a.active), fetchedAt: optionalNumber(a.fetchedAt), error: optionalString(a.error), windows: array(a.windows).map(value => {
+        return { id: string(a.id), label: optionalString(a.label), active: a.active === undefined ? undefined : boolean(a.active), fetchedAt: optionalNumber(a.fetchedAt), error: optionalString(a.error), windows: array(a.windows).map(value => {
           const w = object(value), utilization = count(w.utilization)
           if (utilization > 1) return fail()
           return { type: string(w.type), group: optionalString(w.group), utilization, resetsAt: number(w.resetsAt) }
@@ -57,7 +57,7 @@ export function providerOverview(data: ProviderSnapshot, filter: ProviderFilter 
     <div class="provider-grid">${providers.map(p => `<article class="provider-card" data-provider-card="${p.id}"><header><div><span class="provider-eyebrow">${eyebrow[p.id]}</span><h2>${esc(p.name)}</h2></div><span class="provider-state ${p.status === 'healthy' ? 'good' : ''}">${esc(p.enabled ? p.status : 'Not enabled')}</span></header>
       ${p.enabled ? `<p class="provider-endpoint">${esc(p.endpoint)}</p>${p.error ? `<p class="provider-warning" role="status">${esc(p.error)}</p>` : ''}
       ${p.activity ? `<div class="provider-activity"><span><strong>${num(p.activity.requests)}</strong> requests</span><span><strong>${num(p.activity.inputTokens + p.activity.outputTokens)}</strong> tokens</span></div>` : '<p class="provider-caption">Activity unavailable</p>'}
-      ${p.accounts.map(account => `<section class="provider-account"><h3>${esc(account.id)}${account.active ? ' <span class="provider-caption">· Current account</span>' : ''}</h3>${account.error ? `<p class="provider-warning">${esc(account.error)}${account.windows.length ? ' · Last known limits shown below.' : ''}</p>` : ''}${account.windows.map(w => {
+      ${p.accounts.map(account => `<section class="provider-account"><h3>${esc(account.label ?? account.id)}${account.active ? ' <span class="provider-caption">· Current account</span>' : ''}</h3>${account.error ? `<p class="provider-warning">${esc(account.error)}${account.windows.length ? ' · Last known limits shown below.' : ''}</p>` : ''}${account.windows.map(w => {
         const stale = !!account.error || !account.fetchedAt || data.fetchedAt - account.fetchedAt > 90000 || w.resetsAt <= data.fetchedAt
         const value = Math.round(w.utilization * 100)
         return `<div class="provider-quota"><div><span>${esc(w.group ? w.group + ' · ' : '')}${esc(windowLabel(w.type))}</span><strong>${value}% used${stale ? ' · stale' : ''}</strong></div><progress max="1" value="${w.utilization}" class="${stale ? 'stale' : value >= 85 ? 'danger' : value >= 60 ? 'warning' : ''}" aria-label="${esc(w.group || p.name)} ${esc(w.type)} usage"></progress><small>${stale ? 'Last known reset' : 'Resets'} ${esc(new Date(w.resetsAt).toLocaleString())}</small></div>`

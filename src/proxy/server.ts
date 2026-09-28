@@ -1,7 +1,7 @@
 import { providerPageHtml } from '../telemetry/providerPage'
 import { providerOverview, isProviderFilter } from '../telemetry/providerView'
 import { ClaudeProviderFacts, disabledProvider, providerSnapshot } from './backends/providerStatus'
-import { chatGptProvider, CHATGPT_ADAPTER } from './backends/chatgptStatus'
+import { chatGptProvider, chatGptSeatLabel, CHATGPT_ADAPTER } from './backends/chatgptStatus'
 import { createChatGptBackend, type ChatGptTurnEvent } from './backends/chatgpt'
 import { resolveChatGptSource } from './chatgpt/config'
 import { getCodexUsage } from './codex/service'
@@ -7961,7 +7961,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   const recordChatGptTurn = (event: ChatGptTurnEvent): void => {
     const usage = event.usage
     const seat = event.seat ? chatGptSource?.seats().find(view => view.id === event.seat) : undefined
-    const profileId = event.seat ? `chatgpt:${seat?.email ?? event.seat.slice(-6)}` : undefined
+    const profileId = event.seat ? `chatgpt:${chatGptSeatLabel(event.seat, seat?.email ?? null)}` : undefined
     // Claude's convention: inputTokens is the UNCACHED part, cache reads are
     // separate. ChatGPT reports a total with cached_tokens inside it.
     const uncached = usage ? Math.max(0, usage.inputTokens - usage.cachedInputTokens) : undefined
