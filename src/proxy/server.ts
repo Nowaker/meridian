@@ -5,6 +5,7 @@ import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { stream } from "hono/streaming"
 import { serve, createAdaptorServer } from "@hono/node-server"
+import { getConnInfo } from "@hono/node-server/conninfo"
 import { socketActivationFd, parseIdleExitSeconds, isModelRequestPath } from "./socketActivation"
 import type { Server } from "node:http"
 import { homedir } from "node:os"
@@ -16,6 +17,7 @@ import { IdleStallCeilingError, IdleStallTracker, idleStallRequestKey } from "./
 import { linkRequestAbort, type RequestAbortLink } from "./requestAbort"
 import { processSessionTree, truncateSessionKey, type SessionTreeRegistration } from "./sessionTree"
 import { AbortableSemaphore, getProcessSdkSemaphore, type SemaphoreLease } from "./concurrency"
+import { InflightRegistry, isLoopbackPeer, onResponseDone, type InflightHandle } from "./inflight"
 import { closeServerWithGracePeriod, trackServerConnections } from "./shutdown"
 import { fetchOAuthUsage, fetchOAuthUsageResult, toUsageEntry, peekOAuthUsage } from "./oauthUsage"
 import { resolveSdkWorkingDirectory } from "./cwd"
@@ -298,6 +300,8 @@ interface RequestMeta {
   }
   /** Permanently retain the session lease when mandatory durable cleanup fails. */
   retainSessionTurnFence?: () => void
+  /** This request's `GET /inflight` entry; shared by every failover attempt. */
+  inflight?: InflightHandle
   /**
    * Cancel this request's live session subtree (see `sessionTree.ts`).
    *
@@ -809,6 +813,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   let draining = false
   let durableWritesRevoked = false
   let inFlightRequests = 0
+  /** The same requests as inFlightRequests, broken down for GET /inflight. */
+  const inflight = new InflightRegistry()
   const activeRequestAborts = new Set<AbortController>()
   /** Cause-aware shutdown aborts: each entry labels its request's registry
    * before the controller fires, because the shutdown producer aborts the
@@ -898,12 +904,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     // proxyOverheadMs — corrupting the one number that says "the proxy is the
     // bottleneck" precisely under the load that makes clients cancel.
     const acquireStartedAt = Date.now()
+    const leaveSdkQueue = requestMeta.inflight?.enterQueue()
     let lease: SemaphoreLease
     try {
       lease = await sdkSemaphore.acquire(signal)
     } catch (error) {
       requestMeta.sdkQueueWaitMs += Date.now() - acquireStartedAt
       throw error
+    } finally {
+      leaveSdkQueue?.()
     }
     requestMeta.sdkQueueWaitMs += lease.waitedMs
     const startedAt = Date.now()
@@ -995,10 +1004,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   app.use("/antigravity/*", requireAuth)
 
   // Separate provider routes; Claude retains all existing paths and semantics.
-  app.all('/antigravity/*', c => {
+  app.all('/antigravity/*', async c => {
     if (!antigravity) return c.json({ error: { type: 'not_found_error', message: 'Antigravity is not enabled' } }, 404)
     const url = new URL(c.req.url); url.pathname = url.pathname.slice('/antigravity'.length)
-    return antigravity.app.fetch(new Request(url.toString(), c.req.raw))
+    // Model work arrives as POST; reads and polls are not in-flight work.
+    const entry = c.req.method === 'POST' ? inflight.begin('antigravity') : undefined
+    try {
+      const response = await antigravity.app.fetch(new Request(url.toString(), c.req.raw))
+      if (!entry) return response
+      entry.setStream((response.headers.get('content-type') ?? '').includes('text/event-stream'))
+      return onResponseDone(response, entry.end)
+    } catch (error) {
+      entry?.end()
+      throw error
+    }
   })
   app.get('/providers', c => c.html(providerPageHtml))
   for (const route of ['/providers/status', '/providers/view']) app.get(route, async c => {
@@ -2182,6 +2201,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
         // Allow transform pipeline to override streaming preference (e.g. LiteLLM requires non-streaming)
         const stream = pipelineCtx.prefersStreaming !== undefined ? pipelineCtx.prefersStreaming : (body.stream ?? false)
+        requestMeta.inflight?.setStream(stream === true)
 
         // --- SDK parameter passthrough ---
         // Extract effort, thinking, taskBudget, and native structured output
@@ -7599,6 +7619,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     let retainSessionTurnFence = false
     let leaseWatchdog: ReturnType<typeof setTimeout> | undefined
     inFlightRequests++
+    const inflightEntry = inflight.begin("claude", queueEnteredAt)
     // Releasing the lease is deliberately separate from finishing the request:
     // the watchdog must be able to unblock the session without also corrupting
     // the in-flight count that the shutdown drain reads.
@@ -7646,6 +7667,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       activeRequestAborts.delete(turnWatchdogAbort)
       activeShutdownLabels.delete(turnWatchdogAbort)
       inFlightRequests--
+      inflightEntry.end()
     }
 
     let body: any
@@ -7668,6 +7690,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           error: { type: "invalid_request_error", message: "Request body must be valid JSON" },
         }), { status: 400, headers: { "Content-Type": "application/json" } })
       }
+      inflightEntry.setStream(body?.stream === true)
 
       // Fingerprints are intentionally excluded here: they only hash the first
       // user message + cwd and cannot distinguish independent headerless chats.
@@ -7725,8 +7748,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             }, SESSION_TURN_MAX_HOLD_MS)
             leaseWatchdog.unref?.()
             const acquireSignal = AbortSignal.any([c.req.raw.signal, turnWatchdogAbort.signal])
-            sessionTurnLease = await processSessionTurns.acquire(turnKey, acquireSignal)
-            crossProcessTurnLease = await crossProcessSessionTurns.acquire(turnKey, acquireSignal)
+            const leaveTurnQueue = inflightEntry.enterQueue()
+            try {
+              sessionTurnLease = await processSessionTurns.acquire(turnKey, acquireSignal)
+              crossProcessTurnLease = await crossProcessSessionTurns.acquire(turnKey, acquireSignal)
+            } finally {
+              leaveTurnQueue()
+            }
           } catch (error) {
             if (
               c.req.raw.signal.aborted
@@ -7802,6 +7830,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         routingTurnIdentity,
         retainSessionTurnFence: () => { retainSessionTurnFence = true },
         cascadeSubtreeCancel,
+        inflight: inflightEntry,
       }
       const response = await handleMessages(c, requestMeta, {
         body,
@@ -8054,6 +8083,25 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return c.body(body, 200, {
       "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
     })
+  })
+
+  // Would restarting this process now cut a client off? Counts only, for a
+  // supervisor on the same host that restarts when `total` is 0. Open like
+  // /health (no API key), but answered only to a loopback peer: the counts say
+  // when this machine is being used, which nobody off the host needs to know.
+  app.get("/inflight", (c) => {
+    let remoteAddress: string | undefined
+    try {
+      remoteAddress = getConnInfo(c).remote.address
+    } catch {
+      // Served by something other than @hono/node-server: no peer to trust.
+      remoteAddress = undefined
+    }
+    if (!isLoopbackPeer(remoteAddress, c.req.raw.headers)) {
+      return c.json({ error: { type: "forbidden", message: "/inflight is answered only to loopback clients" } }, 403)
+    }
+    c.header("Cache-Control", "no-store")
+    return c.json(inflight.snapshot(antigravity ? ["claude", "antigravity"] : ["claude"]))
   })
 
   // Liveness — would restarting this process help? Answered without touching
