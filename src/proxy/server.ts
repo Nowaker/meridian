@@ -191,6 +191,7 @@ import {
   readSessionStoreSnapshot,
   readSessionStoreGenerationSnapshot,
   type StoredSessionGeneration,
+  DEFAULT_PROFILE_COPY_GRACE_MS,
 } from "./sessionStore"
 import {
   abandonFork,
@@ -204,6 +205,7 @@ import {
   publishPinnedTranscript,
   registerLiveTranscript,
   releaseJoinedTranscriptLease,
+  releaseSupersededProfileCopies,
   runGc as runSessionGc,
   getTranscriptResourceKey,
   SessionLifecycleError,
@@ -802,9 +804,32 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   }
   sessionGcOptions.pinProvider = collectSessionGcPins
 
+  const profileCopyGraceMs = Math.max(0, envInt("SESSION_PROFILE_COPY_GRACE_MS", DEFAULT_PROFILE_COPY_GRACE_MS))
+  const pruneSupersededProfileCopies = async (): Promise<void> => {
+    try {
+      const pruned = await releaseSupersededProfileCopies({
+        profileIds: getEffectiveProfiles(finalConfig.profiles).map((profile) => profile.id),
+        graceMs: profileCopyGraceMs,
+        // In this process, a request snapshots every profile's mapping
+        // generation and registers its turn in one synchronous step, so no
+        // local request can see a copy vanish under it. Another process sharing
+        // the store is covered for the length of its held turn lock.
+        isConversationActive: (conversationId) => {
+          const turnKey = `session:${conversationId}`
+          return processSessionTurns.isActive(turnKey) || crossProcessSessionTurns.isHeld(turnKey)
+        },
+      }, sessionGcOptions)
+      if (pruned > 0) claudeLog("session.profile_copies_pruned", { pruned })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      claudeLog("session.profile_copy_prune_failed", { error: message })
+    }
+  }
+
   const sweepSessionGc = (): Promise<void> => {
     if (sessionGcRunning) return sessionGcRunning
     sessionGcRunning = (async () => {
+      await pruneSupersededProfileCopies()
       const result = await runSessionGc(collectSessionGcPins(), sessionGcOptions)
       if (result.deleted || result.notFound || result.failed) {
         claudeLog("session.gc", { ...result })

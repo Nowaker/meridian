@@ -33,7 +33,12 @@ export {
   SessionLifecycleQueueStalledError,
   SessionLifecycleReentrancyError,
 } from "./session/lifecycleErrors"
-import { getMaxStoredSessionsLimit, getSessionStoreDir } from "./sessionStore"
+import {
+  getMaxStoredSessionsLimit,
+  getSessionStoreDir,
+  pruneSupersededProfileCopies,
+  type ProfileCopyPruneOptions,
+} from "./sessionStore"
 import {
   directoryRenameWasBlocked,
   syncDirectoryDurably,
@@ -745,6 +750,30 @@ export async function reconcile(
     if (changed) await writeSidecar(paths.sidecar, sidecar)
     return result
   })
+}
+
+/**
+ * Remove superseded cross-profile mappings no faster than the transcript
+ * backlog can absorb them. Fresh-request admission draws on the same pending
+ * budget and, when it is full, returns the newest retired transcripts to live
+ * (deferRetirementForAdmission) - which would undo this prune's retirements
+ * one request at a time. The transcripts unpinned here are therefore capped to
+ * keep at least half of the budget free: a large first prune drains over
+ * successive sweeps, as retired transcripts are deleted, instead of filling
+ * the backlog at once.
+ * Reconciliation performs the actual retirement. Returns mappings removed.
+ */
+export async function releaseSupersededProfileCopies(
+  copies: Omit<ProfileCopyPruneOptions, "maxUnpinnedTranscripts">,
+  options: SessionLifecycleOptions = {},
+): Promise<number> {
+  const maxPending = option(options.maxPending, DEFAULT_MAX_PENDING, "maxPending")
+  // Every sidecar write is an atomic rename, so an unlocked read is a coherent
+  // snapshot; the budget only needs to be conservative, not exact.
+  const sidecar = await readSidecar(join(getStoreDir(options), SIDECAR_NAME))
+  const budget = Math.floor(maxPending / 2) - pendingResourceCount(sidecar)
+  if (budget <= 0) return 0
+  return pruneSupersededProfileCopies({ ...copies, maxUnpinnedTranscripts: budget })
 }
 
 /**
