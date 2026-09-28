@@ -24,7 +24,7 @@ export interface BuildBadgePart {
 
 export type BuildIdentityView =
   | { readonly mode: "hidden" }
-  | { readonly mode: "update"; readonly text: string; readonly href: string; readonly title: string }
+  | { readonly mode: "release"; readonly text: string; readonly title: string }
   | { readonly mode: "local"; readonly parts: readonly BuildBadgePart[]; readonly label: string; readonly title: string }
 
 export interface BuildDriftView {
@@ -54,14 +54,8 @@ export function buildIdentityView(build: unknown): BuildIdentityView {
   if (!isRecord(build)) return { mode: "hidden" }
   const version = text(build.version)
   if (build.source === "npm") {
-    const latest = text(build.latest)
-    if (build.updateAvailable !== true || !latest) return { mode: "hidden" }
-    return {
-      mode: "update",
-      text: latest + " available",
-      href: "https://github.com/rynfar/meridian/releases",
-      title: "Running " + (version ?? "unknown") + " - update with:\nnpm install -g @rynfar/meridian@latest",
-    }
+    if (!version || version === "unknown") return { mode: "hidden" }
+    return { mode: "release", text: "v" + version.replace(/^v/, ""), title: "Running Meridian " + version }
   }
 
   const parts: BuildBadgePart[] = []

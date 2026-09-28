@@ -34,18 +34,18 @@ describe("buildIdentityView", () => {
     expect(profileBarJs).toContain(buildDriftView.toString())
   })
 
-  test("a current npm install says nothing", () => {
-    expect(identity({ source: "npm", version: "1.77.1", latest: "1.77.1", updateAvailable: false })).toEqual({ mode: "hidden" })
-    expect(identity({ source: "npm", version: "1.77.1" })).toEqual({ mode: "hidden" })
+  test("an npm install shows its version, current or not", () => {
+    // Whether a newer release exists is the separate update badge's job, so
+    // the identity view reads the same either way.
+    const release: BuildIdentityView = { mode: "release", text: "v1.77.1", title: "Running Meridian 1.77.1" }
+    expect(identity({ source: "npm", version: "1.77.1", latest: "1.77.1", updateAvailable: false })).toEqual(release)
+    expect(identity({ source: "npm", version: "1.77.1" })).toEqual(release)
+    expect(identity({ source: "npm", version: "1.77.1", latest: "1.78.0", updateAvailable: true })).toEqual(release)
   })
 
-  test("an outdated npm install keeps the releases-page update chip", () => {
-    expect(identity({ source: "npm", version: "1.77.0", latest: "1.77.1", updateAvailable: true })).toEqual({
-      mode: "update",
-      text: "1.77.1 available",
-      href: "https://github.com/rynfar/meridian/releases",
-      title: "Running 1.77.0 - update with:\nnpm install -g @rynfar/meridian@latest",
-    })
+  test("an npm install with no known version shows nothing rather than a guess", () => {
+    expect(identity({ source: "npm", version: "unknown" })).toEqual({ mode: "hidden" })
+    expect(identity({ source: "npm" })).toEqual({ mode: "hidden" })
   })
 
   test("a certified artifact shows release, counter, linked branch and commit, dirty", () => {

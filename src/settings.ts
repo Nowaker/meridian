@@ -62,6 +62,12 @@ export interface MeridianSettings {
   telemetrySize?: number
   /** Entries the in-memory diagnostic log ring holds. MERIDIAN_DIAGNOSTIC_LOG_SIZE wins. */
   diagnosticLogSize?: number
+
+  /** Ask the npm registry once a day whether a newer Meridian is published.
+   *  Off unless switched on: an instance only reaches a third party on a timer
+   *  because someone asked it to. The header shows the running version either
+   *  way. MERIDIAN_NO_UPDATE_CHECK=1 forces it off regardless. */
+  checkForUpdates?: boolean
 }
 
 /**

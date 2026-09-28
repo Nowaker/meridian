@@ -52,26 +52,56 @@ describe("shared site header", () => {
     expect(profileBarJs).toContain("/profiles/list")
   })
 
-  test("header shows a build chip fed by /health's build block", () => {
+  test("header shows the running version and an update badge, fed by /health's build block", () => {
     expect(profileBarHtml).toContain("mhBuild")
+    expect(profileBarHtml).toContain("mhProv")
+    expect(profileBarHtml).toContain("mhUpdate")
     expect(profileBarJs).toContain("renderBuild")
     expect(profileBarJs).toContain("updateAvailable")
   })
 
-  test("build chip colours follow the DESIGN.md role split", () => {
-    // Blue = interactive: the update chip is a link to the releases page.
-    // Violet = meta: the provenance chip has no href and must not be blue.
-    // Swapping these is the single easiest way to break the design language,
-    // and it is invisible in a screenshot review.
-    // The provenance pill is violet, but its branch/commit pieces are links
-    // and must be blue; drift uses the semantic warning hue and nothing else.
+  test("the version sits right of the status pill, and the update badge right of that", () => {
+    // The npm version chip and the local provenance pill are never shown
+    // together; whichever applies sits between the status and the badge.
+    const right = profileBarHtml.slice(profileBarHtml.indexOf('class="mh-right"'))
+    const at = (id: string) => right.indexOf(`id="${id}"`)
+    expect(at("mhStatus")).toBeGreaterThanOrEqual(0)
+    expect(at("mhStatus")).toBeLessThan(at("mhBuild"))
+    expect(at("mhBuild")).toBeLessThan(at("mhProv"))
+    expect(at("mhProv")).toBeLessThan(at("mhDrift"))
+    expect(at("mhDrift")).toBeLessThan(at("mhUpdate"))
+  })
+
+  test("the update badge is not limited to npm installs", () => {
+    // A checkout compares its package.json version, so it too is told when a
+    // newer release is out; only the advice in the tooltip differs.
+    expect(profileBarJs).toContain("if (build && build.updateAvailable && build.latest)")
+    expect(profileBarJs).toContain("pull and restart this checkout")
+    expect(profileBarJs).toContain("pull and rebuild this checkout")
+  })
+
+  test("chip colours follow the DESIGN.md role split", () => {
+    // Blue = interactive: the update badge links to the releases page, and the
+    // provenance pill's branch/commit pieces are links too.
+    // Violet = meta: the provenance pill itself annotates a non-npm build.
+    // An npm install's version is neither: always-on chrome, so it is muted
+    // and takes no accent at all. Drift uses the semantic warning hue and
+    // nothing else. Swapping these is the single easiest way to break the
+    // design language, and it is invisible in a screenshot review.
     const rule = (selector: string) => {
       const start = profileBarCss.indexOf(`.meridian-header ${selector} {`)
       expect(start, `${selector} rule exists`).toBeGreaterThanOrEqual(0)
       return profileBarCss.slice(start, profileBarCss.indexOf("}", start))
     }
 
-    const updateRule = rule(".mh-build.update")
+    const versionRule = rule(".mh-build")
+    expect(versionRule).toContain("var(--muted, #8b949e)")
+    expect(versionRule).not.toContain("--accent")
+    // Not a link in any state, so it must not offer a pointer affordance.
+    expect(versionRule).toContain("cursor: default")
+    expect(profileBarHtml).toContain('<span class="mh-build" id="mhBuild">')
+
+    const updateRule = rule(".mh-update")
     expect(updateRule).toContain("var(--accent, #58a6ff)")
     expect(updateRule).not.toContain("--accent2")
 
@@ -89,7 +119,20 @@ describe("shared site header", () => {
 
     // Pieces without a safe URL render as spans, never as href-less anchors.
     expect(profileBarJs).toContain("document.createElement(part.href ? 'a' : 'span')")
-    expect(profileBarJs).toContain("removeAttribute('href')")
+  })
+
+  test("header css is brace-balanced, so no rule swallows the ones below it", () => {
+    // An unclosed rule nests every rule after it and CSS drops them all,
+    // which neither review nor a screenshot of what still renders catches.
+    let depth = 0
+    let lowest = 0
+    for (const ch of profileBarCss) {
+      if (ch === "{") depth++
+      else if (ch === "}") depth--
+      lowest = Math.min(lowest, depth)
+    }
+    expect(lowest).toBe(0)
+    expect(depth).toBe(0)
   })
 
   test("drift is polled only for local builds, never overlapping, and bypasses the cache", () => {

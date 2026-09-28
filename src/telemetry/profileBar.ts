@@ -126,21 +126,21 @@ export const profileBarCss = `
   .meridian-header .mh-profile .mh-profile-type {
     color: var(--muted, #8b949e); font-size: 10px;
   }
-  /* npm update chip — a link to the releases page, so it is blue
-     (interactive). Local/dev provenance is the separate .mh-prov pill. */
+  /* Version chips, then the update badge beside them. The colours are not a
+     style choice: "update available" is a link to the releases page, so it
+     is blue (interactive); a local/dev build's identity is the violet .mh-prov
+     meta pill below; an npm install's version is neither, so it is muted
+     chrome. Swapping these would break the DESIGN.md rule. */
   .meridian-header .mh-build {
     display: none; align-items: center; gap: 6px;
     font-size: 11px; font-weight: 500; white-space: nowrap;
-    padding: 3px 10px; border-radius: 20px; text-decoration: none;
-    transition: background 0.15s;
+    padding: 3px 10px; border-radius: 20px;
+    color: var(--muted, #8b949e);
+    background: var(--surface, #161b22);
+    border: 1px solid var(--border, #30363d);
+    cursor: default;
   }
   .meridian-header .mh-build.visible { display: inline-flex; }
-  .meridian-header .mh-build.update {
-    color: var(--accent, #58a6ff);
-    background: rgba(88,166,255,0.12);
-    border: 1px solid rgba(88,166,255,0.35);
-  }
-  .meridian-header .mh-build.update:hover { background: rgba(88,166,255,0.18); }
   /* Local/dev build identity: a violet meta pill whose branch and commit
      pieces become blue links only when the backend supplied a safe URL.
      Drift sits beside it as its own chip, because it is refreshed from a
@@ -179,6 +179,17 @@ export const profileBarCss = `
     background: rgba(210,153,34,0.12);
     border-color: rgba(210,153,34,0.35);
   }
+  .meridian-header .mh-update {
+    display: none; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 500; white-space: nowrap;
+    padding: 3px 10px; border-radius: 20px; text-decoration: none;
+    color: var(--accent, #58a6ff);
+    background: rgba(88,166,255,0.12);
+    border: 1px solid rgba(88,166,255,0.35);
+    transition: background 0.15s;
+  }
+  .meridian-header .mh-update.visible { display: inline-flex; }
+  .meridian-header .mh-update:hover { background: rgba(88,166,255,0.18); }
   .meridian-header .mh-profile.following { border-color: var(--accent2, #bc8cff); }
   .meridian-header .mh-profile .mh-profile-follow {
     color: var(--accent2, #bc8cff); font-size: 10px;
@@ -219,11 +230,12 @@ export const profileBarHtml = `
     <a href="/plugins" id="nav-plugins">Plugins</a>
   </nav>
   <div class="mh-right">
-    <a class="mh-build" id="mhBuild" target="_blank" rel="noopener"></a>
-    <span class="mh-prov" id="mhProv" role="group"></span>
-    <span class="mh-drift" id="mhDrift" role="status" hidden></span>
     <a class="mh-profile" id="mhProfile" href="/" title="Active profile — switch from the home page"></a>
     <span class="mh-status" id="mhStatus"><span class="mh-dot" id="mhDot"></span><span class="mh-status-text" id="mhStatusText"></span></span>
+    <span class="mh-build" id="mhBuild"></span>
+    <span class="mh-prov" id="mhProv" role="group"></span>
+    <span class="mh-drift" id="mhDrift" role="status" hidden></span>
+    <a class="mh-update" id="mhUpdate" href="https://github.com/rynfar/meridian/releases" target="_blank" rel="noopener"></a>
   </div>
 </header>
 `
@@ -232,6 +244,7 @@ export const profileBarJs = `
 (function() {
   var profileChip = document.getElementById('mhProfile');
   var buildChip = document.getElementById('mhBuild');
+  var updateChip = document.getElementById('mhUpdate');
   var statusDot = document.getElementById('mhDot');
   var statusText = document.getElementById('mhStatusText');
 
@@ -254,18 +267,17 @@ export const profileBarJs = `
   var provKey = '';
   var driftKey = '';
 
-  // Build chips. Hidden entirely for a current npm install, which is the case
-  // that needs no comment. Rebuilt only when the view changes, so a poll never
-  // yanks a link out from under the pointer or keyboard focus.
+  // Build chips, right of the health pill. The version is a muted chip for an
+  // npm install and the violet provenance pill for a local/dev build. The pill
+  // is rebuilt only when the view changes, so a poll never yanks a link out
+  // from under the pointer or keyboard focus.
   function renderBuild(build) {
     var view = buildIdentityView(build);
-    if (view.mode === 'update') {
+    if (view.mode === 'release') {
       buildChip.textContent = view.text;
-      buildChip.href = view.href;
       buildChip.title = view.title;
-      buildChip.className = 'mh-build update visible';
+      buildChip.className = 'mh-build visible';
     } else {
-      buildChip.removeAttribute('href');
       buildChip.className = 'mh-build';
     }
     var key = JSON.stringify(view);
@@ -291,6 +303,7 @@ export const profileBarJs = `
       }
     }
     setDriftTracking(view.mode === 'local');
+    renderUpdate(build);
   }
 
   // Drift comes from /build-status, which only local/dev builds serve. It has
@@ -342,6 +355,22 @@ export const profileBarJs = `
     driftKey = '';
     driftChip.hidden = true;
     driftChip.textContent = '';
+  }
+
+  // The update badge answers a separate question: is a newer release
+  // published? It shows once an enabled update check has resolved one, for
+  // every build source. A checkout compares its package.json version, so it
+  // is told too, with advice it can actually follow.
+  function renderUpdate(build) {
+    if (build && build.updateAvailable && build.latest) {
+      updateChip.textContent = 'update available';
+      updateChip.title = build.latest + ' is published, running ' + build.version + ' — ' +
+        (build.source === 'npm' ? 'update with:\\nnpm install -g @rynfar/meridian@latest'
+          : build.kind === 'source' ? 'pull and restart this checkout' : 'pull and rebuild this checkout');
+      updateChip.className = 'mh-update visible';
+    } else {
+      updateChip.className = 'mh-update';
+    }
   }
 
   function loadHeader() {
