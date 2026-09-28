@@ -959,37 +959,63 @@ function validateStoreMeta(value: unknown): SessionStoreMeta {
   }
 }
 
-interface StoreDocumentCache {
-  path: string
+interface StoreFileIdentity {
+  dev: number
   ino: number
   mtimeMs: number
+  ctimeMs: number
   size: number
+}
+
+interface StoreDocumentCache extends StoreFileIdentity {
+  path: string
   document: SessionStoreDocument
 }
 
+function sameStoreFile(cached: StoreDocumentCache | undefined, path: string, info: StoreFileIdentity): boolean {
+  return cached?.path === path
+    && cached.dev === info.dev
+    && cached.ino === info.ino
+    && cached.mtimeMs === info.mtimeMs
+    && cached.ctimeMs === info.ctimeMs
+    && cached.size === info.size
+}
+
 // Takes the synchronous full-file parse — well over a hundred milliseconds on a
-// long-lived store — off every lookup and out from under the session lifecycle
-// lock. Identity keying is exact because every writer, this process or a
-// foreign one, publishes through renameSync and therefore a new inode.
-// Callers must treat the document and its sessions as immutable; mutation goes
-// through mutateStore.
+// long-lived store — off every lookup and every locked mutation. Identity
+// keying is exact because every writer, this process or a foreign one,
+// publishes through renameSync and therefore a new inode with fresh times.
+// The document and its sessions are immutable: mutateStore hands mutators a
+// copy-on-write view, and entries are replaced rather than edited in place.
 let storeDocumentCache: StoreDocumentCache | undefined
+
+function cacheStoreDocument(path: string, info: StoreFileIdentity, document: SessionStoreDocument): void {
+  // An in-place edit would reach disk through the serialization memo or be
+  // lost on the next write; freezing turns that into an immediate error.
+  for (const session of Object.values(document.sessions)) Object.freeze(session)
+  storeDocumentCache = {
+    path,
+    dev: info.dev,
+    ino: info.ino,
+    mtimeMs: info.mtimeMs,
+    ctimeMs: info.ctimeMs,
+    size: info.size,
+    document,
+  }
+}
 
 function readStoreDocumentCached(path: string): SessionStoreDocument {
   let fd: number | undefined
   try {
     const info = statSync(path)
-    const cached = storeDocumentCache
-    if (cached?.path === path && cached.ino === info.ino && cached.mtimeMs === info.mtimeMs && cached.size === info.size) {
-      return cached.document
-    }
+    if (sameStoreFile(storeDocumentCache, path, info)) return storeDocumentCache!.document
     // Identity is re-taken from the same fd the content is read from, so a
     // rename landing between stat and read can never pair one file's identity
     // with another file's bytes.
     fd = openSync(path, "r")
     const identity = fstatSync(fd)
     const document = parseStoreDocument(readFileSync(fd, "utf8"))
-    storeDocumentCache = { path, ino: identity.ino, mtimeMs: identity.mtimeMs, size: identity.size, document }
+    cacheStoreDocument(path, identity, document)
     return document
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
@@ -1005,22 +1031,10 @@ function readStoreDocumentCached(path: string): SessionStoreDocument {
  *  must never turn a committed write into a thrown mutation. */
 function publishStoreCache(path: string, document: SessionStoreDocument): void {
   try {
-    const info = statSync(path)
-    storeDocumentCache = { path, ino: info.ino, mtimeMs: info.mtimeMs, size: info.size, document }
+    cacheStoreDocument(path, statSync(path), document)
   } catch {
     storeDocumentCache = undefined
   }
-}
-
-function readStoreDocumentStrict(path: string): SessionStoreDocument {
-  let data: string
-  try {
-    data = readFileSync(path, "utf8")
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyStoreDocument()
-    throw error
-  }
-  return parseStoreDocument(data)
 }
 
 /** Parse and validate raw store bytes, for both the strict and the cached read. */
@@ -1107,16 +1121,34 @@ function fsyncParentDirectory(path: string): void {
   }
 }
 
+// Entries are immutable once cached, so each is stringified and UTF-8 encoded
+// at most once; a mutation re-encodes only the entries it replaced. Encoding
+// the whole store was most of a write's CPU, all of it blocking the loop.
+const serializedEntries = new WeakMap<StoredSession, Buffer>()
+
+function serializeStoreDocument(document: SessionStoreDocument): Buffer {
+  // Compact on purpose: machine-read only, and indentation costs ~20% of the
+  // bytes and of the stringify CPU on a large store.
+  const chunks: Buffer[] = [Buffer.from(`{${JSON.stringify(STORE_META_KEY)}:${JSON.stringify(document.meta)}`, "utf8")]
+  for (const [key, session] of Object.entries(document.sessions)) {
+    let entry = serializedEntries.get(session)
+    if (entry === undefined) {
+      entry = Buffer.from(JSON.stringify(session), "utf8")
+      serializedEntries.set(session, entry)
+    }
+    chunks.push(Buffer.from(`,${JSON.stringify(key)}:`, "utf8"), entry)
+  }
+  chunks.push(Buffer.from("}", "utf8"))
+  return Buffer.concat(chunks)
+}
+
 function writeStore(path: string, document: SessionStoreDocument): void {
   const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`
   let fd: number | undefined
   try {
     fd = openSync(tmp, "wx", 0o600)
     fchmodSync(fd, 0o600)
-    const serialized = { [STORE_META_KEY]: document.meta, ...document.sessions }
-    // Compact on purpose: machine-read only, and indentation costs ~20% of the
-    // bytes and of the stringify CPU on a large store.
-    writeFileSync(fd, JSON.stringify(serialized), "utf8")
+    writeFileSync(fd, serializeStoreDocument(document))
     fsyncSync(fd)
     closeSync(fd)
     fd = undefined
@@ -1145,10 +1177,18 @@ function mutateStore(mutator: (document: SessionStoreDocument) => boolean): void
   const path = getStorePath()
   const lock = acquireLock(`${path}.lock`)
   try {
-    const document = readStoreDocumentStrict(path)
-    if (mutator(document)) {
-      writeStore(path, document)
-      publishStoreCache(path, document)
+    // Every writer publishes while holding this lock, so the file identity
+    // checked here cannot change before our own rename: a cache hit is the
+    // current durable document without a re-parse. The draft shares entries
+    // with it; mutators replace entries and never edit them in place.
+    const current = readStoreDocumentCached(path)
+    const draft: SessionStoreDocument = {
+      sessions: { ...current.sessions },
+      meta: structuredClone(current.meta),
+    }
+    if (mutator(draft)) {
+      writeStore(path, draft)
+      publishStoreCache(path, draft)
     }
   } finally {
     releaseLock(lock)
@@ -1670,8 +1710,8 @@ export function storeSharedSessionAndPriorityAssignment(
       passthroughToolCallAssistantUuid: options.passthroughToolCallAssistantUuid ?? undefined,
       passthroughToolCallIds: options.passthroughToolCallIds ?? undefined,
       contextUsage: options.contextUsage,
-      ...(resolvedCurrentTranscript ? { currentTranscript: resolvedCurrentTranscript } : {}),
-      ...(previousTranscript ? { previousTranscript } : {}),
+      ...(resolvedCurrentTranscript ? { currentTranscript: { ...resolvedCurrentTranscript } } : {}),
+      ...(previousTranscript ? { previousTranscript: { ...previousTranscript } } : {}),
       ...(previousClaudeSessionId ? { previousClaudeSessionId } : {}),
     }
     document.sessions[options.key] = stored
@@ -1964,11 +2004,15 @@ export function attachSharedTranscriptLocator(
     if (expectedGeneration !== undefined && getStoredSessionGeneration(existing, key) !== expectedGeneration) return false
     if (!sameTranscriptLocator(existing.currentTranscript, locator)) {
       // Copy, never alias — same reason as in storeSharedSession.
-      existing.currentTranscript = { ...locator }
-      existing.revision = (existing.revision ?? 0) + 1
-      existing.generationId = randomUUID()
+      const attached: StoredSession = {
+        ...existing,
+        currentTranscript: { ...locator },
+        revision: (existing.revision ?? 0) + 1,
+        generationId: randomUUID(),
+      }
+      store[key] = attached
       advanceKeySlot(key, meta)
-      attachedGeneration = getStoredSessionGeneration(existing, key)
+      attachedGeneration = getStoredSessionGeneration(attached, key)
       if (meta.version === PRIORITY_STORE_META_VERSION) {
         for (const [routeKey, assignment] of Object.entries(meta.priorityAssignments)) {
           if (assignment.mappingKey !== key) continue
@@ -2009,6 +2053,99 @@ export function evictSharedSession(
     return true
   })
   return evicted
+}
+
+export interface ProfileCopyPruneOptions {
+  /** Configured non-default profile IDs; only their `${id}:` prefixes are recognized. */
+  profileIds: Iterable<string>
+  /** Copies used within this window are kept alongside the newest one. */
+  graceMs: number
+  /** Most transcripts the removed mappings may stop pinning in this call. */
+  maxUnpinnedTranscripts: number
+  /** A conversation with a request arrived or running keeps every copy. */
+  isConversationActive: (conversationId: string) => boolean
+}
+
+function pinnedTranscriptCount(session: StoredSession): number {
+  let count = 0
+  if (session.currentTranscript?.sessionId === session.claudeSessionId) count++
+  if (session.previousTranscript && session.previousTranscript.sessionId === session.previousClaudeSessionId) count++
+  return count
+}
+
+function selectSupersededProfileCopies(
+  document: SessionStoreDocument,
+  options: ProfileCopyPruneOptions,
+  now: number,
+): string[] {
+  const profileIds = new Set(options.profileIds)
+  profileIds.delete("default")
+  const protectedKeys = new Set(document.meta.version === PRIORITY_STORE_META_VERSION
+    ? [
+        ...Object.values(document.meta.priorityAssignments).map((assignment) => assignment.mappingKey),
+        ...Object.values(document.meta.priorityRollbackMappings).map((rollback) => rollback.mappingKey),
+      ]
+    : [])
+  const copiesByConversation = new Map<string, string[]>()
+  for (const key of Object.keys(document.sessions)) {
+    const separator = key.indexOf(":")
+    const conversationId = separator > 0 && profileIds.has(key.slice(0, separator))
+      ? key.slice(separator + 1)
+      : key
+    const copies = copiesByConversation.get(conversationId)
+    if (copies) copies.push(key)
+    else copiesByConversation.set(conversationId, [key])
+  }
+
+  const lastUsed = (key: string): number => document.sessions[key]!.lastUsedAt || 0
+  const candidates: string[] = []
+  for (const [conversationId, copies] of copiesByConversation) {
+    if (copies.length < 2) continue
+    const newest = copies.reduce((best, key) => (lastUsed(key) > lastUsed(best) ? key : best))
+    const superseded = copies.filter((key) => (
+      key !== newest && !protectedKeys.has(key) && now - lastUsed(key) > options.graceMs
+    ))
+    if (superseded.length > 0 && !options.isConversationActive(conversationId)) candidates.push(...superseded)
+  }
+  candidates.sort((left, right) => lastUsed(left) - lastUsed(right))
+
+  const victims: string[] = []
+  let remaining = options.maxUnpinnedTranscripts
+  for (const key of candidates) {
+    const cost = pinnedTranscriptCount(document.sessions[key]!)
+    if (cost > remaining) continue
+    remaining -= cost
+    victims.push(key)
+  }
+  return victims
+}
+
+/**
+ * Remove mappings superseded by a newer copy of the same conversation under
+ * another profile, oldest first. A copy only replays locally what the newer
+ * copy already resumes, and the account's prompt cache it was warm against
+ * expires within the hour, yet it keeps its per-message hashes and its
+ * transcript pinned. Removal unpins those transcripts; lifecycle
+ * reconciliation retires them through the normal bounded backlog.
+ * Returns the number of mappings removed.
+ */
+export function pruneSupersededProfileCopies(options: ProfileCopyPruneOptions): number {
+  // Select from the cached document first so the common no-op sweep takes no
+  // lock and writes nothing.
+  if (selectSupersededProfileCopies(readStoreDocumentCached(getStorePath()), options, Date.now()).length === 0) {
+    return 0
+  }
+  let pruned = 0
+  mutateStore(({ sessions, meta }) => {
+    const victims = selectSupersededProfileCopies({ sessions, meta }, options, Date.now())
+    for (const key of victims) {
+      delete sessions[key]
+      advanceKeySlot(key, meta)
+    }
+    pruned = victims.length
+    return pruned > 0
+  })
+  return pruned
 }
 
 /** Look up recovery information for a session key.

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto"
+import { existsSync } from "node:fs"
 import { hostname } from "node:os"
 import { basename, dirname, join } from "node:path"
 import {
@@ -391,6 +392,11 @@ export class CrossProcessTurnCoordinator {
     if (this.heartbeatIntervalMs >= this.staleAfterMs) {
       throw new TypeError("heartbeatIntervalMs must be shorter than staleAfterMs")
     }
+  }
+
+  /** Whether any process holds the turn lock for key, or left it behind stale. */
+  isHeld(key: string): boolean {
+    return existsSync(join(this.root, lockName(key)))
   }
 
   async acquire(key: string, signal?: AbortSignal): Promise<CrossProcessTurnLease> {

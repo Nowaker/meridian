@@ -209,9 +209,11 @@ import {
   publishPinnedTranscript,
   registerLiveTranscript,
   releaseJoinedTranscriptLease,
+  releaseSupersededProfileCopies,
   runGc as runSessionGc,
   getTranscriptResourceKey,
   SessionLifecycleError,
+  SessionLifecycleLockError,
   type SessionLifecycleOptions,
   type TranscriptLocator,
 } from "./sessionLifecycle"
@@ -798,9 +800,32 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   }
   sessionGcOptions.pinProvider = collectSessionGcPins
 
+  const profileCopyGraceMs = Math.max(0, envInt("SESSION_PROFILE_COPY_GRACE_MS", 60 * 60_000))
+  const pruneSupersededProfileCopies = async (): Promise<void> => {
+    try {
+      const pruned = await releaseSupersededProfileCopies({
+        profileIds: getEffectiveProfiles(finalConfig.profiles).map((profile) => profile.id),
+        graceMs: profileCopyGraceMs,
+        // In this process, a request snapshots every profile's mapping
+        // generation and registers its turn in one synchronous step, so no
+        // local request can see a copy vanish under it. Another process sharing
+        // the store is covered for the length of its held turn lock.
+        isConversationActive: (conversationId) => {
+          const turnKey = `session:${conversationId}`
+          return processSessionTurns.isActive(turnKey) || crossProcessSessionTurns.isHeld(turnKey)
+        },
+      }, sessionGcOptions)
+      if (pruned > 0) claudeLog("session.profile_copies_pruned", { pruned })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      claudeLog("session.profile_copy_prune_failed", { error: message })
+    }
+  }
+
   const sweepSessionGc = (): Promise<void> => {
     if (sessionGcRunning) return sessionGcRunning
     sessionGcRunning = (async () => {
+      await pruneSupersededProfileCopies()
       const result = await runSessionGc(collectSessionGcPins(), sessionGcOptions)
       if (result.deleted || result.notFound || result.failed) {
         claudeLog("session.gc", { ...result })
@@ -1760,6 +1785,26 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // retire; the reverse order could expose a mapping to a deleted target.
         await commitFork(managedForkTarget, admissionLifecycleOptions)
         managedForkCommitted = true
+      }
+
+      // Terminal publication only records where the NEXT turn resumes; this
+      // turn's answer already exists. A lifecycle lock error is raised before
+      // its transaction runs, so the durable mapping is still the pre-turn one
+      // and would resume a transcript without this answer. Invalidating it
+      // degrades the next turn to a replay instead of failing an answered turn
+      // - and every other turn queued behind the same lock - with a 503 the
+      // client can only answer by regenerating the whole turn. A durable
+      // priority attempt cannot finalize without its atomic publication, so it
+      // still fails closed.
+      const deferTerminalPublication = (
+        error: unknown,
+        mode: string,
+        invalidateMapping: () => boolean,
+      ): boolean => {
+        if (!(error instanceof SessionLifecycleLockError) || options.priorityPublication) return false
+        if (!invalidateMapping()) return false
+        claudeLog("session.publication_deferred", { mode, error: error.message })
+        return true
       }
 
       const assertPriorityPublicationReady = (): void => {
@@ -4755,9 +4800,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   claudeLog("passthrough.noncanonical_session_evicted", { mode: "non_stream" })
                 } else {
                   validateManagedForkResult(currentSessionId)
-                  await commitManagedFork()
-                  let mappingStored: false | StoredSessionGeneration
+                  let mappingStored: false | StoredSessionGeneration = false
+                  let publicationDeferred = false
                   try {
+                    await commitManagedFork()
                     assertDurableWritesAllowed()
                     mappingStored = await publishPinnedTranscript(
                       publicationTranscriptLocator(currentSessionId!),
@@ -4792,14 +4838,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       admissionLifecycleOptions,
                     )
                   } catch (error) {
+                    publicationDeferred = deferTerminalPublication(error, "non_stream", invalidateNonStreamMapping)
                     if (
+                      !publicationDeferred &&
                       (requestAbort.controller.signal.aborted || durableWritesRevoked) &&
                       managedForkPublished &&
                       !invalidateNonStreamMapping()
                     ) {
                       throw new Error("Shared session mapping changed before canceled non-stream publication cleanup")
                     }
-                    throw error
+                    if (!publicationDeferred) throw error
                   }
                   if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
                     if (mappingStored && !invalidateNonStreamMapping()) {
@@ -4807,7 +4855,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     }
                     throw new Error("Request canceled after non-stream publication")
                   }
-                  if (!mappingStored) {
+                  if (!mappingStored && !publicationDeferred) {
                     if (profileSessionId) {
                       throw new Error("Shared session mapping changed before publication")
                     }
@@ -4816,7 +4864,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     // own resume state without failing the other successful response.
                     claudeLog("session.fingerprint_publication_lost", {})
                     void sweepSessionGc()
-                  } else {
+                  } else if (mappingStored) {
                     mappingExpectedGeneration = mappingStored
                     if (managedForkTarget?.sessionId === currentSessionId) {
                       managedForkPublished = true
@@ -5972,9 +6020,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   claudeLog("passthrough.noncanonical_session_evicted", { mode: "stream" })
                 } else {
                   validateManagedForkResult(currentSessionId)
-                  await commitManagedFork()
+                  let publicationDeferred = false
+                  const deferStreamPublication = (error: unknown): false => {
+                    if (!deferTerminalPublication(error, "stream", () => evictSession(
+                      profileSessionId,
+                      profileScopedCwd,
+                      lineageMessages,
+                      mappingExpectedGeneration,
+                    ))) throw error
+                    publicationDeferred = true
+                    return false
+                  }
+                  await commitManagedFork().catch(deferStreamPublication)
                   assertDurableWritesAllowed()
-                  const mappingStored = await publishPinnedTranscript(
+                  const mappingStored = publicationDeferred ? false : await publishPinnedTranscript(
                     publicationTranscriptLocator(currentSessionId!),
                     () => {
                       assertDurableWritesAllowed()
@@ -6005,7 +6064,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       return stored
                     },
                     admissionLifecycleOptions,
-                  )
+                  ).catch(deferStreamPublication)
                   if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
                     if (
                       mappingStored && !isIndependentSession &&
@@ -6015,7 +6074,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     }
                     throw new Error("Request canceled after stream publication")
                   }
-                  if (!mappingStored) {
+                  if (!mappingStored && !publicationDeferred) {
                     if (profileSessionId) {
                       throw new Error("Shared session mapping changed before publication")
                     }
@@ -6024,7 +6083,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     // own resume state without failing the other successful response.
                     claudeLog("session.fingerprint_publication_lost", {})
                     void sweepSessionGc()
-                  } else {
+                  } else if (mappingStored) {
                     mappingExpectedGeneration = mappingStored
                     if (managedForkTarget?.sessionId === currentSessionId) {
                       managedForkPublished = true

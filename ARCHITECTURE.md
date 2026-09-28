@@ -496,12 +496,24 @@ An SDK writer lease is released once its writer has been joined. If the lifecycl
 FIFO with at most 256 waiting callers. Local waiting does not consume the
 two-second external-lock acquisition budget; only the head creates a durable
 candidate. A holder stalled for 60 seconds rejects queued/new callers without
-unlocking or abandoning its transaction. Capacity and stalled-holder errors are
+unlocking or abandoning its transaction. A stall deadline that runs more than a
+second late was delayed by a blocked event loop, which delayed the holder too, so
+it rearms instead of rejecting. Capacity and stalled-holder errors are
 distinct, defined in the dependency-leaf `session/lifecycleErrors.ts`.
+A turn whose model already answered does not fail on any of these lock errors
+at terminal publication: they are raised before the transaction runs, so the
+turn invalidates its unchanged pre-turn mapping and the next turn replays. A
+durable priority attempt still requires its atomic publication.
 Request admission signals remove queued work and cancel external acquisition,
 but a running durable callback always finishes before returning ownership.
 Cleanup never receives the canceled admission signal. Publication callbacks
 remain synchronous; same-context recursive acquisition is rejected explicitly.
+
+## Session store write cost
+
+`sessionStore.ts` mutations are synchronous and run on the event loop, so their cost is lag for every request. The parsed document is cached by file identity (device, inode, size, mtime, ctime); every writer publishes by rename while holding the store lock, so a locked mutation that finds the cache current builds on it without re-parsing. Mutators receive a copy-on-write draft and replace entries rather than editing them; cached entries are frozen. Each entry's serialized UTF-8 bytes are memoized, so a write encodes only the entries it changed. The file format, lock, fsync and rename are unchanged.
+
+A conversation that has run under several profiles has one mapping per profile (`<profile>:<session>`), each holding full per-message hashes and pinning its own transcript. Before each GC sweep, mappings superseded by a newer copy under another profile and unused for `MERIDIAN_SESSION_PROFILE_COPY_GRACE_MS` are removed. Priority route and rollback mappings and conversations with a turn registered in this process are exempt. Removal only unpins transcripts; reconciliation retires them through the normal lifecycle backlog, and `releaseSupersededProfileCopies` limits the transcripts it unpins so that at least half of the pending budget stays free for admission. A conversation returning to a pruned profile replays instead of resuming.
 
 ## Lineage hash encoding
 
