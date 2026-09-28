@@ -90,6 +90,19 @@ function turn(sessionId: string, messages: Array<{ role: string; content: string
 
 const stalled = () => new SessionLifecycleQueueStalledError("active lifecycle holder stalled for /store/session-gc.json.lock")
 
+const LOOPBACK = { incoming: { socket: { remoteAddress: "127.0.0.1" } } }
+
+/** GET /inflight's total once it settles; the request's own cleanup runs after its body ends. */
+async function settledInflightTotal(app: ReturnType<typeof createProxyServer>["app"]): Promise<number> {
+  const read = async () => ((await (await app.fetch(new Request("http://localhost/inflight"), LOOPBACK)).json()) as { total: number }).total
+  let total = await read()
+  for (let tries = 0; total !== 0 && tries < 500; tries++) {
+    await Bun.sleep(2)
+    total = await read()
+  }
+  return total
+}
+
 describe("terminal publication under a stalled lifecycle lock", () => {
   let sessionDir = ""
 
@@ -135,6 +148,9 @@ describe("terminal publication under a stalled lifecycle lock", () => {
         // The old mapping would resume a transcript without this turn's
         // answer, so it is gone and the next turn replays instead.
         expect(lookupSharedSession(`personal:${key}`)).toBeUndefined()
+        // A deferred publication still ends the request, so a restart
+        // supervisor reading GET /inflight does not wait on an answered turn.
+        expect(await settledInflightTotal(app)).toBe(0)
 
         const next = await app.fetch(turn(key, THIRD_TURN, stream))
         expect(next.status).toBe(200)
