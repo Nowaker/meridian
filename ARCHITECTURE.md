@@ -509,8 +509,14 @@ An SDK writer lease is released once its writer has been joined. If the lifecycl
 FIFO with at most 256 waiting callers. Local waiting does not consume the
 two-second external-lock acquisition budget; only the head creates a durable
 candidate. A holder stalled for 60 seconds rejects queued/new callers without
-unlocking or abandoning its transaction. Capacity and stalled-holder errors are
+unlocking or abandoning its transaction. A stall deadline that runs more than a
+second late was delayed by a blocked event loop, which delayed the holder too, so
+it rearms instead of rejecting. Capacity and stalled-holder errors are
 distinct, defined in the dependency-leaf `session/lifecycleErrors.ts`.
+A turn whose model already answered does not fail on any of these lock errors
+at terminal publication: they are raised before the transaction runs, so the
+turn invalidates its unchanged pre-turn mapping and the next turn replays. A
+durable priority attempt still requires its atomic publication.
 Request admission signals remove queued work and cancel external acquisition,
 but a running durable callback always finishes before returning ownership.
 Cleanup never receives the canceled admission signal. Publication callbacks
