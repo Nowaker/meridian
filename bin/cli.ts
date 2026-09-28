@@ -29,6 +29,7 @@ Commands:
   setup            Configure client integrations (run once after install)
   profile          Manage Claude account profiles (add, list, switch, remove)
   refresh-token    Refresh the Claude Code OAuth token
+  chatgpt-migrate  Move ChatGPT accounts from oc-codex-multi-auth into Meridian (--help)
 
 Setup options:
   --antigravity                Configure Pi or OpenCode V1 for Antigravity
@@ -209,6 +210,11 @@ if (args[0] === "setup") {
     }
   }
   process.exit(0)
+}
+
+if (args[0] === "chatgpt-migrate") {
+  const { runMigrateCli } = await import("../src/proxy/chatgpt/migrate/cli")
+  process.exit(await runMigrateCli(args.slice(1)))
 }
 
 if (args[0] === "refresh-token") {
