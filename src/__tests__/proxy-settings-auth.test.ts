@@ -120,7 +120,16 @@ describe("auth audit: every registered prefix is protected when MERIDIAN_API_KEY
   //                   profileLogin.ts), and redeeming the code additionally
   //                   needs the PKCE verifier, which never leaves this process.
   //                   A caller without both gets a rejection, not a login.
-  const PUBLIC_PREFIXES = new Set(["/", "/health", "/livez", "/readyz", "/callback"])
+  //
+  // The review for `/inflight`:
+  //
+  //   what it emits   request COUNTS per upstream and two timestamps. No
+  //                   session id, prompt, profile, account or token.
+  //   why not gated   its reader is a restart supervisor on the same host,
+  //                   which has no reason to hold the API key. It is instead
+  //                   answered only to a loopback socket peer without
+  //                   forwarding headers, so it returns 403, not 401, here.
+  const PUBLIC_PREFIXES = new Set(["/", "/health", "/livez", "/readyz", "/callback", "/inflight"])
 
   it("rejects unauthenticated requests to every non-public route prefix", async () => {
     const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })
