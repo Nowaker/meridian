@@ -4,6 +4,7 @@ import {
   SessionLifecycleQueueStalledError,
   SessionLifecycleReentrancyError,
 } from "./lifecycleErrors"
+import { diagnosticLog } from "../../telemetry"
 
 interface QueueOptions {
   readonly maxPending?: number
@@ -12,6 +13,12 @@ interface QueueOptions {
   readonly lagToleranceMs?: number
   readonly schedule?: (callback: () => void, delay: number) => () => void
   readonly now?: () => number
+  readonly log?: (message: string) => void
+}
+
+const logQueueEvent = (message: string): void => {
+  console.error(`[PROXY] ${message}`)
+  diagnosticLog.session(message)
 }
 
 interface Pending {
@@ -35,8 +42,10 @@ export class LifecycleLockQueue {
   private readonly lagToleranceMs: number
   private readonly schedule: (callback: () => void, delay: number) => () => void
   private readonly now: () => number
+  private readonly log: (message: string) => void
 
   constructor(options: QueueOptions = {}) {
+    this.log = options.log ?? logQueueEvent
     this.maxPending = options.maxPending ?? 256
     this.stallMs = options.stallMs ?? 60_000
     this.lagToleranceMs = options.lagToleranceMs ?? 1_000
@@ -110,7 +119,9 @@ export class LifecycleLockQueue {
     const armStallTimer = (): (() => void) => {
       const dueAt = this.now() + this.stallMs
       return this.schedule(() => {
-        if (this.now() - dueAt > this.lagToleranceMs) {
+        const lateMs = this.now() - dueAt
+        if (lateMs > this.lagToleranceMs) {
+          this.log(`session.lifecycle_stall_deadline_late late_ms=${Math.round(lateMs)} queued=${state.pending.size}; event loop was blocked, extending the holder's deadline`)
           stopTimer = armStallTimer()
           return
         }

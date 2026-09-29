@@ -1769,6 +1769,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         if (!(error instanceof SessionLifecycleLockError) || options.priorityPublication) return false
         if (!invalidateMapping()) return false
         claudeLog("session.publication_deferred", { mode, error: error.message })
+        const deferred = `${requestMeta.requestId} session.publication_deferred mode=${mode} reason=${error.constructor.name}; answer delivered, next turn replays`
+        plog(`[PROXY] ${deferred}`)
+        diagnosticLog.session(deferred, requestMeta.requestId)
         return true
       }
 
