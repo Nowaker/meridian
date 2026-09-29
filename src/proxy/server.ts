@@ -1,14 +1,15 @@
 import { providerPageHtml } from '../telemetry/providerPage'
 import { providerOverview, isProviderFilter } from '../telemetry/providerView'
 import { ClaudeProviderFacts, disabledProvider, providerSnapshot } from './backends/providerStatus'
-import { chatGptProvider, chatGptSeatLabel, CHATGPT_ADAPTER } from './backends/chatgptStatus'
-import { createChatGptBackend, type ChatGptTurnEvent } from './backends/chatgpt'
+import { chatGptProvider, CHATGPT_ADAPTER } from './backends/chatgptStatus'
+import { createChatGptBackend, type ChatGptSeatRefusal, type ChatGptTurnEvent, type ObservedSeatLimits } from './backends/chatgpt'
 import { resolveChatGptSource } from './chatgpt/config'
 import { ChatGptTurnLedger, chatGptTokenFields, createChatGptAdmission, createChatGptParityBackend, decorateChatGptTurn, type ChatGptTurnNotes } from './chatgpt/parity'
 import { chatGptFeatureCapabilities, getChatGptFeatures, resetChatGptFeatures, updateChatGptFeatures, validateChatGptFeatureUpdate } from './chatgpt/features'
 import { resolveModelPricing } from '../telemetry/pricing'
 import { getPricingOverrides } from '../telemetry/pricingStore'
 import { computeSummary } from '../telemetry/percentiles'
+import { CHATGPT_WARM_MODELS, chatGptRefusalDiagnosis, chatGptWarmBody, createChatGptProfileSurface } from './chatgpt/profileSurface'
 import { getCodexUsage } from './codex/service'
 import type { CodexUsageResponse } from './codex/types'
 import { createUpstreamRegistry, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
@@ -7973,11 +7974,97 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   const chatGptBodyOverrides = new WeakMap<Context, string>()
   const chatGptExhaustion = new ProfileExhaustion()
 
+  // Usage windows are fetched off the request path and served from the last
+  // result, so /providers never waits on chatgpt.com; /v1/usage/quota/all
+  // waits a bounded moment for a refresh it had to start.
+  const CHATGPT_QUOTA_WAIT_MS = 5_000
+  let chatGptUsage: CodexUsageResponse | null = null
+  let chatGptUsageAt = 0
+  let chatGptUsageRefresh: Promise<void> | undefined
+  const refreshChatGptUsage = (): Promise<void> | undefined => {
+    if (!chatGptSource) return undefined
+    if (!chatGptUsageRefresh && Date.now() - chatGptUsageAt >= 30_000) {
+      chatGptUsageAt = Date.now()
+      chatGptUsageRefresh = getCodexUsage({ loadPool: () => chatGptSource.usagePool() })
+        .then(result => { chatGptUsage = result })
+        .catch(error => { plog(`[PROXY] ChatGPT usage refresh failed: ${error instanceof Error ? error.message : String(error)}`) })
+        .finally(() => { chatGptUsageRefresh = undefined })
+    }
+    return chatGptUsageRefresh
+  }
+
+  // ChatGPT seats as profiles on /profiles/* and /v1/usage/quota/all, so the
+  // account supervisor that drives Claude profiles drives these too
+  // (chatgpt/profileSurface.ts). The backend is created below; its observed
+  // limits are read lazily.
+  let chatGptObserved: () => ReadonlyMap<string, ObservedSeatLimits> = () => new Map()
+  const chatGptProfiles = chatGptSource ? createChatGptProfileSurface({
+    source: chatGptSource,
+    observed: () => chatGptObserved(),
+    usage: () => chatGptUsage,
+    reserved: () => new Set(["default", ...getEffectiveProfiles(finalConfig.profiles).flatMap(p => [p.id, ...(p.aliases ?? [])])]),
+    names: () => getSetting("chatGptProfileNames"),
+    activeSeat: () => getSetting("chatGptActiveSeat"),
+    excluded: configuredRoutingExcludedProfileIds,
+    spent: (profileId) => spentProfiles.get(profileId),
+  }) : undefined
+
+  // `activeProfile` keeps meaning the Claude pointer wherever Claude profiles
+  // exist, so a Claude-only consumer reads what it always read; on an instance
+  // with ChatGPT seats and no Claude profile it names the ChatGPT one.
+  // `activeProfiles` states both.
+  const activeProfileFields = (claudeActive: string | null, fallback: string | null) => {
+    if (!chatGptProfiles) return { activeProfile: fallback }
+    const chatgpt = chatGptProfiles.activeProfileId()
+    const claudeConfigured = getEffectiveProfiles(finalConfig.profiles).length > 0
+    return {
+      activeProfile: claudeConfigured ? claudeActive : chatgpt ?? fallback,
+      activeProfiles: { claude: claudeConfigured ? claudeActive : null, chatgpt },
+    }
+  }
+
+  const recordChatGptRefusal = (refusal: ChatGptSeatRefusal): void => {
+    const profileId = chatGptProfiles?.profileIdFor(refusal.seat) ?? refusal.seat
+    const diagnosis = chatGptRefusalDiagnosis(refusal)
+    // `spent` means quota, as it does for Claude; a refused credential is an
+    // auth problem and is published as an event only.
+    if (refusal.kind === "rate_limited") spentProfiles.record(profileId, diagnosis, `ChatGPT ${refusal.status}: ${diagnosis.rationale}`)
+    failoverEvents.append({
+      kind: "refused",
+      profile: profileId,
+      servedBy: null,
+      reason: refusal.kind === "requires_reauth" ? "authentication_error" : refusal.kind === "rate_limited" ? "rate_limit_error" : refusal.kind,
+      routing: "active",
+      sessionKey: null,
+      internalHop: false,
+      until: refusal.until,
+      limit: diagnosis,
+      provider: "chatgpt",
+    })
+    claudeLog("profile.refused", { profile: profileId, provider: "chatgpt", bucket: diagnosis.bucket, until: refusal.until })
+  }
+
+  const recordChatGptRefusalOutcome = (outcome: { refused: readonly ChatGptSeatRefusal[]; servedBy: string | null }): void => {
+    const first = outcome.refused[0]!
+    const profile = chatGptProfiles?.profileIdFor(first.seat) ?? first.seat
+    failoverEvents.append({
+      kind: outcome.servedBy ? "failover" : "pool_exhausted",
+      profile,
+      servedBy: outcome.servedBy ? chatGptProfiles?.profileIdFor(outcome.servedBy) ?? outcome.servedBy : null,
+      reason: first.kind === "requires_reauth" ? "authentication_error" : "rate_limit_error",
+      routing: "active",
+      sessionKey: null,
+      internalHop: false,
+      until: first.until,
+      limit: chatGptRefusalDiagnosis(first),
+      provider: "chatgpt",
+    })
+  }
+
   const recordChatGptTurn = (event: ChatGptTurnEvent, notes: ChatGptTurnNotes | undefined): void => {
     const usage = event.usage
     const decoration = decorateChatGptTurn(event, notes, chatGptPricing)
-    const seat = event.seat ? chatGptSource?.seats().find(view => view.id === event.seat) : undefined
-    const profileId = event.seat ? `chatgpt:${chatGptSeatLabel(event.seat, seat?.email ?? null)}` : undefined
+    const profileId = event.seat ? chatGptProfiles?.profileIdFor(event.seat) ?? event.seat : undefined
     const tokens = usage ? chatGptTokenFields(usage) : undefined
     telemetryStore.record({
       requestId: event.requestId,
@@ -8029,12 +8116,30 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     },
     // ChatGPT seats are benched in their own tracker, never Claude's.
     exhaustion: chatGptExhaustion,
+    // Only an internal hop carrying this instance's token may claim to be a
+    // warm, which is what lets it use a seat excluded from work.
+    route: (turn) => {
+      const warm = turn.headers.get("x-meridian-internal-hop") === internalHopToken
+        && turn.headers.get("x-meridian-routing-purpose") === "warm"
+      const route = chatGptProfiles!.route(turn.headers.get("x-meridian-profile") ?? undefined, warm ? "warm" : "work")
+      if (route.kind !== "refuse") return route
+      return {
+        kind: "refuse",
+        error: "profile_excluded",
+        response: new Response(JSON.stringify({ error: { type: "profile_excluded", message: `Profile "${route.profile.id}" is excluded from work routing`, code: null } }), {
+          status: 409, headers: { "content-type": "application/json" },
+        }),
+      }
+    },
     hooks: {
       admit: createChatGptAdmission({ ledger: chatGptLedger, features: getChatGptFeatures, pricing: chatGptPricing }),
       onTurn: (event) => recordChatGptTurn(event, chatGptLedger.settle(event.requestId)),
+      onSeatRefused: recordChatGptRefusal,
+      onRefusalsSettled: recordChatGptRefusalOutcome,
     },
   }) : undefined
   if (chatGptBackend) {
+    chatGptObserved = () => chatGptBackend.observedLimits()
     upstream.registerBackend(createChatGptParityBackend<Context>({
       inner: chatGptBackend,
       ledger: chatGptLedger,
@@ -8072,20 +8177,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     }
   }
 
-  // Usage windows are fetched off the request path and served from the last
-  // result, so /providers never waits on chatgpt.com.
-  let chatGptUsage: CodexUsageResponse | null = null
-  let chatGptUsageAt = 0
-  let chatGptUsageRefresh: Promise<void> | undefined
   const chatGptStatus = () => {
     if (!chatGptSource || !chatGptBackend) return disabledProvider('chatgpt')
-    if (!chatGptUsageRefresh && Date.now() - chatGptUsageAt >= 30_000) {
-      chatGptUsageAt = Date.now()
-      chatGptUsageRefresh = getCodexUsage({ loadPool: () => chatGptSource.usagePool() })
-        .then(result => { chatGptUsage = result })
-        .catch(error => { plog(`[PROXY] ChatGPT usage refresh failed: ${error instanceof Error ? error.message : String(error)}`) })
-        .finally(() => { chatGptUsageRefresh = undefined })
-    }
+    void refreshChatGptUsage()
     const provider = chatGptProvider({
       source: chatGptSource,
       observed: chatGptBackend.observedLimits(),
@@ -8725,8 +8819,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     // from and why switching is refused. Absent unless MERIDIAN_FOLLOW_ACTIVE.
     const follow = followStatus(profiles.map(p => p.id))
     return c.json({
-      profiles: enriched,
-      activeProfile,
+      profiles: chatGptProfiles ? [...enriched, ...chatGptProfiles.listEntries()] : enriched,
+      ...activeProfileFields(listedProfiles.length > 0 ? activeProfile : null, activeProfile),
       // Additive (#383): current routing mode so UIs can surface it.
       routing: routingModeNow,
       // Reported in every mode, unlike `exhausted` above: an account that is
@@ -8783,6 +8877,31 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   })
 
   app.post("/profiles/active", async (c) => {
+    // A ChatGPT seat has its own pointer, which follow mode does not follow,
+    // so it is decided before the Claude checks below. Hono memoizes the
+    // parsed body, so the Claude path still reads it.
+    if (chatGptProfiles) {
+      const requested = await c.req.json().then(body => (body as { profile?: unknown } | null)?.profile, () => undefined)
+      if (typeof requested === "string" && chatGptProfiles.resolve(requested)) {
+        const activation = chatGptProfiles.activate(requested)
+        if (!activation.ok) {
+          return activation.status === 409
+            ? profileExcludedResponse(chatGptProfiles.resolve(requested)!.id)
+            : c.json({ error: activation.error }, 400)
+        }
+        const previous = chatGptProfiles.activeProfileId()
+        setSetting("chatGptActiveSeat", activation.profile.seat)
+        claudeLog("profile.switched", {
+          from: previous,
+          to: activation.profile.id,
+          provider: "chatgpt",
+          userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+          origin: c.req.header("origin") ?? c.req.header("referer")?.slice(0, 120) ?? null,
+        })
+        plog(`[PROXY] Active ChatGPT profile switched to: ${activation.profile.id} (from ${previous ?? "unset"}, ua: ${(c.req.header("user-agent") || "unknown").slice(0, 60)})`)
+        return c.json({ success: true, activeProfile: activation.profile.id, provider: "chatgpt" })
+      }
+    }
     // Refuse rather than accept-and-lose. Under follow mode the write would
     // persist locally, be shadowed by the followed value on the very next
     // resolve, and be erased by the next poll — a picker that appears to work
@@ -8843,8 +8962,37 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return c.json({ success: true, activeProfile: body.profile })
   })
 
-  app.post("/profiles/:id/warm", (c) => {
+  app.post("/profiles/:id/warm", async (c) => {
     const profileId = c.req.param("id")
+    const chatGptWarmProfile = chatGptProfiles?.resolve(profileId)
+    if (chatGptWarmProfile) {
+      // The smallest real Responses turn, pinned to the seat through the same
+      // gateway work takes, so the seat's own window starts. A model the seat
+      // refuses as a request (400) moves on to the next warm model.
+      const warmHeaders: Record<string, string> = {
+        "content-type": "application/json",
+        "x-meridian-profile": chatGptWarmProfile.id,
+        "x-meridian-internal-hop": internalHopToken,
+        "x-meridian-routing-purpose": "warm",
+        "x-meridian-source": "warm",
+      }
+      const warmApiKey = c.req.header("x-api-key")
+      if (warmApiKey) warmHeaders["x-api-key"] = warmApiKey
+      const warmAuthorization = c.req.header("authorization")
+      if (warmAuthorization) warmHeaders.authorization = warmAuthorization
+      let response: Response | undefined
+      for (const model of CHATGPT_WARM_MODELS) {
+        void response?.body?.cancel().catch(() => {})
+        response = await app.fetch(new Request("http://internal/v1/responses", {
+          method: "POST",
+          headers: warmHeaders,
+          body: JSON.stringify(chatGptWarmBody(model)),
+          signal: c.req.raw.signal,
+        }))
+        if (response.status !== 400) return response
+      }
+      return response!
+    }
     const profiles = getEffectiveProfiles(finalConfig.profiles)
     const availableProfileIds = profiles.length > 0 ? profiles.map(profile => profile.id) : ["default"]
     if (!availableProfileIds.includes(profileId)) {
@@ -9771,21 +9919,34 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   app.get("/v1/usage/quota/all", async (c) => {
     const profilesList = getEffectiveProfiles(finalConfig.profiles)
     const activeId = resolveActiveProfileId(profilesList.map(p => p.id)) || finalConfig.defaultProfile || profilesList[0]?.id || null
+    const chatGptEntries = async () => {
+      if (!chatGptProfiles) return []
+      const pending = refreshChatGptUsage()
+      if (pending) await Promise.race([pending, new Promise(resolve => setTimeout(resolve, CHATGPT_QUOTA_WAIT_MS))])
+      return chatGptProfiles.quotaEntries()
+    }
 
     if (profilesList.length === 0) {
       // Single-account mode — just return the default OAuth account's data.
+      // Beside ChatGPT seats, a `default` that has never produced a reading is
+      // not an account at all (a ChatGPT-only instance has none), so it is
+      // left out - whatever its error says, since a usage cooldown turns the
+      // missing token into `rate_limited`.
+      const [defaultUsage, chatgpt] = await Promise.all([fetchOAuthUsageResult({}), chatGptEntries()])
+      const claude = chatGptProfiles && !defaultUsage.snapshot && !defaultUsage.lastGood ? [] : [{
+        id: "default",
+        isActive: true,
+        ...toUsageEntry(defaultUsage),
+        spent: spentProfiles.get("default") ?? null,
+      }]
       return c.json({
-        profiles: [{
-          id: "default",
-          isActive: true,
-          ...toUsageEntry(await fetchOAuthUsageResult({})),
-          spent: spentProfiles.get("default") ?? null,
-        }],
-        activeProfile: "default",
+        profiles: [...claude, ...chatgpt],
+        ...activeProfileFields(claude.length > 0 ? "default" : null, "default"),
         asOf: Date.now(),
       })
     }
 
+    const chatgptPending = chatGptEntries()
     const results = await Promise.all(profilesList.map(async (p) => {
       // Skip API-key profiles — OAuth usage endpoint only applies to Claude Max OAuth.
       const type = p.type ?? "claude-max"
@@ -9819,8 +9980,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     }))
 
     return c.json({
-      profiles: results,
-      activeProfile: activeId,
+      profiles: [...results, ...await chatgptPending],
+      ...activeProfileFields(activeId, activeId),
       asOf: Date.now(),
     })
   })

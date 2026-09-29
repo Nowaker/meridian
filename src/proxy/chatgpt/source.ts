@@ -44,6 +44,8 @@ export type SeatUnavailableReason =
   | "expired"
   | "requires_reauth"
   | "no_authority"
+  /** Taken out of work routing by the operator or a supervisor (routing exclusions). */
+  | "excluded"
 
 export interface ChatGptServingAccount {
   accountUserId: string

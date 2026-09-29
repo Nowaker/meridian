@@ -244,7 +244,7 @@ describe("telemetry", () => {
     expect(row?.cacheReadInputTokens).toBe(400)
     expect(row?.outputTokens).toBe(200)
     expect(row?.reasoningOutputTokens).toBe(50)
-    expect(row?.profileId).toBe("chatgpt:a@example.test · id:user-a")
+    expect(row?.profileId).toBe("a-user-a")
     const summary = telemetryStore.summarize(3_600_000)
     // gpt-5.6-sol list price: $4 input, $0.40 cached input, $20 output per 1M.
     expect(summary.costEstimate?.totalUsd).toBeCloseTo((600 * 4 + 400 * 0.4 + 200 * 20) / 1e6, 9)

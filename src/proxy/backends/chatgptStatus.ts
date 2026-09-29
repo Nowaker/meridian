@@ -10,10 +10,11 @@
 import type { ProviderUsage } from '../../telemetry/providerView'
 import type { RequestMetric } from '../../telemetry/types'
 import type { CodexUsageResponse } from '../codex/types'
-import { codexWindowLabel } from '../codex/windows'
+import { chatGptSeatLabel, observedUsageWindows } from '../chatgpt/profiles'
 import type { ChatGptCredentialSource, SeatUnavailableReason } from '../chatgpt/source'
-import type { ChatGptUsageWindow } from '../chatgpt/windows'
 import type { ObservedSeatLimits } from './chatgpt'
+
+export { chatGptSeatLabel }
 
 const REASON_TEXT: Record<SeatUnavailableReason, string> = {
   unknown: 'Account not found in the credential store.',
@@ -24,30 +25,15 @@ const REASON_TEXT: Record<SeatUnavailableReason, string> = {
   expired: 'Access token expired; waiting for its owner to refresh it.',
   requires_reauth: 'Needs an interactive login.',
   no_authority: 'This Meridian does not hold refresh authority.',
+  excluded: 'Excluded from work routing.',
 }
 
 export const CHATGPT_ADAPTER = 'chatgpt'
 
-/**
- * How a seat is named to people: `email · id:xxxxxx`, matching oc-codex's own
- * `email, id:xxxxxx` surfaces. The email alone is not enough - one person holds
- * seats in several workspaces, so it repeats. A seat id is
- * `user-<user>__<workspace accountId>`, so its last six characters are the
- * workspace suffix, which is what separates one person's seats.
- */
-export function chatGptSeatLabel(seatId: string, email: string | null): string {
-  return `${email ?? 'seat'} · id:${seatId.slice(-6)}`
-}
-
 function headerWindows(observed: ObservedSeatLimits | undefined) {
-  if (!observed) return []
-  return [observed.rateLimit.primary_window, observed.rateLimit.secondary_window]
-    .filter((w): w is ChatGptUsageWindow => !!w && typeof w.used_percent === 'number')
-    .map(w => ({
-      type: codexWindowLabel(w.limit_window_seconds),
-      utilization: Math.min(1, Math.max(0, (w.used_percent ?? 0) / 100)),
-      resetsAt: typeof w.reset_at === 'number' ? w.reset_at * 1000 : observed.at + (w.reset_after_seconds ?? 0) * 1000,
-    }))
+  return observedUsageWindows(observed)
+    .filter(w => w.utilization !== null && w.resetsAt !== null)
+    .map(w => ({ type: w.type, utilization: w.utilization!, resetsAt: w.resetsAt! }))
 }
 
 export function chatGptProvider(input: {
