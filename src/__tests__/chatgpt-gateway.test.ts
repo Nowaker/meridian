@@ -194,6 +194,45 @@ describe("ChatGPT gateway routing", () => {
     expect(upstreamCalls).toHaveLength(0)
   })
 
+  it("serves an unlisted OpenAI model from ChatGPT, never from Claude", async () => {
+    writePool([account(0)])
+    const { app } = await server("follow-external")
+    const res = await app.fetch(responses({ ...LUNA, model: "gpt-5.4-nano" }))
+    expect(res.status).toBe(200)
+    expect(await res.text()).toContain('"delta":"pong"')
+    expect(sdkCalls).toBe(0)
+    expect(upstreamCalls.map(call => call.body.model)).toEqual(["gpt-5.4-nano"])
+    const [metric] = telemetryStore.getRecent({ limit: 1 })
+    expect(metric).toMatchObject({ adapter: "chatgpt", requestModel: "gpt-5.4-nano" })
+  })
+
+  it("returns the backend's refusal of a model in OpenAI's error shape, without benching or trying another seat", async () => {
+    writePool([account(0), account(1)])
+    const detail = "The 'gpt-5.4-nano' model is not supported when using Codex with a ChatGPT account."
+    respond = () => new Response(JSON.stringify({ detail }), { status: 400, headers: { "content-type": "application/json" } })
+    const { app } = await server("follow-external")
+    for (const stream of [false, true]) {
+      const res = await app.fetch(responses({ ...LUNA, model: "gpt-5.4-nano", stream }))
+      expect(res.status).toBe(400)
+      expect(await res.json()).toEqual({ error: { type: "invalid_request_error", message: detail, code: null } })
+    }
+    expect(upstreamCalls.map(call => call.accountId)).toEqual(["workspace-0", "workspace-0"])
+    expect(sdkCalls).toBe(0)
+    expect(telemetryStore.getRecent({ limit: 2 }).map(m => [m.adapter, m.status, m.error])).toEqual([
+      ["chatgpt", 400, "request_refused"], ["chatgpt", 400, "request_refused"],
+    ])
+  })
+
+  it("passes a refusal already in OpenAI's shape through unchanged", async () => {
+    writePool([account(0)])
+    const body = JSON.stringify({ error: { type: "invalid_request_error", message: "bad field", code: "unknown_parameter" } })
+    respond = () => new Response(body, { status: 400, headers: { "content-type": "application/json" } })
+    const { app } = await server("follow-external")
+    const res = await app.fetch(responses({ ...LUNA, stream: false }))
+    expect(res.status).toBe(400)
+    expect(await res.text()).toBe(body)
+  })
+
   it("leaves GPT names on Claude when no ChatGPT source is configured", async () => {
     writePool([account(0)])
     const { app } = await server(undefined)

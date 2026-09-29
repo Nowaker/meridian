@@ -5,12 +5,19 @@
  * resolution, session lookup and transcript work, because all of those are
  * Claude-shaped and a ChatGPT request must not enter them.
  *
- * An EXACT-MATCH allowlist of the model ids a ChatGPT subscription serves.
- * Everything else resolves to "claude": an absent model, an unknown one, and a
- * GPT id that is not listed. That asymmetry is the compatibility guarantee - a
- * request that works today cannot change provider because a matcher guessed.
- * The dispatcher consults this only when a ChatGPT backend is enabled, so an
- * instance without one keeps translating GPT names onto Claude as before.
+ * `CHATGPT_MODELS` is the model ids a ChatGPT subscription is known to serve,
+ * which is what /providers advertises. Routing is wider on purpose: every id
+ * that names an OPENAI model resolves to "chatgpt", listed or not. An unlisted
+ * one (opencode picks its small model, e.g. gpt-5.4-nano, from models.dev
+ * rather than from this list) used to resolve to "claude", where the Claude
+ * path mapped it onto its sonnet fallback - an OpenAI request answered by
+ * Claude. On ChatGPT it is either served or refused by the backend in OpenAI's
+ * own terms, and either is the truth; a Claude answer is never the truth.
+ *
+ * Everything else still resolves to "claude": an absent model, a Claude one,
+ * and any id that does not name an OpenAI model. The dispatcher consults this
+ * only when a ChatGPT backend is enabled, so an instance without one keeps
+ * translating GPT names onto Claude as before.
  */
 import type { ProviderId } from "./backend"
 
@@ -41,9 +48,19 @@ export const CHATGPT_MODELS: readonly string[] = [
   "codex",
 ]
 
-const CHATGPT_MODEL_SET: ReadonlySet<string> = new Set(CHATGPT_MODELS)
+/**
+ * OpenAI's model families: `gpt-*`, `chatgpt-*`, `codex` / `codex-*` and the
+ * `o<n>` reasoning series (o1, o3-mini, o4-mini, ...). Anchored at both ends
+ * of the family token so a Claude or third-party id that merely contains one
+ * (`claude-gpt-bridge`, `opus-4`) does not match.
+ */
+const OPENAI_MODEL_ID = /^(?:gpt-|chatgpt-|codex(?:-|$)|o\d+(?:-|$))/
+
+export function isOpenAiModelId(model: string): boolean {
+  return OPENAI_MODEL_ID.test(model.trim().toLowerCase())
+}
 
 export function providerForModel(model: string | null | undefined): ProviderId {
   if (typeof model !== "string") return "claude"
-  return CHATGPT_MODEL_SET.has(model.trim().toLowerCase()) ? "chatgpt" : "claude"
+  return isOpenAiModelId(model) ? "chatgpt" : "claude"
 }
