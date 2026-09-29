@@ -13,6 +13,7 @@ import { join } from "node:path"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
+import { CHATGPT_MODELS } from "../proxy/upstream/provider"
 
 let sdkCalls = 0
 installSdkMock(() => ({
@@ -47,6 +48,9 @@ interface UpstreamCall { url: string; authorization: string | null; accountId: s
 let upstreamCalls: UpstreamCall[] = []
 let tokenCalls = 0
 let respond: (call: UpstreamCall, index: number) => Response | Promise<Response> = () => completed()
+const CATALOG_URL = "https://chatgpt.com/backend-api/codex/models"
+let catalogCalls: Array<{ authorization: string | null }> = []
+let catalog: () => Response = () => new Response("{}", { status: 503 })
 const realFetch = globalThis.fetch
 
 function completed(text = "pong", extraHeaders: Record<string, string> = {}): Response {
@@ -87,6 +91,10 @@ function mockFetch(input: string | URL | Request, init?: RequestInit): Promise<R
     const call = { url, authorization: headers.get("authorization"), accountId: headers.get("chatgpt-account-id"), body: JSON.parse(String(init?.body)) as Record<string, unknown> }
     upstreamCalls.push(call)
     return Promise.resolve(respond(call, upstreamCalls.length - 1))
+  }
+  if (url.startsWith(`${CATALOG_URL}?`)) {
+    catalogCalls.push({ authorization: new Headers(init?.headers).get("authorization") })
+    return Promise.resolve(catalog())
   }
   if (url.startsWith("https://chatgpt.com/")) return Promise.resolve(new Response("{}", { status: 503 }))
   return Promise.reject(new Error(`unexpected network call in test: ${url}`))
@@ -145,6 +153,8 @@ beforeEach(() => {
   tokenCalls = 0
   sdkCalls = 0
   respond = () => completed()
+  catalogCalls = []
+  catalog = () => new Response("{}", { status: 503 })
   globalThis.fetch = mockFetch as typeof fetch
   telemetryStore.clear()
   clearSessionCache()
@@ -418,6 +428,80 @@ describe("/providers", () => {
 
     const [metric] = telemetryStore.getRecent({ limit: 1 })
     expect(metric!.profileId).toBe("shared-bbbbbb")
+  })
+})
+
+describe("offered models follow the backend's catalog", () => {
+  const catalogBody = {
+    models: [
+      { slug: "gpt-6-luna", visibility: "list", display_name: "GPT-6-Luna", context_window: 272000, available_in_plans: ["pro"] },
+      { slug: "gpt-daybreak-red-latest", visibility: "hide", available_in_plans: ["pro"] },
+      { slug: "gpt-team-only", visibility: "list", available_in_plans: ["team"] },
+    ],
+  }
+  const openAiIds = async (app: { fetch: (request: Request) => Response | Promise<Response> }) => {
+    const res = await app.fetch(new Request("http://localhost/v1/models"))
+    expect(res.status).toBe(200)
+    const body = await res.json() as { data: Array<{ id: string; owned_by: string; context_window: number }> }
+    expect(body.data.some(model => model.owned_by === "anthropic")).toBe(true)
+    return body.data.filter(model => model.owned_by === "openai")
+  }
+  const providerModels = async (app: { fetch: (request: Request) => Response | Promise<Response> }) => {
+    const data = await (await app.fetch(new Request("http://localhost/providers/status"))).json() as { providers: Array<{ id: string; models: string[]; capabilities?: Array<{ name: string; status: string }> }> }
+    return data.providers.find(p => p.id === "chatgpt")!
+  }
+
+  it("offers the listed models of the seats' plans on /v1/models and /providers, and still routes the rest", async () => {
+    writePool([account(0, { planType: "pro" })])
+    catalog = () => new Response(JSON.stringify(catalogBody), { status: 200, headers: { "content-type": "application/json" } })
+    const { app } = await server("follow-external")
+    const offered = await openAiIds(app)
+    expect(offered.map(model => [model.id, model.context_window])).toEqual([["gpt-6-luna", 272000]])
+    expect(catalogCalls).toEqual([{ authorization: "Bearer at-0" }])
+    const provider = await providerModels(app)
+    expect(provider.models).toEqual(["gpt-6-luna"])
+    expect(provider.capabilities?.find(row => row.name === "Models")?.status).toBe("catalog")
+
+    const res = await app.fetch(responses({ ...LUNA, model: "gpt-team-only" }))
+    expect(res.status).toBe(200)
+    expect(upstreamCalls.map(call => call.body.model)).toEqual(["gpt-team-only"])
+    expect(sdkCalls).toBe(0)
+  })
+
+  it("offers the built-in list while the catalog cannot be read", async () => {
+    writePool([account(0, { planType: "pro" })])
+    const { app } = await server("follow-external")
+    expect((await openAiIds(app)).map(model => model.id)).toEqual([...CHATGPT_MODELS])
+    expect((await providerModels(app)).capabilities?.find(row => row.name === "Models")?.status).toBe("built-in")
+  })
+
+  it("offers no ChatGPT model when the gateway is off", async () => {
+    writePool([account(0)])
+    const { app } = await server("off")
+    expect(await openAiIds(app)).toEqual([])
+    expect(catalogCalls).toEqual([])
+  })
+
+  it("control: owned mode never refreshes a token near expiry to read the catalog", async () => {
+    const storePath = join(dir, "chatgpt-accounts.json")
+    process.env.MERIDIAN_CHATGPT_STORE_PATH = storePath
+    writeFileSync(storePath, JSON.stringify({ version: 1, accounts: [{
+      accountUserId: "user-0__workspace-0", accountId: "workspace-0", email: null, refreshToken: "rt-0",
+      accessToken: "at-0", expiresAt: Date.now() + 60_000, tokenRotatedAt: null, exchangeStartedAt: null,
+    }] }))
+    catalog = () => new Response(JSON.stringify(catalogBody), { status: 200, headers: { "content-type": "application/json" } })
+    const proxy = await server("owned")
+    await proxy.chatGpt!.acquire()
+    try {
+      expect((await openAiIds(proxy.app)).map(model => model.id)).toEqual([...CHATGPT_MODELS])
+      expect(tokenCalls).toBe(0)
+      expect(catalogCalls).toEqual([])
+      const res = await proxy.app.fetch(responses(LUNA))
+      expect(res.status).toBe(200)
+      expect(tokenCalls).toBe(1)
+    } finally {
+      proxy.chatGpt!.release()
+    }
   })
 })
 

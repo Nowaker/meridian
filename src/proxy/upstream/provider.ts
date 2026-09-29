@@ -5,9 +5,16 @@
  * resolution, session lookup and transcript work, because all of those are
  * Claude-shaped and a ChatGPT request must not enter them.
  *
- * `CHATGPT_MODELS` is the model ids a ChatGPT subscription is known to serve,
- * which is what /providers advertises. Routing is wider on purpose: every id
- * that names an OPENAI model resolves to "chatgpt", listed or not. An unlisted
+ * `CHATGPT_MODELS` is what the gateway offers until it has read the backend's
+ * own model catalog (chatgpt/catalog.ts), which then decides what /v1/models,
+ * /providers and the Fallback Model choices offer. It is the catalog's listed
+ * set as read on 2026-09-29, every id probed and served on a Pro and a Team
+ * seat; ids the backend refuses for ChatGPT accounts (gpt-5.4 and older, the
+ * codex-named ones, gpt-5.6-cyber, gpt-daybreak-red) are not on it, since
+ * offering a model no seat can serve is the defect this list once had.
+ *
+ * Routing is wider on purpose: every id that names an OPENAI model resolves
+ * to "chatgpt", listed or not. An unlisted
  * one (opencode picks its small model, e.g. gpt-5.4-nano, from models.dev
  * rather than from this list) used to resolve to "claude", where the Claude
  * path mapped it onto its sonnet fallback - an OpenAI request answered by
@@ -25,27 +32,11 @@ export const CHATGPT_MODELS: readonly string[] = [
   "gpt-6-astra",
   "gpt-6-sol",
   "gpt-6-luna",
-  "gpt-daybreak-blue",
-  "gpt-daybreak-red",
-  "gpt-5.6-cyber",
   "gpt-5.6-sol",
   "gpt-5.6-terra",
   "gpt-5.6-luna",
+  "gpt-daybreak-blue-latest",
   "gpt-5.5",
-  "gpt-5.4",
-  "gpt-5.4-mini",
-  "gpt-5.4-pro",
-  "gpt-5.3-codex",
-  "gpt-5.3-codex-spark",
-  "gpt-5.2",
-  "gpt-5.2-codex",
-  "gpt-5.1",
-  "gpt-5.1-codex",
-  "gpt-5.1-codex-max",
-  "gpt-5.1-codex-mini",
-  "gpt-5-codex",
-  "codex-max",
-  "codex",
 ]
 
 /**
