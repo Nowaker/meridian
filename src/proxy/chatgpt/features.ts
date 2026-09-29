@@ -14,7 +14,7 @@
  * a pass-through response.
  */
 import { getSetting, setSetting } from "../../settings"
-import { CHATGPT_MODELS } from "../upstream/provider"
+import { CHATGPT_MODELS, providerForModel } from "../upstream/provider"
 
 export interface ChatGptFeatures {
   /** Forward ChatGPT's reasoning summaries to the client. */
@@ -31,12 +31,12 @@ export const CHATGPT_FEATURE_DEFAULTS: Readonly<ChatGptFeatures> = {
   fallbackModel: "",
 }
 
-const FALLBACK_MODELS: ReadonlySet<string> = new Set(CHATGPT_MODELS)
-
 /**
  * The effective features. A saved value of the wrong type, a negative budget, or
  * a fallback model this build no longer routes to ChatGPT falls back to the
- * default rather than reaching the request path.
+ * default rather than reaching the request path. What the gateway currently
+ * offers is deliberately not the test here: that follows the backend's catalog
+ * and can shrink for an hour, and a saved choice should outlive that.
  */
 export function getChatGptFeatures(): ChatGptFeatures {
   const saved = getSetting("chatgpt") ?? {}
@@ -47,7 +47,7 @@ export function getChatGptFeatures(): ChatGptFeatures {
     maxBudgetUsd: typeof saved.maxBudgetUsd === "number" && Number.isFinite(saved.maxBudgetUsd) && saved.maxBudgetUsd > 0
       ? saved.maxBudgetUsd
       : CHATGPT_FEATURE_DEFAULTS.maxBudgetUsd,
-    fallbackModel: typeof saved.fallbackModel === "string" && FALLBACK_MODELS.has(saved.fallbackModel)
+    fallbackModel: typeof saved.fallbackModel === "string" && providerForModel(saved.fallbackModel) === "chatgpt"
       ? saved.fallbackModel
       : CHATGPT_FEATURE_DEFAULTS.fallbackModel,
   }
@@ -57,10 +57,11 @@ export function getChatGptFeatures(): ChatGptFeatures {
  * Validate a partial update in full before anything is written, so a body with
  * one good key and one bad one is refused rather than half-applied.
  *
- * The fallback model must be a ChatGPT model: a Claude id here would send a
- * ChatGPT turn to a model the ChatGPT backend cannot serve.
+ * The fallback model must be one the gateway offers (`fallbackChoices`, the
+ * same list the settings page shows): a Claude id, or a ChatGPT id no seat can
+ * serve, would send the retry to a model that refuses it.
  */
-export function validateChatGptFeatureUpdate(raw: unknown): Partial<ChatGptFeatures> {
+export function validateChatGptFeatureUpdate(raw: unknown, fallbackChoices: readonly string[] = CHATGPT_MODELS): Partial<ChatGptFeatures> {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw new Error("body must be a JSON object")
   const result: Partial<ChatGptFeatures> = {}
   for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
@@ -71,8 +72,8 @@ export function validateChatGptFeatureUpdate(raw: unknown): Partial<ChatGptFeatu
       if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new Error("maxBudgetUsd must be a number >= 0")
       result.maxBudgetUsd = value
     } else if (key === "fallbackModel") {
-      if (typeof value !== "string" || (value !== "" && !FALLBACK_MODELS.has(value))) {
-        throw new Error(`fallbackModel must be "" or one of: ${CHATGPT_MODELS.join(", ")}`)
+      if (typeof value !== "string" || (value !== "" && !fallbackChoices.includes(value))) {
+        throw new Error(`fallbackModel must be "" or one of: ${fallbackChoices.join(", ")}`)
       }
       result.fallbackModel = value
     } else {

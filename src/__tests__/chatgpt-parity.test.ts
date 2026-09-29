@@ -280,4 +280,14 @@ describe("ChatGPT feature settings", () => {
     expect(() => validateChatGptFeatureUpdate({ codeSystemPrompt: true })).toThrow()
     expect(validateChatGptFeatureUpdate({ fallbackModel: "", thinkingPassthrough: true })).toEqual({ fallbackModel: "", thinkingPassthrough: true })
   })
+
+  it("accepts only an offered fallback, but keeps a saved one the offer has since dropped", () => {
+    expect(validateChatGptFeatureUpdate({ fallbackModel: "gpt-6-luna" }, ["gpt-6-luna"])).toEqual({ fallbackModel: "gpt-6-luna" })
+    expect(() => validateChatGptFeatureUpdate({ fallbackModel: "gpt-5.4" }, ["gpt-6-luna"])).toThrow('fallbackModel must be "" or one of: gpt-6-luna')
+    updateChatGptFeatures({ fallbackModel: "gpt-5.4" })
+    expect(getChatGptFeatures().fallbackModel).toBe("gpt-5.4")
+    updateChatGptFeatures({ fallbackModel: "sonnet" })
+    expect(getChatGptFeatures().fallbackModel).toBe("")
+    resetChatGptFeatures()
+  })
 })

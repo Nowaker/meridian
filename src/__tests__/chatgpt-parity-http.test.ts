@@ -52,6 +52,7 @@ const { setSetting } = await import("../settings")
 const { resetChatGptFeatures, updateChatGptFeatures } = await import("../proxy/chatgpt/features")
 const { setPricingOverride, deletePricingOverride } = await import("../telemetry/pricingStore")
 const { adaptResponsesBody } = await import("../proxy/chatgpt/body")
+const { CHATGPT_MODELS } = await import("../proxy/upstream/provider")
 const { updateAdapterFeatures, resetAdapterFeatures } = await import("../proxy/sdkFeatures")
 
 interface UpstreamCall { url: string; body: Record<string, unknown>; headers: Headers; signal?: AbortSignal | null }
@@ -68,6 +69,8 @@ beforeAll(() => {
     async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       const url = input instanceof Request ? input.url : String(input)
       if (!url.startsWith("https://chatgpt.com/")) return originalFetch(input, init)
+      // The model catalog read is not a turn; unread, the built-in list is offered.
+      if (url.startsWith("https://chatgpt.com/backend-api/codex/models?")) return new Response("{}", { status: 503 })
       const call = { url, body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>, headers: new Headers(init?.headers), signal: init?.signal }
       calls.push(call)
       return upstream(call)
@@ -408,8 +411,11 @@ describe("status surfaces", () => {
       method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
     }))
     expect((await patch({ fallbackModel: "sonnet" })).status).toBe(400)
+    expect((await patch({ fallbackModel: "gpt-5.4" })).status).toBe(400)
+    expect((await patch({ fallbackModel: "gpt-6-luna" })).status).toBe(200)
     expect((await patch({ thinkingPassthrough: false })).status).toBe(200)
-    const read = await (await app.fetch(new Request("http://localhost/settings/api/chatgpt"))).json() as { enabled: boolean; features: { thinkingPassthrough: boolean } }
+    const read = await (await app.fetch(new Request("http://localhost/settings/api/chatgpt"))).json() as { enabled: boolean; features: { thinkingPassthrough: boolean }; models: string[] }
+    expect(read.models).toEqual([...CHATGPT_MODELS])
     expect(read.enabled).toBe(true)
     expect(read.features.thinkingPassthrough).toBe(false)
     const reset = await (await app.fetch(new Request("http://localhost/settings/api/chatgpt", { method: "DELETE" }))).json() as { features: { thinkingPassthrough: boolean } }

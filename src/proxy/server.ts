@@ -8516,7 +8516,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   })
   app.patch("/settings/api/chatgpt", async (c) => {
     try {
-      const features = updateChatGptFeatures(validateChatGptFeatureUpdate(await c.req.json()))
+      const body = await c.req.json()
+      const offered = (await chatGptOfferedModels()).map(model => model.slug)
+      const features = updateChatGptFeatures(validateChatGptFeatureUpdate(body, offered))
       return c.json({ ok: true, features })
     } catch (e) {
       return c.json({ error: (e as Error).message }, 400)
