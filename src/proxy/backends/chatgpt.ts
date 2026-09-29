@@ -138,6 +138,30 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined
 }
 
+/**
+ * The backend's answer to a request it refuses as a request - an unsupported
+ * model, a field it rejects - rather than as a seat failure.
+ *
+ * The Codex backend states such refusals as `{"detail": "..."}`, which an
+ * OpenAI client does not read: it looks for `error.message` and would show a
+ * generic failure instead of the reason. That one shape is re-enveloped, with
+ * the backend's status and its own words; anything else is returned verbatim.
+ * This touches the RESPONSE only, and only on a refusal.
+ */
+async function requestRefusal(status: number, body: ReadableStream<Uint8Array>, headers: Headers): Promise<Response> {
+  const text = await new Response(body).text()
+  let detail: string | undefined
+  try {
+    const parsed = asRecord(JSON.parse(text) as unknown)
+    detail = parsed && !parsed.error && typeof parsed.detail === "string" ? parsed.detail : undefined
+  } catch {
+    detail = undefined
+  }
+  return detail === undefined
+    ? new Response(text, { status, headers })
+    : errorResponse(status, "invalid_request_error", detail)
+}
+
 export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): ChatGptBackend<Ctx> {
   const dispatch: UpstreamFetch = options.fetchImpl ?? ((url, init) => fetch(url, init))
   const now = options.now ?? Date.now
@@ -233,6 +257,15 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
           if (rateLimit) observed.set(seat, { rateLimit, at: now() })
           attempts.push({ seat, status: upstream.status, failure: sniffed.failure?.kind ?? null })
           const headersOut = forwardHeaders(upstream)
+
+          // Not a seat failure yet not a success: the request itself was
+          // refused, and every other seat would refuse it the same way, so
+          // no seat is benched and none is tried. Treating it as a success
+          // would hand a non-stream client a bogus "stream ended" 502.
+          if (!sniffed.failure && upstream.status >= 400) {
+            report({ status: upstream.status, seat, error: "request_refused" })
+            return await requestRefusal(upstream.status, sniffed.body, headersOut)
+          }
 
           if (!sniffed.failure) {
             const until = chatGptCooldownUntil(rateLimit, now())
