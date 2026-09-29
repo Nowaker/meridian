@@ -254,6 +254,39 @@ describe("landing page layout", () => {
   })
 })
 
+describe("profiles page layout", () => {
+  const rule = (selector: string) => {
+    const start = profilePageHtml.indexOf(`  ${selector} {`)
+    expect(start, `${selector} rule`).toBeGreaterThanOrEqual(0)
+    return profilePageHtml.slice(start, profilePageHtml.indexOf("}", start))
+  }
+
+  test("a card's header wraps instead of pushing its actions past a phone's edge", () => {
+    // Measured at 320px and 375px: the name, type badge and rename button
+    // sat on one unwrapping row and scrolled the page to 536px.
+    expect(rule(".profile-card-header")).toContain("flex-wrap: wrap")
+    expect(rule(".profile-name")).toContain("min-width: 0")
+    expect(rule(".profile-name")).toContain("overflow-wrap: anywhere")
+    expect(rule(".profile-badge")).toContain("overflow-wrap: anywhere")
+    expect(rule(".profile-card-actions")).toContain("margin-left: auto")
+    expect(rule(".profile-card-actions")).toContain("flex-shrink: 0")
+    expect(rule(".rename-input")).toContain("max-width: 100%")
+  })
+
+  test("long values wrap inside the card rather than widening it", () => {
+    // A bare 1fr track is as wide as its longest unbreakable value, so an
+    // email address pushed the detail grid past the card.
+    expect(rule(".profile-details")).toContain("grid-template-columns: 120px minmax(0, 1fr)")
+    expect(rule(".detail-value")).toContain("overflow-wrap: anywhere")
+    expect(rule(".copy-cmd")).toContain("overflow-wrap: anywhere")
+    expect(rule(".switch-btn")).toContain("overflow-wrap: anywhere")
+    expect(rule(".usage-grid")).toContain("minmax(min(140px, 100%), 1fr)")
+    expect(rule(".usage-label")).not.toContain("white-space: nowrap")
+    const narrow = profilePageHtml.slice(profilePageHtml.indexOf("@media (max-width: 480px)"))
+    expect(narrow.slice(0, narrow.indexOf("}"))).toContain("grid-template-columns: minmax(0, 1fr)")
+  })
+})
+
 describe("design-system conformance (DESIGN.md)", () => {
   const pageSources = [
     "src/telemetry/landing.ts",
