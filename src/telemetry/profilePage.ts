@@ -14,6 +14,7 @@ export const profilePageHtml = `<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Meridian — Profiles</title>
+<link rel="icon" type="image/svg+xml" href="/telemetry/icon.svg">
 <style>
   ${themeCss}
   * { box-sizing: border-box; margin: 0; padding: 0; }

@@ -15,6 +15,7 @@ import { settingsPageHtml } from "../telemetry/settingsPage"
 import { profilePageHtml } from "../telemetry/profilePage"
 import { pluginPageHtml } from "../proxy/plugins/pluginPage"
 import { profileBarCss, profileBarHtml, profileBarJs } from "../telemetry/profileBar"
+import { ICON_PATH } from "../telemetry/icon"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "../telemetry/profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT } from "../telemetry/profileSpent"
 
@@ -86,6 +87,15 @@ describe("shared site header", () => {
       expect(count, `${name} page should embed the header once`).toBeGreaterThanOrEqual(1)
     }
   })
+
+  // Without it the browser falls back to /favicon.ico, which nothing serves,
+  // and every page load logs a 404 in the console.
+  test("every page links the Meridian favicon", () => {
+    for (const [name, html] of allPages) {
+      const head = html.slice(0, html.indexOf("</head>"))
+      expect(head, `${name} page should link the favicon`).toContain(`<link rel="icon" type="image/svg+xml" href="${ICON_PATH}">`)
+    }
+  })
 })
 
 describe("landing page layout", () => {
@@ -143,6 +153,24 @@ describe("landing page layout", () => {
     // ...and never as a rule on the card itself, in either state.
     expect(landingHtml).not.toContain(".profile-card.spend-fading, .profile-card.spend-spent {")
     expect(landingHtml).not.toContain(".profile-card.spend-fading:hover, .profile-card.spend-spent:hover {")
+  })
+
+  test("a card's badges wrap instead of pushing the cost past a phone's edge", () => {
+    // Measured at 375px: a "needs login" pill beside a long name pushed the
+    // cost 80px outside its card and scrolled the whole page sideways.
+    const rule = (selector: string) => {
+      const start = landingHtml.indexOf(`  ${selector} {`)
+      expect(start, `${selector} rule`).toBeGreaterThanOrEqual(0)
+      return landingHtml.slice(start, landingHtml.indexOf("}", start))
+    }
+    expect(rule(".profile-grid")).toContain("minmax(min(300px, 100%), 1fr)")
+    expect(rule(".profile-head")).toContain("flex-wrap: wrap")
+    expect(rule(".profile-name")).toContain("flex-wrap: wrap")
+    expect(rule(".profile-name")).toContain("min-width: 0")
+    expect(rule(".profile-name")).toContain("overflow-wrap: anywhere")
+    expect(rule(".profile-cost")).toContain("flex-shrink: 0")
+    const header = profileBarCss.slice(profileBarCss.indexOf(".meridian-header {"))
+    expect(header.slice(0, header.indexOf("}"))).toContain("flex-wrap: wrap")
   })
 
   test("accounts can be re-sorted for viewing without touching the saved order", () => {
