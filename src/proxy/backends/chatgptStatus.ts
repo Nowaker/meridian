@@ -12,6 +12,7 @@ import type { RequestMetric } from '../../telemetry/types'
 import type { CodexUsageResponse } from '../codex/types'
 import { chatGptSeatLabel, observedUsageWindows } from '../chatgpt/profiles'
 import type { ChatGptCredentialSource, SeatUnavailableReason } from '../chatgpt/source'
+import type { ChatGptModelCatalogView } from '../chatgpt/catalog'
 import type { ObservedSeatLimits } from './chatgpt'
 
 export { chatGptSeatLabel }
@@ -30,6 +31,15 @@ const REASON_TEXT: Record<SeatUnavailableReason, string> = {
 
 export const CHATGPT_ADAPTER = 'chatgpt'
 
+function modelsCapability(view: ChatGptModelCatalogView): { name: string; status: string; detail: string } {
+  if (view.source === 'static') {
+    return { name: 'Models', status: 'built-in', detail: "The backend's model catalog has not been read yet; offering the built-in list." }
+  }
+  const plans = Object.entries(view.plans).map(([plan, models]) => `${plan} ${models.length}`).join(', ')
+  const readAt = view.fetchedAt === null ? 'never' : new Date(view.fetchedAt).toISOString()
+  return { name: 'Models', status: 'catalog', detail: `From the backend's model catalog, read ${readAt}. Models per plan: ${plans || 'none'}.` }
+}
+
 function headerWindows(observed: ObservedSeatLimits | undefined) {
   return observedUsageWindows(observed)
     .filter(w => w.utilization !== null && w.resetsAt !== null)
@@ -41,7 +51,7 @@ export function chatGptProvider(input: {
   observed: ReadonlyMap<string, ObservedSeatLimits>
   usage: CodexUsageResponse | null
   recent: readonly RequestMetric[]
-  models: readonly string[]
+  models: ChatGptModelCatalogView
 }): ProviderUsage {
   const { source, observed, usage, recent } = input
   const turns = recent.filter(metric => metric.adapter === CHATGPT_ADAPTER)
@@ -55,12 +65,13 @@ export function chatGptProvider(input: {
     error: source.isServing() ? undefined : source.mode === 'owned'
       ? 'This Meridian does not hold refresh authority for its ChatGPT accounts.'
       : 'The oc-codex-multi-auth store could not be read.',
-    models: [...input.models],
+    models: [...input.models.models],
     capabilities: [
       { name: 'Credentials', status: source.mode, detail: source.mode === 'follow-external'
         ? 'Follows the oc-codex-multi-auth store read-only. Meridian never refreshes or writes it.'
         : 'Meridian owns these accounts and holds the single refresh lease.' },
       { name: 'Pass-through', status: 'on', detail: 'No Claude prompt, no scrubbing, no request plugins. Only store=false, stream=true, the encrypted-reasoning include and removing max_output_tokens are adapted, as the backend requires.' },
+      modelsCapability(input.models),
       { name: 'Thinking', status: 'summaries', detail: 'ChatGPT exposes only short reasoning summaries and encrypted reasoning; both pass through untouched.' },
     ],
     activity: {

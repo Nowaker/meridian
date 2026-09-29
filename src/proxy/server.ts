@@ -9,12 +9,13 @@ import { chatGptFeatureCapabilities, getChatGptFeatures, resetChatGptFeatures, u
 import { resolveModelPricing } from '../telemetry/pricing'
 import { getPricingOverrides } from '../telemetry/pricingStore'
 import { computeSummary } from '../telemetry/percentiles'
+import { chatGptModelList, createChatGptModelCatalog, type CatalogModel } from './chatgpt/catalog'
 import { CHATGPT_WARM_MODELS, chatGptRefusalDiagnosis, chatGptWarmBody, createChatGptProfileSurface } from './chatgpt/profileSurface'
 import { getCodexUsage } from './codex/service'
 import type { CodexUsageResponse } from './codex/types'
 import { createUpstreamRegistry, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
 import { createClaudeBackend } from './upstream/claude'
-import { CHATGPT_MODELS, providerForModel } from './upstream/provider'
+import { providerForModel } from './upstream/provider'
 import { completeUpstreamResponse } from './upstream/completion'
 import { Hono } from "hono"
 import { cors } from "hono/cors"
@@ -7993,6 +7994,21 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return chatGptUsageRefresh
   }
 
+  // What /v1/models, /providers and the Fallback Model choices offer: the
+  // backend's own model catalog (chatgpt/catalog.ts), read hourly off the
+  // request path. Routing never consults it.
+  const chatGptCatalog = chatGptSource ? createChatGptModelCatalog({
+    source: chatGptSource,
+    planTypes: () => new Map((chatGptUsage?.entries ?? []).map(entry => [entry.id, entry.plan?.slug ?? null])),
+  }) : undefined
+  void chatGptCatalog?.refresh()
+  const chatGptOfferedModels = async (): Promise<CatalogModel[]> => {
+    if (!chatGptCatalog) return []
+    const pending = chatGptCatalog.refresh()
+    if (pending) await Promise.race([pending, new Promise(resolve => setTimeout(resolve, CHATGPT_QUOTA_WAIT_MS))])
+    return chatGptCatalog.entries()
+  }
+
   // ChatGPT seats as profiles on /profiles/* and /v1/usage/quota/all, so the
   // account supervisor that drives Claude profiles drives these too
   // (chatgpt/profileSurface.ts). The backend is created below; its observed
@@ -8178,14 +8194,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   }
 
   const chatGptStatus = () => {
-    if (!chatGptSource || !chatGptBackend) return disabledProvider('chatgpt')
+    if (!chatGptSource || !chatGptBackend || !chatGptCatalog) return disabledProvider('chatgpt')
     void refreshChatGptUsage()
+    void chatGptCatalog.refresh()
     const provider = chatGptProvider({
       source: chatGptSource,
       observed: chatGptBackend.observedLimits(),
       usage: chatGptUsage,
       recent: telemetryStore.getRecent({ limit: 100_000, since: Date.now() - 60 * 60_000 }),
-      models: CHATGPT_MODELS,
+      models: chatGptCatalog.view(),
     })
     const featureRows = chatGptFeatureCapabilities(getChatGptFeatures())
     const replaced = new Set(featureRows.map(row => row.name))
@@ -8492,8 +8509,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   })
 
   // ChatGPT gateway features (chatgpt/features.ts), re-read per request.
-  app.get("/settings/api/chatgpt", (c) => {
-    return c.json({ enabled: chatGptSource !== undefined, features: getChatGptFeatures(), models: CHATGPT_MODELS })
+  // `models` is the Fallback Model choice list: what the gateway offers.
+  app.get("/settings/api/chatgpt", async (c) => {
+    const models = (await chatGptOfferedModels()).map(model => model.slug)
+    return c.json({ enabled: chatGptSource !== undefined, features: getChatGptFeatures(), models })
   })
   app.patch("/settings/api/chatgpt", async (c) => {
     try {
@@ -9750,7 +9769,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   app.post("/v1/responses", (c) => dispatchUpstream(c, "responses", "/v1/responses"))
 
   // --- Model Discovery ---
-  // Returns available Claude models in OpenAI-compatible format.
+  // Returns available Claude models in OpenAI-compatible format, followed by
+  // the ChatGPT models the backend's catalog offers when the gateway is on.
   // Context window reflects the subscription tier: Max/Team/Enterprise get 1M
   // on the Opus/Fable tiers, everything else 200k. The tier check is shared
   // with models.ts (subscriptionIncludesExtendedContext) — an "=== max"
@@ -9764,7 +9784,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       profileEnvOverrides,
     )
     const extendedContext = subscriptionIncludesExtendedContext(authStatus?.subscriptionType)
-    return c.json({ object: "list", data: buildModelList(extendedContext) })
+    const chatGptModels = chatGptModelList(await chatGptOfferedModels(), Math.floor(Date.now() / 1000))
+    return c.json({ object: "list", data: [...buildModelList(extendedContext), ...chatGptModels] })
   })
 
   // --- Subscription Quota ---
