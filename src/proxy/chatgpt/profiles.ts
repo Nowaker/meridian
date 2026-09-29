@@ -1,0 +1,329 @@
+/**
+ * ChatGPT seats as Meridian profiles.
+ *
+ * The account switcher and the warmer that drive Claude profiles (Vibeterm,
+ * through `/profiles/*` and `/v1/usage/quota/all`) must see a ChatGPT seat as
+ * one more profile, in the same vocabulary, rather than learn a second API.
+ * This module is that translation and nothing else: seat -> stable profile id,
+ * plan -> allowance, and the seat's usage reading -> Claude-shaped windows.
+ *
+ * Two readings of the provider's windows exist - `/wham/usage` (cached) and
+ * the `x-codex-*` headers of the seat's latest real response - and both are
+ * turned into `CodexUsageWindow` here first, so every consumer applies one set
+ * of rules to either.
+ *
+ * WHICH WINDOWS A SEAT HAS IS READ, NEVER ASSUMED. Pro and most Business
+ * Premium seats report a weekly window only, but one Business Premium seat on
+ * the measured host reports a five-hour window as well, so the plan says
+ * nothing about window shape. A reading's windows are listed in
+ * `windowsReported`; a consumer tells "this seat has no 5h window" from "no
+ * reading yet" by that list being present.
+ *
+ * Pure: no I/O, no clock of its own, no credential field in or out.
+ */
+import { createHash } from "node:crypto"
+import { describeCodexPlan } from "../codex/plan"
+import type { CodexUsageEntry, CodexUsageWindow } from "../codex/types"
+import { codexWindowLabel } from "../codex/windows"
+import type { ChatGptSeatView, SeatUnavailableReason } from "./source"
+import type { ChatGptRateLimit, ChatGptUsageWindow } from "./windows"
+
+export const CHATGPT_PROFILE_TYPE = "chatgpt"
+
+/** Claude's window names, which the switcher and warmer read. */
+export const FIVE_HOUR_WINDOW = "five_hour"
+export const SEVEN_DAY_WINDOW = "seven_day"
+
+const FIVE_HOUR_SECONDS = 5 * 3600
+const SEVEN_DAY_SECONDS = 7 * 86400
+
+/**
+ * How close to its full width a 0% window's countdown may be and still count
+ * as not started. A cold window reports "now + width", so its countdown is the
+ * whole width at the moment of the read; request latency and clock skew eat a
+ * little of that. A window used for less than this reads cold for that long,
+ * which costs nothing: it was started a moment ago either way.
+ */
+const NOT_STARTED_SLACK_MS = 60_000
+
+const PROFILE_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/
+
+export interface ChatGptPlanFields {
+  /** The vendor slug verbatim, e.g. `pro`, `self_serve_business_prolite`. */
+  subscriptionType: string | null
+  planLabel: string | null
+  planName: string | null
+  accountType: string | null
+  /** Displayed multiplier, e.g. `"20x"`; null where the slug does not determine it. */
+  allowance: string | null
+  allowanceWeight: number | null
+}
+
+export interface ChatGptProfile extends ChatGptPlanFields {
+  id: string
+  /** `accountUserId`: the credential store's key for this seat. */
+  seat: string
+  label: string
+  email: string | null
+  eligible: boolean
+  unavailable: SeatUnavailableReason | null
+  /** The credential owner's own next pick. */
+  ownerActive: boolean
+}
+
+/** One window in Claude's `/v1/usage/quota` vocabulary. */
+export interface ProfileWindow {
+  type: string
+  /** Consumed fraction 0..1. */
+  utilization: number | null
+  /** Epoch ms of the reset; null when the window exists but has not started. */
+  resetsAt: number | null
+}
+
+export interface SeatWindowsReading {
+  windows: ProfileWindow[]
+  /** Window types this reading declared, started or not; null = no reading. */
+  windowsReported: string[] | null
+  source: "usage" | "headers" | null
+  fetchedAt: number | null
+  stale: boolean
+}
+
+/** The latest `x-codex-*` reading of a seat, as the backend records it. */
+export interface ObservedRateLimit {
+  rateLimit: ChatGptRateLimit
+  at: number
+}
+
+/**
+ * How a seat is named to people: `email · id:xxxxxx`, matching oc-codex's own
+ * `email, id:xxxxxx` surfaces. The email alone is not enough - one person holds
+ * seats in several workspaces, so it repeats. A seat id is
+ * `user-<user>__<workspace accountId>`, so its last six characters are the
+ * workspace suffix, which is what separates one person's seats.
+ */
+export function chatGptSeatLabel(seatId: string, email: string | null): string {
+  return `${email ?? "seat"} · id:${seatId.slice(-6)}`
+}
+
+function slug(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9._]+/g, "-").replace(/^-+|-+$/g, "")
+}
+
+function derivedId(seat: Pick<ChatGptSeatView, "id" | "email">): string {
+  const local = seat.email ? slug(seat.email.split("@")[0] ?? "") : ""
+  return `${local || "seat"}-${slug(seat.id.slice(-6)) || "x"}`
+}
+
+function seatHash(seatId: string): string {
+  return createHash("sha256").update(seatId).digest("hex").slice(0, 4)
+}
+
+/**
+ * A stable, readable profile id per seat.
+ *
+ * Derived from the seat, not from store order, so it survives restarts and
+ * re-orderings. The email's local part leads because an owner prefix is how a
+ * fleet groups one person's accounts; the operator can rename any seat with
+ * `names` (seat id -> id) where the derived one groups wrongly.
+ */
+export function chatGptProfileIds(
+  seats: readonly Pick<ChatGptSeatView, "id" | "email">[],
+  options: { reserved?: ReadonlySet<string>; names?: Readonly<Record<string, unknown>> } = {},
+): Map<string, string> {
+  const reserved = options.reserved ?? new Set<string>()
+  const named = new Map<string, string>()
+  const namedTaken = new Set<string>()
+  for (const seat of seats) {
+    const wanted = options.names?.[seat.id]
+    if (typeof wanted !== "string" || !PROFILE_ID.test(wanted) || reserved.has(wanted) || namedTaken.has(wanted)) continue
+    named.set(seat.id, wanted)
+    namedTaken.add(wanted)
+  }
+
+  const derived = new Map<string, string>()
+  const counts = new Map<string, number>()
+  for (const seat of seats) {
+    if (named.has(seat.id)) continue
+    const id = derivedId(seat)
+    derived.set(seat.id, id)
+    counts.set(id, (counts.get(id) ?? 0) + 1)
+  }
+
+  const ids = new Map<string, string>()
+  for (const seat of seats) {
+    const name = named.get(seat.id)
+    if (name) { ids.set(seat.id, name); continue }
+    let id = derived.get(seat.id)!
+    if ((counts.get(id) ?? 0) > 1 || namedTaken.has(id)) id = `${id}-${seatHash(seat.id)}`
+    if (reserved.has(id)) id = `chatgpt-${id}`
+    ids.set(seat.id, id)
+  }
+  return ids
+}
+
+export function chatGptPlanFields(planType: string | null | undefined): ChatGptPlanFields {
+  const described = describeCodexPlan(planType)
+  if (described.slug === null) {
+    return { subscriptionType: null, planLabel: null, planName: null, accountType: null, allowance: null, allowanceWeight: null }
+  }
+  const weight = described.multiplier ? Number.parseFloat(described.multiplier) : Number.NaN
+  const label = described.label === "—" ? null : described.label
+  const normalized = described.slug.toLowerCase()
+  const accountType = label === null ? null
+    : /business/.test(normalized) ? "Business"
+    : /team/.test(normalized) ? "Team"
+    : "Personal"
+  return {
+    subscriptionType: described.slug,
+    planLabel: label,
+    planName: label?.replace(/^ChatGPT\s+/, "") ?? null,
+    accountType,
+    allowance: described.multiplier,
+    allowanceWeight: Number.isFinite(weight) ? weight : null,
+  }
+}
+
+/**
+ * Every seat the credential source knows, as profiles.
+ *
+ * `planTypes` carries a fresher plan slug per seat where the usage service
+ * read one; the credential store's copy is the fallback.
+ */
+export function chatGptProfiles(
+  seats: readonly ChatGptSeatView[],
+  options: {
+    reserved?: ReadonlySet<string>
+    names?: Readonly<Record<string, unknown>>
+    planTypes?: ReadonlyMap<string, string | null>
+  } = {},
+): ChatGptProfile[] {
+  const ids = chatGptProfileIds(seats, options)
+  return seats.map(seat => ({
+    id: ids.get(seat.id)!,
+    seat: seat.id,
+    label: chatGptSeatLabel(seat.id, seat.email),
+    email: seat.email,
+    eligible: seat.eligible,
+    unavailable: seat.reason ?? null,
+    ownerActive: seat.active === true,
+    ...chatGptPlanFields(options.planTypes?.get(seat.id) ?? seat.planType),
+  }))
+}
+
+/** A profile by its id or by its raw seat id. */
+export function findChatGptProfile(profiles: readonly ChatGptProfile[], idOrSeat: string | null | undefined): ChatGptProfile | undefined {
+  if (!idOrSeat) return undefined
+  return profiles.find(profile => profile.id === idOrSeat) ?? profiles.find(profile => profile.seat === idOrSeat)
+}
+
+/** Claude's name for a window of this width; any other width keeps its natural label. */
+export function profileWindowType(limitWindowSeconds: number | null | undefined): string {
+  if (limitWindowSeconds === FIVE_HOUR_SECONDS) return FIVE_HOUR_WINDOW
+  if (limitWindowSeconds === SEVEN_DAY_SECONDS) return SEVEN_DAY_WINDOW
+  return codexWindowLabel(limitWindowSeconds)
+}
+
+/**
+ * The `x-codex-*` reading of a response, in the shape `/wham/usage` yields.
+ *
+ * A window the headers gave only as `reset_after_seconds` is anchored at the
+ * moment the response was observed.
+ */
+export function observedUsageWindows(observed: ObservedRateLimit | undefined): CodexUsageWindow[] {
+  if (!observed) return []
+  return [observed.rateLimit.primary_window, observed.rateLimit.secondary_window]
+    .filter((window): window is ChatGptUsageWindow => !!window)
+    .map(window => {
+      const width = typeof window.limit_window_seconds === "number" && Number.isFinite(window.limit_window_seconds)
+        ? window.limit_window_seconds
+        : null
+      const resetsAt = typeof window.reset_at === "number" && window.reset_at > 0
+        ? window.reset_at * 1000
+        : typeof window.reset_after_seconds === "number" && window.reset_after_seconds > 0
+          ? observed.at + window.reset_after_seconds * 1000
+          : null
+      return {
+        type: codexWindowLabel(width),
+        utilization: typeof window.used_percent === "number" && Number.isFinite(window.used_percent)
+          ? Math.min(1, Math.max(0, window.used_percent / 100))
+          : null,
+        resetsAt,
+        limitWindowSeconds: width,
+      }
+    })
+}
+
+/**
+ * Whether a window has not been drawn from since it last reset.
+ *
+ * A rolling ChatGPT window starts at its first request, so an untouched one
+ * reports a reset of "now plus the window" that moves forward on every read.
+ * Reporting that as a reset would tell the warmer the window is running when
+ * it is cold - so it is reported the way Claude reports a cold window, with no
+ * reset at all. A window used even fractionally has a shorter countdown.
+ */
+export function isWindowNotStarted(window: CodexUsageWindow, readAt: number): boolean {
+  if (window.utilization !== 0 || window.resetsAt === null) return false
+  const width = window.limitWindowSeconds
+  if (typeof width !== "number" || !Number.isFinite(width) || width <= 0) return false
+  return window.resetsAt - readAt >= width * 1000 - NOT_STARTED_SLACK_MS
+}
+
+function toProfileWindows(windows: readonly CodexUsageWindow[], readAt: number): ProfileWindow[] {
+  return windows.map(window => ({
+    type: profileWindowType(window.limitWindowSeconds),
+    utilization: window.utilization === null ? null : Math.min(1, Math.max(0, window.utilization)),
+    resetsAt: isWindowNotStarted(window, readAt) ? null : window.resetsAt,
+  }))
+}
+
+/**
+ * A seat's windows from whichever reading is newer: the usage service's or
+ * the headers of the seat's latest response. Either one is a complete
+ * statement of which windows the seat has.
+ */
+export function seatWindows(input: { usage?: CodexUsageEntry; observed?: ObservedRateLimit }): SeatWindowsReading {
+  const usageAt = input.usage && input.usage.fetchedAt !== null && input.usage.windows.length > 0 ? input.usage.fetchedAt : null
+  const observedWindows = observedUsageWindows(input.observed)
+  const observedAt = observedWindows.length > 0 && input.observed ? input.observed.at : null
+
+  const useHeaders = observedAt !== null && (usageAt === null || observedAt > usageAt)
+  if (useHeaders) {
+    const windows = toProfileWindows(observedWindows, observedAt)
+    return { windows, windowsReported: windows.map(window => window.type), source: "headers", fetchedAt: observedAt, stale: false }
+  }
+  if (usageAt !== null) {
+    const windows = toProfileWindows(input.usage!.windows, usageAt)
+    return { windows, windowsReported: windows.map(window => window.type), source: "usage", fetchedAt: usageAt, stale: input.usage!.stale }
+  }
+  return { windows: [], windowsReported: null, source: null, fetchedAt: null, stale: false }
+}
+
+/**
+ * The quota entry's `error`, in the words the switcher already understands:
+ * `no_token` means a human is needed, exactly as for a Claude profile.
+ */
+export function chatGptQuotaError(
+  unavailable: SeatUnavailableReason | null,
+  usageError: string | null | undefined,
+  hasWindows: boolean,
+): string | null {
+  switch (unavailable) {
+    case "no_token":
+    case "requires_reauth":
+    case "unknown":
+      return "no_token"
+    case "expired":
+      return "token_expired"
+    case "disabled":
+      return "disabled"
+    default:
+      return hasWindows ? null : usageError ?? null
+  }
+}
+
+/** Whether the seat's credential can serve right now. */
+export function chatGptLoggedIn(unavailable: SeatUnavailableReason | null): boolean {
+  return unavailable !== "no_token" && unavailable !== "requires_reauth" && unavailable !== "expired" && unavailable !== "unknown"
+}

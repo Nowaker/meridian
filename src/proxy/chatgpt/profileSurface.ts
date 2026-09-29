@@ -1,0 +1,241 @@
+/**
+ * The ChatGPT half of Meridian's profile surface.
+ *
+ * `/profiles/list`, `/v1/usage/quota/all`, `POST /profiles/active`,
+ * `POST /profiles/:id/warm`, `/profiles/events` and the routing exclusions are
+ * the one interface an account supervisor (Vibeterm's switcher and warmer)
+ * drives Claude accounts through. ChatGPT seats join that interface here
+ * instead of getting a second one: server.ts keeps the routes and appends what
+ * this returns, so the supervisor's code is the same for both providers and
+ * only `type: "chatgpt"` tells them apart.
+ *
+ * What this owns: the ChatGPT active pointer's meaning, how a turn is routed
+ * across seats (active first, exclusions honoured, a pin obeyed), the entries
+ * each route returns, and a refusal translated into the limit vocabulary the
+ * events ring already speaks. What it does not own: storage of the pointer and
+ * of the exclusions (settings, injected), the usage reading (injected), and
+ * any credential - nothing here sees a token.
+ */
+import type { CodexUsageResponse } from "../codex/types"
+import type { LimitDiagnosis } from "../limitDetection"
+import type { SpentRecord } from "../profileHealth"
+import {
+  CHATGPT_PROFILE_TYPE,
+  chatGptLoggedIn,
+  chatGptProfiles,
+  chatGptQuotaError,
+  findChatGptProfile,
+  profileWindowType,
+  seatWindows,
+  type ChatGptProfile,
+  type ObservedRateLimit,
+} from "./profiles"
+import type { ChatGptCredentialSource } from "./source"
+import type { ChatGptRateLimit, ChatGptUsageWindow } from "./windows"
+
+/**
+ * The warm request's model, cheapest first. GPT-6 Luna is listed for every
+ * plan and served on the probed seats; an account outside the GPT-6 rollout
+ * refuses it as unsupported, and 5.6 Luna is the same tier one generation
+ * back. A refusal of the model is a request refusal (400), never a seat one.
+ */
+export const CHATGPT_WARM_MODELS = ["gpt-6-luna", "gpt-5.6-luna"] as const
+
+/**
+ * The smallest real Responses request: one short user turn, the lowest
+ * reasoning effort both warm models accept, terse output. No
+ * `max_output_tokens` - the backend refuses that field outright.
+ */
+export function chatGptWarmBody(model: string): Record<string, unknown> {
+  return {
+    model,
+    stream: false,
+    input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+    reasoning: { effort: "low" },
+    text: { verbosity: "low" },
+  }
+}
+
+export interface ChatGptProfileSurfaceDeps {
+  source: ChatGptCredentialSource
+  observed: () => ReadonlyMap<string, ObservedRateLimit>
+  usage: () => CodexUsageResponse | null
+  /** Ids a ChatGPT profile must not take: the Claude profiles', and `default`. */
+  reserved: () => ReadonlySet<string>
+  names: () => Readonly<Record<string, unknown>> | undefined
+  /** The persisted pointer, a seat id. */
+  activeSeat: () => string | undefined
+  /** Routing exclusions as configured: profile ids, seat ids, or Claude ids (ignored here). */
+  excluded: () => readonly string[]
+  spent: (profileId: string) => SpentRecord | undefined
+}
+
+export type ChatGptActivation =
+  | { ok: true; profile: ChatGptProfile }
+  | { ok: false; status: 400 | 409; error: string }
+
+export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
+  const planTypes = (): Map<string, string | null> => new Map(
+    (deps.usage()?.entries ?? []).map(entry => [entry.id, entry.plan?.slug ?? null]),
+  )
+
+  const profiles = (): ChatGptProfile[] => chatGptProfiles(deps.source.seats(), {
+    reserved: deps.reserved(),
+    names: deps.names(),
+    planTypes: planTypes(),
+  })
+
+  const excludedSeats = (list: readonly ChatGptProfile[]): Set<string> => {
+    const seats = new Set<string>()
+    for (const id of deps.excluded()) {
+      const profile = findChatGptProfile(list, id)
+      if (profile) seats.add(profile.seat)
+    }
+    return seats
+  }
+
+  /**
+   * The pointer while it names a seat that may take work; otherwise the
+   * credential owner's own pick, which is where an unpinned turn would go
+   * anyway. An exhausted active seat stays active - the pointer is the
+   * supervisor's decision, and serving around it is failover, not a switch.
+   */
+  const active = (list: readonly ChatGptProfile[]): ChatGptProfile | undefined => {
+    const excluded = excludedSeats(list)
+    const pointer = findChatGptProfile(list, deps.activeSeat())
+    if (pointer && !excluded.has(pointer.seat)) return pointer
+    return list.find(profile => profile.ownerActive && !excluded.has(profile.seat))
+      ?? list.find(profile => profile.eligible && !excluded.has(profile.seat))
+  }
+
+  return {
+    profiles,
+    resolve: (idOrSeat: string | null | undefined) => findChatGptProfile(profiles(), idOrSeat),
+    activeProfileId: (): string | null => active(profiles())?.id ?? null,
+
+    /** Validate a switch; the caller persists `profile.seat` and logs it. */
+    activate(idOrSeat: string): ChatGptActivation {
+      const list = profiles()
+      const profile = findChatGptProfile(list, idOrSeat)
+      if (!profile) return { ok: false, status: 400, error: `Unknown profile: ${idOrSeat}` }
+      if (excludedSeats(list).has(profile.seat)) {
+        return { ok: false, status: 409, error: `Profile "${profile.id}" is excluded from work routing` }
+      }
+      return { ok: true, profile }
+    },
+
+    /**
+     * Where one turn may go. `pin` is the request's own profile header and is
+     * obeyed only when it names a ChatGPT seat - on an instance serving both
+     * providers it may name a Claude profile, which says nothing here. A warm
+     * may use an excluded seat, as a Claude warm may; work may not.
+     */
+    route(pin: string | undefined, purpose: "work" | "warm") {
+      const list = profiles()
+      const excluded = excludedSeats(list)
+      const pinned = findChatGptProfile(list, pin)
+      if (pinned) {
+        if (purpose === "work" && excluded.has(pinned.seat)) {
+          return { kind: "refuse" as const, profile: pinned }
+        }
+        return { kind: "pinned" as const, seat: pinned.seat }
+      }
+      return { kind: "pool" as const, preferred: active(list)?.seat, excluded }
+    },
+
+    /** Profile id for a seat, for telemetry and events. */
+    profileIdFor(seat: string): string | undefined {
+      return profiles().find(profile => profile.seat === seat)?.id
+    },
+
+    listEntries() {
+      const list = profiles()
+      const activeId = active(list)?.id
+      return list.map(profile => ({
+        id: profile.id,
+        type: CHATGPT_PROFILE_TYPE,
+        provider: CHATGPT_PROFILE_TYPE,
+        label: profile.label,
+        seat: profile.seat,
+        isActive: profile.id === activeId,
+        email: profile.email,
+        subscriptionType: profile.subscriptionType,
+        organizationName: null,
+        rateLimitTier: null,
+        seatTier: null,
+        allowance: profile.allowance,
+        allowanceWeight: profile.allowanceWeight,
+        planLabel: profile.planLabel,
+        accountType: profile.accountType,
+        planName: profile.planName,
+        loggedIn: chatGptLoggedIn(profile.unavailable),
+        unavailable: profile.unavailable,
+        lastCheckedAt: null,
+        lastSuccessAt: null,
+        authProvenance: "live" as const,
+        credentialDir: null,
+      }))
+    },
+
+    quotaEntries() {
+      const list = profiles()
+      const activeId = active(list)?.id
+      const usageById = new Map((deps.usage()?.entries ?? []).map(entry => [entry.id, entry]))
+      const observed = deps.observed()
+      return list.map(profile => {
+        const usage = usageById.get(profile.seat)
+        const reading = seatWindows({ usage, observed: observed.get(profile.seat) })
+        return {
+          id: profile.id,
+          isActive: profile.id === activeId,
+          type: CHATGPT_PROFILE_TYPE,
+          provider: CHATGPT_PROFILE_TYPE,
+          windows: reading.windows,
+          windowsReported: reading.windowsReported,
+          windowSource: reading.source,
+          extraUsage: null,
+          fetchedAt: reading.fetchedAt,
+          stale: reading.stale,
+          error: chatGptQuotaError(profile.unavailable, usage?.error, reading.windows.length > 0),
+          failure: null,
+          spent: deps.spent(profile.id) ?? null,
+        }
+      })
+    },
+  }
+}
+
+export type ChatGptProfileSurface = ReturnType<typeof createChatGptProfileSurface>
+
+function spentWindow(rateLimit: ChatGptRateLimit | null): ChatGptUsageWindow | null {
+  let widest: ChatGptUsageWindow | null = null
+  for (const window of [rateLimit?.primary_window, rateLimit?.secondary_window]) {
+    if (!window || (window.used_percent ?? 0) < 100) continue
+    if (!widest || (window.limit_window_seconds ?? 0) > (widest.limit_window_seconds ?? 0)) widest = window
+  }
+  return widest
+}
+
+/**
+ * A seat's refusal in the events ring's limit vocabulary.
+ *
+ * The bucket is the widest window the refusing response itself reported spent
+ * - the same one the bench is timed to - so it is `reported`, never inferred.
+ */
+export function chatGptRefusalDiagnosis(refusal: { kind: string; until: number; rateLimit: ChatGptRateLimit | null }): LimitDiagnosis {
+  if (refusal.kind === "requires_reauth") {
+    return { bucket: null, reported: false, source: "unknown", resetsAt: null, rationale: "The ChatGPT backend refused this seat's access token." }
+  }
+  const window = spentWindow(refusal.rateLimit)
+  if (!window) {
+    return {
+      bucket: null, reported: false, source: "unknown", resetsAt: refusal.until,
+      rationale: "The ChatGPT backend refused this seat without stating which window is spent.",
+    }
+  }
+  const bucket = profileWindowType(window.limit_window_seconds)
+  return {
+    bucket, reported: true, source: "response_headers", resetsAt: refusal.until,
+    rationale: `The ChatGPT backend reported this seat's ${bucket} window spent.`,
+  }
+}

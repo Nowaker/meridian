@@ -71,6 +71,17 @@ export interface ChatGptTurnEvent {
   requestSource?: string
 }
 
+/** A seat said no to a turn: benched until `until`. Carries no credential. */
+export interface ChatGptSeatRefusal {
+  requestId: string
+  seat: string
+  kind: Exclude<ChatGptFailureKind, "transient">
+  status: number
+  until: number
+  /** The limit state the refusing response stated, when it stated one. */
+  rateLimit: ChatGptRateLimit | null
+}
+
 export interface ChatGptHooks {
   /**
    * Admission before any seat is tried - the Max Budget seam. Return a
@@ -84,7 +95,29 @@ export interface ChatGptHooks {
   onPoolExhausted?(turn: ChatGptTurnInfo & { reasons: ReadonlySet<SeatUnavailableReason> }): Promise<Response | undefined>
   /** Usage/telemetry seam: called once per client turn when it ends. */
   onTurn?(event: ChatGptTurnEvent): void
+  /**
+   * Refusal seam for an account supervisor: each seat that refused, and how
+   * the turn ended for the refused seats - `servedBy` another seat, or every
+   * candidate refused (`servedBy: null`).
+   */
+  onSeatRefused?(refusal: ChatGptSeatRefusal): void
+  onRefusalsSettled?(outcome: { requestId: string; refused: readonly ChatGptSeatRefusal[]; servedBy: string | null }): void
 }
+
+/**
+ * Which seats may serve this turn, decided by the caller (server.ts owns the
+ * active pointer, the routing exclusions and the trust of internal headers).
+ *
+ * - `pool`: every eligible seat, `preferred` first when it can serve, the
+ *   `excluded` ones never.
+ * - `pinned`: that seat only, no failover - an explicit profile header, or a
+ *   warm.
+ * - `refuse`: answered before any seat is tried.
+ */
+export type ChatGptRoute =
+  | { kind: "pool"; preferred?: string; excluded: ReadonlySet<string> }
+  | { kind: "pinned"; seat: string }
+  | { kind: "refuse"; response: Response; error: string }
 
 export interface ChatGptBackendOptions<Ctx> {
   source: ChatGptCredentialSource
@@ -92,6 +125,8 @@ export interface ChatGptBackendOptions<Ctx> {
   inboundRequest: (context: Ctx) => Request | Promise<Request>
   /** A ChatGPT-only exhaustion tracker; never shared with Claude profiles. */
   exhaustion: ProfileExhaustion
+  /** Seat selection per turn; without it every eligible seat serves in the owner's order. */
+  route?: (turn: ChatGptTurnInfo) => ChatGptRoute
   hooks?: ChatGptHooks
   fetchImpl?: UpstreamFetch
   now?: () => number
@@ -169,11 +204,12 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
   const affinity = new AssignmentStore(MAX_CONVERSATIONS)
   const observed = new Map<string, ObservedSeatLimits>()
 
-  const bench = (seat: string, kind: ChatGptFailureKind, rateLimit: ChatGptRateLimit | null) => {
+  const bench = (seat: string, kind: ChatGptFailureKind, rateLimit: ChatGptRateLimit | null): number => {
     const until = kind === "requires_reauth"
       ? now() + REAUTH_COOLDOWN_MS
       : chatGptCooldownUntil(rateLimit, now()) ?? now() + DEFAULT_COOLDOWN_MS
     exhaustion.mark(seat, until, kind)
+    return until
   }
 
   return {
@@ -217,20 +253,41 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
         return response
       }
 
+      const route = options.route?.(turn) ?? { kind: "pool", excluded: new Set<string>() }
+      if (route.kind === "refuse") return fail(route.response, route.error)
+
       const refused = await hooks?.admit?.(turn)
       if (refused) return fail(refused, "refused_by_admission")
 
       // Serialized once: every seat is offered exactly the same bytes.
       const outbound = JSON.stringify(adapted.body)
       const reasons = new Set<SeatUnavailableReason>()
-      const listed = source.candidateSeats(model)
-      const live = listed.filter(seat => !exhaustion.isExhausted(seat))
-      if (live.length < listed.length) reasons.add("quota_exhausted")
-      // A conversation stays on the seat holding its prompt-cache prefix while
-      // that seat can serve; moving it costs a cold cache.
       const cacheKey = typeof parsed.prompt_cache_key === "string" && parsed.prompt_cache_key ? parsed.prompt_cache_key : undefined
-      const preferred = cacheKey ? affinity.get(cacheKey)?.profileId : undefined
-      const seats = preferred !== undefined && live.includes(preferred) ? [preferred, ...live.filter(s => s !== preferred)] : live
+      const seats = ((): string[] => {
+        // A pinned seat is tried even when the owner would not pick it: its
+        // own credential check below says why it cannot serve, if it cannot.
+        const listed = route.kind === "pinned" ? [route.seat] : source.candidateSeats(model)
+        const routable = route.kind === "pool" ? listed.filter(seat => !route.excluded.has(seat)) : listed
+        if (routable.length < listed.length) reasons.add("excluded")
+        const live = routable.filter(seat => !exhaustion.isExhausted(seat))
+        if (live.length < routable.length) reasons.add("quota_exhausted")
+        // The active seat leads: a supervisor that moved the pointer wants the
+        // next turn there, at the price of a cold cache. Otherwise a
+        // conversation stays on the seat holding its prompt-cache prefix while
+        // that seat can serve.
+        const active = route.kind === "pool" ? route.preferred : undefined
+        const cached = cacheKey ? affinity.get(cacheKey)?.profileId : undefined
+        const first = [active, cached].find(seat => seat !== undefined && live.includes(seat))
+        return first === undefined ? live : [first, ...live.filter(seat => seat !== first)]
+      })()
+
+      const refusals: ChatGptSeatRefusal[] = []
+      let settled = false
+      const settle = (servedBy: string | null) => {
+        if (settled || refusals.length === 0) return
+        settled = true
+        hooks?.onRefusalsSettled?.({ requestId, refused: refusals, servedBy })
+      }
 
       let spent: Response | undefined
       let spentKind: ChatGptFailureKind | undefined
@@ -249,6 +306,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
             upstream = await dispatch(url, { method: "POST", headers, body: outbound, redirect: "error", signal: inbound.signal })
           } catch {
             // Unreachable for one seat is unreachable for all; report the shape only.
+            settle(null)
             return fail(errorResponse(502, "api_error", "The ChatGPT upstream could not be reached."), "upstream_unreachable")
           }
 
@@ -263,6 +321,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
           // no seat is benched and none is tried. Treating it as a success
           // would hand a non-stream client a bogus "stream ended" 502.
           if (!sniffed.failure && upstream.status >= 400) {
+            settle(null)
             report({ status: upstream.status, seat, error: "request_refused" })
             return await requestRefusal(upstream.status, sniffed.body, headersOut)
           }
@@ -271,6 +330,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
             const until = chatGptCooldownUntil(rateLimit, now())
             if (until !== null) exhaustion.mark(seat, until, "quota_spent")
             if (cacheKey) affinity.set(cacheKey, { profileId: seat, requestId: undefined })
+            settle(seat)
             const onDone = (summary: TapSummary) => report({
               status: upstream.status, seat, model: summary.model ?? model ?? null, usage: summary.usage,
               ttfbMs: summary.firstOutputAt === null ? null : summary.firstOutputAt - startedAt,
@@ -286,12 +346,14 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
 
           // A provider-side fault says nothing about this seat; benching
           // healthy accounts during an incident would only deepen it.
-          if (sniffed.failure.kind === "transient") {
+          const failureKind = sniffed.failure.kind
+          if (failureKind === "transient") {
+            settle(null)
             report({ status: upstream.status, seat, error: "transient" })
             return new Response(sniffed.body, { status: upstream.status, headers: headersOut })
           }
 
-          if (sniffed.failure.kind === "requires_reauth" && !retriedAuth) {
+          if (failureKind === "requires_reauth" && !retriedAuth) {
             // Re-read once: the owner may have rotated this token after we read it.
             const fresh = await source.credentials(seat, { model, reread: true })
             if (fresh.ok && fresh.account.accessToken !== credential.account.accessToken) {
@@ -302,14 +364,20 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
             }
           }
 
-          bench(seat, sniffed.failure.kind, rateLimit)
-          if (sniffed.failure.kind === "requires_reauth") reasons.add("requires_reauth")
+          const refusal: ChatGptSeatRefusal = {
+            requestId, seat, kind: failureKind, status: upstream.status,
+            until: bench(seat, failureKind, rateLimit), rateLimit,
+          }
+          refusals.push(refusal)
+          hooks?.onSeatRefused?.(refusal)
+          if (failureKind === "requires_reauth") reasons.add("requires_reauth")
           void spent?.body?.cancel().catch(() => {})
           spent = new Response(sniffed.body, { status: upstream.status, headers: headersOut })
-          spentKind = sniffed.failure.kind
+          spentKind = failureKind
           break
         }
       }
+      settle(null)
 
       // A quota refusal is returned as the provider sent it, keeping its
       // status and stated wait. A refused credential is not: its body means

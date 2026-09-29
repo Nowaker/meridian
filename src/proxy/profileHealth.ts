@@ -132,6 +132,8 @@ export interface FailoverEvent {
   internalHop: boolean
   until: number | null
   limit: LimitDiagnosis | null
+  /** Which provider's account this is; absent means Claude. */
+  provider?: "chatgpt"
 }
 
 export interface FailoverEventPage {

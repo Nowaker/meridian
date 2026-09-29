@@ -36,6 +36,8 @@ delete process.env.MERIDIAN_API_KEY
 
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 const { telemetryStore } = await import("../telemetry")
+const { __setFetchOAuthUsageOverride, resetOAuthUsageCache } = await import("../proxy/oauthUsage")
+const { saveSettings } = await import("../settings")
 
 const NOW = Date.now()
 const CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -47,7 +49,7 @@ let tokenCalls = 0
 let respond: (call: UpstreamCall, index: number) => Response | Promise<Response> = () => completed()
 const realFetch = globalThis.fetch
 
-function completed(text = "pong"): Response {
+function completed(text = "pong", extraHeaders: Record<string, string> = {}): Response {
   const events = [
     { type: "response.created", response: { id: "r1", output: [] } },
     { type: "response.output_item.added", output_index: 0, item: { type: "message" } },
@@ -57,8 +59,20 @@ function completed(text = "pong"): Response {
   ]
   return new Response(events.map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(""), {
     status: 200,
-    headers: { "content-type": "text/event-stream", "set-cookie": "must-not-leak=1" },
+    headers: { "content-type": "text/event-stream", "set-cookie": "must-not-leak=1", ...extraHeaders },
   })
+}
+
+/** `x-codex-*` window headers as the backend states them: width in minutes, reset in epoch seconds. */
+function codexWindows(windows: Array<{ minutes: number; used: number; resetInS: number }>): Record<string, string> {
+  const headers: Record<string, string> = {}
+  windows.forEach((w, i) => {
+    const position = i === 0 ? "primary" : "secondary"
+    headers[`x-codex-${position}-window-minutes`] = String(w.minutes)
+    headers[`x-codex-${position}-used-percent`] = String(w.used)
+    headers[`x-codex-${position}-reset-at`] = String(Math.floor(Date.now() / 1000) + w.resetInS)
+  })
+  return headers
 }
 const refused = () => new Response(JSON.stringify({ detail: "Unauthorized" }), { status: 401, headers: { "content-type": "application/json" } })
 
@@ -134,8 +148,15 @@ beforeEach(() => {
   globalThis.fetch = mockFetch as typeof fetch
   telemetryStore.clear()
   clearSessionCache()
+  __setFetchOAuthUsageOverride(async () => null)
+  // Another suite in the same process may have switched usage reads off, or
+  // left a Claude `default` reading cached.
+  resetOAuthUsageCache()
+  saveSettings({ integrations: undefined })
 })
 afterEach(() => {
+  __setFetchOAuthUsageOverride(null)
+  saveSettings({ chatGptActiveSeat: undefined, chatGptProfileNames: undefined, routingExcludedProfiles: undefined, routingManagedExcludedProfiles: undefined })
   globalThis.fetch = realFetch
   delete process.env.MERIDIAN_CHATGPT_CREDENTIALS
   delete process.env.MERIDIAN_CODEX_POOL_PATH
@@ -396,6 +417,160 @@ describe("/providers", () => {
     expect(view).toContain("shared@example.test · id:bbbbbb")
 
     const [metric] = telemetryStore.getRecent({ limit: 1 })
-    expect(metric!.profileId).toBe("chatgpt:shared@example.test · id:bbbbbb")
+    expect(metric!.profileId).toBe("shared-bbbbbb")
+  })
+})
+
+describe("ChatGPT seats on the profile surface", () => {
+  type ListBody = { profiles: Array<Record<string, unknown>>; activeProfile: string | null; activeProfiles?: { claude: string | null; chatgpt: string | null } }
+  type QuotaBody = { profiles: Array<{ id: string; type: string; isActive: boolean; windows: Array<{ type: string; utilization: number | null; resetsAt: number | null }>; windowsReported: string[] | null; windowSource: string | null; error: string | null; spent: unknown }>; activeProfile: string | null; activeProfiles?: { chatgpt: string | null } }
+  type App = { fetch: (r: Request) => Response | Promise<Response> }
+  const get = async <T>(app: App, path: string) => {
+    const res = await app.fetch(new Request(`http://localhost${path}`))
+    const text = await res.text()
+    expect(text).not.toMatch(/"at-\d|"rt-\d/)
+    return JSON.parse(text) as T
+  }
+  const post = (app: App, path: string, body?: unknown) =>
+    app.fetch(new Request(`http://localhost${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) }))
+  const rateLimited = (headers: Record<string, string>) =>
+    new Response(JSON.stringify({ detail: "usage limit" }), { status: 429, headers: { "content-type": "application/json", ...headers } })
+
+  it("lists each seat as a chatgpt profile with its plan weight, and no dead default", async () => {
+    writePool([account(0, { planType: "pro" }), account(1, { planType: "self_serve_business_prolite" }), account(2, { expiresAt: NOW - 1 })])
+    const { app } = await server("follow-external")
+    const list = await get<ListBody>(app, "/profiles/list")
+    expect(list.profiles.map(p => [p.id, p.type, p.provider, p.allowanceWeight, p.loggedIn, p.isActive])).toEqual([
+      ["seat0-pace-0", "chatgpt", "chatgpt", 20, true, true],
+      ["seat1-pace-1", "chatgpt", "chatgpt", 5, true, false],
+      ["seat2-pace-2", "chatgpt", "chatgpt", null, false, false],
+    ])
+    expect(list.profiles[0]).toMatchObject({ subscriptionType: "pro", planLabel: "ChatGPT Pro", seat: "user-0__workspace-0", label: "seat0@example.test · id:pace-0" })
+    expect(list.activeProfile).toBe("seat0-pace-0")
+    expect(list.activeProfiles).toEqual({ claude: null, chatgpt: "seat0-pace-0" })
+
+    const quota = await get<QuotaBody>(app, "/v1/usage/quota/all")
+    expect(quota.profiles.map(p => [p.id, p.type, p.windowsReported, p.error])).toEqual([
+      ["seat0-pace-0", "chatgpt", null, "invalid_token"],
+      ["seat1-pace-1", "chatgpt", null, "invalid_token"],
+      ["seat2-pace-2", "chatgpt", null, "token_expired"],
+    ])
+    expect(quota.activeProfile).toBe("seat0-pace-0")
+  })
+
+  it("reports the windows each seat's backend states: weekly-only has no five_hour, a cold window has no reset", async () => {
+    writePool([account(0), account(1)])
+    respond = call => call.accountId === "workspace-0"
+      ? completed("pong", codexWindows([{ minutes: 10080, used: 67, resetInS: 3 * 86400 }]))
+      : completed("pong", codexWindows([{ minutes: 300, used: 0, resetInS: 18000 }, { minutes: 10080, used: 37, resetInS: 5 * 86400 }]))
+    const { app } = await server("follow-external")
+    await (await app.fetch(responses(LUNA, { "x-meridian-profile": "seat0-pace-0" }))).text()
+    await (await app.fetch(responses(LUNA, { "x-meridian-profile": "seat1-pace-1" }))).text()
+    expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-0", "workspace-1"])
+
+    const quota = await get<QuotaBody>(app, "/v1/usage/quota/all")
+    const [weekly, both] = quota.profiles
+    expect(weekly!.windowsReported).toEqual(["seven_day"])
+    expect(weekly!.windows.map(w => w.type)).toEqual(["seven_day"])
+    expect(weekly!.windows[0]!.utilization).toBe(0.67)
+    expect(weekly!.windows[0]!.resetsAt).toBeGreaterThan(Date.now())
+    expect(weekly!.windowSource).toBe("headers")
+    expect(weekly!.error).toBeNull()
+    expect(both!.windowsReported).toEqual(["five_hour", "seven_day"])
+    expect(both!.windows[0]).toEqual({ type: "five_hour", utilization: 0, resetsAt: null })
+    expect(both!.windows[1]!.utilization).toBe(0.37)
+  })
+
+  it("routes unpinned turns to the active seat, refuses an excluded one, persists the pointer", async () => {
+    writePool([account(0), account(1), account(2)])
+    const { app } = await server("follow-external")
+    const switched = await post(app, "/profiles/active", { profile: "seat1-pace-1" })
+    expect(switched.status).toBe(200)
+    expect(await switched.json()).toEqual({ success: true, activeProfile: "seat1-pace-1", provider: "chatgpt" })
+    await (await app.fetch(responses(LUNA))).text()
+    expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-1"])
+    expect((await get<ListBody>(app, "/profiles/list")).activeProfile).toBe("seat1-pace-1")
+
+    // The raw seat id is accepted too, and the pointer survives a new instance.
+    expect((await post(app, "/profiles/active", { profile: "user-2__workspace-2" })).status).toBe(200)
+    const { app: restarted } = await server("follow-external")
+    expect((await get<QuotaBody>(restarted, "/v1/usage/quota/all")).activeProfiles?.chatgpt).toBe("seat2-pace-2")
+
+    saveSettings({ routingManagedExcludedProfiles: ["seat0-pace-0"] })
+    expect((await post(app, "/profiles/active", { profile: "seat0-pace-0" })).status).toBe(409)
+    expect((await post(app, "/profiles/active", { profile: "nobody" })).status).toBe(400)
+    const pinned = await app.fetch(responses(LUNA, { "x-meridian-profile": "seat0-pace-0" }))
+    expect(pinned.status).toBe(409)
+    expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-1"])
+  })
+
+  it("never serves unpinned work from an excluded seat, even when the others refuse", async () => {
+    writePool([account(0), account(1)])
+    saveSettings({ routingExcludedProfiles: ["seat0-pace-0"] })
+    respond = () => rateLimited(codexWindows([{ minutes: 10080, used: 100, resetInS: 86400 }]))
+    const { app } = await server("follow-external")
+    const res = await app.fetch(responses(LUNA))
+    expect(res.status).toBe(429)
+    expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-1"])
+  })
+
+  it("warms a seat with the smallest real request, on that seat only, without refreshing or writing", async () => {
+    writePool([account(0), account(1)])
+    saveSettings({ routingManagedExcludedProfiles: ["seat1-pace-1"] })
+    const before = snapshotPoolDir()
+    const { app } = await server("follow-external")
+    const res = await post(app, "/profiles/seat1-pace-1/warm")
+    expect(res.status).toBe(200)
+    await res.text()
+    expect(upstreamCalls).toHaveLength(1)
+    expect(upstreamCalls[0]!.authorization).toBe("Bearer at-1")
+    expect(upstreamCalls[0]!.body).toMatchObject({ model: "gpt-6-luna", store: false, reasoning: { effort: "low" } })
+    expect(upstreamCalls[0]!.body).not.toHaveProperty("max_output_tokens")
+    expect(telemetryStore.getRecent({ limit: 1 })[0]).toMatchObject({ adapter: "chatgpt", requestSource: "warm", profileId: "seat1-pace-1" })
+    expect(tokenCalls).toBe(0)
+    expect(snapshotPoolDir()).toEqual(before)
+    expect((await post(app, "/profiles/nobody/warm")).status).toBe(404)
+  })
+
+  it("falls back to the next warm model when the seat refuses the first as a request", async () => {
+    writePool([account(0)])
+    respond = call => call.body.model === "gpt-6-luna"
+      ? new Response(JSON.stringify({ detail: "The 'gpt-6-luna' model is not supported" }), { status: 400, headers: { "content-type": "application/json" } })
+      : completed()
+    const { app } = await server("follow-external")
+    const res = await post(app, "/profiles/seat0-pace-0/warm")
+    expect(res.status).toBe(200)
+    expect(upstreamCalls.map(c => c.body.model)).toEqual(["gpt-6-luna", "gpt-5.6-luna"])
+  })
+
+  it("publishes refusals, failovers and pool exhaustion to the events ring and spent", async () => {
+    writePool([account(0), account(1)])
+    const before = snapshotPoolDir()
+    respond = call => call.accountId === "workspace-0"
+      ? rateLimited(codexWindows([{ minutes: 300, used: 40, resetInS: 3600 }, { minutes: 10080, used: 100, resetInS: 2 * 86400 }]))
+      : completed()
+    const { app } = await server("follow-external")
+    expect((await app.fetch(responses(LUNA))).status).toBe(200)
+
+    type Events = { events: Array<{ kind: string; profile: string; servedBy: string | null; reason: string; provider?: string; until: number | null; limit: { bucket: string | null; source: string; reported: boolean } | null }>; nextSince: number }
+    const page = await get<Events>(app, "/profiles/events?since=0")
+    expect(page.events.map(e => [e.kind, e.profile, e.servedBy, e.reason, e.provider])).toEqual([
+      ["refused", "seat0-pace-0", null, "rate_limit_error", "chatgpt"],
+      ["failover", "seat0-pace-0", "seat1-pace-1", "rate_limit_error", "chatgpt"],
+    ])
+    expect(page.events[0]!.limit).toMatchObject({ bucket: "seven_day", source: "response_headers", reported: true })
+    expect(page.events[0]!.until).toBeGreaterThan(Date.now() + 86400_000)
+    const quota = await get<QuotaBody>(app, "/v1/usage/quota/all")
+    expect(quota.profiles.find(p => p.id === "seat0-pace-0")!.spent).toMatchObject({ profileId: "seat0-pace-0" })
+
+    respond = () => refused()
+    await (await app.fetch(responses(LUNA, { "x-meridian-profile": "seat1-pace-1" }))).text()
+    const next = await get<Events>(app, `/profiles/events?since=${page.nextSince}`)
+    expect(next.events.map(e => [e.kind, e.profile, e.reason])).toEqual([
+      ["refused", "seat1-pace-1", "authentication_error"],
+      ["pool_exhausted", "seat1-pace-1", "authentication_error"],
+    ])
+    expect(tokenCalls).toBe(0)
+    expect(snapshotPoolDir()).toEqual(before)
   })
 })

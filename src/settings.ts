@@ -44,6 +44,10 @@ export interface MeridianSettings {
   priorityFailback?: PriorityFailbackPolicy
   routingExcludedProfiles?: string[]
   routingManagedExcludedProfiles?: string[]
+  /** The ChatGPT seat (accountUserId) unpinned ChatGPT turns go to first; POST /profiles/active. */
+  chatGptActiveSeat?: string
+  /** Operator-chosen profile ids for ChatGPT seats, keyed by seat id (accountUserId). */
+  chatGptProfileNames?: Record<string, string>
 
   /**
    * Keep telemetry in SQLite instead of memory, so it survives a restart.
