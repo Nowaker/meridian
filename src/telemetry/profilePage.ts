@@ -39,7 +39,7 @@ export const profilePageHtml = `<!DOCTYPE html>
   .profile-search input::placeholder { color: var(--muted); }
   .profile-search input:focus { outline: none; border-color: var(--accent); }
   .profile-search-count { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .profile-no-match { padding: 32px; }
+  .profile-no-match { padding: 32px; overflow-wrap: anywhere; }
   .profile-no-match[hidden] { display: none; }
   .link-btn {
     background: none; border: none; padding: 0; font: inherit; color: var(--accent); cursor: pointer;
@@ -85,7 +85,7 @@ export const profilePageHtml = `<!DOCTYPE html>
     margin-bottom: 12px; padding: 12px 14px; border-radius: 8px;
     background: rgba(248,81,73,0.08); border: 1px solid rgba(248,81,73,0.35);
   }
-  .remove-confirm-text { font-size: 12px; color: var(--text); }
+  .remove-confirm-text { font-size: 12px; color: var(--text); overflow-wrap: anywhere; }
   .remove-confirm-actions { margin-top: 10px; display: flex; gap: 8px; }
   .confirm-btn {
     background: var(--bg); color: var(--text); border: 1px solid var(--border);
@@ -174,7 +174,7 @@ export const profilePageHtml = `<!DOCTYPE html>
     margin-top: 12px; padding: 14px 16px; background: var(--surface2);
     border: 1px solid var(--border); border-radius: 8px;
   }
-  .login-panel-title { font-size: 12px; font-weight: 600; margin-bottom: 8px; }
+  .login-panel-title { font-size: 12px; font-weight: 600; margin-bottom: 8px; overflow-wrap: anywhere; }
   .login-note {
     font-size: 12px; color: var(--muted); margin-bottom: 8px; padding: 8px 10px;
     background: rgba(210,153,34,0.1); border: 1px solid rgba(210,153,34,0.3); border-radius: 6px;
