@@ -285,6 +285,14 @@ describe("profiles page layout", () => {
     const narrow = profilePageHtml.slice(profilePageHtml.indexOf("@media (max-width: 480px)"))
     expect(narrow.slice(0, narrow.indexOf("}"))).toContain("grid-template-columns: minmax(0, 1fr)")
   })
+
+  test("the sign-in, remove and search panels wrap a long name or query", () => {
+    // Measured at 320px: "Create <long name>" widened the page to 564px and a
+    // long unmatched query to 902px.
+    expect(rule(".login-panel-title")).toContain("overflow-wrap: anywhere")
+    expect(rule(".remove-confirm-text")).toContain("overflow-wrap: anywhere")
+    expect(rule(".profile-no-match")).toContain("overflow-wrap: anywhere")
+  })
 })
 
 describe("design-system conformance (DESIGN.md)", () => {
