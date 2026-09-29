@@ -16,6 +16,7 @@ import { installMcpToolsMock } from "./mcpToolsMock"
 import { lookupSharedSession, setSessionStoreDir } from "../proxy/sessionStore"
 import * as lifecycle from "../proxy/sessionLifecycle"
 import { SessionLifecycleQueueStalledError } from "../proxy/session/lifecycleErrors"
+import { diagnosticLog } from "../telemetry"
 import {
   assistantMessage,
   blockStop,
@@ -111,6 +112,7 @@ describe("terminal publication under a stalled lifecycle lock", () => {
     setSessionStoreDir(sessionDir)
     resetActiveProfile()
     clearSessionCache()
+    diagnosticLog.clear()
     queryCalls = 0
   })
 
@@ -151,6 +153,11 @@ describe("terminal publication under a stalled lifecycle lock", () => {
         // A deferred publication still ends the request, so a restart
         // supervisor reading GET /inflight does not wait on an answered turn.
         expect(await settledInflightTotal(app)).toBe(0)
+        const deferrals = diagnosticLog.getRecent({ category: "session" })
+          .filter(entry => entry.message.includes("session.publication_deferred"))
+        expect(deferrals).toHaveLength(1)
+        expect(deferrals[0]!.message).toContain(`mode=${stream ? "stream" : "non_stream"} reason=SessionLifecycleQueueStalledError`)
+        expect(deferrals[0]!.requestId).toBeDefined()
 
         const next = await app.fetch(turn(key, THIRD_TURN, stream))
         expect(next.status).toBe(200)
