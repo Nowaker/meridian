@@ -273,7 +273,7 @@ describe("SDK and Session concurrency coordination", () => {
   const originalHold = process.env.MERIDIAN_SESSION_TURN_MAX_HOLD_MS
   const originalRouting = process.env.MERIDIAN_ROUTING
 
-  beforeEach(() => {
+  beforeEach(async () => {
     testSessionDir = mkdtempSync(join(tmpdir(), "meridian-concurrency-"))
     setSessionStoreDir(testSessionDir)
     process.env.MERIDIAN_MAX_CONCURRENT = "1"
@@ -283,7 +283,7 @@ describe("SDK and Session concurrency coordination", () => {
     controls = []
     capturedParams = []
     rateLimitWorkQueries = false
-    clearSessionCache()
+    await clearSessionCache()
     resetProcessSdkSemaphoreForTests()
     telemetryStore.clear()
   })
@@ -993,7 +993,7 @@ describe("SDK and Session concurrency coordination", () => {
     try { await arrival.arrived } finally { arrival.restore() }
 
     // The request has taken its coherent snapshot and joined the real queue.
-    storeSharedSession(
+    await storeSharedSession(
       sessionId,
       "winner-sdk",
       committed.length,
@@ -1037,7 +1037,7 @@ describe("SDK and Session concurrency coordination", () => {
     try { await arrival.arrived } finally { arrival.restore() }
 
     // Same admission boundary as the unmarked side call; no timing sleep.
-    storeSharedSession(
+    await storeSharedSession(
       sessionId,
       "winner-sdk",
       committed.length,
@@ -1102,7 +1102,7 @@ describe("SDK and Session concurrency coordination", () => {
     try { await arrival.arrived } finally { arrival.restore() }
 
     // The round this request lost to has committed; its body reads as an undo.
-    storeSharedSession(
+    await storeSharedSession(
       derivedKey!,
       "winner-sdk",
       committed.length,
@@ -1178,7 +1178,7 @@ describe("SDK and Session concurrency coordination", () => {
     // profile and its durable mapping visible before the queued turn is granted.
     await Bun.sleep(20)
     profiles.push({ id: "hot", claudeConfigDir: "/tmp/meridian-test-hot-new" })
-    storeSharedSession(`hot:${sessionId}`, "hot-existing-sdk", 2, "hot-lineage", ["old-a", "old-b"])
+    await storeSharedSession(`hot:${sessionId}`, "hot-existing-sdk", 2, "hot-lineage", ["old-a", "old-b"])
     rateLimitWorkQueries = true
     lease.release()
 
