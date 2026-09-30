@@ -218,7 +218,7 @@ src/
 │   │   ├── turnCoordinator.ts ← Process-wide serialization for reliable session IDs
 │   │   ├── crossProcessTurnCoordinator.ts ← Durable coordination across proxy processes
 │   │   ├── processIncarnation.ts ← Process/host identity for lock ownership
-│   │   ├── storeDatabase.ts   ← SQLite database behind the session store (WAL, off-loop commits)
+│   │   ├── storeDatabase.ts   ← SQLite database behind the session store and lifecycle journal (WAL, off-loop commits)
 │   │   └── durableFileSystem.ts ← Durable file operations
 │   ├── sessionStore.ts        ← Shared session store (cross-proxy session resume)
 │   ├── profiles.ts            ← Multi-profile support: resolve, list, switch auth contexts (leaf)

@@ -202,7 +202,7 @@ describe("request cancellation propagation", () => {
       expect(capturedController).toBeUndefined()
       expect(released).toBe(true)
       expect(resourceKey).toBeDefined()
-      const sidecar: unknown = JSON.parse(readFileSync(join(getSessionStoreDir(), "session-gc.json"), "utf8"))
+      const sidecar: unknown = lifecycle.readSessionGcSnapshot(getSessionStoreDir())
       expect(sidecar).toHaveProperty(`resources.${resourceKey}`)
       expect(sidecar).not.toHaveProperty(`resources.${resourceKey}.activeLeases`)
     } finally {
