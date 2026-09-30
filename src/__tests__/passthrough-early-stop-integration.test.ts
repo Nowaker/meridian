@@ -14,6 +14,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { assistantMessage, messageStart, textBlockStart, textDelta, toolUseBlockStart, inputJsonDelta, blockStop, messageDelta, messageStop, parseSSE, resolveMockSdkSessionId } from "./helpers"
+import { commitRawSession } from "./storeDatabaseHelpers"
 
 interface LifecycleResourceSnapshot {
   locator: { sessionId: string }
@@ -126,7 +127,7 @@ installMcpToolsMock(() => ({
 
 const { createProxyServer } = await import("../proxy/server")
 const { clearSessionCache } = await import("../proxy/session/cache")
-const { evictSharedSession, lookupSharedSession, storeSharedSession, setSessionStoreDir } = await import("../proxy/sessionStore")
+const { evictSharedSession, lookupSharedSession, readSessionStoreSnapshot, storeSharedSession, setSessionStoreDir } = await import("../proxy/sessionStore")
 const { diagnosticLog, telemetryStore } = await import("../telemetry")
 
 function userDenyMessage(toolUseId: string) {
@@ -287,17 +288,18 @@ describe("Integration: passthrough early stop", () => {
     const sessionKey = `${sessionHeader}-${TEST_RUN_ID}`
     usedSessionKeys.add(sessionKey)
     const now = Date.now()
-    writeFileSync(join(TEST_SESSION_DIR, "sessions.json"), JSON.stringify({
-      [sessionKey]: {
-        claudeSessionId: "legacy-sdk-session",
-        revision: 1,
-        createdAt: now,
-        lastUsedAt: now,
-        messageCount: 1,
-        lineageHash: "legacy-lineage",
-        passthroughResumeUuid: "legacy-user-denial-uuid",
-      },
-    }))
+    // Opens the store, so the row below lands in a database that exists.
+    expect(lookupSharedSession(sessionKey)).toBeUndefined()
+    commitRawSession(TEST_SESSION_DIR, sessionKey, {
+      claudeSessionId: "legacy-sdk-session",
+      revision: 1,
+      createdAt: now,
+      lastUsedAt: now,
+      messageCount: 1,
+      lineageHash: "legacy-lineage",
+      passthroughResumeUuid: "legacy-user-denial-uuid",
+    })
+    expect(readSessionStoreSnapshot()[sessionKey]).toMatchObject({ passthroughResumeUuid: "legacy-user-denial-uuid" })
     mockMessages = [assistantMessage([{ type: "text", text: "fresh replay" }])]
 
     const response = await post(app, {
