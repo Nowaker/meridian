@@ -217,8 +217,9 @@ src/
 │   │   ├── turnCoordinator.ts ← Process-wide serialization for reliable session IDs
 │   │   ├── crossProcessTurnCoordinator.ts ← Durable coordination across proxy processes
 │   │   ├── processIncarnation.ts ← Process/host identity for lock ownership
+│   │   ├── storeDatabase.ts   ← SQLite database behind the session store (WAL, off-loop commits)
 │   │   └── durableFileSystem.ts ← Durable file operations
-│   ├── sessionStore.ts        ← Shared file store (cross-proxy session resume)
+│   ├── sessionStore.ts        ← Shared session store (cross-proxy session resume)
 │   ├── profiles.ts            ← Multi-profile support: resolve, list, switch auth contexts (leaf)
 │   ├── profileCli.ts          ← CLI commands for profile management (leaf, I/O)
 │   ├── statusProbe.ts         ← Asks a busy port whether it is Meridian, and collects what / shows

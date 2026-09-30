@@ -22,9 +22,12 @@ import { join } from "node:path"
 import {
   attachSharedTranscriptLocator,
   lookupSharedSession,
+  readSessionStoreDocument,
+  sessionStoreWritesSettled,
   setSessionStoreDir,
   storeSharedSession,
 } from "../proxy/sessionStore"
+import { commitRawSession, committedStoreSeq, readCommittedSession } from "./storeDatabaseHelpers"
 
 const META_KEY = "\u0000meridian-session-store"
 
@@ -163,7 +166,7 @@ describe("session store mutation cost on a large store", () => {
       parse.mockRestore()
       stringify.mockRestore()
     }
-    expect(readFileSync(join(dir, "sessions.json"), "utf8").length).toBeLessThan(text.length)
+    expect(JSON.stringify(readSessionStoreDocument()).length).toBeLessThan(text.length)
   })
 })
 
@@ -180,15 +183,15 @@ describe("copy-on-write store mutations", () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it("writes exactly the document a full serialization would produce", async () => {
+  it("commits each mapping's latest state, as the cache holds it", async () => {
     await storeSharedSession("a", "claude-a", 2, "h", ["m1", "m2"])
     await storeSharedSession("b", "claude-b", 1, "h", ["m1"])
     await storeSharedSession("a", "claude-a", 3, "h", ["m1", "m2", "m3"])
-    const raw = readFileSync(join(dir, "sessions.json"), "utf8")
-    const parsed = JSON.parse(raw) as Record<string, unknown>
-    expect(Object.keys(parsed)).toEqual([META_KEY, "a", "b"])
-    expect(raw).toBe(JSON.stringify(parsed))
-    expect((parsed.a as { messageCount: number }).messageCount).toBe(3)
+    const document = readSessionStoreDocument()
+    expect(Object.keys(document)).toEqual([META_KEY, "a", "b"])
+    expect(readCommittedSession(dir, "a")).toEqual(document.a as Record<string, unknown>)
+    expect(readCommittedSession(dir, "b")).toEqual(document.b as Record<string, unknown>)
+    expect(readCommittedSession(dir, "a")?.messageCount).toBe(3)
   })
 
   it("hands out frozen entries and leaves earlier reads untouched by later mutations", async () => {
@@ -203,24 +206,26 @@ describe("copy-on-write store mutations", () => {
 
   it("discards a mutator's partial changes when it throws", async () => {
     await storeSharedSession("a", "claude-a", 1, "h", ["m1"])
-    const bytes = readFileSync(join(dir, "sessions.json"), "utf8")
-    await expect(storeSharedSession(
+    const seq = committedStoreSeq(dir)
+    // Awaited rather than through expect().rejects, which cannot wait for a
+    // store write under bun test (see session/storeDatabase.ts).
+    const outcome = await storeSharedSession(
       "a", "claude-other", 1, "h", ["m1"], undefined, undefined, undefined, undefined, undefined,
       { sessionId: "claude-other", configDir: "/tmp/config" },
       { sessionId: "not-the-replaced-session", configDir: "/tmp/config" },
-    )).rejects.toThrow()
-    expect(readFileSync(join(dir, "sessions.json"), "utf8")).toBe(bytes)
+    ).then(() => "stored", (error: unknown) => error)
+    expect(outcome).toBeInstanceOf(Error)
+    expect(committedStoreSeq(dir)).toBe(seq)
     expect(lookupSharedSession("a")!.claudeSessionId).toBe("claude-a")
   })
 
-  it("builds a mutation on a foreign writer's document, not on the stale cache", async () => {
+  it("builds a mutation on a foreign writer's commit, not on the stale cache", async () => {
     await storeSharedSession("a", "claude-a", 1, "h", ["m1"])
-    const foreign = JSON.parse(readFileSync(join(dir, "sessions.json"), "utf8")) as Record<string, unknown>
-    foreign.b = fixtureEntry(2, Date.now())
-    publishForeign(dir, foreign)
+    commitRawSession(dir, "b", fixtureEntry(2, Date.now()))
 
     await storeSharedSession("c", "claude-c", 1, "h", ["m1"])
-    const parsed = JSON.parse(readFileSync(join(dir, "sessions.json"), "utf8")) as Record<string, unknown>
-    expect(Object.keys(parsed).sort()).toEqual([META_KEY, "a", "b", "c"].sort())
+    await sessionStoreWritesSettled()
+    expect(Object.keys(readSessionStoreDocument()).sort()).toEqual([META_KEY, "a", "b", "c"].sort())
+    for (const key of ["a", "b", "c"]) expect(readCommittedSession(dir, key)).toBeDefined()
   })
 })

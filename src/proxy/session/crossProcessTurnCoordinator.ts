@@ -272,7 +272,7 @@ function ownerlessVerdict(
 
 function canRecover(snapshot: LockSnapshot, policy: RecoveryPolicy, now = Date.now()): boolean {
   // Never steal from a process that may still be executing: without a fencing
-  // token in sessions.json, a stale-but-live owner could later overwrite its
+  // token in the session store, a stale-but-live owner could later overwrite its
   // successor. Same-host PID death is authoritative. Cross-host locks fail
   // closed and require operator cleanup after the host is confirmed dead.
   const lastHeartbeat = snapshot.owner

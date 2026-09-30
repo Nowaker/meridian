@@ -23,8 +23,10 @@ import {
 import {
   pruneSupersededProfileCopies,
   readSessionStoreSnapshot,
+  sessionStoreWritesSettled,
   setSessionStoreDir,
 } from "../proxy/sessionStore"
+import { committedStoreSeq } from "./storeDatabaseHelpers"
 
 const META_KEY = "\u0000meridian-session-store"
 const HOUR = 60 * 60_000
@@ -38,11 +40,13 @@ interface FixtureCopy {
 
 type FixtureDocument = Record<string, Record<string, unknown>>
 
-function writeStore(
+/** Seed the store with these copies through a sessions.json, as an earlier
+ *  version left it, and wait until the store has imported it. */
+async function writeStore(
   dir: string,
   copies: FixtureCopy[],
   decorate: (document: FixtureDocument) => void = () => {},
-): void {
+): Promise<void> {
   const now = Date.now()
   const document: FixtureDocument = { [META_KEY]: { version: 1, slots: {} } }
   for (const copy of copies) {
@@ -67,6 +71,8 @@ function writeStore(
   fsyncSync(fd)
   closeSync(fd)
   renameSync(temp, join(dir, "sessions.json"))
+  readSessionStoreSnapshot()
+  await sessionStoreWritesSettled()
 }
 
 function storedKeys(): string[] {
@@ -97,7 +103,7 @@ describe("pruneSupersededProfileCopies", () => {
   })
 
   it("keeps the newest copy of a conversation and removes older copies past the grace window", async () => {
-    writeStore(dir, [
+    await writeStore(dir, [
       { key: "work:ses_a", ageMs: 5 * HOUR },
       { key: "personal:ses_a", ageMs: 2 * HOUR },
       { key: "ses_a", ageMs: 1_000 },
@@ -108,7 +114,7 @@ describe("pruneSupersededProfileCopies", () => {
   })
 
   it("keeps every copy touched within the grace window, and a zero grace keeps only the newest", async () => {
-    writeStore(dir, [
+    await writeStore(dir, [
       { key: "work:ses_a", ageMs: 30 * 60_000 },
       { key: "personal:ses_a", ageMs: 1_000 },
     ])
@@ -119,7 +125,7 @@ describe("pruneSupersededProfileCopies", () => {
   })
 
   it("groups only configured profile prefixes, never unrelated keys that contain a colon", async () => {
-    writeStore(dir, [
+    await writeStore(dir, [
       { key: "unknown:ses_a", ageMs: 5 * HOUR },
       { key: "work:ses_a", ageMs: 1_000 },
       { key: "ses_a#title", ageMs: 5 * HOUR },
@@ -128,7 +134,7 @@ describe("pruneSupersededProfileCopies", () => {
   })
 
   it("keeps every copy of a conversation that has a request in flight", async () => {
-    writeStore(dir, [
+    await writeStore(dir, [
       { key: "work:ses_a", ageMs: 5 * HOUR },
       { key: "personal:ses_a", ageMs: 1_000 },
       { key: "work:ses_b", ageMs: 5 * HOUR },
@@ -139,7 +145,7 @@ describe("pruneSupersededProfileCopies", () => {
   })
 
   it("never removes a mapping a priority route depends on", async () => {
-    writeStore(dir, [
+    await writeStore(dir, [
       { key: "work:ses_a", ageMs: 5 * HOUR },
       { key: "personal:ses_a", ageMs: 1_000 },
     ], (document) => {
@@ -167,7 +173,7 @@ describe("pruneSupersededProfileCopies", () => {
   })
 
   it("stops once the removed mappings would unpin more transcripts than the budget, oldest first", async () => {
-    writeStore(dir, [
+    await writeStore(dir, [
       { key: "work:ses_a", ageMs: 9 * HOUR },
       { key: "work:ses_b", ageMs: 8 * HOUR, transcript: false },
       { key: "work:ses_c", ageMs: 7 * HOUR },
@@ -181,10 +187,11 @@ describe("pruneSupersededProfileCopies", () => {
   })
 
   it("takes no lock and writes nothing when nothing is superseded", async () => {
-    writeStore(dir, [{ key: "work:ses_a", ageMs: 5 * HOUR }])
-    const before = readFileSync(join(dir, "sessions.json"), "utf8")
+    await writeStore(dir, [{ key: "work:ses_a", ageMs: 5 * HOUR }])
+    const before = committedStoreSeq(dir)
     expect(await prune()).toBe(0)
-    expect(readFileSync(join(dir, "sessions.json"), "utf8")).toBe(before)
+    await sessionStoreWritesSettled()
+    expect(committedStoreSeq(dir)).toBe(before)
   })
 })
 
@@ -229,7 +236,7 @@ describe("mass prune through the transcript lifecycle", () => {
       staleCopies.push({ key: `work:ses_${index}`, ageMs: (10 + index) * HOUR })
       staleCopies.push({ key: `personal:ses_${index}`, ageMs: (40 + index) * HOUR })
     }
-    writeStore(dir, [...staleCopies, ...newest])
+    await writeStore(dir, [...staleCopies, ...newest])
     const options: SessionLifecycleOptions = {
       storeDir: dir,
       maxPending,

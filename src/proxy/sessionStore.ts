@@ -1,57 +1,30 @@
 /**
- * File-based session store for cross-proxy session resume.
+ * Shared session store for cross-proxy session resume.
  *
  * When running per-terminal proxies (each on a different port),
  * sessions need to be shared so you can resume a conversation
- * started in one terminal from another. This stores session
- * mappings in a JSON file that all proxy instances read/write.
+ * started in one terminal from another. Every proxy instance reads
+ * and writes one SQLite database in the store directory, one row per
+ * mapping (see session/storeDatabase.ts).
  *
- * Format: { [key]: { claudeSessionId, createdAt, lastUsedAt } }
  * Keys are either OpenCode session IDs or conversation fingerprints.
+ * Earlier versions kept the whole store in sessions.json; the first
+ * open of a directory imports that file once and renames it aside.
  */
 
-import {
-  chmodSync,
-  closeSync,
-  existsSync,
-  fstatSync,
-  fsyncSync,
-  lstatSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  readdirSync,
-  renameSync,
-  rmSync,
-  statSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs"
-import { link, open, readFile, rename, unlink, type FileHandle } from "node:fs/promises"
-import { setTimeout as waitForLockRetry } from "node:timers/promises"
+import { existsSync, readFileSync } from "node:fs"
+import { readFile, rename } from "node:fs/promises"
 import { createHash, randomUUID } from "node:crypto"
-import { homedir, hostname } from "node:os"
+import { homedir } from "node:os"
 import { basename, dirname, isAbsolute, join } from "node:path"
-import {
-  directoryRenameWasBlockedSync,
-  syncDirectoryDurably,
-  syncDirectoryDurablySync,
-} from "./session/durableFileSystem"
+import { syncDirectoryDurably } from "./session/durableFileSystem"
 import type { TokenUsage } from "./session/lineage"
 import {
-  createRecoveryClaimOwner,
-  getRecoveryClaimPath,
-  getRecoveryClaimTombstonePath,
-  parseRecoveryClaimOwnerJson,
-  recoveryClaimOwnerIsDead,
-  type RecoveryClaimOwner,
-} from "./session/recoveryClaim"
-import {
-  captureProcessIncarnation,
-  parseProcessIncarnation,
-  processIncarnationIsDead,
-  type ProcessIncarnation,
-} from "./session/processIncarnation"
+  openStoreDatabase,
+  peekStoreDatabase,
+  type StoreDatabase,
+  type WriteOp,
+} from "./session/storeDatabase"
 
 export interface TranscriptLocator {
   sessionId: string
@@ -234,9 +207,7 @@ function advanceKeySlot(key: string, meta: SessionStoreMeta): void {
 const DEFAULT_MAX_STORED_SESSIONS = 10_000
 const DEFAULT_MAX_PRIORITY_ASSIGNMENTS = 5_000
 const DEFAULT_MAX_PRIORITY_ATTEMPTS = 5_000
-const STALE_LOCK_THRESHOLD_MS = 30_000
 const DEFAULT_LOCK_WAIT_MS = 10_000
-const LOCK_RETRY_MS = 10
 
 export function getMaxStoredSessionsLimit(): number {
   const raw = process.env.MERIDIAN_MAX_STORED_SESSIONS ?? process.env.CLAUDE_PROXY_MAX_STORED_SESSIONS
@@ -271,411 +242,6 @@ function getLockWaitMs(): number {
   return parsed
 }
 
-interface StoreLock {
-  path: string
-  token: string
-}
-
-interface StoreLockCandidate {
-  /** Become the lock with an atomic no-replace hard link. False: it is held. */
-  publish: () => Promise<boolean>
-  /** Drop the staging name. A published candidate stays linked as the lock. */
-  discard: () => Promise<void>
-}
-
-/** Initialise fully written lock metadata once per acquisition, off the event
- *  loop, and re-link it on every attempt.
- *
- *  The fsync is load-bearing: stale-lock recovery retires only a lock whose
- *  owner it can parse and prove dead, so a crash must never leave the lock
- *  linked to an unwritten inode. One fsync per attempt does not follow from
- *  that, and on a slow disk it made every retry cost a journal commit on the
- *  directory the holder is about to fsync. This is the same protocol as the
- *  session lifecycle sidecar lock. */
-async function createInitializedLockCandidate(path: string, contents: string): Promise<StoreLockCandidate> {
-  const staging = `${path}.candidate-${process.pid}-${randomUUID()}`
-  const discard = async (): Promise<void> => {
-    try {
-      await unlink(staging)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        console.error("[sessionStore] lock staging cleanup failed:", (error as Error).message)
-      }
-    }
-  }
-  let handle: FileHandle | undefined
-  try {
-    handle = await open(staging, "wx", 0o600)
-    await handle.chmod(0o600)
-    await handle.writeFile(contents, "utf8")
-    await handle.sync()
-    await handle.close()
-    handle = undefined
-  } catch (error) {
-    if (handle) {
-      await handle.close().catch((closeError: unknown) => {
-        console.error("[sessionStore] lock staging close failed:", (closeError as Error).message)
-      })
-    }
-    await discard()
-    throw error
-  }
-  return {
-    publish: async () => {
-      try {
-        await link(staging, path)
-        return true
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") return false
-        throw error
-      }
-    },
-    discard,
-  }
-}
-
-interface CanonicalStoreLockOwner {
-  pid: number
-  hostname: string
-  token: string
-  incarnation: ProcessIncarnation
-}
-
-function parseCanonicalStoreLockOwner(contents: string): CanonicalStoreLockOwner | undefined {
-  try {
-    const owner = JSON.parse(contents) as Record<string, unknown>
-    const incarnation = parseProcessIncarnation(owner.incarnation)
-    if (
-      typeof owner.pid !== "number"
-      || !Number.isInteger(owner.pid)
-      || owner.pid <= 0
-      || typeof owner.hostname !== "string"
-      || owner.hostname.length === 0
-      || typeof owner.token !== "string"
-      || owner.token.length === 0
-      || !incarnation
-    ) return undefined
-    return {
-      pid: owner.pid,
-      hostname: owner.hostname,
-      token: owner.token,
-      incarnation,
-    }
-  } catch {
-    return undefined
-  }
-}
-
-function canonicalStoreLockOwnerIsDead(contents: string): boolean {
-  const owner = parseCanonicalStoreLockOwner(contents)
-  return owner ? processIncarnationIsDead(owner.incarnation) : false
-}
-
-interface StoreRecoveryClaimSnapshot {
-  dev: number
-  ino: number
-  owner?: RecoveryClaimOwner
-}
-
-function snapshotStoreRecoveryClaim(claimPath: string): StoreRecoveryClaimSnapshot | undefined {
-  let info: ReturnType<typeof lstatSync>
-  try {
-    info = lstatSync(claimPath)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
-    throw error
-  }
-  if (!info.isDirectory() || info.isSymbolicLink()) return { dev: info.dev, ino: info.ino }
-
-  let owner: RecoveryClaimOwner | undefined
-  try {
-    owner = parseRecoveryClaimOwnerJson(readFileSync(join(claimPath, "owner.json"), "utf8"))
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-  }
-  return { dev: info.dev, ino: info.ino, owner }
-}
-
-/** Atomically publish a fully initialized, non-empty recovery owner directory. */
-function publishStoreRecoveryClaim(claimPath: string, owner: RecoveryClaimOwner): boolean {
-  const candidate = `${claimPath}.candidate-${process.pid}-${owner.token}`
-  let fd: number | undefined
-  let published = false
-  try {
-    mkdirSync(candidate, { mode: 0o700 })
-    fd = openSync(join(candidate, "owner.json"), "wx", 0o600)
-    writeFileSync(fd, JSON.stringify(owner), "utf8")
-    fsyncSync(fd)
-    closeSync(fd)
-    fd = undefined
-    syncDirectoryDurablySync(candidate)
-
-    // Protocol-created destinations are non-empty directories, so rename is
-    // atomic and no-replace. Refuse malformed pre-existing paths as well.
-    try {
-      lstatSync(claimPath)
-      return false
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-    }
-    try {
-      renameSync(candidate, claimPath)
-      published = true
-      syncDirectoryDurablySync(dirname(claimPath))
-      return true
-    } catch (error) {
-      if (directoryRenameWasBlockedSync(error, claimPath)) return false
-      throw error
-    }
-  } finally {
-    if (fd !== undefined) {
-      try { closeSync(fd) } catch (error) {
-        console.error("[sessionStore] recovery claim owner close failed:", (error as Error).message)
-      }
-    }
-    if (!published) {
-      try { rmSync(candidate, { recursive: true, force: true }) } catch (error) {
-        console.error("[sessionStore] recovery claim candidate cleanup failed:", (error as Error).message)
-      }
-    }
-  }
-}
-
-/** Retire only the observed dead claim generation. Its tombstone fences ABA. */
-function retireDeadStoreRecoveryClaim(claimPath: string, generation: string): boolean {
-  const observed = snapshotStoreRecoveryClaim(claimPath)
-  if (!observed) return true
-  if (
-    !observed.owner
-    || observed.owner.generation !== generation
-    || !recoveryClaimOwnerIsDead(observed.owner)
-  ) return false
-
-  const tombstone = getRecoveryClaimTombstonePath(claimPath, observed.owner.token)
-  try {
-    lstatSync(tombstone)
-    return false
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-  }
-
-  const current = snapshotStoreRecoveryClaim(claimPath)
-  if (
-    !current
-    || current.dev !== observed.dev
-    || current.ino !== observed.ino
-    || current.owner?.token !== observed.owner.token
-    || current.owner.generation !== generation
-    || !recoveryClaimOwnerIsDead(current.owner)
-  ) return !current
-
-  try {
-    renameSync(claimPath, tombstone)
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
-    if (code === "ENOENT") return true
-    if (directoryRenameWasBlockedSync(error, tombstone)) return false
-    throw error
-  }
-
-  const moved = snapshotStoreRecoveryClaim(tombstone)
-  if (
-    !moved
-    || moved.dev !== observed.dev
-    || moved.ino !== observed.ino
-    || moved.owner?.token !== observed.owner.token
-    || moved.owner.generation !== generation
-  ) throw new Error("recovery claim identity changed during retirement")
-  return true
-}
-
-function releaseStoreRecoveryClaim(claimPath: string, owner: RecoveryClaimOwner): void {
-  try {
-    const current = snapshotStoreRecoveryClaim(claimPath)
-    if (current?.owner?.token === owner.token && current.owner.generation === owner.generation) {
-      rmSync(claimPath, { recursive: true })
-    }
-  } catch (error) {
-    console.error("[sessionStore] stale recovery claim cleanup failed:", (error as Error).message)
-  }
-}
-
-function cleanupStoreRecoveryTombstones(claimPath: string): void {
-  const prefix = `${basename(claimPath)}.orphan-`
-  try {
-    for (const name of readdirSync(dirname(claimPath))) {
-      if (!name.startsWith(prefix)) continue
-      const path = join(dirname(claimPath), name)
-      const info = lstatSync(path)
-      if (info.isDirectory() && !info.isSymbolicLink()) {
-        rmSync(path, { recursive: true })
-      }
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      console.error("[sessionStore] stale recovery tombstone cleanup failed:", (error as Error).message)
-    }
-  }
-}
-
-function retireStaleLock(lockPath: string): boolean {
-  let token: string
-  let info: ReturnType<typeof statSync>
-  try {
-    token = readFileSync(lockPath, "utf8")
-    info = statSync(lockPath)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true
-    throw new Error(`[sessionStore] stale lock inspection failed: ${(error as Error).message}`, { cause: error })
-  }
-  if (
-    Date.now() - info.mtimeMs <= STALE_LOCK_THRESHOLD_MS
-    || !canonicalStoreLockOwnerIsDead(token)
-  ) return false
-
-  const generation = token
-  const claimPath = getRecoveryClaimPath(lockPath, generation)
-  const claimOwner = createRecoveryClaimOwner(generation)
-  try {
-    if (!publishStoreRecoveryClaim(claimPath, claimOwner)) {
-      if (!retireDeadStoreRecoveryClaim(claimPath, generation)) return false
-      if (!publishStoreRecoveryClaim(claimPath, claimOwner)) return false
-    }
-  } catch (error) {
-    throw new Error(`[sessionStore] stale recovery claim failed: ${(error as Error).message}`, { cause: error })
-  }
-
-  let generationResolved = false
-  try {
-    let currentToken: string
-    let currentInfo: ReturnType<typeof statSync>
-    try {
-      currentToken = readFileSync(lockPath, "utf8")
-      currentInfo = statSync(lockPath)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        generationResolved = true
-        return true
-      }
-      throw error
-    }
-    if (
-      currentToken !== token
-      || currentInfo.dev !== info.dev
-      || currentInfo.ino !== info.ino
-    ) {
-      generationResolved = true
-      return true
-    }
-    if (
-      Date.now() - currentInfo.mtimeMs <= STALE_LOCK_THRESHOLD_MS
-      || !canonicalStoreLockOwnerIsDead(currentToken)
-    ) return false
-
-    const retiredPath = `${lockPath}.stale-${process.pid}-${randomUUID()}`
-    renameSync(lockPath, retiredPath)
-    generationResolved = true
-    try {
-      const movedToken = readFileSync(retiredPath, "utf8")
-      if (movedToken !== currentToken) {
-        throw new Error("claimed lock identity changed during stale recovery")
-      }
-      unlinkSync(retiredPath)
-    } catch (error) {
-      console.error("[sessionStore] stale lock cleanup failed:", (error as Error).message)
-    }
-    return true
-  } catch (error) {
-    const err = error as NodeJS.ErrnoException
-    if (err.code === "ENOENT") {
-      generationResolved = true
-      return true
-    }
-    throw new Error(`[sessionStore] stale lock recovery failed: ${err.message}`, { cause: err })
-  } finally {
-    releaseStoreRecoveryClaim(claimPath, claimOwner)
-    if (generationResolved) cleanupStoreRecoveryTombstones(claimPath)
-  }
-}
-
-async function acquireLock(lockPath: string): Promise<StoreLock> {
-  const incarnation = captureProcessIncarnation()
-  if (!incarnation) throw new Error("[sessionStore] cannot capture lock owner process incarnation")
-  const token = JSON.stringify({
-    pid: process.pid,
-    hostname: hostname(),
-    token: randomUUID(),
-    incarnation,
-  })
-  const deadline = performance.now() + getLockWaitMs()
-
-  let candidate: StoreLockCandidate
-  try {
-    candidate = await createInitializedLockCandidate(lockPath, token)
-  } catch (error) {
-    throw new Error(`[sessionStore] lock acquire failed: ${(error as Error).message}`, { cause: error })
-  }
-  try {
-    while (true) {
-      try {
-        if (await candidate.publish()) return { path: lockPath, token }
-      } catch (error) {
-        throw new Error(`[sessionStore] lock acquire failed: ${(error as Error).message}`, { cause: error })
-      }
-
-      if (deadline - performance.now() <= 0) {
-        throw new Error(`[sessionStore] timed out waiting for lock ${lockPath}`)
-      }
-      if (retireStaleLock(lockPath)) continue
-      const remaining = deadline - performance.now()
-      if (remaining <= 0) {
-        throw new Error(`[sessionStore] timed out waiting for lock ${lockPath}`)
-      }
-      await waitForLockRetry(Math.min(LOCK_RETRY_MS, remaining))
-    }
-  } finally {
-    await candidate.discard()
-  }
-}
-
-async function releaseLock(lock: StoreLock): Promise<void> {
-  try {
-    if (await readFile(lock.path, "utf8") !== lock.token) {
-      console.error("[sessionStore] lock ownership changed before release")
-      return
-    }
-    await unlink(lock.path)
-  } catch (error) {
-    const err = error as NodeJS.ErrnoException
-    if (err.code !== "ENOENT") {
-      console.error("[sessionStore] lock release failed:", err.message)
-    }
-  }
-}
-
-// One store's mutations run one at a time within this process, in call order.
-// The lock file arbitrates between processes; this queue keeps a process's own
-// writers from polling that lock against each other, which would let a later
-// caller's write land before an earlier one's.
-const storeMutationQueues = new Map<string, Promise<void>>()
-
-function runStoreMutationInOrder(lockPath: string, mutation: () => Promise<void>): Promise<void> {
-  const previous = storeMutationQueues.get(lockPath) ?? Promise.resolve()
-  const current = previous.then(mutation)
-  const tail = current.catch(() => undefined)
-  storeMutationQueues.set(lockPath, tail)
-  void tail.then(() => {
-    if (storeMutationQueues.get(lockPath) === tail) storeMutationQueues.delete(lockPath)
-  })
-  return current
-}
-
-/** Settles, never rejecting, once every store mutation this process has
- *  already started has landed. Mutations started later are not waited for. */
-export function sessionStoreWritesSettled(): Promise<void> {
-  return storeMutationQueues.get(`${getStorePath()}.lock`) ?? Promise.resolve()
-}
-
 /** Override for testing — avoids env var race when test files run in parallel */
 let sessionDirOverride: string | null = null
 
@@ -692,15 +258,6 @@ export function getSessionStoreDir(): string {
     || process.env.MERIDIAN_SESSION_DIR
     || process.env.CLAUDE_PROXY_SESSION_DIR
     || getDefaultCacheDir()
-}
-
-function getStorePath(): string {
-  const dir = getSessionStoreDir()
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true, mode: 0o700 })
-  }
-  chmodSync(dir, 0o700)
-  return join(dir, "sessions.json")
 }
 
 /**
@@ -980,30 +537,7 @@ function validateStoreMeta(value: unknown): SessionStoreMeta {
   }
   const priorityRollbackMappings: Record<string, DurablePriorityRollbackMapping> = {}
   for (const [routeKey, value] of Object.entries(meta.priorityRollbackMappings)) {
-    if (!priorityAssignments[routeKey] || !value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} is invalid`)
-    }
-    const rollback = value as Record<string, unknown>
-    if (
-      !hasExactObjectKeys(rollback, ["mappingKey", "mappingGeneration"])
-      || typeof rollback.mappingKey !== "string"
-      || !rollback.mappingKey
-      || rollback.mappingKey.length > 1_024
-    ) {
-      throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} is invalid`)
-    }
-    const expectedMappingPrefix = `p:${keyDigest(rollback.mappingKey)}:`
-    if (
-      typeof rollback.mappingGeneration !== "string"
-      || !rollback.mappingGeneration.startsWith(expectedMappingPrefix)
-      || !UUID_PATTERN.test(rollback.mappingGeneration.slice(expectedMappingPrefix.length))
-    ) {
-      throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} has invalid mapping generation`)
-    }
-    priorityRollbackMappings[routeKey] = {
-      mappingKey: rollback.mappingKey,
-      mappingGeneration: rollback.mappingGeneration,
-    }
+    priorityRollbackMappings[routeKey] = validatePriorityRollback(routeKey, value, priorityAssignments)
   }
   return {
     version: PRIORITY_STORE_META_VERSION,
@@ -1014,85 +548,56 @@ function validateStoreMeta(value: unknown): SessionStoreMeta {
   }
 }
 
-interface StoreFileIdentity {
-  dev: number
-  ino: number
-  mtimeMs: number
-  ctimeMs: number
-  size: number
-}
-
-interface StoreDocumentCache extends StoreFileIdentity {
-  path: string
-  document: SessionStoreDocument
-}
-
-function sameStoreFile(cached: StoreDocumentCache | undefined, path: string, info: StoreFileIdentity): boolean {
-  return cached?.path === path
-    && cached.dev === info.dev
-    && cached.ino === info.ino
-    && cached.mtimeMs === info.mtimeMs
-    && cached.ctimeMs === info.ctimeMs
-    && cached.size === info.size
-}
-
-// Takes the synchronous full-file parse — well over a hundred milliseconds on a
-// long-lived store — off every lookup and every locked mutation. Identity
-// keying is exact because every writer, this process or a foreign one,
-// publishes through rename and therefore a new inode with fresh times.
-// The document and its sessions are immutable: mutateStore hands mutators a
-// copy-on-write view, and entries are replaced rather than edited in place.
-let storeDocumentCache: StoreDocumentCache | undefined
-
-function cacheStoreDocument(path: string, info: StoreFileIdentity, document: SessionStoreDocument): void {
-  // An in-place edit would reach disk through the serialization memo or be
-  // lost on the next write; freezing turns that into an immediate error.
-  for (const session of Object.values(document.sessions)) Object.freeze(session)
-  storeDocumentCache = {
-    path,
-    dev: info.dev,
-    ino: info.ino,
-    mtimeMs: info.mtimeMs,
-    ctimeMs: info.ctimeMs,
-    size: info.size,
-    document,
+function validatePriorityRollback(
+  routeKey: string,
+  value: unknown,
+  priorityAssignments: Record<string, DurablePriorityAssignment>,
+): DurablePriorityRollbackMapping {
+  if (!priorityAssignments[routeKey] || !value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} is invalid`)
+  }
+  const rollback = value as Record<string, unknown>
+  if (
+    !hasExactObjectKeys(rollback, ["mappingKey", "mappingGeneration"])
+    || typeof rollback.mappingKey !== "string"
+    || !rollback.mappingKey
+    || rollback.mappingKey.length > 1_024
+  ) {
+    throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} is invalid`)
+  }
+  const expectedMappingPrefix = `p:${keyDigest(rollback.mappingKey)}:`
+  if (
+    typeof rollback.mappingGeneration !== "string"
+    || !rollback.mappingGeneration.startsWith(expectedMappingPrefix)
+    || !UUID_PATTERN.test(rollback.mappingGeneration.slice(expectedMappingPrefix.length))
+  ) {
+    throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} has invalid mapping generation`)
+  }
+  return {
+    mappingKey: rollback.mappingKey,
+    mappingGeneration: rollback.mappingGeneration,
   }
 }
 
-function readStoreDocumentCached(path: string): SessionStoreDocument {
-  let fd: number | undefined
-  try {
-    const info = statSync(path)
-    if (sameStoreFile(storeDocumentCache, path, info)) return storeDocumentCache!.document
-    // Identity is re-taken from the same fd the content is read from, so a
-    // rename landing between stat and read can never pair one file's identity
-    // with another file's bytes.
-    fd = openSync(path, "r")
-    const identity = fstatSync(fd)
-    const document = parseStoreDocument(readFileSync(fd, "utf8"))
-    cacheStoreDocument(path, identity, document)
-    return document
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-    storeDocumentCache = undefined
-    return emptyStoreDocument()
-  } finally {
-    if (fd !== undefined) closeSync(fd)
+/** Every rollback must retain the exact, distinct mapping it would restore. */
+function validateRollbackReferences(sessions: Record<string, StoredSession>, meta: SessionStoreMeta): void {
+  if (meta.version !== PRIORITY_STORE_META_VERSION) return
+  for (const [routeKey, rollback] of Object.entries(meta.priorityRollbackMappings)) {
+    const assignment = meta.priorityAssignments[routeKey]!
+    const mapping = sessions[rollback.mappingKey]
+    if (!mapping) {
+      throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} has no retained mapping`)
+    }
+    if (rollback.mappingKey === assignment.mappingKey) {
+      throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} aliases its current mapping`)
+    }
+    if (getStoredSessionGeneration(mapping, rollback.mappingKey) !== rollback.mappingGeneration) {
+      throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} has a stale mapping generation`)
+    }
   }
 }
 
-/** Publish a just-written document under the identity of the file it landed in.
- *  A failure to read that identity only costs the next reader a re-parse, so it
- *  must never turn a committed write into a thrown mutation. */
-function publishStoreCache(path: string, document: SessionStoreDocument): void {
-  try {
-    cacheStoreDocument(path, statSync(path), document)
-  } catch {
-    storeDocumentCache = undefined
-  }
-}
-
-/** Parse and validate raw store bytes, for both the strict and the cached read. */
+/** Parse and validate a legacy sessions.json document. */
 function parseStoreDocument(data: string): SessionStoreDocument {
   const parsed: unknown = JSON.parse(data)
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -1108,32 +613,211 @@ function parseStoreDocument(data: string): SessionStoreDocument {
     validateStoredSession(key, value)
     sessions[key] = value as StoredSession
   }
-  if (meta.version === PRIORITY_STORE_META_VERSION) {
-    for (const [routeKey, rollback] of Object.entries(meta.priorityRollbackMappings)) {
-      const assignment = meta.priorityAssignments[routeKey]!
-      const mapping = sessions[rollback.mappingKey]
-      if (!mapping) {
-        throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} has no retained mapping`)
-      }
-      if (rollback.mappingKey === assignment.mappingKey) {
-        throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} aliases its current mapping`)
-      }
-      if (getStoredSessionGeneration(mapping, rollback.mappingKey) !== rollback.mappingGeneration) {
-        throw new Error(`session store priority rollback ${JSON.stringify(routeKey)} has a stale mapping generation`)
-      }
-    }
-  }
+  validateRollbackReferences(sessions, meta)
   return { sessions, meta }
 }
 
-function readStoreStrict(path: string): Record<string, StoredSession> {
-  return readStoreDocumentCached(path).sessions
+const LEGACY_STORE_NAME = "sessions.json"
+
+interface StoreInfoRow {
+  seq: number
+  meta_version: number
+  commit_token: string | null
+  imported_json_sha256: string | null
+}
+
+interface StoreCache {
+  /** The commit sequence the document reflects. Every commit advances it. */
+  seq: number
+  document: SessionStoreDocument
+}
+
+// The store as of the latest commit this process has read. While nothing
+// changed, a read costs one lookup of the commit sequence; a commit by another
+// process is read incrementally by that sequence. Cached entries are frozen and
+// shared with drafts: a mutation replaces the entries it changes, so the diff
+// against the cache is exactly what it writes.
+const storeCaches = new WeakMap<StoreDatabase, StoreCache>()
+// Databases whose directory has been checked for a legacy sessions.json.
+const legacyChecked = new WeakSet<StoreDatabase>()
+
+interface PendingImport {
+  legacyPath: string
+  digest: string
+  legacy: SessionStoreDocument
+  /** The store as the import will leave it, served to readers until it lands. */
+  view: SessionStoreDocument
+}
+
+// A sessions.json that has been read but not yet committed to the database.
+// Until the import lands the file stays authoritative: readers see its
+// contents, and no mutation commits before it.
+const pendingImports = new WeakMap<StoreDatabase, PendingImport>()
+
+const UPSERT_SESSION = "INSERT INTO sessions (key, seq, entry) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET seq = excluded.seq, entry = excluded.entry"
+const DELETE_SESSION = "DELETE FROM sessions WHERE key = ?"
+const UPSERT_SLOT = "INSERT INTO generation_slots (slot, counter) VALUES (?, ?) ON CONFLICT(slot) DO UPDATE SET counter = excluded.counter"
+const UPDATE_STORE_INFO = "UPDATE store_info SET seq = ?, meta_version = ?, commit_token = ? WHERE id = 1"
+const RECORD_IMPORT = "UPDATE store_info SET imported_json_sha256 = ?, imported_json_at = ? WHERE id = 1"
+
+const PRIORITY_TABLES = {
+  priorityAssignments: "priority_assignments",
+  priorityAttempts: "priority_attempts",
+  priorityRollbackMappings: "priority_rollbacks",
+} as const
+type PriorityRecordField = keyof typeof PRIORITY_TABLES
+const PRIORITY_RECORD_FIELDS = Object.keys(PRIORITY_TABLES) as PriorityRecordField[]
+
+function upsertPriorityRecord(field: PriorityRecordField): string {
+  return `INSERT INTO ${PRIORITY_TABLES[field]} (route_key, record) VALUES (?, ?) ON CONFLICT(route_key) DO UPDATE SET record = excluded.record`
+}
+
+function deletePriorityRecord(field: PriorityRecordField): string {
+  return `DELETE FROM ${PRIORITY_TABLES[field]} WHERE route_key = ?`
+}
+
+/** The database of the current store directory, with any legacy file taken in. */
+function storeDatabase(): StoreDatabase {
+  const database = openStoreDatabase(getSessionStoreDir(), getLockWaitMs())
+  if (!legacyChecked.has(database)) {
+    checkLegacyStore(database)
+    legacyChecked.add(database)
+  }
+  return database
+}
+
+function readStoreInfo(database: StoreDatabase): StoreInfoRow {
+  const info = database.get<StoreInfoRow>(
+    "SELECT seq, meta_version, commit_token, imported_json_sha256 FROM store_info WHERE id = 1",
+  )
+  if (!info || !Number.isSafeInteger(info.seq) || info.seq < 0) {
+    throw new Error(`session store ${database.path} has no valid store_info row`)
+  }
+  return info
+}
+
+/** Run several reads against one snapshot of the database. */
+function readConsistently<T>(database: StoreDatabase, read: () => T): T {
+  database.reader.exec("BEGIN")
+  try {
+    return read()
+  } finally {
+    database.reader.exec("COMMIT")
+  }
+}
+
+function parseSessionRow(key: string, entry: string): StoredSession {
+  const value: unknown = JSON.parse(entry)
+  validateStoredSession(key, value)
+  return Object.freeze(value)
+}
+
+function loadSlots(database: StoreDatabase): Record<string, number> {
+  const slots: Record<string, number> = {}
+  for (const row of database.all<{ slot: string; counter: number }>("SELECT slot, counter FROM generation_slots")) {
+    if (!/^[0-9a-f]{4}$/.test(row.slot) || !Number.isSafeInteger(row.counter) || row.counter < 0) {
+      throw new Error(`session store metadata has invalid generation slot ${JSON.stringify(row.slot)}`)
+    }
+    slots[row.slot] = row.counter
+  }
+  return slots
+}
+
+function priorityRows(database: StoreDatabase, field: PriorityRecordField): Array<{ route_key: string; record: string }> {
+  return database.all<{ route_key: string; record: string }>(`SELECT route_key, record FROM ${PRIORITY_TABLES[field]}`)
+}
+
+function loadMeta(database: StoreDatabase, version: number, slots: Record<string, number>): SessionStoreMeta {
+  if (version === STORE_META_VERSION) {
+    for (const field of PRIORITY_RECORD_FIELDS) {
+      if (priorityRows(database, field).length > 0) {
+        throw new Error("session store v1 metadata has priority records")
+      }
+    }
+    return { version: STORE_META_VERSION, slots }
+  }
+  if (version !== PRIORITY_STORE_META_VERSION) {
+    throw new Error("session store metadata has an unsupported format")
+  }
+  const priorityAssignments: Record<string, DurablePriorityAssignment> = {}
+  for (const row of priorityRows(database, "priorityAssignments")) {
+    priorityAssignments[row.route_key] = validatePriorityAssignment(row.route_key, JSON.parse(row.record))
+  }
+  const priorityAttempts: Record<string, DurablePriorityAttempt> = {}
+  for (const row of priorityRows(database, "priorityAttempts")) {
+    priorityAttempts[row.route_key] = validatePriorityAttempt(row.route_key, JSON.parse(row.record))
+  }
+  const priorityRollbackMappings: Record<string, DurablePriorityRollbackMapping> = {}
+  for (const row of priorityRows(database, "priorityRollbackMappings")) {
+    priorityRollbackMappings[row.route_key] = validatePriorityRollback(
+      row.route_key,
+      JSON.parse(row.record),
+      priorityAssignments,
+    )
+  }
+  return {
+    version: PRIORITY_STORE_META_VERSION,
+    slots,
+    priorityAssignments,
+    priorityAttempts,
+    priorityRollbackMappings,
+  }
+}
+
+function loadStore(database: StoreDatabase, info: StoreInfoRow): StoreCache {
+  const sessions: Record<string, StoredSession> = {}
+  for (const row of database.all<{ key: string; entry: string }>("SELECT key, entry FROM sessions")) {
+    sessions[row.key] = parseSessionRow(row.key, row.entry)
+  }
+  const meta = loadMeta(database, info.meta_version, loadSlots(database))
+  validateRollbackReferences(sessions, meta)
+  return { seq: info.seq, document: { sessions, meta } }
+}
+
+/** Apply the commits since `cached` without re-reading unchanged entries.
+ *  Rows carry the sequence of the commit that last wrote them. */
+function catchUpStore(database: StoreDatabase, cached: StoreCache, info: StoreInfoRow): StoreCache {
+  const sessions = { ...cached.document.sessions }
+  const present = new Set(database.all<{ key: string }>("SELECT key FROM sessions").map((row) => row.key))
+  for (const key of Object.keys(sessions)) {
+    if (!present.has(key)) delete sessions[key]
+  }
+  for (const row of database.all<{ key: string; entry: string }>(
+    "SELECT key, entry FROM sessions WHERE seq > ?",
+    cached.seq,
+  )) {
+    sessions[row.key] = parseSessionRow(row.key, row.entry)
+  }
+  const meta = loadMeta(database, info.meta_version, loadSlots(database))
+  validateRollbackReferences(sessions, meta)
+  return { seq: info.seq, document: { sessions, meta } }
+}
+
+/** The cache, brought up to the database's latest commit. */
+function freshStoreCache(database: StoreDatabase): StoreCache {
+  const cached = storeCaches.get(database)
+  if (cached && readStoreInfo(database).seq === cached.seq) return cached
+  const fresh = readConsistently(database, () => {
+    const info = readStoreInfo(database)
+    if (cached?.seq === info.seq) return cached
+    return cached && cached.seq < info.seq
+      ? catchUpStore(database, cached, info)
+      : loadStore(database, info)
+  })
+  storeCaches.set(database, fresh)
+  return fresh
+}
+
+/** The current store. Callers must treat it as immutable. */
+function currentDocument(): SessionStoreDocument {
+  const database = storeDatabase()
+  return pendingImports.get(database)?.view ?? freshStoreCache(database).document
 }
 
 /** Read a strict, coherent snapshot for maintenance tasks such as session GC.
- *  Unlike lookup helpers, malformed JSON and I/O errors are propagated. */
+ *  Unlike lookup helpers, a corrupt store and I/O errors are propagated. */
 export function readSessionStoreSnapshot(): Record<string, StoredSession> {
-  return readStoreStrict(getStorePath())
+  return currentDocument().sessions
 }
 
 /** Capture exact durable generations for one adapter session across profile keys. */
@@ -1141,7 +825,7 @@ export function readSessionStoreGenerationSnapshot(
   adapterSessionId: string,
   profileIds: readonly string[] = [],
 ): Record<string, StoredSessionGeneration> {
-  const document = readStoreDocumentCached(getStorePath())
+  const document = currentDocument()
   const keys = new Set(Object.keys(document.sessions).filter((key) =>
     key === adapterSessionId || key.endsWith(`:${adapterSessionId}`)))
   keys.add(adapterSessionId)
@@ -1157,7 +841,6 @@ export function readSessionStoreGenerationSnapshot(
   ]))
 }
 
-
 function readStore(): Record<string, StoredSession> {
   try {
     return readSessionStoreSnapshot()
@@ -1167,95 +850,325 @@ function readStore(): Record<string, StoredSession> {
   }
 }
 
-async function fsyncParentDirectory(path: string): Promise<void> {
-  try {
-    await syncDirectoryDurably(dirname(path))
-  } catch (error) {
-    // Preserve the store's legacy best-effort parent flush on supported filesystems.
-    void error
+/** A copy of the whole store in the shape sessions.json had: the mappings plus
+ *  the metadata under its reserved key. For diagnostics and tests. */
+export function readSessionStoreDocument(): Record<string, unknown> {
+  const { sessions, meta } = currentDocument()
+  const slots: Record<string, number> = {}
+  // Draft counters inherit the ones they did not advance.
+  for (const slot in meta.slots) slots[slot] = meta.slots[slot]!
+  return structuredClone({ [STORE_META_KEY]: { ...meta, slots }, ...sessions })
+}
+
+/** Settles, never rejecting, once every store write this process has already
+ *  started has landed. Writes started later are not waited for. */
+export function sessionStoreWritesSettled(): Promise<void> {
+  return peekStoreDatabase(getSessionStoreDir())?.settled() ?? Promise.resolve()
+}
+
+function copyRecords<T extends object>(records: Record<string, T>): Record<string, T> {
+  const copy: Record<string, T> = {}
+  for (const [key, record] of Object.entries(records)) copy[key] = { ...record }
+  return copy
+}
+
+/**
+ * The document a mutator edits. Entries are shared with the cache, frozen, and
+ * replaced by the mutators that change them. Slot counters overlay the cache's
+ * through the prototype chain, so the draft's own properties are exactly the
+ * counters advanced. Priority records are edited in place, so they are copies.
+ */
+function draftStoreDocument(base: SessionStoreDocument): SessionStoreDocument {
+  const slots = Object.create(base.meta.slots) as Record<string, number>
+  const sessions = { ...base.sessions }
+  if (base.meta.version === STORE_META_VERSION) {
+    return { sessions, meta: { version: STORE_META_VERSION, slots } }
+  }
+  return {
+    sessions,
+    meta: {
+      version: PRIORITY_STORE_META_VERSION,
+      slots,
+      priorityAssignments: copyRecords(base.meta.priorityAssignments),
+      priorityAttempts: copyRecords(base.meta.priorityAttempts),
+      priorityRollbackMappings: copyRecords(base.meta.priorityRollbackMappings),
+    },
   }
 }
 
-// Entries are immutable once cached, so each is stringified and UTF-8 encoded
-// at most once; a mutation re-encodes only the entries it replaced. Encoding
-// the whole store was most of a write's CPU, all of it blocking the loop.
-const serializedEntries = new WeakMap<StoredSession, Buffer>()
-
-function serializeStoreDocument(document: SessionStoreDocument): Buffer {
-  // Compact on purpose: machine-read only, and indentation costs ~20% of the
-  // bytes and of the stringify CPU on a large store.
-  const chunks: Buffer[] = [Buffer.from(`{${JSON.stringify(STORE_META_KEY)}:${JSON.stringify(document.meta)}`, "utf8")]
-  for (const [key, session] of Object.entries(document.sessions)) {
-    let entry = serializedEntries.get(session)
-    if (entry === undefined) {
-      entry = Buffer.from(JSON.stringify(session), "utf8")
-      serializedEntries.set(session, entry)
-    }
-    chunks.push(Buffer.from(`,${JSON.stringify(key)}:`, "utf8"), entry)
-  }
-  chunks.push(Buffer.from("}", "utf8"))
-  return Buffer.concat(chunks)
+function sameFlatRecord(left: object, right: object): boolean {
+  const leftEntries = Object.entries(left)
+  if (leftEntries.length !== Object.keys(right).length) return false
+  return leftEntries.every(([key, value]) => (right as Record<string, unknown>)[key] === value)
 }
 
-/** Write the document to a temporary file, fsync it, then rename it over the
- *  store. Every step is awaited on a file handle: on a busy filesystem one
- *  fsync of the store can take seconds, and doing it synchronously stopped the
- *  whole proxy for that long. */
-async function writeStore(path: string, document: SessionStoreDocument): Promise<void> {
-  const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`
-  let handle: FileHandle | undefined
-  try {
-    handle = await open(tmp, "wx", 0o600)
-    await handle.chmod(0o600)
-    await handle.writeFile(serializeStoreDocument(document))
-    await handle.sync()
-    await handle.close()
-    handle = undefined
-    await rename(tmp, path)
-  } catch (error) {
-    if (handle) {
-      await handle.close().catch((closeError: unknown) => {
-        console.error("[sessionStore] temp close failed:", (closeError as Error).message)
-      })
-    }
-    try {
-      await unlink(tmp)
-    } catch (cleanupError) {
-      if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") {
-        console.error("[sessionStore] temp cleanup failed:", (cleanupError as Error).message)
+function priorityRecords(meta: SessionStoreMeta, field: PriorityRecordField): Record<string, object> {
+  return meta.version === PRIORITY_STORE_META_VERSION ? meta[field] : {}
+}
+
+/** The statements that turn `base` into `draft`, or none when they are equal. */
+function storeChangeOps(
+  base: SessionStoreDocument,
+  draft: SessionStoreDocument,
+  seq: number,
+  commitToken: string,
+): WriteOp[] {
+  const ops: WriteOp[] = []
+  for (const [key, entry] of Object.entries(draft.sessions)) {
+    if (base.sessions[key] !== entry) ops.push([UPSERT_SESSION, [key, seq, JSON.stringify(entry)]])
+  }
+  for (const key of Object.keys(base.sessions)) {
+    if (!Object.hasOwn(draft.sessions, key)) ops.push([DELETE_SESSION, [key]])
+  }
+  const slots = draft.meta.slots
+  const advanced = Object.getPrototypeOf(slots) === base.meta.slots
+    ? Object.keys(slots)
+    // A mutator replaced the counters outright: compare every one.
+    : Object.keys(slots).filter((slot) => slots[slot] !== base.meta.slots[slot])
+  for (const slot of advanced) ops.push([UPSERT_SLOT, [slot, slots[slot]!]])
+  for (const field of PRIORITY_RECORD_FIELDS) {
+    const before = priorityRecords(base.meta, field)
+    const after = priorityRecords(draft.meta, field)
+    for (const [routeKey, record] of Object.entries(after)) {
+      const previous = before[routeKey]
+      if (!previous || !sameFlatRecord(previous, record)) {
+        ops.push([upsertPriorityRecord(field), [routeKey, JSON.stringify(record)]])
       }
     }
-    throw new Error(`[sessionStore] write failed: ${(error as Error).message}`, { cause: error })
+    for (const routeKey of Object.keys(before)) {
+      if (!Object.hasOwn(after, routeKey)) ops.push([deletePriorityRecord(field), [routeKey]])
+    }
   }
+  if (ops.length === 0 && draft.meta.version === base.meta.version) return ops
+  ops.push([UPDATE_STORE_INFO, [seq, draft.meta.version, commitToken]])
+  return ops
+}
+
+/** The cached document after `draft` committed over `base`. */
+function committedDocument(base: SessionStoreDocument, draft: SessionStoreDocument): SessionStoreDocument {
+  for (const [key, entry] of Object.entries(draft.sessions)) {
+    if (base.sessions[key] !== entry) Object.freeze(entry)
+  }
+  // The counters only advance. Updating the cached object in place is safe
+  // because mutations run one at a time and readers use it synchronously.
+  const slots = base.meta.slots
+  for (const slot of Object.keys(draft.meta.slots)) slots[slot] = draft.meta.slots[slot]!
+  const meta: SessionStoreMeta = draft.meta.version === PRIORITY_STORE_META_VERSION
+    ? { ...draft.meta, slots }
+    : { version: STORE_META_VERSION, slots }
+  return { sessions: draft.sessions, meta }
+}
+
+interface StoreCommit {
+  base: StoreCache
+  draft: SessionStoreDocument
+  seq: number
 }
 
 async function mutateStore(mutator: (document: SessionStoreDocument) => boolean): Promise<void> {
-  const path = getStorePath()
-  const lockPath = `${path}.lock`
-  await runStoreMutationInOrder(lockPath, async () => {
-    const lock = await acquireLock(lockPath)
-    try {
-      // Every writer publishes while holding this lock, so the file identity
-      // checked here cannot change before our own rename: a cache hit is the
-      // current durable document without a re-parse. The draft shares entries
-      // with it; mutators replace entries and never edit them in place.
-      const current = readStoreDocumentCached(path)
-      const draft: SessionStoreDocument = {
-        sessions: { ...current.sessions },
-        meta: structuredClone(current.meta),
-      }
-      if (mutator(draft)) {
-        await writeStore(path, draft)
-        // Readers see the renamed file from here on whether or not the
-        // directory flush below has finished; publishing now spares them a
-        // re-parse of the whole store while that flush waits on the disk.
-        publishStoreCache(path, draft)
-        await fsyncParentDirectory(path)
-      }
-    } finally {
-      await releaseLock(lock)
+  const database = storeDatabase()
+  const commitToken = randomUUID()
+  await database.enqueue(async () => {
+    const pending = pendingImports.get(database)
+    if (pending) await importLegacyStore(database, pending)
+    const { committed, result: commit } = await database.transactNow<StoreCommit | undefined>({
+      lockWaitMs: getLockWaitMs(),
+      build: () => {
+        // This process holds the write lock, so the store cannot change while
+        // the mutator decides: catch the cache up and draft on top of it.
+        const base = freshStoreCache(database)
+        const draft = draftStoreDocument(base.document)
+        if (!mutator(draft)) return { ops: [], result: undefined }
+        const seq = base.seq + 1
+        return { ops: storeChangeOps(base.document, draft, seq, commitToken), result: { base, draft, seq } }
+      },
+      landedDespiteError: () => readStoreInfo(database).commit_token === commitToken,
+    })
+    if (!committed || !commit) return
+    if (storeCaches.get(database) === commit.base) {
+      storeCaches.set(database, { seq: commit.seq, document: committedDocument(commit.base.document, commit.draft) })
+    } else if ((storeCaches.get(database)?.seq ?? -1) < commit.seq) {
+      // A read replaced the cache before this commit landed; the next read
+      // loads what the database holds.
+      storeCaches.delete(database)
     }
   })
+}
+
+function sha256(data: Buffer): string {
+  return createHash("sha256").update(data).digest("hex")
+}
+
+function storeIsEmpty(document: SessionStoreDocument): boolean {
+  if (Object.keys(document.sessions).length > 0 || Object.keys(document.meta.slots).length > 0) return false
+  return PRIORITY_RECORD_FIELDS.every((field) => Object.keys(priorityRecords(document.meta, field)).length === 0)
+}
+
+function protectedMappingKeys(meta: SessionStoreMeta): Set<string> {
+  if (meta.version !== PRIORITY_STORE_META_VERSION) return new Set()
+  return new Set([
+    ...Object.values(meta.priorityAssignments).map((assignment) => assignment.mappingKey),
+    ...Object.values(meta.priorityRollbackMappings).map((rollback) => rollback.mappingKey),
+  ])
+}
+
+interface LegacyImport {
+  draft: SessionStoreDocument
+  /** Mappings taken from the file. */
+  imported: number
+  /** Mappings of the file the database already had in a newer or protected copy. */
+  kept: number
+  /** Priority records of the file left out of a merge. */
+  skippedRoutes: number
+  merged: boolean
+}
+
+/**
+ * The store after taking a legacy sessions.json into `base`.
+ *
+ * An empty database takes the file whole. A database that already holds a
+ * store, because a process still on an older version rewrote the file after
+ * the first import, only merges it: an entry of the file replaces the
+ * database's copy only when it was used more recently, nothing is deleted, and
+ * the file's priority records are left out, so the database's routes and the
+ * mappings they protect stay exactly as they are.
+ */
+function legacyImportDraft(base: SessionStoreDocument, legacy: SessionStoreDocument): LegacyImport {
+  const draft = draftStoreDocument(base)
+  if (storeIsEmpty(base)) {
+    Object.assign(draft.sessions, legacy.sessions)
+    for (const [slot, counter] of Object.entries(legacy.meta.slots)) draft.meta.slots[slot] = counter
+    if (legacy.meta.version === PRIORITY_STORE_META_VERSION) {
+      draft.meta = {
+        version: PRIORITY_STORE_META_VERSION,
+        slots: draft.meta.slots,
+        priorityAssignments: copyRecords(legacy.meta.priorityAssignments),
+        priorityAttempts: copyRecords(legacy.meta.priorityAttempts),
+        priorityRollbackMappings: copyRecords(legacy.meta.priorityRollbackMappings),
+      }
+    }
+    return { draft, imported: Object.keys(legacy.sessions).length, kept: 0, skippedRoutes: 0, merged: false }
+  }
+  for (const [slot, counter] of Object.entries(legacy.meta.slots)) {
+    if (counter > (draft.meta.slots[slot] ?? 0)) draft.meta.slots[slot] = counter
+  }
+  const protectedKeys = protectedMappingKeys(base.meta)
+  let imported = 0
+  let kept = 0
+  for (const [key, entry] of Object.entries(legacy.sessions)) {
+    const current = base.sessions[key]
+    if (protectedKeys.has(key) || (current && current.lastUsedAt >= entry.lastUsedAt)) {
+      kept++
+      continue
+    }
+    draft.sessions[key] = entry
+    advanceKeySlot(key, draft.meta)
+    imported++
+  }
+  const skippedRoutes = PRIORITY_RECORD_FIELDS
+    .reduce((count, field) => count + Object.keys(priorityRecords(legacy.meta, field)).length, 0)
+  return { draft, imported, kept, skippedRoutes, merged: true }
+}
+
+/**
+ * Find a sessions.json left by an earlier version and queue its import.
+ *
+ * The file stays authoritative until the import commits: readers see what it
+ * holds, no mutation commits before it, and a failed import is retried by the
+ * next mutation, which fails with it. The database records the digest of the
+ * file it imported, so a file found again after a crash between the commit and
+ * the rename is only renamed. A file that does not parse fails every store
+ * operation and is left untouched, as it was before the database existed.
+ */
+function checkLegacyStore(database: StoreDatabase): void {
+  const legacyPath = join(database.dir, LEGACY_STORE_NAME)
+  let raw: Buffer
+  try {
+    raw = readFileSync(legacyPath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+    throw error
+  }
+  const digest = sha256(raw)
+  if (readStoreInfo(database).imported_json_sha256 === digest) {
+    void database.enqueue(() => retireLegacyStore(legacyPath, digest))
+    return
+  }
+  const legacy = parseStoreDocument(raw.toString("utf8"))
+  for (const entry of Object.values(legacy.sessions)) Object.freeze(entry)
+  const pending: PendingImport = {
+    legacyPath,
+    digest,
+    legacy,
+    view: legacyImportDraft(freshStoreCache(database).document, legacy).draft,
+  }
+  pendingImports.set(database, pending)
+  void database.enqueue(() => importLegacyStore(database, pending)).catch((error: unknown) => {
+    console.error(
+      `[sessionStore] importing ${LEGACY_STORE_NAME} failed; it stays the store until the next write retries:`,
+      (error as Error).message,
+    )
+  })
+}
+
+/** Commit a pending import. Only from inside an enqueued task. */
+async function importLegacyStore(database: StoreDatabase, pending: PendingImport): Promise<void> {
+  if (pendingImports.get(database) !== pending) return
+  const { committed, result: taken } = await database.transactNow<LegacyImport | undefined>({
+    lockWaitMs: getLockWaitMs(),
+    build: () => {
+      // Another process may have imported the same file while this one waited.
+      if (readStoreInfo(database).imported_json_sha256 === pending.digest) return { ops: [], result: undefined }
+      const base = freshStoreCache(database)
+      const taken = legacyImportDraft(base.document, pending.legacy)
+      return {
+        ops: [
+          ...storeChangeOps(base.document, taken.draft, base.seq + 1, randomUUID()),
+          [RECORD_IMPORT, [pending.digest, Date.now()]],
+        ],
+        result: taken,
+      }
+    },
+    landedDespiteError: () => readStoreInfo(database).imported_json_sha256 === pending.digest,
+  })
+  pendingImports.delete(database)
+  storeCaches.delete(database)
+  if (committed && taken) {
+    const into = basename(database.path)
+    console.error(taken.merged
+      ? `[sessionStore] merged ${taken.imported} sessions from ${LEGACY_STORE_NAME} into ${into}; kept the database's copy of ${taken.kept}`
+        + (taken.skippedRoutes > 0 ? ` and left out ${taken.skippedRoutes} priority records` : "")
+      : `[sessionStore] imported ${taken.imported} sessions from ${LEGACY_STORE_NAME} into ${into}`)
+  }
+  await retireLegacyStore(pending.legacyPath, pending.digest)
+}
+
+/** Rename an imported sessions.json aside, never deleting it. The import it
+ *  was taken in by is a synced commit, so the file is no longer needed. */
+async function retireLegacyStore(legacyPath: string, digest: string): Promise<void> {
+  try {
+    let current: Buffer
+    try {
+      current = await readFile(legacyPath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+      throw error
+    }
+    // Rewritten since the import, by a process still on an older version: the
+    // next start takes it in again.
+    if (sha256(current) !== digest) return
+    const retiredPath = `${legacyPath}.migrated-${new Date().toISOString().replace(/[:.]/g, "-")}`
+    try {
+      await rename(legacyPath, retiredPath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+      throw error
+    }
+    await syncDirectoryDurably(dirname(legacyPath))
+    console.error(`[sessionStore] ${LEGACY_STORE_NAME} is in the database now; the file is kept as ${basename(retiredPath)}`)
+  } catch (error) {
+    console.error(`[sessionStore] renaming the imported ${LEGACY_STORE_NAME} aside failed; it is retried on the next start:`, (error as Error).message)
+  }
 }
 
 function hasLegacyUserDenialBoundary(session: StoredSession): boolean {
@@ -1271,7 +1184,7 @@ export type SharedSessionLookupResult =
 /** Distinguish an authoritative absence from a transient/corrupt read. */
 export function lookupSharedSessionResult(key: string): SharedSessionLookupResult {
   try {
-    const document = readStoreDocumentCached(getStorePath())
+    const document = currentDocument()
     const session = document.sessions[key]
     const generation = keyGeneration(key, session, document.meta)
     if (!session) return { status: "missing", generation }
@@ -1305,7 +1218,7 @@ export type PriorityAssignmentLookupResult =
 /** Read one exact durable route. V1 documents authoritatively contain none. */
 export function lookupPriorityAssignmentResult(routeKey: string): PriorityAssignmentLookupResult {
   try {
-    const document = readStoreDocumentCached(getStorePath())
+    const document = currentDocument()
     const assignment = document.meta.version === PRIORITY_STORE_META_VERSION
       ? document.meta.priorityAssignments[routeKey]
       : undefined
@@ -1325,7 +1238,7 @@ export function lookupPriorityAssignmentResult(routeKey: string): PriorityAssign
 
 export function lookupSharedSessionByClaudeIdResult(claudeSessionId: string): SharedSessionLookupResult {
   try {
-    const document = readStoreDocumentCached(getStorePath())
+    const document = currentDocument()
     let newest: StoredSession | undefined
     let newestKey: string | undefined
     for (const [key, session] of Object.entries(document.sessions)) {
@@ -2195,7 +2108,7 @@ function selectSupersededProfileCopies(
 export async function pruneSupersededProfileCopies(options: ProfileCopyPruneOptions): Promise<number> {
   // Select from the cached document first so the common no-op sweep takes no
   // lock and writes nothing.
-  if (selectSupersededProfileCopies(readStoreDocumentCached(getStorePath()), options, Date.now()).length === 0) {
+  if (selectSupersededProfileCopies(currentDocument(), options, Date.now()).length === 0) {
     return 0
   }
   let pruned = 0
