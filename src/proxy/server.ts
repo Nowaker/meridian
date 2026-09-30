@@ -4,7 +4,7 @@ import { ClaudeProviderFacts, disabledProvider, providerSnapshot } from './backe
 import { chatGptProvider, CHATGPT_ADAPTER } from './backends/chatgptStatus'
 import { createChatGptBackend, type ChatGptSeatRefusal, type ChatGptTurnEvent, type ObservedSeatLimits } from './backends/chatgpt'
 import { resolveChatGptSource } from './chatgpt/config'
-import { ChatGptTurnLedger, chatGptTokenFields, createChatGptAdmission, createChatGptParityBackend, decorateChatGptTurn, type ChatGptTurnNotes } from './chatgpt/parity'
+import { ChatGptTurnLedger, chatGptTokenFields, createChatGptAdmission, createChatGptParityBackend, createUnpricedModelWarning, decorateChatGptTurn, type ChatGptTurnNotes } from './chatgpt/parity'
 import { chatGptFeatureCapabilities, getChatGptFeatures, resetChatGptFeatures, updateChatGptFeatures, validateChatGptFeatureUpdate } from './chatgpt/features'
 import { resolveModelPricing } from '../telemetry/pricing'
 import { getPricingOverrides } from '../telemetry/pricingStore'
@@ -7972,6 +7972,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   const upstreamSignals = new WeakMap<Context, AbortSignal>()
 
   const chatGptPricing = (model: string) => resolveModelPricing(model, getPricingOverrides())
+  const warnUnpricedChatGptModel = createUnpricedModelWarning(chatGptPricing, plog)
   const chatGptLedger = new ChatGptTurnLedger<Context>()
   const chatGptBodyOverrides = new WeakMap<Context, string>()
   const chatGptExhaustion = new ProfileExhaustion()
@@ -8084,6 +8085,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   const recordChatGptTurn = (event: ChatGptTurnEvent, notes: ChatGptTurnNotes | undefined): void => {
     const usage = event.usage
     const decoration = decorateChatGptTurn(event, notes, chatGptPricing)
+    const pricedModel = event.model ?? event.requestModel
+    if (usage && pricedModel) warnUnpricedChatGptModel(pricedModel)
     const profileId = event.seat ? chatGptProfiles?.profileIdFor(event.seat) ?? event.seat : undefined
     const tokens = usage ? chatGptTokenFields(usage) : undefined
     telemetryStore.record({

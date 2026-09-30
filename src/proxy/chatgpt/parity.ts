@@ -202,6 +202,24 @@ export function decorateChatGptTurn(
   return { error, ...(fallbackFromModel ? { fallbackFromModel } : {}) }
 }
 
+/**
+ * Logs once per model id when a served turn has no price, so a model OpenAI
+ * released since the last pricing update shows up in the journal instead of
+ * only as an unpriced row. A later override or table update is picked up by
+ * the next turn, since the price is looked up each time.
+ */
+export function createUnpricedModelWarning(
+  pricing: (model: string) => ModelPricing | null,
+  log: (message: string) => void,
+): (model: string) => void {
+  const warned = new Set<string>()
+  return (model) => {
+    if (warned.has(model) || pricing(model)) return
+    warned.add(model)
+    log(`[PROXY] chatgpt model=${model} has no price; its turns are left out of the cost estimate. Run scripts/update-openai-pricing.ts or set a pricing override.`)
+  }
+}
+
 // --- Response stream transform ---------------------------------------------
 
 interface SseEvent {

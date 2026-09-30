@@ -7,7 +7,7 @@
  * listed here. When OpenAI changes a list price, update this file by hand from
  * the official pages below; the next update run then accepts the new rate.
  *
- * Sources (snapshot 2026-09-27):
+ * Sources (snapshot 2026-09-27; gpt-6.1-sol added 2026-09-29):
  *   - developers.openai.com/api/docs/pricing
  *   - help.openai.com/en/articles/20001106-codex-rate-card
  *
@@ -21,6 +21,7 @@ export interface OfficialOpenAiRates {
 }
 
 export const OFFICIAL_OPENAI_PRICING: Record<string, OfficialOpenAiRates> = {
+  "gpt-6.1-sol": { input: 2, cachedInput: 0.1, output: 10 },
   "gpt-6-astra": { input: 10, cachedInput: 1, output: 50 },
   "gpt-6-sol": { input: 2, cachedInput: 0.2, output: 10 },
   "gpt-6-luna": { input: 0.1, cachedInput: 0.01, output: 0.5 },

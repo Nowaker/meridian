@@ -65,6 +65,14 @@ describe("OpenAI pricing lookup", () => {
     expect(resolveModelPricing("gpt-5.6-luna-max")).toEqual(resolveModelPricing("gpt-5.6-luna"))
   })
 
+  it("prices gpt-6.1-sol, released 2026-09-29, at its models.dev and official short-context rate", () => {
+    expect(resolveModelPricing("gpt-6.1-sol")).toEqual({ inputPerMTok: 2, outputPerMTok: 10, cacheReadPerMTok: 0.1, cacheWritePerMTok: 2.5 })
+    expect(resolveModelPricing("gpt-6.1-sol-high")).toEqual(resolveModelPricing("gpt-6.1-sol"))
+    const metric = makeMetric({ model: "gpt-6.1-sol", inputTokens: 800_000, cacheReadInputTokens: 200_000, outputTokens: 500_000 })
+    // 0.8 * $2 + 0.2 * $0.10 + 0.5 * $10
+    expect(computeCostEstimate([metric]).totalUsd).toBeCloseTo(1.6 + 0.02 + 5, 6)
+  })
+
   it("leaves unknown GPT models unpriced instead of guessing a family rate", () => {
     expect(resolveModelPricing("gpt-7-nova")).toBeNull()
     expect(resolveModelPricing("gpt-4o")).toBeNull()

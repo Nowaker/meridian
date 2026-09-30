@@ -4,6 +4,7 @@ import {
   chatGptCostUsd,
   chatGptTokenFields,
   createChatGptAdmission,
+  createUnpricedModelWarning,
   decorateChatGptTurn,
   fallbackTrigger,
   MAX_BUDGET_ERROR_CODE,
@@ -228,6 +229,23 @@ describe("cached and reasoning tokens are valued exactly once", () => {
     const event = turnEvent({ requestModel: "gpt-5.4", model: "gpt-5.4", usage })
     // $0.0046 at gpt-5.4 rates stays under $0.005; the $0.00656 gpt-5.6-sol price would not.
     expect(decorateChatGptTurn(event, notes, resolveModelPricing).error).toBeNull()
+  })
+})
+
+describe("unpriced model warning", () => {
+  it("logs once per unpriced model, never for a priced one, and stops once a price exists", () => {
+    const logs: string[] = []
+    const overrides: Record<string, ModelPricing> = {}
+    const warn = createUnpricedModelWarning(model => resolveModelPricing(model, overrides), m => logs.push(m))
+    warn("gpt-6.1-sol")
+    warn("gpt-7-nova")
+    warn("gpt-7-nova")
+    warn("gpt-7-omega")
+    expect(logs).toHaveLength(2)
+    expect(logs[0]).toContain("model=gpt-7-nova has no price")
+    overrides["gpt-8"] = { inputPerMTok: 1, outputPerMTok: 1, cacheReadPerMTok: 1, cacheWritePerMTok: 1 }
+    warn("gpt-8")
+    expect(logs).toHaveLength(2)
   })
 })
 
