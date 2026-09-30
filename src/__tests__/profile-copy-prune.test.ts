@@ -15,6 +15,7 @@ import { CrossProcessTurnCoordinator } from "../proxy/session/crossProcessTurnCo
 import {
   abandonFork,
   prepareFork,
+  readSessionGcSnapshot,
   reconcile,
   registerLiveTranscript,
   releaseSupersededProfileCopies,
@@ -284,7 +285,7 @@ describe("mass prune through the transcript lifecycle", () => {
       }, options)))
       expect(removed.reduce((sum, value) => sum + value, 0)).toBeLessThanOrEqual(4)
       await reconcile(pins(), options)
-      const sidecar = JSON.parse(readFileSync(join(dir, "session-gc.json"), "utf8")) as { resources: Record<string, { state: string }> }
+      const sidecar = readSessionGcSnapshot(dir)
       expect(Object.values(sidecar.resources).filter(resource => ["prepared", "retired", "deleting"].includes(resource.state)).length).toBeLessThanOrEqual(4)
     } finally {
       setSessionStoreDir(null)
@@ -340,9 +341,7 @@ describe("mass prune through the transcript lifecycle", () => {
         isConversationActive: () => false,
       }, options)
       await reconcile(pins(), options)
-      const sidecar = JSON.parse(readFileSync(join(dir, "session-gc.json"), "utf8")) as {
-        resources: Record<string, { state: string }>
-      }
+      const sidecar = readSessionGcSnapshot(dir)
       const pending = Object.values(sidecar.resources)
         .filter((resource) => ["prepared", "retired", "deleting"].includes(resource.state)).length
       maxObservedPending = Math.max(maxObservedPending, pending)
