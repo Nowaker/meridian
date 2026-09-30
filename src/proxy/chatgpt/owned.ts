@@ -70,6 +70,7 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
           ...(pending ? { reason: "requires_reauth" as const } : {}),
           expiresAt: account.expiresAt,
           active: index === 0,
+          storeIndex: index,
         }
       })
     },

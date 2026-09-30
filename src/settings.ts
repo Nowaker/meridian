@@ -48,6 +48,12 @@ export interface MeridianSettings {
   chatGptActiveSeat?: string
   /** Operator-chosen profile ids for ChatGPT seats, keyed by seat id (accountUserId). */
   chatGptProfileNames?: Record<string, string>
+  /**
+   * Former ids of renamed ChatGPT seats, keyed by seat id. The ChatGPT half of
+   * a Claude profile's `aliases`: a request, link or exclusion naming one still
+   * reaches the seat until a profile takes that name again.
+   */
+  chatGptProfileAliases?: Record<string, string[]>
 
   /**
    * Keep telemetry in SQLite instead of memory, so it survives a restart.

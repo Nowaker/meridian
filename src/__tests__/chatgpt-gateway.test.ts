@@ -39,6 +39,7 @@ const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 const { telemetryStore } = await import("../telemetry")
 const { __setFetchOAuthUsageOverride, resetOAuthUsageCache } = await import("../proxy/oauthUsage")
 const { saveSettings } = await import("../settings")
+const { resetCodexUsageCache } = await import("../proxy/codex/service")
 
 const NOW = Date.now()
 const CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -51,6 +52,9 @@ let respond: (call: UpstreamCall, index: number) => Response | Promise<Response>
 const CATALOG_URL = "https://chatgpt.com/backend-api/codex/models"
 let catalogCalls: Array<{ authorization: string | null }> = []
 let catalog: () => Response = () => new Response("{}", { status: 503 })
+const WHAM_PREFIX = "https://chatgpt.com/backend-api/wham/"
+let whamCalls: Array<{ url: string; method: string; authorization: string | null }> = []
+let wham: (url: string, authorization: string | null) => Response | undefined = () => undefined
 const realFetch = globalThis.fetch
 
 function completed(text = "pong", extraHeaders: Record<string, string> = {}): Response {
@@ -95,6 +99,12 @@ function mockFetch(input: string | URL | Request, init?: RequestInit): Promise<R
   if (url.startsWith(`${CATALOG_URL}?`)) {
     catalogCalls.push({ authorization: new Headers(init?.headers).get("authorization") })
     return Promise.resolve(catalog())
+  }
+  if (url.startsWith(WHAM_PREFIX)) {
+    const authorization = new Headers(init?.headers).get("authorization")
+    whamCalls.push({ url, method: init?.method ?? "GET", authorization })
+    const answer = wham(url, authorization)
+    if (answer) return Promise.resolve(answer)
   }
   if (url.startsWith("https://chatgpt.com/")) return Promise.resolve(new Response("{}", { status: 503 }))
   return Promise.reject(new Error(`unexpected network call in test: ${url}`))
@@ -155,6 +165,8 @@ beforeEach(() => {
   respond = () => completed()
   catalogCalls = []
   catalog = () => new Response("{}", { status: 503 })
+  whamCalls = []
+  wham = () => undefined
   globalThis.fetch = mockFetch as typeof fetch
   telemetryStore.clear()
   clearSessionCache()
@@ -166,7 +178,10 @@ beforeEach(() => {
 })
 afterEach(() => {
   __setFetchOAuthUsageOverride(null)
-  saveSettings({ chatGptActiveSeat: undefined, chatGptProfileNames: undefined, routingExcludedProfiles: undefined, routingManagedExcludedProfiles: undefined })
+  saveSettings({
+    chatGptActiveSeat: undefined, chatGptProfileNames: undefined, chatGptProfileAliases: undefined, profileOrder: undefined,
+    routingExcludedProfiles: undefined, routingManagedExcludedProfiles: undefined,
+  })
   globalThis.fetch = realFetch
   delete process.env.MERIDIAN_CHATGPT_CREDENTIALS
   delete process.env.MERIDIAN_CODEX_POOL_PATH
@@ -656,5 +671,129 @@ describe("ChatGPT seats on the profile surface", () => {
     ])
     expect(tokenCalls).toBe(0)
     expect(snapshotPoolDir()).toEqual(before)
+  })
+
+  /** An access token shaped like the real one, so the usage reader will use it. */
+  const seatToken = (n: number, expSeconds = Math.floor(NOW / 1000) + 3600) => {
+    const part = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url")
+    return `${part({ alg: "RS256" })}.${part({
+      exp: expSeconds,
+      "https://api.openai.com/auth": {
+        chatgpt_account_id: `workspace-${n}`, chatgpt_account_user_id: `user-${n}__workspace-${n}`,
+        chatgpt_user_id: `user-${n}`, chatgpt_plan_type: "pro",
+      },
+    })}.sig`
+  }
+
+  it("states each seat's banked resets from the list codex-reset reads, never refreshing a token to read them", async () => {
+    resetCodexUsageCache()
+    const live = seatToken(0)
+    const expired = seatToken(1, Math.floor(NOW / 1000) - 60)
+    writePool([account(0, { accessToken: live, planType: "pro" }), account(1, { accessToken: expired, expiresAt: NOW - 60_000 })])
+    const soon = NOW + 3 * 86_400_000 + 3_600_000
+    const later = NOW + 11 * 86_400_000 + 3_600_000
+    wham = (url, authorization) => {
+      if (authorization !== `Bearer ${live}`) return new Response("{}", { status: 401 })
+      if (url.endsWith("/wham/usage")) {
+        return Response.json({
+          user_id: "user-0", account_id: "workspace-0", email: "seat0@example.test", plan_type: "pro",
+          rate_limit: { primary_window: { used_percent: 40, limit_window_seconds: 604_800, reset_at: Math.floor(NOW / 1000) + 3 * 86_400 }, secondary_window: null },
+          rate_limit_reset_credits: { available_count: 2, applicable_available_count: 0 },
+        })
+      }
+      if (url.endsWith("/wham/rate-limit-reset-credits")) {
+        return Response.json({
+          available_count: 2,
+          credits: [
+            { id: "c-later", status: "available", expires_at: new Date(later).toISOString() },
+            { id: "c-spent", status: "redeemed", expires_at: new Date(soon).toISOString() },
+            { id: "c-soon", status: "available", expires_at: new Date(soon).toISOString() },
+          ],
+        })
+      }
+      return undefined
+    }
+    const before = snapshotPoolDir()
+    const { app } = await server("follow-external")
+    await get<QuotaBody>(app, "/v1/usage/quota/all")
+    const list = await get<ListBody>(app, "/profiles/list")
+    expect(JSON.stringify(list)).not.toContain(live)
+    expect(JSON.stringify(list)).not.toContain(expired)
+    expect(list.profiles[0]).toMatchObject({ id: "seat0-pace-0", loggedIn: true, tokenState: "ok", resets: { available: 2, expiresAt: [soon, later] } })
+    // No valid token, so nothing was asked: the card says "unknown".
+    expect(list.profiles[1]).toMatchObject({ id: "seat1-pace-1", loggedIn: false, tokenState: "expired", resets: null })
+    expect(whamCalls.map(c => c.url.slice(WHAM_PREFIX.length)).sort()).toEqual(["rate-limit-reset-credits", "usage"])
+    expect(whamCalls.every(c => c.method === "GET" && c.authorization === `Bearer ${live}`)).toBe(true)
+    expect(tokenCalls).toBe(0)
+    expect(snapshotPoolDir()).toEqual(before)
+  })
+
+  it("renames a seat the way a Claude profile is renamed: the old name keeps answering", async () => {
+    writePool([account(0), account(1)])
+    const before = snapshotPoolDir()
+    const { app } = await server("follow-external")
+    const renamed = await post(app, "/profiles/rename", { from: "seat0-pace-0", to: "enrique-pro" })
+    expect(renamed.status).toBe(200)
+    expect(await renamed.json()).toEqual({ success: true, from: "seat0-pace-0", to: "enrique-pro", aliases: ["seat0-pace-0"], provider: "chatgpt" })
+    const list = await get<ListBody>(app, "/profiles/list")
+    expect(list.profiles.map(p => [p.id, p.aliases ?? null])).toEqual([["enrique-pro", ["seat0-pace-0"]], ["seat1-pace-1", null]])
+
+    // The former id still selects the seat and pins a request to it.
+    expect(await (await post(app, "/profiles/active", { profile: "seat0-pace-0" })).json()).toEqual({ success: true, activeProfile: "enrique-pro", provider: "chatgpt" })
+    await (await app.fetch(responses(LUNA, { "x-meridian-profile": "seat0-pace-0" }))).text()
+    expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-0"])
+    expect(telemetryStore.getRecent({ limit: 1 })[0]).toMatchObject({ adapter: "chatgpt", profileId: "enrique-pro" })
+
+    expect((await post(app, "/profiles/rename", { from: "enrique-pro", to: "seat1-pace-1" })).status).toBe(400)
+    expect((await post(app, "/profiles/rename", { from: "enrique-pro", to: "Enrique Pro" })).status).toBe(400)
+    // A name is Meridian's setting: the owner's store is not touched.
+    expect(snapshotPoolDir()).toEqual(before)
+    expect(tokenCalls).toBe(0)
+  })
+
+  it("answers a remove of a followed seat with where to remove it, and removes nothing", async () => {
+    writePool([account(0), account(1)])
+    const before = snapshotPoolDir()
+    const { app } = await server("follow-external")
+    const res = await post(app, "/profiles/remove", { profile: "seat1-pace-1" })
+    expect(res.status).toBe(409)
+    const body = await res.json() as { error: string; code: string; provider: string }
+    expect(body).toMatchObject({ code: "owned_elsewhere", provider: "chatgpt" })
+    expect(body.error).toContain("oc-codex-multi-auth owns")
+    expect(body.error).toContain("codex-remove index=2 confirm=true")
+    expect((await get<ListBody>(app, "/profiles/list")).profiles.map(p => p.id)).toEqual(["seat0-pace-0", "seat1-pace-1"])
+    expect(snapshotPoolDir()).toEqual(before)
+  })
+
+  it("says who owns the seats' logins, and keeps a Claude profile off a seat's name", async () => {
+    writePool([account(0)])
+    const { app } = await server("follow-external")
+    const list = await get<ListBody & { chatgpt?: { owner: Record<string, unknown> } }>(app, "/profiles/list")
+    expect(list.chatgpt?.owner).toMatchObject({ name: "oc-codex-multi-auth", mode: "follow-external", login: "opencode auth login" })
+    expect(list.profiles[0]).toMatchObject({ owner: { account: 1, remove: "codex-remove index=1 confirm=true" } })
+    expect((await post(app, "/profiles/add/start", { profile: "seat0-pace-0" })).status).toBe(400)
+  })
+
+  it("fails over in the order saved on the Profiles page, after the active seat", async () => {
+    writePool([account(0), account(1), account(2)])
+    const { app } = await server("follow-external")
+    const saved = await app.fetch(new Request("http://localhost/settings/api/routing", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ profileOrder: ["seat2-pace-2", "seat1-pace-1", "seat0-pace-0"] }),
+    }))
+    expect(saved.status).toBe(200)
+    const routing = await get<{ profiles: string[]; profileOrder: string[] }>(app, "/settings/api/routing")
+    expect(routing.profiles).toEqual(["seat0-pace-0", "seat1-pace-1", "seat2-pace-2"])
+    expect(routing.profileOrder).toEqual(["seat2-pace-2", "seat1-pace-1", "seat0-pace-0"])
+
+    respond = call => call.accountId === "workspace-0"
+      ? rateLimited(codexWindows([{ minutes: 10080, used: 100, resetInS: 86400 }]))
+      : completed()
+    const res = await app.fetch(responses(LUNA))
+    expect(res.status).toBe(200)
+    await res.text()
+    // The owner's pick (seat 0) leads; the saved order, not the store's, follows.
+    expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-0", "workspace-2"])
   })
 })

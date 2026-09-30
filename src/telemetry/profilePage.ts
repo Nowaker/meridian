@@ -195,6 +195,24 @@ export const profilePageHtml = `<!DOCTYPE html>
   .login-reopen { color: var(--accent); font-size: 11px; text-decoration: none; }
   .login-reopen:hover { text-decoration: underline; }
   .add-intro { font-size: 13px; color: var(--muted); margin-bottom: 10px; }
+  .add-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .add-tab {
+    background: none; border: 1px solid var(--border); border-radius: 6px; color: var(--muted);
+    font-family: inherit; font-size: 12px; padding: 4px 10px; cursor: pointer;
+  }
+  .add-tab:hover { color: var(--text); }
+  .add-tab.active { color: var(--accent); border-color: var(--accent); background: rgba(88,166,255,0.08); }
+  .cmd-row { margin-top: 10px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .cmd-label { font-size: 11px; color: var(--muted); }
+  .cmd-note { font-size: 11px; color: var(--muted); min-width: 0; overflow-wrap: anywhere; }
+  .access-note {
+    margin-top: 12px; padding: 10px 14px; background: rgba(210,153,34,0.1);
+    border: 1px solid rgba(210,153,34,0.3); border-radius: 8px; font-size: 12px; overflow-wrap: anywhere;
+  }
+  .remove-confirm-text code, .access-note code {
+    font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 11px;
+    background: var(--bg); padding: 1px 5px; border-radius: 4px; color: var(--accent2);
+  }
   .add-note { font-size: 11px; color: var(--muted); margin-top: 8px; }
   /* Deliberately lighter than .profile-card: it now sits above the account
      list, where a card's weight would read as the page's headline. */
@@ -275,7 +293,7 @@ export const profilePageHtml = `<!DOCTYPE html>
 ` + profileBarHtml + `
 <div class="container">
 <h1>Profiles</h1>
-<div class="subtitle">Manage Claude account profiles</div>
+<div class="subtitle" id="profiles-subtitle">Manage Claude account profiles</div>
 
 <!-- Outside #content on purpose: render() rebuilds that element wholesale on
      every poll, which would destroy a half-typed name or a pasted code. -->
@@ -364,6 +382,8 @@ ${reorderLiveRegionHtml}
       the renamed profile, so nothing breaks mid-flight. That redirect is dropped
       as soon as the old name is taken again by a new profile.
     </p>
+    <!-- Filled in once /profiles/list says this instance serves ChatGPT. -->
+    <div id="chatgpt-guide" hidden></div>
   </div>
 </div>
 </div>
@@ -548,13 +568,186 @@ async function refresh() {
       try { meridianReorder.adopt(await routingRes.json()); } catch (_) { /* keep the last good order */ }
     }
     lastProfiles = profiles;
+    adoptChatGpt(profiles);
     render(profiles, lastQuota);
+    noticeNewChatGptSeats(profiles.profiles || []);
   } catch {
     document.getElementById('content').innerHTML = '<div class="empty-state"><h2>Could not load profiles</h2><p>Is Meridian running?</p></div>';
   }
 }
 
 function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// esc() goes through textContent, which leaves quotes alone: fine for text,
+// not for a value inside an attribute.
+function attr(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (ch) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
+  });
+}
+
+// Server-written guidance marks each command with backticks; set those as code.
+function codeSpans(text) {
+  return String(text || '').split('\`').map(function (part, i) {
+    return i % 2 === 1 ? '<code>' + esc(part) + '</code>' : esc(part);
+  }).join('');
+}
+
+var ICON_COPY = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25zM5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25z"/></svg>';
+
+function copyButton(cmd) {
+  return '<button class="copy-btn" data-cmd="' + attr(cmd) + '" onclick="copyCmd(this)" title="Copy to clipboard">' + ICON_COPY + '</button>';
+}
+
+function commandRow(label, cmd, note, extraHtml) {
+  return '<div class="cmd-row">'
+    + '<span class="cmd-label">' + esc(label) + ':</span> '
+    + '<code class="copy-cmd">' + esc(cmd) + '</code>' + copyButton(cmd)
+    + (extraHtml || '')
+    + (note ? '<span class="cmd-note">' + esc(note) + '</span>' : '')
+    + '</div>';
+}
+
+// The rows that say how a profile is signed in again. A Claude profile's is
+// Meridian's own command plus the browser login; a ChatGPT seat's are its
+// owner's, because Meridian only follows that login.
+function renderLoginRows(p) {
+  if (!isChatGptProfile(p)) {
+    var browserLogin = '';
+    // Only claude-max profiles have an OAuth flow; api and oauth-token profiles
+    // would only ever get a refusal, so they get no button.
+    if ((p.type || 'claude-max') === 'claude-max') {
+      // A real anchor with a real href, not a button. That is the only way the
+      // browser offers "Open Link in Incognito Window" and "Copy Link Address"
+      // — and someone signed into several Claude accounts needs those, because
+      // the ambient session in their main browser is usually the wrong account
+      // for the profile being re-authenticated. A button, or an anchor that
+      // navigates from a click handler, gets no such menu.
+      browserLogin = '<a class="login-btn login-link" data-profile="' + attr(p.id) + '"'
+        + ' href="' + attr(loginHrefFor(p.id) || '#') + '"'
+        + (loginHrefFor(p.id) ? '' : ' aria-disabled="true"')
+        + ' target="_blank" rel="noopener noreferrer"'
+        + ' onclick="return onLoginLinkClick(event, &quot;' + esc(p.id) + '&quot;)">Log in from browser</a>';
+    }
+    return commandRow('Login', 'meridian profile login ' + p.id, '', browserLogin);
+  }
+  var owner = p.owner || {};
+  if (owner.name === 'meridian') {
+    return owner.importCommand ? commandRow('Import', owner.importCommand, 'Meridian holds this seat\\u2019s login') : '';
+  }
+  var rows = commandRow('Login', owner.login, '\\u2192 ' + owner.loginMethod + ' \\u2192 ' + (p.label || p.id) + ' \\u2192 Refresh account \\u00b7 at ' + owner.name);
+  if (p.tokenState === 'expired') {
+    rows += commandRow('Renew', owner.refresh, 'or the ' + owner.refreshTool + ' tool in an opencode session');
+  }
+  return rows;
+}
+
+function renderAccessNote(p) {
+  if (!isChatGptProfile(p)) {
+    return '<div class="access-note"><strong style="color:var(--yellow)">\\u26a0 Needs re-authentication</strong></div>';
+  }
+  var help = profileAccessHelp(p);
+  return '<div class="access-note"><strong style="color:var(--yellow)">\\u26a0 '
+    + esc(help.pill.charAt(0).toUpperCase() + help.pill.slice(1)) + '</strong> \\u2014 ' + esc(help.reason) + '</div>';
+}
+
+// --- ChatGPT seats ---
+//
+// An instance that serves ChatGPT says so in /profiles/list (\`chatgpt\`),
+// with who owns the seats' logins. That turns on the ChatGPT half of the add
+// card and the guide; the seats themselves are ordinary profiles already.
+var chatGptOwnerInfo = null;
+var chatGptAddShown = false;
+var addProvider = 'claude';
+// Seats present when the ChatGPT add card was opened, so one that arrives
+// afterwards can be announced (and named) the moment a poll sees it.
+var chatGptAddBaseline = null;
+
+function chatGptSeatsOf(profiles) {
+  var seats = {};
+  for (var i = 0; i < profiles.length; i++) if (isChatGptProfile(profiles[i])) seats[profiles[i].seat] = true;
+  return seats;
+}
+
+function adoptChatGpt(data) {
+  if (!data || !data.chatgpt || !data.chatgpt.owner) return;
+  if (!chatGptOwnerInfo) {
+    chatGptOwnerInfo = data.chatgpt.owner;
+    document.getElementById('profiles-subtitle').textContent = 'Manage Claude accounts and ChatGPT seats';
+    renderChatGptGuide(chatGptOwnerInfo);
+  }
+  // The add card is redrawn only while untouched - a half-typed name must not
+  // vanish under a poll - so a later poll retries until it can. ChatGPT is
+  // offered first where it is all the instance has.
+  if (chatGptAddShown) return;
+  var input = addSlot() && addSlot().querySelector('.add-input');
+  if (activeAdd || (input && (input.value || document.activeElement === input))) return;
+  chatGptAddShown = true;
+  if (!(data.profiles || []).some(function (p) { return !isChatGptProfile(p); })) addProvider = 'chatgpt';
+  resetAddForm('');
+}
+
+function renderChatGptGuide(owner) {
+  var guide = document.getElementById('chatgpt-guide');
+  if (owner.name === 'meridian') {
+    guide.innerHTML = '<h3 style="margin-top:16px">ChatGPT seats</h3>'
+      + '<p style="font-size:13px;color:var(--muted);margin-bottom:8px">Meridian holds these seats\\u2019 logins and renews their tokens itself. '
+      + 'Bring a seat signed in elsewhere into its store with <code>' + esc(owner.importCommand) + '</code>.</p>';
+    guide.hidden = false;
+    return;
+  }
+  guide.innerHTML = '<h3 style="margin-top:16px">ChatGPT seats</h3>'
+    + '<p style="font-size:13px;color:var(--muted);margin-bottom:8px">Each ChatGPT seat is a profile like any other here: switch to it, rename it, '
+    + 'reorder it, search for it and link to it. Its login belongs to <strong>' + esc(owner.name) + '</strong>, which Meridian follows read-only: '
+    + 'Meridian never signs a seat in, renews its token or deletes it. Those happen there:</p>'
+    + '<ol>'
+    +   '<li><strong>Add a seat:</strong> <code>' + esc(owner.login) + '</code> \\u2192 ' + esc(owner.loginMethod) + ' \\u2192 Add account. '
+    +     'The seat appears here within ten seconds.</li>'
+    +   '<li><strong>Sign a seat in again:</strong> the same menu \\u2192 pick the seat \\u2192 Refresh account</li>'
+    +   '<li><strong>Renew an expired access token:</strong> <code>' + esc(owner.refresh) + '</code>, or the <code>' + esc(owner.refreshTool) + '</code> tool in an opencode session</li>'
+    +   '<li><strong>Remove a seat:</strong> the same menu \\u2192 pick the seat \\u2192 Delete this account</li>'
+    + '</ol>'
+    + '<p style="font-size:13px;color:var(--muted);margin-top:8px">A turn for a ChatGPT model goes to the active seat first, then to the others '
+    + 'in the order above. Renaming a seat keeps its old name working, as for a Claude profile. Resets are the banked rate-limit resets '
+    + 'chatgpt.com lists for the seat; ' + esc(owner.name) + '\\u2019s <code>codex-reset</code> tool redeems one, and Meridian only reads them.</p>';
+  guide.hidden = false;
+}
+
+// A seat that was not there when the ChatGPT add card opened has been signed
+// in at its owner. Say so, give it the name typed for it, and go to its card.
+async function noticeNewChatGptSeats(profiles) {
+  if (addProvider !== 'chatgpt' || !chatGptOwnerInfo) return;
+  if (!chatGptAddBaseline) { chatGptAddBaseline = chatGptSeatsOf(profiles); return; }
+  var fresh = profiles.filter(function (p) { return isChatGptProfile(p) && !chatGptAddBaseline[p.seat]; });
+  if (fresh.length === 0) return;
+  for (var i = 0; i < fresh.length; i++) chatGptAddBaseline[fresh[i].seat] = true;
+  var slot = addSlot();
+  var input = slot ? slot.querySelector('.add-input') : null;
+  var wanted = input ? input.value.trim() : '';
+  var id = fresh[0].id;
+  var note = '';
+  if (wanted && fresh.length === 1 && wanted !== id) {
+    var data;
+    try {
+      var res = await fetch('/profiles/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: id, to: wanted })
+      });
+      data = await res.json();
+    } catch (err) {
+      data = { error: 'Could not reach Meridian.' };
+    }
+    if (data && data.success) { id = data.to; if (input) input.value = ''; }
+    else note = ' It keeps the name ' + id + ': ' + ((data && data.error) || 'the rename failed') + '.';
+  }
+  var added = fresh.length === 1
+    ? 'Added ' + (fresh[0].label || fresh[0].id) + ' as ' + id + '.'
+    : 'Added ' + fresh.length + ' seats: ' + fresh.map(function (p) { return p.id; }).join(', ') + '.';
+  setPanelMsg(slot, added + note, note ? 'err' : '');
+  await refresh();
+  location.hash = encodeURIComponent(id);
+}
 
 function factRows(facts) {
   return facts.map(function (f) {
@@ -627,11 +820,12 @@ function renderSpentBadge(spent) {
   return '<span class="profile-badge badge-spent" title="' + esc(s.why) + '">out of ' + esc(s.label) + '</span>';
 }
 
-function renderSpentNote(spent) {
+function renderSpentNote(spent, p) {
   var s = spentSummary(spent);
   if (!s) return '';
+  var refused = refusalSubject(p);
   return '<div class="spent-note">'
-    + '<strong style="color:var(--red)">\u26a0 Anthropic is refusing this account</strong> - '
+    + '<strong style="color:var(--red)">\u26a0 ' + refused.vendor + ' is refusing this ' + refused.noun + '</strong> - '
     + 'out of <strong>' + esc(s.label) + '</strong>'
     + (s.reset ? ', expected back ' + esc(s.reset) : '')
     + '. Refused ' + esc(timeAgo(s.at)) + '.'
@@ -639,7 +833,7 @@ function renderSpentNote(spent) {
     + '</div>';
 }
 
-function renderUsageSection(profileQuota) {
+function renderUsageSection(profileQuota, p) {
   // No quota data for this profile yet (cold start or fetch failed) — hide
   // entirely so we don't render an empty box.
   if (!profileQuota) return '';
@@ -653,12 +847,19 @@ function renderUsageSection(profileQuota) {
 
   var failedRun = describeFailedRun(profileQuota.failure);
   var usageTag = cachedTag(profileQuota.stale ? 'cached' : 'live');
+  var chatgpt = isChatGptProfile(p);
 
   // No figures at all means this profile has never been read successfully —
   // the route serves the last good reading at any age, so an empty windows
   // array is no longer "the stale window lapsed". Saying so keeps it distinct
   // from a profile genuinely sitting at 0%.
   if (windows.length === 0 && !extra) {
+    if (chatgpt) {
+      var gap = chatGptUsageGap(profileQuota.error);
+      return gap
+        ? '<div class="usage-section"><div class="usage-section-title">Usage</div><div class="usage-empty">No reading: ' + esc(gap) + '.</div></div>'
+        : '';
+    }
     if (profileQuota.error === 'no_token') {
       return '<div class="usage-section">'
         + '<div class="usage-section-title">Usage</div>'
@@ -678,8 +879,11 @@ function renderUsageSection(profileQuota) {
     return ''; // nothing fetched yet
   }
 
+  // A seat's windows come from its usage endpoint or, when newer, from the
+  // headers of the last response it served; the second is worth naming.
   var asOf = profileQuota.fetchedAt
-    ? '<span class="usage-as-of">updated ' + timeAgo(profileQuota.fetchedAt) + '</span>'
+    ? '<span class="usage-as-of">updated ' + timeAgo(profileQuota.fetchedAt)
+      + (chatgpt && profileQuota.windowSource === 'headers' ? ' \u00b7 from its last response' : '') + '</span>'
     : '';
 
   // Figures are only ever this old because a later check failed, so the note
@@ -732,7 +936,6 @@ function renderUsageSection(profileQuota) {
 
 function render(data, quotaData) {
   const profiles = meridianReorder.sortProfiles(data.profiles || []);
-  const active = data.activeProfile;
   const refocusId = meridianReorder.focusAnchor();
   // Build quick lookup: profileId -> per-profile quota entry from
   // /v1/usage/quota/all. Endpoint may be unavailable (older Meridian)
@@ -757,11 +960,13 @@ function render(data, quotaData) {
   const reorderable = profiles.length > 1 && !meridianReorder.envPinned();
 
   let html = '';
-  if (profiles.length > 1) html += meridianReorder.noteHtml(reorderable);
+  if (profiles.length > 1) html += meridianReorder.noteHtml(reorderable, profiles.some(isChatGptProfile));
 
   for (let idx = 0; idx < profiles.length; idx++) {
     const p = profiles[idx];
-    const isActive = p.id === active;
+    // Per profile rather than against data.activeProfile: an instance serving
+    // both providers has an active Claude account AND an active ChatGPT seat.
+    const isActive = !!p.isActive;
     html += '<div class="profile-card' + (isActive ? ' active' : '') + '" id="' + esc(profileAnchorElementId(p.id)) + '" data-id="' + esc(p.id) + '" data-index="' + idx + '">';
     html += '<div class="profile-card-header">';
     if (editingProfile === p.id) {
@@ -785,13 +990,21 @@ function render(data, quotaData) {
       html += "</span>";
     }
     html += '</div>';
-    html += renderSpentNote((quotaById[p.id] || {}).spent);
+    html += renderSpentNote((quotaById[p.id] || {}).spent, p);
 
     if (editingProfile === p.id && renameError) {
       html += '<div class="rename-error">' + esc(renameError) + '</div>';
     }
 
-    if (removingProfile === p.id) {
+    if (removingProfile === p.id && isChatGptProfile(p)) {
+      // A seat's owner, not Meridian, deletes it: the panel says where,
+      // instead of offering a Remove that could only be refused.
+      html += '<div class="remove-confirm">';
+      html += '<div class="remove-confirm-text">' + codeSpans(p.removal || '') + '</div>';
+      html += '<div class="remove-confirm-actions">';
+      html += '<button class="confirm-btn" onclick="cancelRemove()">Close</button>';
+      html += '</div></div>';
+    } else if (removingProfile === p.id) {
       html += '<div class="remove-confirm">';
       html += '<div class="remove-confirm-text">Remove <strong>' + esc(p.id) + '</strong>? Its stored credentials are deleted with it, so putting it back means logging in again.</div>';
       if (removeError) html += '<div class="rename-error">' + esc(removeError) + '</div>';
@@ -803,38 +1016,13 @@ function render(data, quotaData) {
 
     html += '<div class="profile-details">' + factRows(profileFacts(p)) + '</div>';
 
-    if (!p.loggedIn) {
-      html += '<div style="margin-top:12px;padding:10px 14px;background:rgba(210,153,34,0.1);border:1px solid rgba(210,153,34,0.3);border-radius:8px;font-size:12px">';
-      html += '<strong style="color:var(--yellow)">\u26a0 Needs re-authentication</strong>';
-      html += '</div>';
-    }
+    if (!p.loggedIn) html += renderAccessNote(p);
 
-    html += '<div style="margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">';
-    html += '<span style="font-size:11px;color:var(--muted)">Login:</span> ';
-    html += '<code class="copy-cmd">meridian profile login ' + esc(p.id) + '</code>';
-    html += '<button class="copy-btn" data-cmd="meridian profile login ' + esc(p.id) + '" onclick="copyCmd(this)" title="Copy to clipboard">';
-    html += '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25zM5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25z"/></svg>';
-    html += '</button>';
-    // Only claude-max profiles have an OAuth flow; api and oauth-token profiles
-    // would only ever get a refusal, so they get no button.
-    if ((p.type || 'claude-max') === 'claude-max') {
-      // A real anchor with a real href, not a button. That is the only way the
-      // browser offers "Open Link in Incognito Window" and "Copy Link Address"
-      // — and someone signed into several Claude accounts needs those, because
-      // the ambient session in their main browser is usually the wrong account
-      // for the profile being re-authenticated. A button, or an anchor that
-      // navigates from a click handler, gets no such menu.
-      html += '<a class="login-btn login-link" data-profile="' + esc(p.id) + '"'
-        + ' href="' + esc(loginHrefFor(p.id) || '#') + '"'
-        + (loginHrefFor(p.id) ? '' : ' aria-disabled="true"')
-        + ' target="_blank" rel="noopener noreferrer"'
-        + ' onclick="return onLoginLinkClick(event, &quot;' + esc(p.id) + '&quot;)">Log in from browser</a>';
-    }
-    html += '</div>';
+    html += renderLoginRows(p);
 
     html += '<div class="login-slot" id="login-slot-' + esc(p.id) + '"></div>';
 
-    html += renderUsageSection(quotaById[p.id]);
+    html += renderUsageSection(quotaById[p.id], p);
 
     if (!isActive) {
       html += '<button class="switch-btn" onclick="switchProfile(&quot;'+esc(p.id)+'&quot;)">Switch to ' + esc(p.id) + '</button>';
@@ -977,7 +1165,7 @@ function copyCmd(btn) {
   btn.innerHTML = '\u2713';
   setTimeout(function() {
     btn.classList.remove('copied');
-    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25zM5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25z"/></svg>';
+    btn.innerHTML = ICON_COPY;
   }, 1500);
 }
 
@@ -1372,13 +1560,65 @@ function renderAddForm(prefill) {
     + '<div class="login-msg"></div>';
 }
 
+function renderAddTabs() {
+  if (!chatGptOwnerInfo) return '';
+  function tab(provider, label) {
+    var on = addProvider === provider;
+    return '<button type="button" class="add-tab' + (on ? ' active' : '') + '" data-add-provider="' + provider + '"'
+      + ' aria-pressed="' + (on ? 'true' : 'false') + '">' + label + '</button>';
+  }
+  return '<div class="add-tabs" role="group" aria-label="Kind of profile to add">'
+    + tab('claude', 'Claude account') + tab('chatgpt', 'ChatGPT seat') + '</div>';
+}
+
+// Meridian cannot sign in a seat it only follows - its owner does - so the
+// card gives the owner's steps, and noticeNewChatGptSeats announces the seat
+// once a poll sees it.
+function renderChatGptAdd() {
+  var owner = chatGptOwnerInfo || {};
+  if (owner.name === 'meridian') {
+    return '<div class="add-intro">Meridian holds the ChatGPT logins on this instance. Sign the account in with opencode first, then bring it into Meridian\\u2019s store:</div>'
+      + commandRow('Import', owner.importCommand, '')
+      + '<div class="add-note">The seat appears in the list below once the import has finished.</div>'
+      + '<div class="login-msg"></div>';
+  }
+  return '<div class="add-intro">' + esc(owner.name) + ' owns the ChatGPT logins this Meridian serves. Sign the account in there, and Meridian '
+    + 'picks the new seat up from its store by itself.</div>'
+    + '<ol class="login-steps">'
+    +   '<li>In a terminal on the machine running this Meridian:</li>'
+    + '</ol>'
+    + commandRow('Run', owner.login, '')
+    + '<ol class="login-steps" start="2" style="margin-top:10px">'
+    +   '<li>Choose <strong>' + esc(owner.loginMethod) + '</strong>, then <strong>Add account</strong> if it asks, and sign in. '
+    +     'For a second ChatGPT account, sign in from a private browser window.</li>'
+    +   '<li>The seat appears in the list below within ten seconds. Type a name for it here first, and Meridian gives it that name as it arrives.</li>'
+    + '</ol>'
+    + '<div class="login-row">'
+    +   '<input class="login-input add-input" type="text" autocomplete="off" spellcheck="false" placeholder="name for the new seat (optional)">'
+    + '</div>'
+    + '<div class="add-note">Lowercase letters, numbers, dots, hyphens and underscores.</div>'
+    + '<div class="login-msg"></div>';
+}
+
+function setAddProvider(provider) {
+  if (addProvider === provider) return;
+  addProvider = provider;
+  chatGptAddBaseline = provider === 'chatgpt' && lastProfiles ? chatGptSeatsOf(lastProfiles.profiles || []) : null;
+  resetAddForm('');
+}
+
 function resetAddForm(prefill) {
   activeAdd = null;
   var slot = addSlot();
   if (!slot) return;
-  slot.innerHTML = renderAddForm(prefill);
+  var chatgpt = addProvider === 'chatgpt' && chatGptOwnerInfo;
+  slot.innerHTML = renderAddTabs() + (chatgpt ? renderChatGptAdd() : renderAddForm(prefill));
+  var tabs = slot.querySelectorAll('[data-add-provider]');
+  for (var i = 0; i < tabs.length; i++) {
+    tabs[i].addEventListener('click', function (e) { setAddProvider(e.currentTarget.getAttribute('data-add-provider')); });
+  }
   var input = slot.querySelector('.add-input');
-  if (input) input.addEventListener('keydown', function (e) { if (e.key === 'Enter') startAdd(); });
+  if (input && !chatgpt) input.addEventListener('keydown', function (e) { if (e.key === 'Enter') startAdd(); });
 }
 
 function renderAddPanel(id, authorizeUrl) {

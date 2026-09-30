@@ -11,15 +11,20 @@ import { landingHtml } from "../telemetry/landing"
 import { profilePageHtml } from "../telemetry/profilePage"
 
 interface Fact { label: string; value: string; tone: string }
+interface AccessHelp { pill: string; reason: string; summary: string }
 
 const evaluated = new Function(
-  profileFactsJs + "\nreturn { profileFacts: profileFacts, timeAgo: timeAgo };",
+  profileFactsJs + "\nreturn { profileFacts, timeAgo, formatResets, profileAccessHelp, chatGptUsageGap, refusalSubject };",
 )() as {
   profileFacts: (p: Record<string, unknown>) => Fact[]
   timeAgo: (ts: number | null | undefined) => string
+  formatResets: (resets: unknown, now: number) => string
+  profileAccessHelp: (p: Record<string, unknown>) => AccessHelp
+  chatGptUsageGap: (error: string | null | undefined) => string
+  refusalSubject: (p: Record<string, unknown> | undefined) => { vendor: string; noun: string }
 }
 
-const { profileFacts, timeAgo } = evaluated
+const { profileFacts, timeAgo, formatResets, profileAccessHelp, chatGptUsageGap, refusalSubject } = evaluated
 
 function labels(p: Record<string, unknown>): string[] {
   return profileFacts(p).map(f => f.label)
@@ -97,6 +102,87 @@ describe("profileFacts", () => {
       lastSuccessAt: at - 60_000,
       lastCheckedAt: at,
     })).toEqual(["Status", "Email", "Organization", "Plan", "Last Verified", "Last Checked"])
+  })
+})
+
+describe("a ChatGPT seat's card", () => {
+  const DAY = 86_400_000
+  const HOUR = 3_600_000
+  // The shape /profiles/list gives a seat followed from oc-codex-multi-auth.
+  const owner = {
+    name: "oc-codex-multi-auth", mode: "follow-external", account: 3,
+    login: "opencode auth login", loginMethod: "OpenAI → Codex OAuth (ChatGPT Plus/Pro)",
+    refresh: "npx -y oc-codex-multi-auth doctor --fix", refreshTool: "codex-refresh",
+    remove: "codex-remove index=3 confirm=true", importCommand: null,
+  }
+  const seat = (extra: Record<string, unknown> = {}) => ({
+    id: "oferty-c487c4", type: "chatgpt", provider: "chatgpt", label: "oferty@nowaker.net · id:c487c4",
+    email: "oferty@nowaker.net", accountType: "Personal", planName: "Pro", subscriptionType: "pro",
+    allowance: "20x", loggedIn: true, tokenState: "ok", unavailable: null, authProvenance: "live",
+    resets: { available: 0, expiresAt: [] }, owner, ...extra,
+  })
+
+  test("states banked resets as the brief spells them", () => {
+    const now = 1_800_000_000_000
+    expect(formatResets({ available: 1, expiresAt: [now + 13 * DAY + 5 * HOUR] }, now)).toBe("1 (expires 13d)")
+    expect(formatResets({ available: 2, expiresAt: [now + 3 * DAY + HOUR, now + 11 * DAY + 2 * HOUR] }, now)).toBe("2 (expire 3d, 11d)")
+    expect(formatResets({ available: 0, expiresAt: [] }, now)).toBe("0")
+  })
+
+  test("never hides a reset whose expiry it does not know, and says unknown with nothing to go on", () => {
+    const now = 1_800_000_000_000
+    expect(formatResets({ available: 2, expiresAt: [now + 3 * DAY, null] }, now)).toBe("2 (expire 3d, unknown)")
+    expect(formatResets({ available: 2, expiresAt: null }, now)).toBe("2 (expiry unknown)")
+    expect(formatResets({ available: 1, expiresAt: [now + 5 * HOUR + 1] }, now)).toBe("1 (expires 5h)")
+    expect(formatResets({ available: 1, expiresAt: [now + 40 * 60_000 + 1] }, now)).toBe("1 (expires 40m)")
+    // No valid access token, so the credits were never asked for.
+    expect(formatResets(null, now)).toBe("unknown")
+    expect(formatResets(undefined, now)).toBe("unknown")
+  })
+
+  test("prints Resets right after Plan, and only for a seat", () => {
+    const facts = profileFacts(seat({ resets: { available: 1, expiresAt: [Date.now() + 13 * DAY + HOUR] } }))
+    const rows = facts.map(f => f.label)
+    expect(rows.slice(rows.indexOf("Plan"), rows.indexOf("Plan") + 2)).toEqual(["Plan", "Resets"])
+    expect(facts.find(f => f.label === "Resets")?.value).toBe("1 (expires 13d)")
+    expect(valueOf(seat({ resets: null }), "Resets")).toBe("unknown")
+    expect(labels({ subscriptionType: "max", allowance: "20x" })).not.toContain("Resets")
+  })
+
+  test("words the allowance against ChatGPT Plus, and the owner of the login", () => {
+    expect(valueOf(seat(), "Allowance")).toBe("20x of a ChatGPT Plus plan’s Codex usage")
+    expect(valueOf({ allowance: "20x" }, "Allowance")).toBe("20x of a Pro plan’s Claude Code usage")
+    expect(valueOf(seat(), "Owner")).toBe("oc-codex-multi-auth · account 3")
+    expect(valueOf(seat({ unavailable: "quota_exhausted" }), "Owner state")).toBe("quota exhausted")
+    expect(labels({ subscriptionType: "max" })).not.toContain("Owner")
+  })
+
+  test("says what is wrong with the token rather than 'not logged in'", () => {
+    const status = (tokenState: string) => valueOf(seat({ loggedIn: false, tokenState }), "Status")
+    expect(status("expired")).toBe("✗ Access token expired")
+    expect(status("refused")).toBe("✗ Token refused by chatgpt.com")
+    expect(status("no_token")).toBe("✗ No access token")
+    expect(valueOf(seat(), "Status")).toBe("✓ Authenticated")
+  })
+
+  test("sends a seat that cannot serve to its owner's exact command, never to meridian's", () => {
+    const expired = profileAccessHelp(seat({ loggedIn: false, tokenState: "expired" }))
+    expect(expired.pill).toBe("token expired")
+    expect(expired.summary).toContain("npx -y oc-codex-multi-auth doctor --fix")
+    expect(expired.summary).toContain("oc-codex-multi-auth owns this login")
+    const refused = profileAccessHelp(seat({ loggedIn: false, tokenState: "refused" }))
+    expect(refused.pill).toBe("token refused")
+    expect(refused.summary).toContain("opencode auth login → OpenAI → Codex OAuth (ChatGPT Plus/Pro) → oferty@nowaker.net · id:c487c4 → Refresh account")
+    for (const help of [expired, refused]) expect(help.summary).not.toContain("meridian profile login")
+    expect(profileAccessHelp({ id: "work" })).toMatchObject({ pill: "needs login", summary: "Cannot serve requests — run: meridian profile login work" })
+  })
+
+  test("explains a missing reading and names who is refusing", () => {
+    expect(chatGptUsageGap("token_expired")).toContain("never renews")
+    expect(chatGptUsageGap("unauthorized")).toContain("refused")
+    expect(chatGptUsageGap(null)).toBe("")
+    expect(refusalSubject(seat())).toEqual({ vendor: "ChatGPT", noun: "seat" })
+    expect(refusalSubject({ id: "work" })).toEqual({ vendor: "Anthropic", noun: "account" })
   })
 })
 

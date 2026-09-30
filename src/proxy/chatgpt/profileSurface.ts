@@ -21,10 +21,14 @@ import type { LimitDiagnosis } from "../limitDetection"
 import type { SpentRecord } from "../profileHealth"
 import {
   CHATGPT_PROFILE_TYPE,
-  chatGptLoggedIn,
+  chatGptOwner,
   chatGptProfiles,
   chatGptQuotaError,
+  chatGptRemovalRefusal,
+  chatGptResetsView,
+  chatGptTokenState,
   findChatGptProfile,
+  planChatGptRename,
   profileWindowType,
   seatWindows,
   type ChatGptProfile,
@@ -63,10 +67,14 @@ export interface ChatGptProfileSurfaceDeps {
   /** Ids a ChatGPT profile must not take: the Claude profiles', and `default`. */
   reserved: () => ReadonlySet<string>
   names: () => Readonly<Record<string, unknown>> | undefined
+  /** Former ids of renamed seats, seat id -> ids (the `chatGptProfileAliases` setting). */
+  aliases?: () => Readonly<Record<string, unknown>> | undefined
   /** The persisted pointer, a seat id. */
   activeSeat: () => string | undefined
   /** Routing exclusions as configured: profile ids, seat ids, or Claude ids (ignored here). */
   excluded: () => readonly string[]
+  /** The saved profile order (`profileOrder`), Claude ids included; ChatGPT failover follows it after the active seat. */
+  order?: () => readonly string[] | undefined
   spent: (profileId: string) => SpentRecord | undefined
 }
 
@@ -83,7 +91,18 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
     reserved: deps.reserved(),
     names: deps.names(),
     planTypes: planTypes(),
+    aliases: deps.aliases?.(),
   })
+
+  /** Seats in the saved order, or undefined while the order names none of them. */
+  const savedSeatOrder = (list: readonly ChatGptProfile[]): string[] | undefined => {
+    const seats: string[] = []
+    for (const id of deps.order?.() ?? []) {
+      const profile = findChatGptProfile(list, id)
+      if (profile && !seats.includes(profile.seat)) seats.push(profile.seat)
+    }
+    return seats.length > 0 ? seats : undefined
+  }
 
   const excludedSeats = (list: readonly ChatGptProfile[]): Set<string> => {
     const seats = new Set<string>()
@@ -140,7 +159,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
         }
         return { kind: "pinned" as const, seat: pinned.seat }
       }
-      return { kind: "pool" as const, preferred: active(list)?.seat, excluded }
+      return { kind: "pool" as const, preferred: active(list)?.seat, excluded, order: savedSeatOrder(list) }
     },
 
     /** Profile id for a seat, for telemetry and events. */
@@ -148,33 +167,66 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
       return profiles().find(profile => profile.seat === seat)?.id
     },
 
+    /** Who owns these seats' logins, for a page offering to add one. */
+    owner: () => chatGptOwner(deps.source.mode, null),
+
+    /** Validate a rename; the caller persists `names` and `aliasesBySeat`. */
+    planRename: (from: string, to: string) => planChatGptRename({
+      profiles: profiles(),
+      reserved: deps.reserved(),
+      names: deps.names(),
+      aliases: deps.aliases?.(),
+      from,
+      to,
+    }),
+
+    /** Why a remove of this seat is refused, and what removes it at its owner. */
+    removalRefusal(profile: ChatGptProfile): string {
+      return chatGptRemovalRefusal(profile, chatGptOwner(deps.source.mode, profile.storeIndex))
+    },
+
     listEntries() {
       const list = profiles()
       const activeId = active(list)?.id
-      return list.map(profile => ({
-        id: profile.id,
-        type: CHATGPT_PROFILE_TYPE,
-        provider: CHATGPT_PROFILE_TYPE,
-        label: profile.label,
-        seat: profile.seat,
-        isActive: profile.id === activeId,
-        email: profile.email,
-        subscriptionType: profile.subscriptionType,
-        organizationName: null,
-        rateLimitTier: null,
-        seatTier: null,
-        allowance: profile.allowance,
-        allowanceWeight: profile.allowanceWeight,
-        planLabel: profile.planLabel,
-        accountType: profile.accountType,
-        planName: profile.planName,
-        loggedIn: chatGptLoggedIn(profile.unavailable),
-        unavailable: profile.unavailable,
-        lastCheckedAt: null,
-        lastSuccessAt: null,
-        authProvenance: "live" as const,
-        credentialDir: null,
-      }))
+      const usage = deps.usage()
+      const usageById = new Map((usage?.entries ?? []).map(entry => [entry.id, entry]))
+      return list.map(profile => {
+        const reading = usageById.get(profile.seat)
+        const tokenState = chatGptTokenState(profile.unavailable, reading?.error)
+        const owner = chatGptOwner(deps.source.mode, profile.storeIndex)
+        return {
+          id: profile.id,
+          type: CHATGPT_PROFILE_TYPE,
+          provider: CHATGPT_PROFILE_TYPE,
+          label: profile.label,
+          seat: profile.seat,
+          isActive: profile.id === activeId,
+          ...(profile.aliases.length > 0 ? { aliases: profile.aliases } : {}),
+          email: profile.email,
+          subscriptionType: profile.subscriptionType,
+          organizationName: null,
+          rateLimitTier: null,
+          seatTier: null,
+          allowance: profile.allowance,
+          allowanceWeight: profile.allowanceWeight,
+          planLabel: profile.planLabel,
+          accountType: profile.accountType,
+          planName: profile.planName,
+          loggedIn: tokenState === "ok",
+          tokenState,
+          unavailable: profile.unavailable,
+          resets: chatGptResetsView(reading?.resetCredits),
+          owner,
+          removal: chatGptRemovalRefusal(profile, owner),
+          // A usage read succeeding is chatgpt.com accepting the token, the
+          // same evidence Claude's "Last Verified" rests on. A reading served
+          // from cache was last checked when it was read, not now.
+          lastCheckedAt: reading ? (reading.error ? usage?.asOf ?? null : reading.fetchedAt) : null,
+          lastSuccessAt: reading?.fetchedAt ?? null,
+          authProvenance: "live" as const,
+          credentialDir: null,
+        }
+      })
     },
 
     quotaEntries() {

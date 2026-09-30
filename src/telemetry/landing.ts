@@ -240,11 +240,12 @@ var GENERAL_WINDOW_TYPES=${JSON.stringify(GENERAL_WINDOW_TYPES)};
 var FADE_FROM=${FADE_FROM};
 var SPENT_AT=${SPENT_AT};
 function isUnusable(p){if(p.loggedIn===false)return true;return p.error==='no_token'}
-function generalUtilization(windows){
+function generalUtilization(windows,provider){
+  var everyWindow=provider==='chatgpt';
   var worst=null;
   for(var i=0;i<(windows||[]).length;i++){
     var w=windows[i];
-    if(GENERAL_WINDOW_TYPES.indexOf(w.type)<0)continue;
+    if(!everyWindow&&GENERAL_WINDOW_TYPES.indexOf(w.type)<0)continue;
     if(w.utilization==null||!isFinite(w.utilization))continue;
     var c=Math.max(0,Math.min(1,w.utilization));
     if(worst==null||c>worst)worst=c;
@@ -253,7 +254,7 @@ function generalUtilization(windows){
 }
 function computeProfileSpend(p){
   if(isUnusable(p))return {fraction:1,state:'spent',fade:0,reason:'unusable'};
-  var f=generalUtilization(p.windows);
+  var f=generalUtilization(p.windows,p.provider);
   if(f==null)return {fraction:null,state:'unknown',fade:0,reason:null};
   if(f>=SPENT_AT)return {fraction:f,state:'spent',fade:1,reason:'usage'};
   if(f>=FADE_FROM)return {fraction:f,state:'fading',fade:(f-FADE_FROM)/(SPENT_AT-FADE_FROM),reason:null};
@@ -308,7 +309,7 @@ function setViewSort(mode){
   var refocus=!!(document.activeElement&&document.activeElement.closest&&document.activeElement.closest('.sort-tab'));
   viewSort=mode;
   try{localStorage.setItem(SORT_STORAGE_KEY,mode)}catch(_){/* a lost preference is not worth failing over */}
-  if(lastData)render(lastData[0],lastData[1],lastData[2],lastData[3],lastData[4]);
+  if(lastData)render(lastData[0],lastData[1],lastData[2],lastData[3]);
   if(refocus){var el=document.querySelector('.sort-tab[data-sort="'+mode+'"]');if(el)el.focus()}
 }
 
@@ -320,11 +321,22 @@ function introSection(h){
   if(h.auth&&h.auth.loggedIn)meta.push(esc(h.auth.email||'')+(h.auth.subscriptionType?' ('+esc(h.auth.subscriptionType)+')':''));
   meta.push(h.mode||'internal');
   meta.push('port '+location.port);
+  var chatgpt=!!h.chatgpt;
   return '<div class="intro">'
-    +'<h2>Claude &amp; Antigravity, in your tools.</h2>'
-    +'<p>This page manages Claude accounts. Use <a href="/providers">Providers</a> to connect Claude or Antigravity. For Claude, point your supported client’s <code>ANTHROPIC_BASE_URL</code> at <code>http://'+esc(location.host)+'</code> and every request routes through the active account below. Setup guides for each agent live in the <a href="https://github.com/rynfar/meridian/blob/main/docs/agents.md">Agent Setup guide</a>.</p>'
+    +'<h2>'+(chatgpt?'Claude, ChatGPT &amp; Antigravity':'Claude &amp; Antigravity')+', in your tools.</h2>'
+    +'<p>This page manages '+(chatgpt?'Claude accounts and ChatGPT seats':'Claude accounts')+'. Use <a href="/providers">Providers</a> to connect Claude or Antigravity. For Claude, point your supported client’s <code>ANTHROPIC_BASE_URL</code> at <code>http://'+esc(location.host)+'</code> and every request routes through the active account below.'
+    +(chatgpt?' For ChatGPT, point an OpenAI Responses client (opencode’s <code>openai-meridian</code> provider) at <code>http://'+esc(location.host)+'/v1</code>: each turn goes to the active seat below, then to the others in their order.':'')
+    +' Setup guides for each agent live in the <a href="https://github.com/rynfar/meridian/blob/main/docs/agents.md">Agent Setup guide</a>.</p>'
     +'<div class="intro-meta">'+meta.join(' · ')+'</div>'
     +'</div>';
+}
+
+// A renamed profile's traffic from before the rename is filed under its former
+// names, so the 24h line sums every name the profile has answered to.
+function profileCost(byProfile,p){
+  var ids=[p.id].concat((p.entry&&p.entry.aliases)||[]);var sum=null;
+  for(var i=0;i<ids.length;i++){var c=byProfile[ids[i]];if(!c)continue;if(!sum)sum={requests:0,estimatedUsd:0};sum.requests+=c.requests||0;sum.estimatedUsd+=c.estimatedUsd||0}
+  return sum;
 }
 
 function infoIcon(entry,type){
@@ -359,6 +371,7 @@ function profileSection(q,s,pl,h){
   var profs=[];var seen={};
   var configured=(pl&&Array.isArray(pl.profiles))?pl.profiles:[];
   var multi=configured.length>1;
+  var entryById={};for(var i=0;i<configured.length;i++)entryById[configured[i].id]=configured[i];
   if(configured.length>0){\n    // Real profiles exist: show exactly those. Traffic that predates
     // per-profile attribution (the synthetic "default" bucket) still
     // counts in the totals strip but doesn't render as a fake account.
@@ -377,17 +390,18 @@ function profileSection(q,s,pl,h){
   profs=meridianReorder.sortProfiles(profs);
   function spentOf(p){
     var quota=quotaByProfile[p.id]||{};
-    return computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn}).fraction;
+    return computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn,provider:p.entry&&p.entry.provider}).fraction;
   }
   profs=sortProfilesForView(profs,viewSort,spentOf);
   var reorderable=multi&&!meridianReorder.envPinned()&&viewSort==='configured';
   var cards='';
   var pos=0;
   for(var i=0;i<profs.length;i++){
-    var p=profs[i];var cost=byProfile[p.id];
+    var p=profs[i];var cost=profileCost(byProfile,p);
+    var chat=isChatGptProfile(p.entry);
     var quota=quotaByProfile[p.id]||{};
     var wins=(quota.windows||[]).filter(function(w){return w.utilization!=null});
-    var spend=computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn});
+    var spend=computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn,provider:p.entry&&p.entry.provider});
     if(!p.configured&&wins.length===0&&!cost)continue;
     var rows='';
     for(var j=0;j<wins.length;j++){
@@ -410,21 +424,31 @@ function profileSection(q,s,pl,h){
         +'<span class="w-pct" style="color:'+paceColor(pc)+'">'+deltaLabel+'</span>'
         +'<span class="w-reset">'+(pc.status==='over'?'runs out before reset':pc.proj!=null?'~'+pc.proj+'% by reset':'')+'</span></div>';
     }
-    if(!rows)rows='<div class="no-usage">no usage data yet</div>';
+    if(!rows){
+      var gap=chat?chatGptUsageGap(quota.error):'';
+      rows='<div class="no-usage">'+(gap?'no reading \u2014 '+esc(gap):'no usage data yet')+'</div>';
+    }
     var isPriority=pl&&pl.routing==='priority';
     // active+priority keeps the active profile meaningful - switching it is how
     // you move traffic, so the card stays clickable, unlike in pure priority.
     var isActivePriority=pl&&pl.routing==='active+priority';
     var follow=pl&&pl.follow;
-    var switchable=multi&&p.configured&&!p.isActive&&!isPriority&&!follow;
-    var badge=isPriority?'':p.isActive?'<span class="active-pill">Active</span>':switchable?'<span class="switch-hint">Click to activate</span>':'';
-    if(follow&&p.isActive)badge+=' <span class="pool-chip">'+(follow.activeProfile?'following '+esc(follow.url):'local — '+esc(follow.url)+' unreachable')+(follow.stale?' · stale':'')+'</span>';
+    // A ChatGPT seat has an active pointer of its own that neither priority
+    // routing nor follow mode takes over, so it is switchable in every mode.
+    var switchable=multi&&p.configured&&!p.isActive&&(chat||(!isPriority&&!follow));
+    var badge=isPriority&&!chat?'':p.isActive?'<span class="active-pill">Active</span>':switchable?'<span class="switch-hint">Click to activate</span>':'';
+    if(follow&&p.isActive&&!chat)badge+=' <span class="pool-chip">'+(follow.activeProfile?'following '+esc(follow.url):'local — '+esc(follow.url)+' unreachable')+(follow.stale?' · stale':'')+'</span>';
     // Sits beside the name because it qualifies the percentages below it: 70%
     // of a 20x account is several times the work left in 70% of a 5x one.
     if(p.allowance)badge+='<span class="plan-chip" title="'+esc((p.planLabel||'')+(p.rateLimitTier?' · '+p.rateLimitTier:''))+'">'+esc(p.allowance)+'</span>';
     if(isPriority||isActivePriority){
-      var orderIdx=(pl.profileOrder||[]).indexOf(p.id);
-      if(orderIdx>=0)badge+='<span class="pool-chip">'+(isActivePriority?'#'+(orderIdx+1)+' fallback':'#'+(orderIdx+1)+' in pool')+'</span>';      var exh=(pl.exhausted||[]).filter(function(e){return e.id===p.id})[0];
+      // Positions count within one provider: a Claude turn never falls over
+      // to a ChatGPT seat. A seat is always tried after the active seat, so
+      // its place is a fallback one in either mode.
+      var poolOrder=(pl.profileOrder||[]).filter(function(id){return !!entryById[id]&&isChatGptProfile(entryById[id])===chat});
+      var orderIdx=poolOrder.indexOf(p.id);
+      if(orderIdx>=0)badge+='<span class="pool-chip">'+(isActivePriority||chat?'#'+(orderIdx+1)+' fallback':'#'+(orderIdx+1)+' in pool')+'</span>';
+      var exh=(pl.exhausted||[]).filter(function(e){return e.id===p.id})[0];
       // Suppressed when a refusal is being reported below: both say the same
       // thing, and the banner says it better.
       if(exh&&!spentByProfile[p.id]){\n        // A billing refusal has no reset to wait for — the pool re-probes on the
@@ -432,31 +456,35 @@ function profileSection(q,s,pl,h){
         // Showing it as 'resets in 9m' promises a recovery that never comes.
         badge+=exh.reason==='billing_error'
           ?' <span class="pool-chip exhausted" title="Subscription or payment refused — this does not clear on its own">subscription refused</span>'
-          :' <span class="pool-chip exhausted">exhausted · resets '+resetIn(exh.until)+'</span>';
+          :exh.reason==='requires_reauth'
+            ?' <span class="pool-chip exhausted" title="chatgpt.com refused this seat\u2019s access token; it is tried again then">token refused · retry '+resetIn(exh.until)+'</span>'
+            :' <span class="pool-chip exhausted">exhausted · resets '+resetIn(exh.until)+'</span>';
       }
     }
     var sp=spentByProfile[p.id];
     var spentBanner='';
     if(sp){\n      var spBucket=(sp.diagnosis&&sp.diagnosis.bucket)?winLabel(sp.diagnosis.bucket):'its limit';
       var spGuess=(sp.diagnosis&&sp.diagnosis.reported)?'':' (guess)';
+      var refused=refusalSubject(p.entry);
       badge+=' <span class="pool-chip exhausted">out of '+esc(spBucket+spGuess)+'</span>';
       // A full-width line immediately above the usage bars, not a chip beside
       // the name: measured in review, a 10px chip wraps to four lines in a
       // narrow card and loses to the large "67%" rendered right below it -
       // which is the exact misreading this whole feature exists to stop.
       spentBanner='<div class="spent-banner" title="'+esc((sp.diagnosis&&sp.diagnosis.rationale)||'')+'">'
-        +'<strong>⚠ Anthropic is refusing this account</strong> - out of '+esc(spBucket+spGuess)
+        +'<strong>⚠ '+refused.vendor+' is refusing this '+refused.noun+'</strong> - out of '+esc(spBucket+spGuess)
         +(sp.until?', back '+resetIn(sp.until):'')
         +'<div class="spent-banner-sub">figures below are the last successful read, not live</div></div>';
     }
-    if(spend.reason==='unusable')badge+=' '+(p.configured
-      ?'<a class="spend-pill needs-login" href="'+esc(profileHref(p.id))+'" title="Open this profile to log in again">needs login</a>'
-      :'<span class="spend-pill needs-login">needs login</span>');
+    var access=spend.reason==='unusable'?profileAccessHelp(p.entry||p):null;
+    if(access)badge+=' '+(p.configured
+      ?'<a class="spend-pill needs-login" href="'+esc(profileHref(p.id))+'" title="'+esc(chat?access.summary:'Open this profile to log in again')+'">'+esc(access.pill)+'</a>'
+      :'<span class="spend-pill needs-login">'+esc(access.pill)+'</span>');
     else if(spend.state==='spent')badge+=' <span class="spend-pill">spent</span>';
     var spendClass=spend.reason==='unusable'?' needs-login':spend.fade>0?' spend-'+spend.state:'';
     var spendStyle=spend.fade>0?' style="--spend-fade:'+spend.fade.toFixed(2)+'"':'';
-    var spendTip=spend.reason==='unusable'?' title="Cannot serve requests \u2014 run: meridian profile login '+esc(p.id)+'"'
-      :spend.fraction!=null&&spend.fade>0?' title="'+Math.round(spend.fraction*100)+'% of this account\u2019s 5h / 7d allowance is used"':'';
+    var spendTip=access?' title="'+esc(access.summary)+'"'
+      :spend.fraction!=null&&spend.fade>0?' title="'+Math.round(spend.fraction*100)+'% of this '+(chat?'seat\u2019s allowance':'account\u2019s 5h / 7d allowance')+' is used"':'';
     var draggable=reorderable&&p.configured;
     cards+='<div class="profile-card'+(p.isActive?' active':'')+(switchable?' switchable':'')+spendClass+'"'+spendStyle+spendTip
       +(p.configured?' data-id="'+esc(p.id)+'" data-index="'+pos+'"':'')
@@ -469,25 +497,8 @@ function profileSection(q,s,pl,h){
   }
   if(!cards)return '';
   return '<div class="section"><div class="section-head"><div class="section-title">'+(profs.length===1?'Account':'Accounts')+'</div>'+sortTabs(profs.length)+'</div>'
-    +(multi?meridianReorder.noteHtml(reorderable):'')
+    +(multi?meridianReorder.noteHtml(reorderable,configured.some(isChatGptProfile)):'')
     +'<div class="profile-grid">'+cards+'</div></div>';
-}
-
-// ChatGPT seats, only on instances that serve ChatGPT (/health.chatgpt). The
-// same snapshot as /providers, so both pages agree; the busiest quota window
-// of each seat is its headline.
-function chatgptSection(pv){
-  var p=pv&&Array.isArray(pv.providers)?pv.providers.filter(function(x){return x.id==='chatgpt'})[0]:null;
-  if(!p||!p.enabled)return '';
-  var items=[];
-  for(var i=0;i<p.accounts.length;i++){var a=p.accounts[i];
-    var w=null;for(var j=0;j<a.windows.length;j++)if(!w||a.windows[j].utilization>w.utilization)w=a.windows[j];
-    var pct=w?Math.round(w.utilization*100):null;
-    items.push([esc(a.label||a.id)+(a.active?' · current':''),pct===null?'—':pct+'%',pct!==null&&pct>=85?'red':'',a.error?esc(a.error):w?esc(w.type)+' window':'no quota data',a.error?'red':'']);
-  }
-  if(p.activity)items.push(['Requests (1h)',String(p.activity.requests),'',p.activity.errors>0?p.activity.errors+' error'+(p.activity.errors===1?'':'s'):'no errors',p.activity.errors>0?'red':'']);
-  return '<div class="section"><div class="section-title">ChatGPT</div>'+strip(items)
-    +'<p class="intro-meta"><a href="/providers?provider=chatgpt">Quota windows and models on Providers</a></p></div>';
 }
 
 function strip(items){
@@ -508,22 +519,20 @@ async function refresh(){
       fetch('/settings/api/routing').then(r=>r.json()).catch(function(){return null})
     ]);
     meridianReorder.adopt(routing);
-    const providers=health&&health.chatgpt?await fetch('/providers/status').then(r=>r.json()).catch(function(){return null}):null;
-    render(health,stats,quota,profiles,providers);
+    render(health,stats,quota,profiles);
   }catch(e){document.getElementById('content').innerHTML='<div style="color:var(--red);padding:40px;text-align:center">Could not connect</div>'}
 }
 
 function tokens(v){if(v==null)return '—';if(v>=1e6)return (v/1e6).toFixed(1)+'M';if(v>=1e3)return (v/1e3).toFixed(1)+'k';return String(v)}
 
-function render(h,s,q,pl,pv){
-  lastData=[h,s,q,pl,pv];
+function render(h,s,q,pl){
+  lastData=[h,s,q,pl];
   var refocusId=meridianReorder.focusAnchor();
   let o='';
   o+=introSection(h);
 
   // Accounts — per-profile usage + est cost; click a card to switch
   o+=profileSection(q,s,pl,h);
-  o+=chatgptSection(pv);
 
   // Last 24 hours — meaningful signals only. Errors and envelope
   // violations appear only when there is something to report.

@@ -1938,7 +1938,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         if (isPoolRouting(routingMode) && !options.forcedProfileId && !c.req.header("x-meridian-profile")) {
           const effectivePool = getEffectiveProfiles(finalConfig.profiles)
           if (effectivePool.length > 1) {
-            const { order: fullOrder, unknown } = resolvePriorityOrder(effectivePool.map(p => p.id), priorityProfileOrderSetting())
+            const { order: fullOrder, unknown: notClaude } = resolvePriorityOrder(effectivePool.map(p => p.id), priorityProfileOrderSetting())
+            // The saved order lists ChatGPT seats as well; those are not typos.
+            const unknown = notClaude.filter(id => !chatGptProfiles?.resolve(id))
             if (unknown.length > 0) claudeLog("priority.unknown_order_ids", { unknown })
             const order = filterEligibleProfileIds(fullOrder, routingAccess.excludedProfileIds)
             const assignmentCwd = adapter.extractClientWorkingDirectory?.(body)
@@ -8025,10 +8027,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     usage: () => chatGptUsage,
     reserved: () => new Set(["default", ...getEffectiveProfiles(finalConfig.profiles).flatMap(p => [p.id, ...(p.aliases ?? [])])]),
     names: () => getSetting("chatGptProfileNames"),
+    aliases: () => getSetting("chatGptProfileAliases"),
     activeSeat: () => getSetting("chatGptActiveSeat"),
     excluded: configuredRoutingExcludedProfileIds,
+    order: priorityProfileOrderSetting,
     spent: (profileId) => spentProfiles.get(profileId),
   }) : undefined
+  const orderableProfileIds = (): string[] => [
+    ...listProfiles(finalConfig.profiles, finalConfig.defaultProfile).map(p => p.id),
+    ...(chatGptProfiles?.profiles().map(p => p.id) ?? []),
+  ]
 
   // `activeProfile` keeps meaning the Claude pointer wherever Claude profiles
   // exist, so a Claude-only consumer reads what it always read; on an instance
@@ -8368,14 +8376,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // the /settings UI. MERIDIAN_ROUTING / MERIDIAN_PROFILE_ORDER env vars
   // still take precedence when set (reported so the UI can say so).
   app.get("/settings/api/routing", (c) => {
-    const profiles = listProfiles(finalConfig.profiles, finalConfig.defaultProfile)
+    const profileIds = orderableProfileIds()
     return c.json({
       routing: getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing")),
       modes: ROUTING_MODES,
-      profileOrder: resolvePriorityOrder(profiles.map(p => p.id), priorityProfileOrderSetting()).order,
+      profileOrder: resolvePriorityOrder(profileIds, priorityProfileOrderSetting()).order,
       routingExcludedProfiles: parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles")),
       routingManagedExcludedProfiles: parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")),
-      profiles: profiles.map(p => p.id),
+      profiles: profileIds,
       envOverride: {
         routing: Boolean(process.env.MERIDIAN_ROUTING),
         profileOrder: Boolean(process.env.MERIDIAN_PROFILE_ORDER),
@@ -8403,7 +8411,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       if (!Array.isArray(body.profileOrder) || body.profileOrder.some(x => typeof x !== "string")) {
         return c.json({ error: "profileOrder must be an array of profile ids" }, 400)
       }
-      const known = new Set(listProfiles(finalConfig.profiles, finalConfig.defaultProfile).map(p => p.id))
+      const known = new Set(orderableProfileIds())
       const unknown = (body.profileOrder as string[]).filter(id => !known.has(id))
       if (unknown.length > 0) return c.json({ error: `Unknown profiles: ${unknown.join(", ")}` }, 400)
       updates.profileOrder = body.profileOrder as string[]
@@ -8839,8 +8847,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     // (meridian home, pylon's switcher) can render the pool.
     const priorityInfo = isPoolRouting(routingModeNow)
       ? {
-          profileOrder: resolvePriorityOrder(profiles.map(p => p.id), priorityProfileOrderSetting()).order,
-          exhausted: priorityExhaustion.snapshot(),
+          profileOrder: resolvePriorityOrder(orderableProfileIds(), priorityProfileOrderSetting()).order,
+          exhausted: [
+            ...priorityExhaustion.snapshot(),
+            ...chatGptExhaustion.snapshot().map(mark => ({ ...mark, id: chatGptProfiles?.profileIdFor(mark.id) ?? mark.id })),
+          ],
         }
       : {}
     // Additive: follow state, so UIs can say where the active profile comes
@@ -8856,6 +8867,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       spent: spentProfiles.snapshot(),
       ...priorityInfo,
       ...(follow ? { follow } : {}),
+      // Additive: who owns the ChatGPT seats' logins, so a page can say how to
+      // add one. Absent on an instance that serves no ChatGPT.
+      ...(chatGptProfiles ? { chatgpt: { owner: chatGptProfiles.owner() } } : {}),
     })
   })
 
@@ -9157,6 +9171,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     } catch {
       return c.json({ error: "Invalid JSON in request body" }, 400)
     }
+    if (body.profile && chatGptProfiles?.profiles().some(p => p.id === body.profile)) {
+      return c.json({ error: `Profile "${body.profile}" already exists: it is a ChatGPT seat.`, code: "profile_exists" }, 400)
+    }
     const result = startProfileAdd({ profiles: finalConfig.profiles, profileId: body.profile ?? "" })
     if (!result.ok) {
       claudeLog("profile.add_refused", {
@@ -9245,6 +9262,28 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     if (!body.from || !body.to) {
       return c.json({ error: "Missing 'from' or 'to' in request body" }, 400)
     }
+    // A ChatGPT seat's name lives in Meridian's settings, not in any
+    // credential, so a read-only instance may still rename one.
+    if (chatGptProfiles?.resolve(body.from)) {
+      const plan = chatGptProfiles.planRename(body.from, body.to)
+      if (!plan.ok) return c.json({ error: plan.error }, 400)
+      saveSettings({ chatGptProfileNames: plan.names, chatGptProfileAliases: plan.aliasesBySeat })
+      const order = getSetting("profileOrder")
+      if (order?.includes(plan.from)) setSetting("profileOrder", order.map(id => (id === plan.from ? plan.to : id)))
+      claudeLog("profile.renamed", {
+        from: plan.from,
+        to: plan.to,
+        aliases: plan.aliases,
+        provider: "chatgpt",
+        userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+        origin: c.req.header("origin") ?? c.req.header("referer")?.slice(0, 120) ?? null,
+      })
+      plog(`[PROXY] ChatGPT profile renamed: ${plan.from} -> ${plan.to} (still answers to: ${plan.aliases.join(", ")})`)
+      return c.json({ success: true, from: plan.from, to: plan.to, aliases: plan.aliases, provider: "chatgpt" })
+    }
+    if (chatGptProfiles?.profiles().some(p => p.id === body.to)) {
+      return c.json({ error: `Profile "${body.to}" already exists: it is a ChatGPT seat.` }, 400)
+    }
     if (envBool("CREDENTIALS_READONLY")) {
       return c.json({ error: "MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials." }, 403)
     }
@@ -9292,6 +9331,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     }
     if (!body.profile) {
       return c.json({ error: "Missing 'profile' in request body" }, 400)
+    }
+    const chatGptSeat = chatGptProfiles?.resolve(body.profile)
+    if (chatGptSeat) {
+      return c.json({ error: chatGptProfiles!.removalRefusal(chatGptSeat), code: "owned_elsewhere", provider: "chatgpt" }, 409)
     }
     if (envBool("CREDENTIALS_READONLY")) {
       return c.json({ error: "MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials." }, 403)

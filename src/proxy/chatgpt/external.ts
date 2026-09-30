@@ -44,6 +44,8 @@ interface ExternalAccount {
   coolingDownUntil: number | null
   quotaExhaustedUntil: number | null
   rateLimitResetTimes: Record<string, number>
+  /** Position in the store's own array, counting records this module skips, as `codex-list` does. */
+  storeIndex: number
 }
 
 interface Snapshot {
@@ -66,7 +68,7 @@ function record(value: unknown): Record<string, unknown> | null {
 const str = (v: unknown) => typeof v === "string" && v.length > 0 ? v : null
 const num = (v: unknown) => typeof v === "number" && Number.isFinite(v) ? v : null
 
-function parseAccount(value: unknown): ExternalAccount | null {
+function parseAccount(value: unknown, storeIndex: number): ExternalAccount | null {
   const raw = record(value)
   if (!raw) return null
   // The seat is the only safe key: one workspace `accountId` covers several
@@ -91,6 +93,7 @@ function parseAccount(value: unknown): ExternalAccount | null {
     coolingDownUntil: num(raw.coolingDownUntil),
     quotaExhaustedUntil: num(raw.quotaExhaustedUntil),
     rateLimitResetTimes: limits,
+    storeIndex,
   }
 }
 
@@ -123,7 +126,7 @@ export function createExternalCredentialSource(options: ExternalSourceOptions = 
       }
       cached = {
         key,
-        accounts: root.accounts.map(parseAccount).filter((a): a is ExternalAccount => a !== null),
+        accounts: root.accounts.map((value, index) => parseAccount(value, index)).filter((a): a is ExternalAccount => a !== null),
         activeIndex: num(root.activeIndex) ?? 0,
         activeIndexByFamily: byFamily,
         error: null,
@@ -173,6 +176,7 @@ export function createExternalCredentialSource(options: ExternalSourceOptions = 
           ...(reason ? { reason } : {}),
           expiresAt: account.expiresAt,
           active: account.accountUserId === active,
+          storeIndex: account.storeIndex,
         }
       })
     },

@@ -4,11 +4,18 @@
  */
 import { describe, expect, it } from "bun:test"
 import {
+  chatGptOwner,
   chatGptPlanFields,
   chatGptProfileIds,
+  chatGptProfiles,
   chatGptQuotaError,
+  chatGptRemovalRefusal,
+  chatGptResetsView,
+  chatGptTokenState,
+  findChatGptProfile,
   isWindowNotStarted,
   observedUsageWindows,
+  planChatGptRename,
   profileWindowType,
   seatWindows,
 } from "../proxy/chatgpt/profiles"
@@ -167,5 +174,164 @@ describe("profile surface routing", () => {
     const body = chatGptWarmBody("gpt-6-luna")
     expect(body).not.toHaveProperty("max_output_tokens")
     expect(body).toMatchObject({ model: "gpt-6-luna", stream: false, reasoning: { effort: "low" } })
+  })
+
+  it("fails over in the saved profile order, which may name seats by id, former id or seat id", () => {
+    const withOrder = (order: string[]) => createChatGptProfileSurface({
+      source, observed: () => new Map(), usage: () => null, reserved: () => new Set(), names: () => undefined,
+      aliases: () => ({ "user-c__ws-cccccc": ["old-c"] }),
+      activeSeat: () => undefined, excluded: () => [], order: () => order, spent: () => undefined,
+    })
+    expect(withOrder(["claude-work", "old-c", "user-b__ws-bbbbbb", "a-aaaaaa"]).route(undefined, "work"))
+      .toMatchObject({ kind: "pool", order: ["user-c__ws-cccccc", "user-b__ws-bbbbbb", "user-a__ws-aaaaaa"] })
+    // An order that names no seat leaves the credential owner's order alone.
+    expect(withOrder(["claude-work"]).route(undefined, "work")).toMatchObject({ kind: "pool", order: undefined })
+  })
+})
+
+describe("renaming a seat", () => {
+  const seats = [seat("user-a__ws-aaaaaa", "a@x.test"), seat("user-b__ws-bbbbbb", "b@x.test")]
+  const list = (names?: Record<string, unknown>, aliases?: Record<string, unknown>, reserved = new Set<string>()) =>
+    chatGptProfiles(seats, { names, aliases, reserved })
+
+  it("keeps each former id as an alias, and a current id always beats one", () => {
+    const profiles = list({ "user-a__ws-aaaaaa": "work" }, { "user-a__ws-aaaaaa": ["a-aaaaaa", "Bad Name"], "user-b__ws-bbbbbb": ["work"] })
+    expect(profiles.map(p => [p.id, p.aliases])).toEqual([["work", ["a-aaaaaa"]], ["b-bbbbbb", []]])
+    expect(findChatGptProfile(profiles, "a-aaaaaa")?.seat).toBe("user-a__ws-aaaaaa")
+    expect(findChatGptProfile(profiles, "work")?.seat).toBe("user-a__ws-aaaaaa")
+    expect(findChatGptProfile(profiles, "user-b__ws-bbbbbb")?.id).toBe("b-bbbbbb")
+  })
+
+  it("drops an alias the moment a Claude profile is called that", () => {
+    const profiles = list(undefined, { "user-a__ws-aaaaaa": ["personal"] }, new Set(["personal"]))
+    expect(profiles[0]!.aliases).toEqual([])
+  })
+
+  it("plans the rename as settings to write, collapsing the chain", () => {
+    const first = planChatGptRename({ profiles: list(), reserved: new Set(), names: undefined, aliases: undefined, from: "a-aaaaaa", to: "work" })
+    expect(first).toEqual({
+      ok: true, seat: "user-a__ws-aaaaaa", from: "a-aaaaaa", to: "work", aliases: ["a-aaaaaa"],
+      names: { "user-a__ws-aaaaaa": "work" }, aliasesBySeat: { "user-a__ws-aaaaaa": ["a-aaaaaa"] },
+    })
+    if (!first.ok) throw new Error("unreachable")
+    const renamed = list(first.names, first.aliasesBySeat)
+    // A second rename, asked for by the former id, keeps both former ids.
+    const second = planChatGptRename({ profiles: renamed, reserved: new Set(), names: first.names, aliases: first.aliasesBySeat, from: "a-aaaaaa", to: "work2" })
+    expect(second).toMatchObject({ ok: true, from: "work", to: "work2", aliases: ["a-aaaaaa", "work"] })
+    // Renaming back to a former id takes it out of the alias list.
+    const back = planChatGptRename({ profiles: renamed, reserved: new Set(), names: first.names, aliases: first.aliasesBySeat, from: "work", to: "a-aaaaaa" })
+    expect(back).toMatchObject({ ok: true, aliases: ["work"] })
+    expect(back.ok && back.aliasesBySeat).toEqual({ "user-a__ws-aaaaaa": ["work"] })
+  })
+
+  it("takes a name another seat once had, and refuses one in use or malformed", () => {
+    const profiles = list(undefined, { "user-b__ws-bbbbbb": ["shared"] })
+    const taken = planChatGptRename({ profiles, reserved: new Set(), names: undefined, aliases: { "user-b__ws-bbbbbb": ["shared"] }, from: "a-aaaaaa", to: "shared" })
+    expect(taken.ok && taken.aliasesBySeat).toEqual({ "user-a__ws-aaaaaa": ["a-aaaaaa"] })
+    const plan = (to: string, reserved = new Set<string>()) => planChatGptRename({ profiles, reserved, names: undefined, aliases: undefined, from: "a-aaaaaa", to })
+    expect(plan("b-bbbbbb")).toEqual({ ok: false, error: 'Profile "b-bbbbbb" already exists.' })
+    expect(plan("personal", new Set(["personal"]))).toEqual({ ok: false, error: 'Profile "personal" already exists.' })
+    expect(plan("a-aaaaaa")).toEqual({ ok: false, error: 'Profile "a-aaaaaa" is already called that.' })
+    expect(plan("Work Seat")).toMatchObject({ ok: false, error: expect.stringContaining("Invalid profile name") })
+    expect(planChatGptRename({ profiles, reserved: new Set(), names: undefined, aliases: undefined, from: "nobody", to: "x" }))
+      .toEqual({ ok: false, error: 'Profile "nobody" not found.' })
+  })
+})
+
+describe("banked resets on the card", () => {
+  const resets = (extra: Partial<NonNullable<CodexUsageEntry["resetCredits"]>>) => ({
+    availableCount: null, applicableAvailableCount: null, listedCount: null, credits: null, error: null, ...extra,
+  })
+
+  it("is unknown without a count, and zero is a count", () => {
+    expect(chatGptResetsView(null)).toBeNull()
+    expect(chatGptResetsView(resets({}))).toBeNull()
+    expect(chatGptResetsView(resets({ availableCount: 1.5 }))).toBeNull()
+    expect(chatGptResetsView(resets({ availableCount: 0, listedCount: 0, credits: [] }))).toEqual({ available: 0, expiresAt: [] })
+  })
+
+  it("prefers the credit list's count and lists one expiry per reset, soonest first", () => {
+    const credits = [{ status: "available", expiresAt: NOW + 11 }, { status: "available", expiresAt: null }, { status: "available", expiresAt: NOW + 3 }]
+    expect(chatGptResetsView(resets({ availableCount: 1, listedCount: 3, credits }))).toEqual({ available: 3, expiresAt: [NOW + 3, NOW + 11, null] })
+    expect(chatGptResetsView(resets({ listedCount: 2, credits }))).toEqual({ available: 2, expiresAt: [NOW + 3, NOW + 11] })
+    expect(chatGptResetsView(resets({ listedCount: 2, credits: [credits[2]!] }))).toEqual({ available: 2, expiresAt: [NOW + 3, null] })
+  })
+
+  it("falls back to the usage payload's count when the credit list could not be read", () => {
+    expect(chatGptResetsView(resets({ availableCount: 2, error: "upstream_error" }))).toEqual({ available: 2, expiresAt: null })
+  })
+})
+
+describe("a seat's token and owner", () => {
+  it("reads the token's own state even behind an owner's quota or cooldown mark", () => {
+    expect(chatGptTokenState("quota_exhausted", "token_expired")).toBe("expired")
+    expect(chatGptTokenState(null, "unauthorized")).toBe("refused")
+    expect(chatGptTokenState("expired", null)).toBe("expired")
+    expect(chatGptTokenState("requires_reauth", null)).toBe("requires_reauth")
+    expect(chatGptTokenState("cooling_down", "rate_limited")).toBe("ok")
+    expect(chatGptTokenState(null, null)).toBe("ok")
+  })
+
+  it("names oc-codex-multi-auth's own commands for what Meridian will not do to a followed seat", () => {
+    const owner = chatGptOwner("follow-external", 2)
+    expect(owner).toEqual({
+      name: "oc-codex-multi-auth", mode: "follow-external", account: 3,
+      login: "opencode auth login", loginMethod: "OpenAI → Codex OAuth (ChatGPT Plus/Pro)",
+      refresh: "npx -y oc-codex-multi-auth doctor --fix", refreshTool: "codex-refresh",
+      remove: "codex-remove index=3 confirm=true", importCommand: null,
+    })
+    const refusal = chatGptRemovalRefusal({ id: "oferty-c487c4", label: "oferty@x.test · id:c487c4" }, owner)
+    expect(refusal).toContain("oc-codex-multi-auth owns")
+    expect(refusal).toContain("pick oferty@x.test · id:c487c4 and choose \"Delete this account\"")
+    expect(refusal).toContain("check with `codex-list` that account 3 is oferty@x.test · id:c487c4 and run `codex-remove index=3 confirm=true`")
+    expect(chatGptOwner("owned", 0)).toMatchObject({ name: "meridian", login: null, refresh: null, remove: null, importCommand: "meridian chatgpt-migrate --step import" })
+  })
+})
+
+describe("list entries", () => {
+  const seats = [
+    seat("user-a__ws-aaaaaa", "a@x.test", { active: true, storeIndex: 0 }),
+    seat("user-b__ws-bbbbbb", "b@x.test", { eligible: false, reason: "quota_exhausted", storeIndex: 2 }),
+    seat("user-c__ws-cccccc", "c@x.test", { storeIndex: 3 }),
+  ]
+  const entry = (id: string, extra: Partial<CodexUsageEntry>): CodexUsageEntry => ({
+    id, type: "codex", identity: id, email: null, plan: null, windows: [], resetCredits: null, fetchedAt: null, stale: false, error: null, ...extra,
+  })
+  const usage = {
+    asOf: NOW,
+    error: null,
+    entries: [
+      entry("user-a__ws-aaaaaa", {
+        fetchedAt: NOW - 20_000,
+        resetCredits: { availableCount: 1, applicableAvailableCount: 0, listedCount: 1, credits: [{ status: "available", expiresAt: NOW + 13 * 86_400_000 }], error: null },
+      }),
+      entry("user-b__ws-bbbbbb", { error: "token_expired" }),
+      entry("user-c__ws-cccccc", { error: "unauthorized" }),
+    ],
+  }
+  const surface = createChatGptProfileSurface({
+    source: { mode: "follow-external", seats: () => seats } as unknown as ChatGptCredentialSource,
+    observed: () => new Map(), usage: () => usage, reserved: () => new Set(), names: () => undefined,
+    aliases: () => ({ "user-a__ws-aaaaaa": ["old-a"] }),
+    activeSeat: () => undefined, excluded: () => [], spent: () => undefined,
+  })
+  const [a, b, c] = surface.listEntries()
+
+  it("carries what the card states: resets, owner, token state, former names", () => {
+    expect(a).toMatchObject({
+      id: "a-aaaaaa", isActive: true, loggedIn: true, tokenState: "ok", aliases: ["old-a"],
+      resets: { available: 1, expiresAt: [NOW + 13 * 86_400_000] },
+      owner: { name: "oc-codex-multi-auth", account: 1 },
+      lastSuccessAt: NOW - 20_000, lastCheckedAt: NOW - 20_000,
+    })
+    expect(a!.removal).toContain("account 1")
+    // An expired token behind a quota mark cannot serve, and says so.
+    expect(b).toMatchObject({ loggedIn: false, tokenState: "expired", unavailable: "quota_exhausted", resets: null, lastSuccessAt: null, lastCheckedAt: NOW })
+    expect(c).toMatchObject({ loggedIn: false, tokenState: "refused", resets: null })
+    expect(b).not.toHaveProperty("aliases")
+  })
+
+  it("never carries a credential", () => {
+    expect(JSON.stringify(surface.listEntries())).not.toMatch(/accessToken|refreshToken|Bearer/)
   })
 })

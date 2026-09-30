@@ -23,12 +23,26 @@
  */
 import { createHash } from "node:crypto"
 import { describeCodexPlan } from "../codex/plan"
-import type { CodexUsageEntry, CodexUsageWindow } from "../codex/types"
+import type { CodexResetCredits, CodexUsageEntry, CodexUsageWindow } from "../codex/types"
 import { codexWindowLabel } from "../codex/windows"
-import type { ChatGptSeatView, SeatUnavailableReason } from "./source"
+import type { ChatGptCredentialMode, ChatGptSeatView, SeatUnavailableReason } from "./source"
 import type { ChatGptRateLimit, ChatGptUsageWindow } from "./windows"
 
 export const CHATGPT_PROFILE_TYPE = "chatgpt"
+
+/**
+ * What a person runs at oc-codex-multi-auth for the things Meridian must not
+ * do to a seat it follows: sign it in, renew its token, delete it. Meridian
+ * only reads that store, so each card quotes these instead of offering a
+ * button that would have to refuse. The menu labels are the plugin's own
+ * (`AUTH_LABELS.OAUTH`, lib/ui/auth-menu.ts).
+ */
+export const CHATGPT_OWNER_TOOL = "oc-codex-multi-auth"
+export const CHATGPT_LOGIN_COMMAND = "opencode auth login"
+export const CHATGPT_LOGIN_METHOD = "OpenAI \u2192 Codex OAuth (ChatGPT Plus/Pro)"
+/** Renews every enabled account from its refresh token; no browser needed. */
+export const CHATGPT_REFRESH_COMMAND = "npx -y oc-codex-multi-auth doctor --fix"
+export const CHATGPT_REFRESH_TOOL = "codex-refresh"
 
 /** Claude's window names, which the switcher and warmer read. */
 export const FIVE_HOUR_WINDOW = "five_hour"
@@ -69,6 +83,10 @@ export interface ChatGptProfile extends ChatGptPlanFields {
   unavailable: SeatUnavailableReason | null
   /** The credential owner's own next pick. */
   ownerActive: boolean
+  /** Former ids from renames; each still resolves to this seat. */
+  aliases: string[]
+  /** 0-based position in the credential owner's store, when it has one. */
+  storeIndex: number | null
 }
 
 /** One window in Claude's `/v1/usage/quota` vocabulary. */
@@ -184,11 +202,19 @@ export function chatGptPlanFields(planType: string | null | undefined): ChatGptP
   }
 }
 
+function storedAliases(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return [...new Set(value.filter((alias): alias is string => typeof alias === "string" && PROFILE_ID.test(alias)))]
+}
+
 /**
  * Every seat the credential source knows, as profiles.
  *
  * `planTypes` carries a fresher plan slug per seat where the usage service
- * read one; the credential store's copy is the fallback.
+ * read one; the credential store's copy is the fallback. `aliases` are the
+ * former ids renames left behind (seat id -> ids). A former id stops being an
+ * alias the moment a profile - ChatGPT or Claude - is called that, exactly as
+ * a Claude profile's redirect is dropped when its old name is taken again.
  */
 export function chatGptProfiles(
   seats: readonly ChatGptSeatView[],
@@ -196,25 +222,208 @@ export function chatGptProfiles(
     reserved?: ReadonlySet<string>
     names?: Readonly<Record<string, unknown>>
     planTypes?: ReadonlyMap<string, string | null>
+    aliases?: Readonly<Record<string, unknown>>
   } = {},
 ): ChatGptProfile[] {
   const ids = chatGptProfileIds(seats, options)
-  return seats.map(seat => ({
-    id: ids.get(seat.id)!,
-    seat: seat.id,
-    label: chatGptSeatLabel(seat.id, seat.email),
-    email: seat.email,
-    eligible: seat.eligible,
-    unavailable: seat.reason ?? null,
-    ownerActive: seat.active === true,
-    ...chatGptPlanFields(options.planTypes?.get(seat.id) ?? seat.planType),
-  }))
+  const taken = new Set([...ids.values(), ...(options.reserved ?? [])])
+  const claimed = new Set<string>()
+  return seats.map(seat => {
+    const aliases = storedAliases(options.aliases?.[seat.id]).filter(alias => !taken.has(alias) && !claimed.has(alias))
+    for (const alias of aliases) claimed.add(alias)
+    return {
+      id: ids.get(seat.id)!,
+      seat: seat.id,
+      label: chatGptSeatLabel(seat.id, seat.email),
+      email: seat.email,
+      eligible: seat.eligible,
+      unavailable: seat.reason ?? null,
+      ownerActive: seat.active === true,
+      aliases,
+      storeIndex: seat.storeIndex ?? null,
+      ...chatGptPlanFields(options.planTypes?.get(seat.id) ?? seat.planType),
+    }
+  })
 }
 
-/** A profile by its id or by its raw seat id. */
+/** A profile by its id, its raw seat id, or a former id - in that order, so a current id always wins. */
 export function findChatGptProfile(profiles: readonly ChatGptProfile[], idOrSeat: string | null | undefined): ChatGptProfile | undefined {
   if (!idOrSeat) return undefined
-  return profiles.find(profile => profile.id === idOrSeat) ?? profiles.find(profile => profile.seat === idOrSeat)
+  return profiles.find(profile => profile.id === idOrSeat)
+    ?? profiles.find(profile => profile.seat === idOrSeat)
+    ?? profiles.find(profile => profile.aliases.includes(idOrSeat))
+}
+
+export type ChatGptRenamePlan =
+  | {
+    ok: true
+    seat: string
+    from: string
+    to: string
+    /** The seat's former ids after the rename, chains collapsed. */
+    aliases: string[]
+    /** The complete `chatGptProfileNames` and `chatGptProfileAliases` settings to write. */
+    names: Record<string, string>
+    aliasesBySeat: Record<string, string[]>
+  }
+  | { ok: false; error: string }
+
+/**
+ * Plan renaming a seat's profile id, the way a Claude rename works: the new
+ * id is the seat's name from now on, and the old one keeps answering as an
+ * alias, so a request, an exclusion or a link that names it still reaches the
+ * seat. Renaming onto another seat's former id takes that id over. Pure:
+ * the caller persists both settings.
+ */
+export function planChatGptRename(input: {
+  profiles: readonly ChatGptProfile[]
+  reserved: ReadonlySet<string>
+  names: Readonly<Record<string, unknown>> | undefined
+  aliases: Readonly<Record<string, unknown>> | undefined
+  from: string
+  to: string
+}): ChatGptRenamePlan {
+  const { profiles, reserved, from, to } = input
+  const profile = findChatGptProfile(profiles, from)
+  if (!profile) return { ok: false, error: `Profile "${from}" not found.` }
+  if (!PROFILE_ID.test(to)) {
+    return {
+      ok: false,
+      error: `Invalid profile name "${to}". A ChatGPT seat's name uses lowercase letters, numbers, dots, hyphens and underscores, starts with a letter or number, and is at most 64 characters.`,
+    }
+  }
+  if (to === profile.id) return { ok: false, error: `Profile "${to}" is already called that.` }
+  if (reserved.has(to) || profiles.some(other => other.id === to)) {
+    return { ok: false, error: `Profile "${to}" already exists.` }
+  }
+
+  const names: Record<string, string> = {}
+  for (const [seat, name] of Object.entries(input.names ?? {})) {
+    if (typeof name === "string") names[seat] = name
+  }
+  names[profile.seat] = to
+
+  const aliasesBySeat: Record<string, string[]> = {}
+  for (const [seat, value] of Object.entries(input.aliases ?? {})) {
+    const kept = storedAliases(value).filter(alias => alias !== to)
+    if (kept.length > 0) aliasesBySeat[seat] = kept
+  }
+  const aliases = [...new Set([...profile.aliases, profile.id])].filter(alias => alias !== to)
+  if (aliases.length > 0) aliasesBySeat[profile.seat] = aliases
+  else delete aliasesBySeat[profile.seat]
+
+  return { ok: true, seat: profile.seat, from: profile.id, to, aliases, names, aliasesBySeat }
+}
+
+/**
+ * A seat's banked rate-limit resets as its card states them.
+ *
+ * `expiresAt` holds one entry per banked reset, soonest first; null for one
+ * whose expiry is not known. The whole list is null when the per-credit lookup
+ * failed and only the count is known; the view itself is null when not even
+ * the count is (no valid token to ask with, or both reads failed).
+ */
+export interface ChatGptResetsView {
+  available: number
+  expiresAt: Array<number | null> | null
+}
+
+const soonestFirst = (a: number | null, b: number | null): number =>
+  a === null ? (b === null ? 0 : 1) : b === null ? -1 : a - b
+
+export function chatGptResetsView(resets: CodexResetCredits | null | undefined): ChatGptResetsView | null {
+  const available = resets ? resets.listedCount ?? resets.availableCount : null
+  if (!resets || available === null || !Number.isInteger(available) || available < 0) return null
+  if (resets.credits === null) return { available, expiresAt: null }
+  // One expiry per banked reset: the list may state more credits than its
+  // count or fewer, and the count is what the seat holds.
+  const expiresAt = resets.credits.map(credit => credit.expiresAt).sort(soonestFirst).slice(0, available)
+  while (expiresAt.length < available) expiresAt.push(null)
+  return { available, expiresAt }
+}
+
+/** Who holds a seat's login, and what a person runs there for what Meridian will not do itself. */
+export interface ChatGptOwner {
+  name: typeof CHATGPT_OWNER_TOOL | "meridian"
+  mode: ChatGptCredentialMode
+  /** 1-based number in the owner's store: what `codex-list` prints and `codex-remove index=` takes. */
+  account: number | null
+  /** Signs a seat in, or in again; null where Meridian owns the login. */
+  login: string | null
+  loginMethod: string | null
+  /** Renews an expired access token; null where Meridian refreshes it itself. */
+  refresh: string | null
+  refreshTool: string | null
+  /** Deletes the seat at its owner; null where no such command exists. */
+  remove: string | null
+  /** Brings a seat signed in elsewhere into Meridian's own store; null in follow-external mode. */
+  importCommand: string | null
+}
+
+export const CHATGPT_IMPORT_COMMAND = "meridian chatgpt-migrate --step import"
+
+export function chatGptOwner(mode: ChatGptCredentialMode, storeIndex: number | null): ChatGptOwner {
+  const account = storeIndex === null ? null : storeIndex + 1
+  if (mode === "owned") {
+    return {
+      name: "meridian", mode, account, login: null, loginMethod: null, refresh: null, refreshTool: null, remove: null,
+      importCommand: CHATGPT_IMPORT_COMMAND,
+    }
+  }
+  return {
+    name: CHATGPT_OWNER_TOOL,
+    mode,
+    account,
+    login: CHATGPT_LOGIN_COMMAND,
+    loginMethod: CHATGPT_LOGIN_METHOD,
+    refresh: CHATGPT_REFRESH_COMMAND,
+    refreshTool: CHATGPT_REFRESH_TOOL,
+    remove: account === null ? null : `codex-remove index=${account} confirm=true`,
+    importCommand: null,
+  }
+}
+
+/**
+ * Why Meridian answers a remove of this seat with a refusal, and what removes
+ * it instead. The interactive menu leads because it names each account by its
+ * email; `codex-remove` takes a store position, which moves when an account
+ * is added or deleted, so it is offered with the check that comes first.
+ */
+export function chatGptRemovalRefusal(profile: Pick<ChatGptProfile, "id" | "label">, owner: ChatGptOwner): string {
+  if (owner.mode === "owned") {
+    return `"${profile.id}" is a ChatGPT seat in Meridian's own store. Removing an owned seat from the web UI is not supported; exclude it from routing to stop it serving work.`
+  }
+  const menu = `run \`${owner.login}\`, choose ${owner.loginMethod}, pick ${profile.label} and choose "Delete this account"`
+  const tool = owner.remove
+    ? `, or in an opencode session check with \`codex-list\` that account ${owner.account} is ${profile.label} and run \`${owner.remove}\``
+    : ""
+  return `"${profile.id}" is a ChatGPT seat that ${CHATGPT_OWNER_TOOL} owns. Meridian only reads that store, so it cannot remove the seat. To remove it, ${menu}${tool}. Meridian drops the card on its next read of the store.`
+}
+
+/**
+ * Whether a seat's access token can serve right now.
+ *
+ * The store states one reason per seat, and a quota or cooldown mark hides
+ * the token's own state behind it: a seat marked quota-exhausted may hold an
+ * expired token as well. The usage service reads the token's `exp` claim
+ * before any request (`token_expired`), and a 401/403 from the usage endpoint
+ * is chatgpt.com refusing the token, so both count here.
+ */
+export type ChatGptTokenState = "ok" | "expired" | "refused" | "no_token" | "requires_reauth" | "unknown"
+
+export function chatGptTokenState(unavailable: SeatUnavailableReason | null, usageError: string | null | undefined): ChatGptTokenState {
+  switch (unavailable) {
+    case "no_token":
+    case "requires_reauth":
+    case "unknown":
+    case "expired":
+      return unavailable
+    default:
+      if (usageError === "no_token") return "no_token"
+      if (usageError === "token_expired") return "expired"
+      if (usageError === "unauthorized") return "refused"
+      return "ok"
+  }
 }
 
 /** Claude's name for a window of this width; any other width keeps its natural label. */

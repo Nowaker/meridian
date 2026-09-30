@@ -234,11 +234,12 @@ window.meridianReorder = (function () {
     if (live) live.textContent = message;
   }
 
-  function noteHtml(reorderable) {
+  function noteHtml(reorderable, withChatGpt) {
+    var seats = withChatGpt ? ' ChatGPT seats are tried in this order too, after the active seat.' : '';
     return reorderable
       ? '<div class="order-note">Drag a card by its handle to reorder, or focus a handle and press \\u2191 / \\u2193. '
-        + 'The order is saved, and drives <a href="/settings" style="color:var(--accent)">Priority routing</a> \\u2014 the pool drains from the top.</div>'
-      : '<div class="order-note locked">Order is pinned by the <code>MERIDIAN_PROFILE_ORDER</code> environment variable. Unset it to reorder from here.</div>';
+        + 'The order is saved, and drives <a href="/settings" style="color:var(--accent)">Priority routing</a> \\u2014 the pool drains from the top.' + seats + '</div>'
+      : '<div class="order-note locked">Order is pinned by the <code>MERIDIAN_PROFILE_ORDER</code> environment variable. Unset it to reorder from here.' + seats + '</div>';
   }
 
   function handleHtml(id, index, total) {

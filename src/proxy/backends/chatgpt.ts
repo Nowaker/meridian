@@ -109,13 +109,14 @@ export interface ChatGptHooks {
  * active pointer, the routing exclusions and the trust of internal headers).
  *
  * - `pool`: every eligible seat, `preferred` first when it can serve, the
- *   `excluded` ones never.
+ *   `excluded` ones never. The rest follow `order` (the saved profile
+ *   order) where given, then the credential owner's order.
  * - `pinned`: that seat only, no failover - an explicit profile header, or a
  *   warm.
  * - `refuse`: answered before any seat is tried.
  */
 export type ChatGptRoute =
-  | { kind: "pool"; preferred?: string; excluded: ReadonlySet<string> }
+  | { kind: "pool"; preferred?: string; excluded: ReadonlySet<string>; order?: readonly string[] }
   | { kind: "pinned"; seat: string }
   | { kind: "refuse"; response: Response; error: string }
 
@@ -171,6 +172,15 @@ function forwardHeaders(upstream: Response): Headers {
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+}
+
+/** Seats the order names first, in its order; the rest after them, as they came. */
+function inSavedOrder(seats: readonly string[], order: readonly string[]): string[] {
+  const rank = new Map(order.map((seat, index) => [seat, index]))
+  return seats
+    .map((seat, index) => ({ seat, index, rank: rank.get(seat) ?? Number.MAX_SAFE_INTEGER }))
+    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .map(entry => entry.seat)
 }
 
 /**
@@ -269,8 +279,9 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
         const listed = route.kind === "pinned" ? [route.seat] : source.candidateSeats(model)
         const routable = route.kind === "pool" ? listed.filter(seat => !route.excluded.has(seat)) : listed
         if (routable.length < listed.length) reasons.add("excluded")
-        const live = routable.filter(seat => !exhaustion.isExhausted(seat))
-        if (live.length < routable.length) reasons.add("quota_exhausted")
+        const unbenched = routable.filter(seat => !exhaustion.isExhausted(seat))
+        if (unbenched.length < routable.length) reasons.add("quota_exhausted")
+        const live = route.kind === "pool" && route.order ? inSavedOrder(unbenched, route.order) : unbenched
         // The active seat leads: a supervisor that moved the pointer wants the
         // next turn there, at the price of a cold cache. Otherwise a
         // conversation stays on the seat holding its prompt-cache prefix while

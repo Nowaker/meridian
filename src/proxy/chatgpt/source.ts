@@ -33,6 +33,8 @@ export interface ChatGptSeatView {
   expiresAt: number | null
   /** The seat the credential owner itself would pick next. */
   active?: boolean
+  /** 0-based position in the store; the owner's own account numbers are this plus one. */
+  storeIndex?: number
 }
 
 export type SeatUnavailableReason =
