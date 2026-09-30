@@ -403,7 +403,8 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
       if (fallback) return fallback
 
       const message = source.describeUnavailable(reasons)
-      const auth = reasons.has("expired") || reasons.has("requires_reauth")
+      // No seat at all is a sign-in to do, not an outage to wait out.
+      const auth = reasons.has("expired") || reasons.has("requires_reauth") || source.seats().length === 0
       const quota = !auth && reasons.size > 0 && [...reasons].every(r => r === "quota_exhausted" || r === "cooling_down")
       const response = auth
         ? errorResponse(401, "authentication_error", message)

@@ -633,7 +633,13 @@ function renderLoginRows(p) {
   }
   var owner = p.owner || {};
   if (owner.name === 'meridian') {
-    return owner.importCommand ? commandRow('Import', owner.importCommand, 'Meridian holds this seat\\u2019s login') : '';
+    if (!owner.webSignIn) {
+      return owner.importCommand ? commandRow('Import', owner.importCommand, 'Meridian holds this seat\\u2019s login') : '';
+    }
+    return '<div class="cmd-row"><span class="cmd-label">Token:</span> '
+      + '<button class="switch-btn" style="margin-top:0" data-profile="' + attr(p.id) + '" onclick="renewChatGptSeat(this)">Renew now</button>'
+      + '<span class="cmd-note">Meridian renews it by itself before it expires. To sign this seat in again, use Add a profile \\u2192 ChatGPT seat.</span>'
+      + '</div>';
   }
   var rows = commandRow('Login', owner.login, '\\u2192 ' + owner.loginMethod + ' \\u2192 ' + (p.label || p.id) + ' \\u2192 Refresh account \\u00b7 at ' + owner.name);
   if (p.tokenState === 'expired') {
@@ -692,7 +698,9 @@ function renderChatGptGuide(owner) {
   if (owner.name === 'meridian') {
     guide.innerHTML = '<h3 style="margin-top:16px">ChatGPT seats</h3>'
       + '<p style="font-size:13px;color:var(--muted);margin-bottom:8px">Meridian holds these seats\\u2019 logins and renews their tokens itself. '
-      + 'Bring a seat signed in elsewhere into its store with <code>' + esc(owner.importCommand) + '</code>.</p>';
+      + (owner.webSignIn
+        ? 'Connect a seat, or sign one in again, under <strong>Add a profile \\u2192 ChatGPT seat \\u2192 Sign in with ChatGPT</strong>.</p>'
+        : 'Bring a seat signed in elsewhere into its store with <code>' + esc(owner.importCommand) + '</code>.</p>');
     guide.hidden = false;
     return;
   }
@@ -1593,6 +1601,15 @@ function renderAddTabs() {
 // once a poll sees it.
 function renderChatGptAdd() {
   var owner = chatGptOwnerInfo || {};
+  if (owner.name === 'meridian' && owner.webSignIn) {
+    return '<div class="add-intro">Meridian holds the ChatGPT logins on this instance and renews their tokens itself. '
+      + 'Signing in a seat that is already here signs it in again.</div>'
+      + '<div class="login-row">'
+      +   '<button class="login-btn" onclick="startChatGptConnect()">Sign in with ChatGPT</button>'
+      + '</div>'
+      + '<div class="add-note">For a second ChatGPT account, sign out of chatgpt.com first or copy the sign-in link into a private window.</div>'
+      + '<div class="login-msg"></div>';
+  }
   if (owner.name === 'meridian') {
     return '<div class="add-intro">Meridian holds the ChatGPT logins on this instance. Sign the account in with opencode first, then bring it into Meridian\\u2019s store:</div>'
       + commandRow('Import', owner.importCommand, '')
@@ -1736,6 +1753,158 @@ function cancelAdd() {
   // Keeps the name. Abandoning a sign-in almost always means the wrong Claude
   // account was signed in, not that the name was wrong.
   resetAddForm(activeAdd ? activeAdd.profile : '');
+}
+
+// --- Sign a ChatGPT seat in (owned mode) ---
+//
+// Meridian listens for OpenAI's fixed redirect, http://localhost:1455, while a
+// sign-in is open. A browser on the same machine lands there and the poll
+// below sees the login finish; a browser elsewhere cannot reach that address,
+// so the page also takes the address it ended on, pasted back.
+var activeChatGptConnect = null;
+var chatGptConnectTimer = null;
+
+function renderChatGptConnectPanel(authorizeUrl, loopback) {
+  return '<div class="login-panel">'
+    + '<div class="login-panel-title">Sign in with ChatGPT</div>'
+    + '<ol class="login-steps">'
+    +   '<li>A ChatGPT sign-in tab just opened \\u2014 '
+    +     '<a class="login-reopen" href="' + esc(authorizeUrl) + '" target="_blank" rel="noopener noreferrer">open it again</a>'
+    +     ' if it was blocked. Right-click it to sign in from a private window.</li>'
+    +   '<li>Sign in with the ChatGPT account this seat should use.</li>'
+    +   (loopback
+      ? '<li>On this machine that is all \\u2014 the tab ends on a Meridian page saying the seat is connected. '
+        + 'From another machine the tab ends on a page that cannot load; paste its whole address below.</li>'
+      : '<li>The tab ends on a page that cannot load. Paste its whole address below.</li>')
+    + '</ol>'
+    + '<div class="login-row">'
+    +   '<input class="login-input" type="text" autocomplete="off" spellcheck="false" placeholder="http://localhost:1455/auth/callback?code=\\u2026">'
+    +   '<button class="login-btn login-submit" onclick="submitChatGptConnect()">Connect</button>'
+    +   '<button class="switch-btn current login-cancel" style="margin-top:0" onclick="cancelChatGptConnect()">Cancel</button>'
+    + '</div>'
+    + '<div class="login-msg busy">Waiting for you to finish signing in\\u2026</div>'
+    + '</div>';
+}
+
+function stopChatGptConnectPoll() {
+  if (chatGptConnectTimer) clearTimeout(chatGptConnectTimer);
+  chatGptConnectTimer = null;
+}
+
+function finishChatGptConnect(message) {
+  stopChatGptConnectPoll();
+  activeChatGptConnect = null;
+  resetAddForm('');
+  setPanelMsg(addSlot(), message, '');
+  if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
+  refresh();
+}
+
+async function startChatGptConnect() {
+  var slot = addSlot();
+  if (!slot) return;
+  setPanelMsg(slot, 'Starting\\u2026', 'busy');
+  var res, data;
+  try {
+    res = await fetch('/profiles/chatgpt/connect/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ returnTo: location.origin + '/profiles' })
+    });
+    data = await res.json();
+  } catch (err) {
+    setPanelMsg(slot, 'Could not reach Meridian.', 'err');
+    return;
+  }
+  if (!res.ok) { setPanelMsg(slot, data.error || 'Could not start the sign-in.', 'err'); return; }
+  activeChatGptConnect = { connectId: data.connectId };
+  slot.innerHTML = renderChatGptConnectPanel(data.authorizeUrl, data.loopback);
+  var input = slot.querySelector('.login-input');
+  if (input) input.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitChatGptConnect(); });
+  window.open(data.authorizeUrl, '_blank', 'noopener');
+  chatGptConnectTimer = setTimeout(pollChatGptConnect, 1500);
+}
+
+async function pollChatGptConnect() {
+  var current = activeChatGptConnect;
+  if (!current) return;
+  var res, data;
+  try {
+    res = await fetch('/profiles/chatgpt/connect/status?connectId=' + encodeURIComponent(current.connectId));
+    data = await res.json();
+  } catch (err) {
+    chatGptConnectTimer = setTimeout(pollChatGptConnect, 1500);
+    return;
+  }
+  if (activeChatGptConnect !== current) return;
+  if (res.ok && (data.status === 'waiting' || data.status === 'exchanging')) {
+    chatGptConnectTimer = setTimeout(pollChatGptConnect, 1500);
+    return;
+  }
+  if (res.ok && data.status === 'completed') {
+    finishChatGptConnect('Connected ' + (data.email || data.accountUserId) + '.');
+    return;
+  }
+  stopChatGptConnectPoll();
+  setPanelMsg(addSlot(), data.message || data.error || 'The sign-in failed.', 'err');
+}
+
+async function submitChatGptConnect() {
+  var current = activeChatGptConnect;
+  var slot = addSlot();
+  if (!current || !slot) return;
+  var input = slot.querySelector('.login-input');
+  var value = input ? input.value.trim() : '';
+  if (!value) { setPanelMsg(slot, 'Paste the address the sign-in tab ended on first.', 'err'); return; }
+  setPanelMsg(slot, 'Connecting\\u2026', 'busy');
+  var res, data;
+  try {
+    res = await fetch('/profiles/chatgpt/connect/complete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ connectId: current.connectId, url: value })
+    });
+    data = await res.json();
+  } catch (err) {
+    setPanelMsg(slot, 'Could not reach Meridian.', 'err');
+    return;
+  }
+  if (activeChatGptConnect !== current) return;
+  if (!res.ok) {
+    if (!data.retryable) stopChatGptConnectPoll();
+    setPanelMsg(slot, data.error || 'The sign-in failed.', 'err');
+    return;
+  }
+  finishChatGptConnect('Connected ' + (data.email || data.seat) + '.');
+}
+
+function cancelChatGptConnect() {
+  stopChatGptConnectPoll();
+  activeChatGptConnect = null;
+  resetAddForm('');
+}
+
+async function renewChatGptSeat(button) {
+  var id = button.getAttribute('data-profile');
+  button.disabled = true;
+  button.textContent = 'Renewing\\u2026';
+  var res, data;
+  try {
+    res = await fetch('/profiles/chatgpt/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile: id })
+    });
+    data = await res.json();
+  } catch (err) {
+    data = { error: 'Could not reach Meridian.' };
+  }
+  var text = res && res.ok && data.status === 'refreshed'
+    ? 'Renewed; valid until ' + new Date(data.expiresAt).toLocaleString() + '.'
+    : (data.error || ('Not renewed: ' + (data.reason || data.status || 'unknown') + '.'));
+  showLoginMessage(id, text, res && res.ok ? '' : 'err');
+  button.disabled = false;
+  button.textContent = 'Renew now';
 }
 
 meridianReorder.init({ onSaved: refresh });

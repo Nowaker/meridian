@@ -278,13 +278,13 @@ describe("a seat's token and owner", () => {
       name: "oc-codex-multi-auth", mode: "follow-external", account: 3,
       login: "opencode auth login", loginMethod: "OpenAI → Codex OAuth (ChatGPT Plus/Pro)",
       refresh: "npx -y oc-codex-multi-auth doctor --fix", refreshTool: "codex-refresh",
-      remove: "codex-remove index=3 confirm=true", importCommand: null,
+      remove: "codex-remove index=3 confirm=true", importCommand: null, webSignIn: false,
     })
     const refusal = chatGptRemovalRefusal({ id: "oferty-c487c4", label: "oferty@x.test · id:c487c4" }, owner)
     expect(refusal).toContain("oc-codex-multi-auth owns")
     expect(refusal).toContain("pick oferty@x.test · id:c487c4 and choose \"Delete this account\"")
     expect(refusal).toContain("check with `codex-list` that account 3 is oferty@x.test · id:c487c4 and run `codex-remove index=3 confirm=true`")
-    expect(chatGptOwner("owned", 0)).toMatchObject({ name: "meridian", login: null, refresh: null, remove: null, importCommand: "meridian chatgpt-migrate --step import" })
+    expect(chatGptOwner("owned", 0)).toMatchObject({ name: "meridian", login: null, refresh: null, remove: null, importCommand: "meridian chatgpt-migrate --step import", webSignIn: true })
   })
 })
 

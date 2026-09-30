@@ -358,6 +358,8 @@ export interface ChatGptOwner {
   remove: string | null
   /** Brings a seat signed in elsewhere into Meridian's own store; null in follow-external mode. */
   importCommand: string | null
+  /** Whether /profiles can sign a seat in directly (POST /profiles/chatgpt/connect/start). Owned mode only. */
+  webSignIn: boolean
 }
 
 export const CHATGPT_IMPORT_COMMAND = "meridian chatgpt-migrate --step import"
@@ -367,7 +369,7 @@ export function chatGptOwner(mode: ChatGptCredentialMode, storeIndex: number | n
   if (mode === "owned") {
     return {
       name: "meridian", mode, account, login: null, loginMethod: null, refresh: null, refreshTool: null, remove: null,
-      importCommand: CHATGPT_IMPORT_COMMAND,
+      importCommand: CHATGPT_IMPORT_COMMAND, webSignIn: true,
     }
   }
   return {
@@ -380,6 +382,7 @@ export function chatGptOwner(mode: ChatGptCredentialMode, storeIndex: number | n
     refreshTool: CHATGPT_REFRESH_TOOL,
     remove: account === null ? null : `codex-remove index=${account} confirm=true`,
     importCommand: null,
+    webSignIn: false,
   }
 }
 

@@ -7,7 +7,7 @@
  * Claude path, where the same plugin does run.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { installSdkMock } from "./sdkMock"
@@ -40,6 +40,7 @@ const { telemetryStore } = await import("../telemetry")
 const { __setFetchOAuthUsageOverride, resetOAuthUsageCache } = await import("../proxy/oauthUsage")
 const { saveSettings } = await import("../settings")
 const { resetCodexUsageCache } = await import("../proxy/codex/service")
+const { __setChatGptLoginListenOverride } = await import("../proxy/chatgpt/login")
 
 const NOW = Date.now()
 const CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -798,5 +799,110 @@ describe("ChatGPT seats on the profile surface", () => {
     await res.text()
     // The owner's pick (seat 0) leads; the saved order, not the store's, follows.
     expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-0", "workspace-2"])
+  })
+})
+
+describe("owned mode signs its own seats in", () => {
+  const part = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url")
+  const signedIn = `${part({ alg: "none" })}.${part({
+    exp: Math.floor(NOW / 1000) + 3600,
+    email: "fresh@example.test",
+    "https://api.openai.com/auth": { chatgpt_account_id: "workspace-9", chatgpt_account_user_id: "user-9__workspace-9" },
+  })}.sig`
+  const post = (app: { fetch: (r: Request) => Response | Promise<Response> }, path: string, body: unknown) =>
+    app.fetch(new Request(`http://localhost${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }))
+
+  let storeDir: string
+  let storePath: string
+  let codeExchanges = 0
+  beforeEach(() => {
+    storeDir = join(dir, "meridian-gpt")
+    storePath = join(storeDir, "chatgpt-accounts.json")
+    process.env.MERIDIAN_CHATGPT_STORE_PATH = storePath
+    codeExchanges = 0
+    __setChatGptLoginListenOverride(async () => null)
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url === TOKEN_URL && new URLSearchParams(String(init?.body)).get("grant_type") === "authorization_code") {
+        codeExchanges++
+        return new Response(JSON.stringify({ access_token: signedIn, refresh_token: "rt-signed-in", id_token: signedIn, expires_in: 3600 }), { status: 200, headers: { "content-type": "application/json" } })
+      }
+      return mockFetch(input, init)
+    }) as typeof fetch
+  })
+  afterEach(() => { __setChatGptLoginListenOverride(null) })
+
+  it("starts with an empty store, takes the lease, and tells a GPT client to connect an account", async () => {
+    const proxy = await server("owned")
+    await proxy.chatGpt!.acquire()
+    try {
+      expect(existsSync(`${storePath}.lock`)).toBe(true)
+      const res = await proxy.app.fetch(responses(LUNA))
+      expect(res.status).toBe(401)
+      const body = await res.json() as { error: { type: string; message: string } }
+      expect(body.error.type).toBe("authentication_error")
+      expect(body.error.message).toContain("No ChatGPT account is connected")
+      expect(body.error.message).toContain("/profiles")
+      expect(upstreamCalls).toHaveLength(0)
+      expect(sdkCalls).toBe(0)
+      expect(existsSync(storePath)).toBe(false)
+    } finally {
+      proxy.chatGpt!.release()
+    }
+  })
+
+  it("signs a seat in from the web UI into a private store, then serves and renews it", async () => {
+    const proxy = await server("owned")
+    await proxy.chatGpt!.acquire()
+    try {
+      const list = await (await proxy.app.fetch(new Request("http://localhost/profiles/list"))).json() as { chatgpt: { owner: Record<string, unknown> } }
+      expect(list.chatgpt.owner).toMatchObject({ name: "meridian", mode: "owned", webSignIn: true })
+
+      const started = await (await post(proxy.app, "/profiles/chatgpt/connect/start", { returnTo: "https://meridian.example/profiles" })).json() as { connectId: string; authorizeUrl: string; loopback: boolean }
+      expect(started.loopback).toBe(false)
+      const state = new URL(started.authorizeUrl).searchParams.get("state")
+      const done = await post(proxy.app, "/profiles/chatgpt/connect/complete", {
+        connectId: started.connectId, url: `http://localhost:1455/auth/callback?code=one-time&state=${state}`,
+      })
+      const doneText = await done.text()
+      expect(done.status).toBe(200)
+      expect(doneText).not.toContain("rt-signed-in")
+      expect(JSON.parse(doneText)).toEqual({ success: true, seat: "user-9__workspace-9", email: "fresh@example.test" })
+      expect(codeExchanges).toBe(1)
+
+      const status = await (await proxy.app.fetch(new Request(`http://localhost/profiles/chatgpt/connect/status?connectId=${started.connectId}`))).json()
+      expect(status).toMatchObject({ status: "completed", accountUserId: "user-9__workspace-9" })
+
+      expect(statSync(storeDir).mode & 0o777).toBe(0o700)
+      expect(statSync(storePath).mode & 0o777).toBe(0o600)
+      const stored = JSON.parse(readFileSync(storePath, "utf8")) as { accounts: Array<Record<string, unknown>> }
+      expect(stored.accounts.map(a => [a.accountUserId, a.accountId, a.email, a.exchangeStartedAt])).toEqual([["user-9__workspace-9", "workspace-9", "fresh@example.test", null]])
+
+      const served = await proxy.app.fetch(responses(LUNA))
+      expect(served.status).toBe(200)
+      await served.text()
+      expect(upstreamCalls.at(-1)).toMatchObject({ authorization: `Bearer ${signedIn}`, accountId: "workspace-9" })
+      expect(tokenCalls).toBe(0)
+
+      const profiles = await (await proxy.app.fetch(new Request("http://localhost/profiles/list"))).json() as { profiles: Array<{ id: string; seat?: string }> }
+      const seat = profiles.profiles.find(p => p.seat === "user-9__workspace-9")!
+      const renewed = await post(proxy.app, "/profiles/chatgpt/refresh", { profile: seat.id })
+      expect(renewed.status).toBe(200)
+      expect(await renewed.json()).toMatchObject({ status: "refreshed", profile: seat.id })
+      expect(tokenCalls).toBe(1)
+      const rotated = JSON.parse(readFileSync(storePath, "utf8")) as { accounts: Array<Record<string, unknown>> }
+      expect(rotated.accounts[0]).toMatchObject({ refreshToken: "rt-rotated", accessToken: "at-refreshed", exchangeStartedAt: null })
+    } finally {
+      proxy.chatGpt!.release()
+    }
+  })
+
+  it("refuses to sign a seat in where it follows another tool's store", async () => {
+    writePool([account(0)])
+    const proxy = await server("follow-external")
+    const res = await post(proxy.app, "/profiles/chatgpt/connect/start", {})
+    expect(res.status).toBe(409)
+    expect(await res.json()).toMatchObject({ code: "chatgpt_signin_unavailable" })
+    expect(codeExchanges).toBe(0)
   })
 })

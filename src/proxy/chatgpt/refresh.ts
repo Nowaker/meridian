@@ -29,8 +29,9 @@
 import { WriterLeaseRequiredError, type ChatGptCredentialStore } from "./credentials"
 import { WriterLeaseLostError } from "./lease"
 
-const TOKEN_URL = "https://auth.openai.com/oauth/token"
-const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+export const CHATGPT_TOKEN_URL = "https://auth.openai.com/oauth/token"
+/** The Codex CLI's OAuth client. Logins and refreshes must use the same one. */
+export const CHATGPT_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 const EXCHANGE_TIMEOUT_MS = 15_000
 
 export type RequiresReauthReason =
@@ -152,13 +153,13 @@ export function createChatGptRefresher(options: ChatGptRefresherOptions): ChatGp
 
     let response: Response
     try {
-      response = await exchangeFetch(TOKEN_URL, {
+      response = await exchangeFetch(CHATGPT_TOKEN_URL, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
           grant_type: "refresh_token",
           refresh_token: account.refreshToken,
-          client_id: CLIENT_ID,
+          client_id: CHATGPT_OAUTH_CLIENT_ID,
         }).toString(),
         // A refresh token must never be replayed to a redirect target.
         redirect: "error",
@@ -196,6 +197,9 @@ export function createChatGptRefresher(options: ChatGptRefresherOptions): ChatGp
         exchangeStartedAt: null,
       }
     })
+    // One line per renewal, so the operator can see a refresh happen. The
+    // seat id is an identity, not a credential.
+    console.log(`[chatgpt] account ${accountUserId} refreshed${parsed.refreshToken ? " (refresh token rotated)" : ""}; access token valid until ${new Date(expiresAt).toISOString()}`)
     return { status: "refreshed", accountUserId, accessToken, expiresAt }
   }
 

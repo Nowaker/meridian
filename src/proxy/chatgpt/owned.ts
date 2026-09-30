@@ -30,15 +30,25 @@ export interface OwnedSourceOptions {
   /** Token-endpoint fetch, injectable for tests. */
   fetchImpl?: TokenExchangeFetch
   now?: () => number
+  /**
+   * Build the source even over an empty store. Set when the operator asked for
+   * `owned` explicitly: the instance then takes the lease at startup and waits
+   * for a seat to be signed in through its web UI.
+   */
+  allowEmpty?: boolean
 }
 
-/** Undefined when the store holds no accounts: nothing to own, nothing to serve. */
+export const CHATGPT_NO_ACCOUNT_MESSAGE = "No ChatGPT account is connected to this Meridian. "
+  + "Connect one in its web UI: open /profiles, choose \"ChatGPT seat\" under \"Add a profile\", then \"Sign in with ChatGPT\"."
+
+/** Undefined when the store holds no accounts and `allowEmpty` is unset: nothing to own, nothing to serve. */
 export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGptCredentialSource | undefined {
   const { storePath } = options
   // A store that exists but cannot be read throws here and stops startup.
   // Guessing it is empty would silently turn an owning instance into one that
   // routes GPT names back to Claude.
-  if (createChatGptCredentialStore({ path: storePath }).readAccounts().length === 0) return undefined
+  const empty = createChatGptCredentialStore({ path: storePath }).readAccounts().length === 0
+  if (empty && !options.allowEmpty) return undefined
 
   const now = options.now ?? Date.now
   const reader = createChatGptCredentialStore({ path: storePath })
@@ -120,6 +130,7 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
     },
 
     describeUnavailable(reasons) {
+      if (reader.readAccounts().length === 0) return CHATGPT_NO_ACCOUNT_MESSAGE
       if (reasons.has("no_authority")) return "This Meridian does not hold refresh authority for its ChatGPT accounts."
       if (reasons.has("requires_reauth")) return "Every ChatGPT account this Meridian owns needs an interactive login."
       return "Every ChatGPT account this Meridian owns is spent or unavailable."
@@ -144,6 +155,30 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
       store = undefined
       refresher = undefined
       held?.release()
+    },
+
+    connectAccount(account) {
+      if (!store || !holdsLease()) {
+        throw new Error("This Meridian does not hold the writer lease for its ChatGPT store, so it cannot save a sign-in.")
+      }
+      // A seat signed in again replaces its whole credential chain, and with
+      // it any interrupted-exchange stamp: the new refresh token was issued by
+      // this login and has never been spent.
+      store.commitAccount(account.accountUserId, current => ({
+        accountUserId: account.accountUserId,
+        accountId: account.accountId,
+        email: account.email ?? current?.email ?? null,
+        refreshToken: account.refreshToken,
+        accessToken: account.accessToken,
+        expiresAt: account.expiresAt,
+        tokenRotatedAt: now(),
+        exchangeStartedAt: null,
+      }))
+    },
+
+    async refreshSeat(seat) {
+      if (!refresher || !holdsLease()) return { status: "unavailable", accountUserId: seat, reason: "no-write-authority" }
+      return refresher.refreshAccount(seat)
     },
   }
 }

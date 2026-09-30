@@ -122,6 +122,8 @@ import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, res
 import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
 import { startFollowUsagePolling, stopFollowUsagePolling } from "./followUsage"
 import { startProfileLogin, completeProfileLogin, completeProfileLoginFromCallback, getProfileLoginStatus } from "./profileLogin"
+import { createChatGptLogin } from "./chatgpt/login"
+import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
 import { startProfileAdd, completeProfileAdd } from "./profileAdd"
 import { filterEligibleProfileIds, mergeRoutingExcludedProfiles, parseRoutingExcludedProfiles } from "./routingExclusions"
 import { canonicalRoutingExcludedProfileIds, evaluateRoutingProfileAccess, noEligibleProfilesResponse, profileExcludedResponse, replacementForExcludedActive } from "./routingExclusionRuntime"
@@ -9232,7 +9234,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // `http://127.0.0.1/callback`. Its security review is in
   // proxy-settings-auth.test.ts beside the allowlist entry.
   app.get("/callback", async (c) => {
-    const { renderLoginCallbackPage } = await import("../telemetry/loginCallbackPage")
     const result = await completeProfileLoginFromCallback({
       state: c.req.query("state"),
       code: c.req.query("code"),
@@ -9250,6 +9251,104 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     claudeLog("profile.login_completed", { profile: result.profileId, via: "callback" })
     plog(`[PROXY] Profile login completed for "${result.profileId}" (browser redirect)`)
     return c.html(renderLoginCallbackPage({ ok: true, profileId: result.profileId }))
+  })
+
+  // --- ChatGPT seat sign-in (owned mode only) ---
+  //
+  // Meridian holds the writer lease for its own ChatGPT store for as long as it
+  // runs, so it is also the only process that may file a new seat there. The
+  // flow and its loopback listener live in chatgpt/login.ts; these routes only
+  // translate. No response carries a code, verifier or token.
+  const connectChatGptAccount = chatGptSource?.connectAccount?.bind(chatGptSource)
+  const chatGptLogin = connectChatGptAccount ? createChatGptLogin({
+    connect: (account) => {
+      connectChatGptAccount(account)
+      // The usage view and the catalog read the store; make them see the new
+      // seat on the next poll rather than after their own intervals.
+      chatGptUsageAt = 0
+      void chatGptCatalog?.refresh()
+    },
+    renderPage: (result) => renderLoginCallbackPage(result.ok
+      ? { ok: true, okMessage: `ChatGPT seat${result.email ? ` ${result.email}` : ""} is connected to Meridian. You can close this tab.`, ...(result.returnTo ? { backHref: result.returnTo } : {}) }
+      : { ok: false, message: result.message, ...(result.returnTo ? { backHref: result.returnTo } : {}) }),
+    log: plog,
+  }) : undefined
+
+  const chatGptSignInUnavailable = (c: Context) => c.json({
+    error: chatGptSource
+      ? "This Meridian follows another tool's ChatGPT logins, so it cannot sign a seat in itself."
+      : "This Meridian serves no ChatGPT accounts. Start it with MERIDIAN_CHATGPT_CREDENTIALS=owned to connect one.",
+    code: "chatgpt_signin_unavailable",
+  }, 409)
+
+  app.post("/profiles/chatgpt/connect/start", async (c) => {
+    if (!chatGptLogin) return chatGptSignInUnavailable(c)
+    let body: { returnTo?: unknown } = {}
+    try {
+      body = await c.req.json() as { returnTo?: unknown }
+    } catch {
+      body = {}
+    }
+    // Only ever rendered as a link back from the loopback page.
+    let returnTo: string | null = null
+    if (typeof body.returnTo === "string") {
+      try {
+        const url = new URL(body.returnTo)
+        if (url.protocol === "https:" || url.protocol === "http:") returnTo = url.toString()
+      } catch {
+        returnTo = null
+      }
+    }
+    const started = await chatGptLogin.start({ returnTo })
+    plog(`[PROXY] ChatGPT sign-in started (loopback=${started.loopback})`)
+    return c.json(started)
+  })
+
+  app.get("/profiles/chatgpt/connect/status", (c) => {
+    if (!chatGptLogin) return chatGptSignInUnavailable(c)
+    const connectId = c.req.query("connectId")
+    if (!connectId) return c.json({ error: "Missing 'connectId' query parameter", code: "invalid_request" }, 400)
+    const state = chatGptLogin.status(connectId)
+    if (!state) return c.json({ error: "This sign-in is no longer open. Start it again.", code: "expired_login" }, 410)
+    return c.json(state)
+  })
+
+  app.post("/profiles/chatgpt/connect/complete", async (c) => {
+    if (!chatGptLogin) return chatGptSignInUnavailable(c)
+    let body: { connectId?: unknown; url?: unknown }
+    try {
+      body = await c.req.json() as { connectId?: unknown; url?: unknown }
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    if (typeof body.connectId !== "string" || !body.connectId) {
+      return c.json({ error: "Missing 'connectId' in request body", code: "invalid_request" }, 400)
+    }
+    const result = await chatGptLogin.complete(body.connectId, typeof body.url === "string" ? body.url : "")
+    if (!result.ok) {
+      return c.json({ error: result.message, code: result.code, ...(result.retryable ? { retryable: true } : {}) }, result.status as 400)
+    }
+    return c.json({ success: true, seat: result.accountUserId, email: result.email })
+  })
+
+  // Renews one owned seat's access token now, through the same single-exchange
+  // path a request takes. Answers with the outcome and the new expiry only.
+  app.post("/profiles/chatgpt/refresh", async (c) => {
+    if (!chatGptSource?.refreshSeat || !chatGptProfiles) return chatGptSignInUnavailable(c)
+    let body: { profile?: unknown }
+    try {
+      body = await c.req.json() as { profile?: unknown }
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    const profile = typeof body.profile === "string" ? chatGptProfiles.resolve(body.profile) : undefined
+    if (!profile) return c.json({ error: "No ChatGPT seat by that profile id.", code: "unknown_profile" }, 404)
+    const outcome = await chatGptSource.refreshSeat(profile.seat)
+    if (outcome.status === "refreshed") {
+      chatGptUsageAt = 0
+      return c.json({ status: "refreshed", profile: profile.id, expiresAt: outcome.expiresAt })
+    }
+    return c.json({ status: outcome.status, profile: profile.id, reason: outcome.reason }, outcome.status === "requires-reauth" ? 401 : 503)
   })
 
   app.post("/profiles/rename", async (c) => {

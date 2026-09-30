@@ -16,6 +16,7 @@
  * token at all, so a view built from it cannot leak one.
  */
 import type { CodexPoolResult } from "../codex/pool"
+import type { RefreshOutcome } from "./refresh"
 
 export type ChatGptCredentialMode = "owned" | "follow-external"
 
@@ -80,4 +81,21 @@ export interface ChatGptCredentialSource {
   /** Take whatever authority this mode needs. No-op for follow-external. */
   acquire(): Promise<void>
   release(): void
+  /**
+   * owned only: file a freshly signed-in seat (or a seat signed in again)
+   * under the writer lease. Throws when this process does not hold it.
+   */
+  connectAccount?(account: ChatGptConnectedAccount): void
+  /** owned only: renew one seat's access token now, through the same single-exchange path a request uses. */
+  refreshSeat?(seat: string): Promise<RefreshOutcome>
+}
+
+/** What an interactive sign-in hands the owned store. */
+export interface ChatGptConnectedAccount {
+  accountUserId: string
+  accountId: string
+  email: string | null
+  refreshToken: string
+  accessToken: string
+  expiresAt: number | null
 }
