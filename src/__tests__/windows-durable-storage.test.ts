@@ -13,7 +13,7 @@ import { hostname, tmpdir } from "node:os"
 import { join } from "node:path"
 import { CrossProcessTurnCoordinator } from "../proxy/session/crossProcessTurnCoordinator"
 import { captureProcessIncarnation } from "../proxy/session/processIncarnation"
-import { prepareFork } from "../proxy/sessionLifecycle"
+import { prepareFork, readSessionGcSnapshot } from "../proxy/sessionLifecycle"
 import { setSessionStoreDir } from "../proxy/sessionStore"
 
 const roots: string[] = []
@@ -49,7 +49,7 @@ describe("Windows-safe durable session storage", () => {
     })
 
     expect(prepared.lifecycleGeneration).toMatch(/^r:[a-f0-9]{64}:1$/)
-    expect(JSON.parse(readFileSync(join(root, "session-gc.json"), "utf8")).version).toBe(2)
+    expect(readSessionGcSnapshot(root).version).toBe(2)
     expect(existsSync(lockPath)).toBe(false)
   }, 30_000)
 

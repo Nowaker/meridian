@@ -38,6 +38,7 @@ installMcpToolsMock(() => ({ createOpencodeMcpServer: () => ({ type: "sdk", name
 
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 const { resetActiveProfile } = await import("../proxy/profiles")
+const { readSessionGcSnapshot } = await import("../proxy/sessionLifecycle")
 const { setSessionStoreDir, readSessionStoreSnapshot } = await import("../proxy/sessionStore")
 
 let root: string
@@ -111,7 +112,7 @@ describe("profile switch admission with bounded retirement", () => {
     await clearSessionCache()
     expect(Object.values(readSessionStoreSnapshot())).toHaveLength(0)
     await sweep()
-    const sidecar = JSON.parse(readFileSync(join(root, "sessions", "session-gc.json"), "utf8")) as {
+    const sidecar = readSessionGcSnapshot(join(root, "sessions")) as {
       resources: Record<string, { state: string }>
     }
     expect(Object.values(sidecar.resources).some(resource => resource.state === "retired")).toBe(true)
@@ -139,7 +140,7 @@ describe("profile switch admission with bounded retirement", () => {
     await sweep()
     await clearSessionCache()
     await sweep()
-    const retired = () => Object.values((JSON.parse(readFileSync(join(root, "sessions", "session-gc.json"), "utf8")) as {
+    const retired = () => Object.values((readSessionGcSnapshot(join(root, "sessions")) as {
       resources: Record<string, { state: string }>
     }).resources).filter(resource => resource.state === "retired").length
     expect(retired()).toBe(1)

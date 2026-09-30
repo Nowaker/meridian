@@ -1,6 +1,7 @@
 /**
- * The SQLite database behind the shared session store: one file per store
- * directory, shared by every Meridian process that uses the directory.
+ * The SQLite database behind the shared session store and the transcript
+ * lifecycle journal: one file per store directory, shared by every Meridian
+ * process that uses the directory.
  *
  * Each process holds two connections to it:
  *
@@ -31,15 +32,29 @@
  * Await the write first and assert on its result or error.
  */
 
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, statSync } from "node:fs"
-import { join } from "node:path"
+import { createHash } from "node:crypto"
+import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, statSync } from "node:fs"
+import { readFile, rename } from "node:fs/promises"
+import { dirname, join } from "node:path"
 import SyncDatabase from "libsql"
 import AsyncDatabase from "libsql/promise"
+import { syncDirectoryDurably } from "./durableFileSystem"
 
 export const STORE_DATABASE_NAME = "sessions.db"
 const STORE_DATABASE_FORMAT = 1
 /** Bounds file descriptors in processes that switch store directories (tests). */
 const MAX_OPEN_DATABASES = 4
+const DEFAULT_LOCK_WAIT_MS = 10_000
+
+/** How long a write waits for another process's write to finish. */
+export function getStoreLockWaitMs(): number {
+  const raw = process.env.MERIDIAN_SESSION_LOCK_TIMEOUT_MS
+    ?? process.env.CLAUDE_PROXY_SESSION_LOCK_TIMEOUT_MS
+  if (!raw) return DEFAULT_LOCK_WAIT_MS
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_LOCK_WAIT_MS
+  return parsed
+}
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS store_info (
@@ -72,8 +87,38 @@ CREATE TABLE IF NOT EXISTS priority_rollbacks (
   route_key TEXT PRIMARY KEY,
   record    TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS lifecycle_info (
+  id                   INTEGER PRIMARY KEY CHECK (id = 1),
+  version              INTEGER NOT NULL,
+  seq                  INTEGER NOT NULL,
+  commit_token         TEXT,
+  imported_json_sha256 TEXT,
+  imported_json_at     INTEGER
+);
+CREATE TABLE IF NOT EXISTS lifecycle_resources (
+  key    TEXT PRIMARY KEY,
+  seq    INTEGER NOT NULL,
+  record TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lifecycle_fence_slots (
+  slot    TEXT PRIMARY KEY,
+  counter INTEGER NOT NULL,
+  seq     INTEGER NOT NULL
+) WITHOUT ROWID;
 INSERT OR IGNORE INTO store_info (id, format, meta_version, seq) VALUES (1, ${STORE_DATABASE_FORMAT}, 1, 0);
+INSERT OR IGNORE INTO lifecycle_info (id, version, seq) VALUES (1, 2, 0);
 `
+const STORE_TABLES = [
+  "store_info",
+  "sessions",
+  "generation_slots",
+  "priority_assignments",
+  "priority_attempts",
+  "priority_rollbacks",
+  "lifecycle_info",
+  "lifecycle_resources",
+  "lifecycle_fence_slots",
+]
 
 export type SqlValue = string | number | null
 
@@ -166,13 +211,9 @@ export class StoreDatabase {
   }
 
   private ensureSchema(): void {
-    let format: unknown
-    try {
-      format = this.get<{ format: number }>("SELECT format FROM store_info WHERE id = 1")?.format
-    } catch (error) {
-      if (!/no such table/i.test(String((error as Error).message))) throw error
-    }
-    if (format === undefined) {
+    const tables = new Set(this.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table'")
+      .map((row) => row.name))
+    if (!STORE_TABLES.every((table) => tables.has(table))) {
       this.reader.exec("BEGIN IMMEDIATE")
       try {
         this.reader.exec(SCHEMA)
@@ -181,8 +222,8 @@ export class StoreDatabase {
         this.reader.exec("ROLLBACK")
         throw error
       }
-      format = this.get<{ format: number }>("SELECT format FROM store_info WHERE id = 1")?.format
     }
+    const format = this.get<{ format: number }>("SELECT format FROM store_info WHERE id = 1")?.format
     if (format !== STORE_DATABASE_FORMAT) {
       throw new Error(`${this.path} has format ${String(format)}; this Meridian understands only format ${STORE_DATABASE_FORMAT}`)
     }
@@ -196,6 +237,17 @@ export class StoreDatabase {
   /** Synchronous read of every matching row through the reader. */
   all<T>(sql: string, ...params: SqlValue[]): T[] {
     return this.readerStatement(sql).all(...params) as T[]
+  }
+
+  /** Run several reads against one snapshot of the database. */
+  snapshot<T>(read: () => T): T {
+    if (this.reader.inTransaction) return read()
+    this.reader.exec("BEGIN")
+    try {
+      return read()
+    } finally {
+      this.reader.exec("COMMIT")
+    }
   }
 
   private readerStatement(sql: string): SyncDatabase.Statement {
@@ -388,4 +440,46 @@ export function openStoreDatabase(dir: string, lockWaitMs: number): StoreDatabas
 /** The database already open for a directory, without opening one. */
 export function peekStoreDatabase(dir: string): StoreDatabase | undefined {
   return openDatabases.get(dir)
+}
+
+export function fileDigest(data: Buffer): string {
+  return createHash("sha256").update(data).digest("hex")
+}
+
+/**
+ * Rename a JSON store the database has taken in to
+ * `<name>.migrated-<timestamp>`, never deleting it or anything already there.
+ * Returns the new path, or undefined when the file is gone or no longer holds
+ * the contents that were imported.
+ */
+export async function retireImportedFile(path: string, digest: string): Promise<string | undefined> {
+  let current: Buffer
+  try {
+    current = await readFile(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
+    throw error
+  }
+  if (fileDigest(current) !== digest) return undefined
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-")
+  let retiredPath = `${path}.migrated-${stamp}`
+  for (let attempt = 1; pathExists(retiredPath); attempt++) retiredPath = `${path}.migrated-${stamp}-${attempt}`
+  try {
+    await rename(path, retiredPath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
+    throw error
+  }
+  await syncDirectoryDurably(dirname(path))
+  return retiredPath
+}
+
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false
+    throw error
+  }
 }

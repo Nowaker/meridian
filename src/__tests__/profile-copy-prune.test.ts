@@ -6,13 +6,14 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import { createHash, randomUUID } from "node:crypto"
-import { closeSync, fsyncSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { closeSync, fsyncSync, mkdtempSync, openSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { CrossProcessTurnCoordinator } from "../proxy/session/crossProcessTurnCoordinator"
 import {
   abandonFork,
   prepareFork,
+  readSessionGcSnapshot,
   reconcile,
   registerLiveTranscript,
   releaseSupersededProfileCopies,
@@ -263,9 +264,7 @@ describe("mass prune through the transcript lifecycle", () => {
         isConversationActive: () => false,
       }, options)
       await reconcile(pins(), options)
-      const sidecar = JSON.parse(readFileSync(join(dir, "session-gc.json"), "utf8")) as {
-        resources: Record<string, { state: string }>
-      }
+      const sidecar = readSessionGcSnapshot(dir)
       const pending = Object.values(sidecar.resources)
         .filter((resource) => ["prepared", "retired", "deleting"].includes(resource.state)).length
       maxObservedPending = Math.max(maxObservedPending, pending)

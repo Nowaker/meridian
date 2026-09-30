@@ -13,15 +13,16 @@
  */
 
 import { existsSync, readFileSync } from "node:fs"
-import { readFile, rename } from "node:fs/promises"
 import { createHash, randomUUID } from "node:crypto"
 import { homedir } from "node:os"
-import { basename, dirname, isAbsolute, join } from "node:path"
-import { syncDirectoryDurably } from "./session/durableFileSystem"
+import { basename, isAbsolute, join } from "node:path"
 import type { TokenUsage } from "./session/lineage"
 import {
+  fileDigest,
+  getStoreLockWaitMs,
   openStoreDatabase,
   peekStoreDatabase,
+  retireImportedFile,
   type StoreDatabase,
   type WriteOp,
 } from "./session/storeDatabase"
@@ -207,7 +208,6 @@ function advanceKeySlot(key: string, meta: SessionStoreMeta): void {
 const DEFAULT_MAX_STORED_SESSIONS = 10_000
 const DEFAULT_MAX_PRIORITY_ASSIGNMENTS = 5_000
 const DEFAULT_MAX_PRIORITY_ATTEMPTS = 5_000
-const DEFAULT_LOCK_WAIT_MS = 10_000
 
 export function getMaxStoredSessionsLimit(): number {
   const raw = process.env.MERIDIAN_MAX_STORED_SESSIONS ?? process.env.CLAUDE_PROXY_MAX_STORED_SESSIONS
@@ -230,15 +230,6 @@ export function getMaxPriorityAttemptsLimit(): number {
   if (!raw) return DEFAULT_MAX_PRIORITY_ATTEMPTS
   const parsed = Number.parseInt(raw, 10)
   if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MAX_PRIORITY_ATTEMPTS
-  return parsed
-}
-
-function getLockWaitMs(): number {
-  const raw = process.env.MERIDIAN_SESSION_LOCK_TIMEOUT_MS
-    ?? process.env.CLAUDE_PROXY_SESSION_LOCK_TIMEOUT_MS
-  if (!raw) return DEFAULT_LOCK_WAIT_MS
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_LOCK_WAIT_MS
   return parsed
 }
 
@@ -640,6 +631,16 @@ interface StoreCache {
 const storeCaches = new WeakMap<StoreDatabase, StoreCache>()
 // Databases whose directory has been checked for a legacy sessions.json.
 const legacyChecked = new WeakSet<StoreDatabase>()
+// The last store task queued on each database, settled. The transcript
+// lifecycle journal shares the database and its write queue; a request waits
+// only for the session store's own writes.
+const storeWriteTails = new WeakMap<StoreDatabase, Promise<void>>()
+
+function enqueueStoreTask<T>(database: StoreDatabase, task: () => Promise<T>): Promise<T> {
+  const run = database.enqueue(task)
+  storeWriteTails.set(database, run.then(() => undefined, () => undefined))
+  return run
+}
 
 interface PendingImport {
   legacyPath: string
@@ -678,7 +679,7 @@ function deletePriorityRecord(field: PriorityRecordField): string {
 
 /** The database of the current store directory, with any legacy file taken in. */
 function storeDatabase(): StoreDatabase {
-  const database = openStoreDatabase(getSessionStoreDir(), getLockWaitMs())
+  const database = openStoreDatabase(getSessionStoreDir(), getStoreLockWaitMs())
   if (!legacyChecked.has(database)) {
     checkLegacyStore(database)
     legacyChecked.add(database)
@@ -694,16 +695,6 @@ function readStoreInfo(database: StoreDatabase): StoreInfoRow {
     throw new Error(`session store ${database.path} has no valid store_info row`)
   }
   return info
-}
-
-/** Run several reads against one snapshot of the database. */
-function readConsistently<T>(database: StoreDatabase, read: () => T): T {
-  database.reader.exec("BEGIN")
-  try {
-    return read()
-  } finally {
-    database.reader.exec("COMMIT")
-  }
 }
 
 function parseSessionRow(key: string, entry: string): StoredSession {
@@ -797,7 +788,7 @@ function catchUpStore(database: StoreDatabase, cached: StoreCache, info: StoreIn
 function freshStoreCache(database: StoreDatabase): StoreCache {
   const cached = storeCaches.get(database)
   if (cached && readStoreInfo(database).seq === cached.seq) return cached
-  const fresh = readConsistently(database, () => {
+  const fresh = database.snapshot(() => {
     const info = readStoreInfo(database)
     if (cached?.seq === info.seq) return cached
     return cached && cached.seq < info.seq
@@ -863,7 +854,8 @@ export function readSessionStoreDocument(): Record<string, unknown> {
 /** Settles, never rejecting, once every store write this process has already
  *  started has landed. Writes started later are not waited for. */
 export function sessionStoreWritesSettled(): Promise<void> {
-  return peekStoreDatabase(getSessionStoreDir())?.settled() ?? Promise.resolve()
+  const database = peekStoreDatabase(getSessionStoreDir())
+  return (database && storeWriteTails.get(database)) ?? Promise.resolve()
 }
 
 function copyRecords<T extends object>(records: Record<string, T>): Record<string, T> {
@@ -968,11 +960,11 @@ interface StoreCommit {
 async function mutateStore(mutator: (document: SessionStoreDocument) => boolean): Promise<void> {
   const database = storeDatabase()
   const commitToken = randomUUID()
-  await database.enqueue(async () => {
+  await enqueueStoreTask(database, async () => {
     const pending = pendingImports.get(database)
     if (pending) await importLegacyStore(database, pending)
     const { committed, result: commit } = await database.transactNow<StoreCommit | undefined>({
-      lockWaitMs: getLockWaitMs(),
+      lockWaitMs: getStoreLockWaitMs(),
       build: () => {
         // This process holds the write lock, so the store cannot change while
         // the mutator decides: catch the cache up and draft on top of it.
@@ -993,10 +985,6 @@ async function mutateStore(mutator: (document: SessionStoreDocument) => boolean)
       storeCaches.delete(database)
     }
   })
-}
-
-function sha256(data: Buffer): string {
-  return createHash("sha256").update(data).digest("hex")
 }
 
 function storeIsEmpty(document: SessionStoreDocument): boolean {
@@ -1089,9 +1077,9 @@ function checkLegacyStore(database: StoreDatabase): void {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return
     throw error
   }
-  const digest = sha256(raw)
+  const digest = fileDigest(raw)
   if (readStoreInfo(database).imported_json_sha256 === digest) {
-    void database.enqueue(() => retireLegacyStore(legacyPath, digest))
+    void enqueueStoreTask(database, () => retireLegacyStore(legacyPath, digest))
     return
   }
   const legacy = parseStoreDocument(raw.toString("utf8"))
@@ -1103,7 +1091,7 @@ function checkLegacyStore(database: StoreDatabase): void {
     view: legacyImportDraft(freshStoreCache(database).document, legacy).draft,
   }
   pendingImports.set(database, pending)
-  void database.enqueue(() => importLegacyStore(database, pending)).catch((error: unknown) => {
+  void enqueueStoreTask(database, () => importLegacyStore(database, pending)).catch((error: unknown) => {
     console.error(
       `[sessionStore] importing ${LEGACY_STORE_NAME} failed; it stays the store until the next write retries:`,
       (error as Error).message,
@@ -1115,7 +1103,7 @@ function checkLegacyStore(database: StoreDatabase): void {
 async function importLegacyStore(database: StoreDatabase, pending: PendingImport): Promise<void> {
   if (pendingImports.get(database) !== pending) return
   const { committed, result: taken } = await database.transactNow<LegacyImport | undefined>({
-    lockWaitMs: getLockWaitMs(),
+    lockWaitMs: getStoreLockWaitMs(),
     build: () => {
       // Another process may have imported the same file while this one waited.
       if (readStoreInfo(database).imported_json_sha256 === pending.digest) return { ops: [], result: undefined }
@@ -1144,28 +1132,15 @@ async function importLegacyStore(database: StoreDatabase, pending: PendingImport
 }
 
 /** Rename an imported sessions.json aside, never deleting it. The import it
- *  was taken in by is a synced commit, so the file is no longer needed. */
+ *  was taken in by is a synced commit, so the file is no longer needed. A file
+ *  rewritten since, by a process still on an older version, stays for the next
+ *  start to take in. */
 async function retireLegacyStore(legacyPath: string, digest: string): Promise<void> {
   try {
-    let current: Buffer
-    try {
-      current = await readFile(legacyPath)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return
-      throw error
+    const retiredPath = await retireImportedFile(legacyPath, digest)
+    if (retiredPath) {
+      console.error(`[sessionStore] ${LEGACY_STORE_NAME} is in the database now; the file is kept as ${basename(retiredPath)}`)
     }
-    // Rewritten since the import, by a process still on an older version: the
-    // next start takes it in again.
-    if (sha256(current) !== digest) return
-    const retiredPath = `${legacyPath}.migrated-${new Date().toISOString().replace(/[:.]/g, "-")}`
-    try {
-      await rename(legacyPath, retiredPath)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return
-      throw error
-    }
-    await syncDirectoryDurably(dirname(legacyPath))
-    console.error(`[sessionStore] ${LEGACY_STORE_NAME} is in the database now; the file is kept as ${basename(retiredPath)}`)
   } catch (error) {
     console.error(`[sessionStore] renaming the imported ${LEGACY_STORE_NAME} aside failed; it is retried on the next start:`, (error as Error).message)
   }
