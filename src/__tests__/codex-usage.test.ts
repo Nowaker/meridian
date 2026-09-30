@@ -384,6 +384,21 @@ describe("fetchCodexAccountUsage — reset credits", () => {
   })
 })
 
+describe("fetchCodexAccountUsage — purchased credits", () => {
+  test("reads the balance the vendor states as a decimal string", async () => {
+    const read = async (credits: unknown) =>
+      (await fetchCodexAccountUsage(credentials(), { fetchImpl: usageOnly(usagePayload({ credits })).impl })).usage?.credits
+    expect(await read({ has_credits: false, unlimited: false, overage_limit_reached: false, balance: "0" }))
+      .toEqual({ hasCredits: false, unlimited: false, overageLimitReached: false, balance: 0 })
+    expect(await read({ has_credits: true, unlimited: false, overage_limit_reached: true, balance: "14.5" }))
+      .toEqual({ hasCredits: true, unlimited: false, overageLimitReached: true, balance: 14.5 })
+    expect(await read({ has_credits: true, balance: "0E-10" })).toMatchObject({ balance: 0 })
+    expect(await read({ has_credits: true, balance: "lots" })).toMatchObject({ hasCredits: true, balance: null })
+    expect(await read(null)).toBeNull()
+    expect(await read(undefined)).toBeNull()
+  })
+})
+
 describe("fetchCodexWorkspaceNames", () => {
   const answering = (body: unknown, status = 200) => recordingFetch(() => jsonResponse(body, status))
 

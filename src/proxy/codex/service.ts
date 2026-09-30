@@ -28,7 +28,7 @@ import { codexAccountIdentity, readCodexPool, type CodexPoolAccount, type CodexP
 import { describeCodexPlan } from "./plan"
 import { decodeCodexToken, type CodexTokenClaims } from "./token"
 import { fetchCodexAccountUsage, fetchCodexWorkspaceNames, type CodexAccountUsage, type CodexUsageOutcome } from "./usage"
-import type { CodexPlan, CodexUsageEntry, CodexUsageError, CodexUsageResponse } from "./types"
+import type { CodexPlan, CodexUsageEntry, CodexUsageError, CodexUsageFailure, CodexUsageResponse } from "./types"
 
 const SUCCESS_TTL_MS = 30_000
 const STALE_MAX_MS = 15 * 60_000
@@ -52,6 +52,7 @@ interface CachedUsage {
 const lastGood = new Map<string, CachedUsage>()
 const inFlight = new Map<string, Promise<CodexUsageOutcome>>()
 const heldOffUntil = new Map<string, { until: number; error: CodexUsageError }>()
+const failureRuns = new Map<string, CodexUsageFailure>()
 const workspaceNames = new Map<string, { name: string | null; until: number }>()
 const workspaceLookups = new Map<string, Promise<void>>()
 
@@ -59,6 +60,7 @@ export function resetCodexUsageCache(): void {
   lastGood.clear()
   inFlight.clear()
   heldOffUntil.clear()
+  failureRuns.clear()
   workspaceNames.clear()
   workspaceLookups.clear()
 }
@@ -141,7 +143,7 @@ async function resolveAccount(
   const cached = lastGood.get(key)
 
   if (cached && now - cached.fetchedAt < SUCCESS_TTL_MS) {
-    return toEntry(account, claims, cached.usage, false, null)
+    return toEntry(account, claims, cached.usage, false, null, null)
   }
 
   let outcome: CodexUsageOutcome
@@ -157,15 +159,16 @@ async function resolveAccount(
     lastGood.set(key, { usage: outcome.usage, fetchedAt: outcome.usage.fetchedAt })
     // Only once a usage read has shown this token good for this account.
     await learnWorkspaceName(account, now, fetchImpl)
-    return toEntry(account, claims, outcome.usage, false, null)
+    return toEntry(account, claims, outcome.usage, false, null, null)
   }
 
+  const failure = failureRuns.get(key) ?? null
   // Old numbers are worth showing through a blip, but never through a
   // credential the vendor has just refused or that does not match the account.
   if (outcome.error && isTransient(outcome.error) && cached && now - cached.fetchedAt < STALE_MAX_MS) {
-    return toEntry(account, claims, cached.usage, true, outcome.error)
+    return toEntry(account, claims, cached.usage, true, outcome.error, failure)
   }
-  return toEntry(account, claims, null, false, outcome.error)
+  return toEntry(account, claims, null, false, outcome.error, failure)
 }
 
 async function obtainUsage(
@@ -195,6 +198,10 @@ async function obtainUsage(
     if (outcome.error) {
       const cooldown = cooldownFor(outcome.error)
       if (cooldown !== null) heldOffUntil.set(key, { until: now + cooldown, error: outcome.error })
+      const run = failureRuns.get(key)
+      failureRuns.set(key, { reason: outcome.error, consecutiveFailures: (run?.consecutiveFailures ?? 0) + 1, lastFailureAt: now })
+    } else {
+      failureRuns.delete(key)
     }
     return outcome
   }).finally(() => {
@@ -271,6 +278,7 @@ function toEntry(
   usage: CodexAccountUsage | null,
   stale: boolean,
   error: CodexUsageError | null,
+  failure: CodexUsageFailure | null,
 ): CodexUsageEntry {
   return {
     id: account.accountUserId ?? account.accountId ?? account.email ?? "unknown",
@@ -283,9 +291,11 @@ function toEntry(
     workspaceName: workspaceNameOf(account),
     windows: usage?.windows ?? [],
     resetCredits: usage?.resetCredits ?? null,
+    credits: usage?.credits ?? null,
     fetchedAt: usage?.fetchedAt ?? null,
     stale,
     error,
+    failure,
   }
 }
 

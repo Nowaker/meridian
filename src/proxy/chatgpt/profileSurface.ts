@@ -221,9 +221,8 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           owner,
           removal: chatGptRemovalRefusal(profile, owner),
           // A usage read succeeding is chatgpt.com accepting the token, the
-          // same evidence Claude's "Last Verified" rests on. A reading served
-          // from cache was last checked when it was read, not now.
-          lastCheckedAt: reading ? (reading.error ? usage?.asOf ?? null : reading.fetchedAt) : null,
+          // same evidence Claude's "Last Verified" rests on.
+          lastCheckedAt: reading?.failure?.lastFailureAt ?? reading?.fetchedAt ?? null,
           lastSuccessAt: reading?.fetchedAt ?? null,
           authProvenance: "live" as const,
           credentialDir: null,
@@ -239,6 +238,11 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
       return list.map(profile => {
         const usage = usageById.get(profile.seat)
         const reading = seatWindows({ usage, observed: observed.get(profile.seat) })
+        // A failed usage check explains the figures only if it came after
+        // them: a response's headers may have given newer ones since.
+        const failure = usage?.failure && (reading.fetchedAt === null || usage.failure.lastFailureAt > reading.fetchedAt)
+          ? usage.failure
+          : null
         return {
           id: profile.id,
           isActive: profile.id === activeId,
@@ -248,10 +252,11 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           windowsReported: reading.windowsReported,
           windowSource: reading.source,
           extraUsage: null,
+          credits: usage?.credits ?? null,
           fetchedAt: reading.fetchedAt,
           stale: reading.stale,
           error: chatGptQuotaError(profile.unavailable, usage?.error, reading.windows.length > 0),
-          failure: null,
+          failure,
           spent: deps.spent(profile.id) ?? null,
         }
       })

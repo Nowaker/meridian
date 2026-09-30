@@ -14,7 +14,7 @@ interface Fact { label: string; value: string; tone: string }
 interface AccessHelp { pill: string; reason: string; summary: string }
 
 const evaluated = new Function(
-  profileFactsJs + "\nreturn { profileFacts, timeAgo, formatResets, profileAccessHelp, chatGptUsageGap, refusalSubject };",
+  profileFactsJs + "\nreturn { profileFacts, timeAgo, formatResets, profileAccessHelp, chatGptUsageGap, refusalSubject, codexCreditsView };",
 )() as {
   profileFacts: (p: Record<string, unknown>) => Fact[]
   timeAgo: (ts: number | null | undefined) => string
@@ -22,9 +22,10 @@ const evaluated = new Function(
   profileAccessHelp: (p: Record<string, unknown>) => AccessHelp
   chatGptUsageGap: (error: string | null | undefined) => string
   refusalSubject: (p: Record<string, unknown> | undefined) => { vendor: string; noun: string }
+  codexCreditsView: (credits: unknown) => { value: string; note: string; status: string } | null
 }
 
-const { profileFacts, timeAgo, formatResets, profileAccessHelp, chatGptUsageGap, refusalSubject } = evaluated
+const { profileFacts, timeAgo, formatResets, profileAccessHelp, chatGptUsageGap, refusalSubject, codexCreditsView } = evaluated
 
 function labels(p: Record<string, unknown>): string[] {
   return profileFacts(p).map(f => f.label)
@@ -182,6 +183,18 @@ describe("a ChatGPT seat's card", () => {
     expect(refused.summary).toContain("opencode auth login → OpenAI → Codex OAuth (ChatGPT Plus/Pro) → oferty@nowaker.net · id:c487c4 → Refresh account")
     for (const help of [expired, refused]) expect(help.summary).not.toContain("meridian profile login")
     expect(profileAccessHelp({ id: "work" })).toMatchObject({ pill: "needs login", summary: "Cannot serve requests — run: meridian profile login work" })
+  })
+
+  test("states purchased Codex credits where a Claude card states extra usage, and nothing without them", () => {
+    const credits = (extra: Record<string, unknown>) => ({ hasCredits: false, unlimited: false, overageLimitReached: false, balance: null, ...extra })
+    expect(codexCreditsView(credits({ hasCredits: true, balance: 1234.5 })))
+      .toEqual({ value: "1,234.5 credits", note: "used once the plan’s limits run out", status: "ok" })
+    expect(codexCreditsView(credits({ unlimited: true }))?.value).toBe("unlimited")
+    expect(codexCreditsView(credits({ hasCredits: true }))?.value).toBe("available")
+    expect(codexCreditsView(credits({ hasCredits: true, balance: 3, overageLimitReached: true })))
+      .toMatchObject({ note: "overage limit reached", status: "high" })
+    expect(codexCreditsView(credits({ balance: 0 }))).toBeNull()
+    expect(codexCreditsView(null)).toBeNull()
   })
 
   test("explains a missing reading and names who is refusing", () => {

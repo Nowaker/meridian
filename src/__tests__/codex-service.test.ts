@@ -345,7 +345,8 @@ describe("codex usage service", () => {
     const { impl } = stubFetch((url, headers) =>
       failing ? { status: 503 } : serveAll([account])(url, headers))
 
-    await getCodexUsage({ settings: {}, loadPool: pool([account]), fetchImpl: impl, now: NOW })
+    const first = await getCodexUsage({ settings: {}, loadPool: pool([account]), fetchImpl: impl, now: NOW })
+    expect(first.entries[0]?.failure).toBeNull()
     failing = true
     const second = await getCodexUsage({
       settings: {}, loadPool: pool([account]), fetchImpl: impl, now: NOW + 60_000,
@@ -355,6 +356,15 @@ describe("codex usage service", () => {
     expect(second.entries[0]?.error).toBe("upstream_error")
     expect(second.entries[0]?.windows).toHaveLength(1)
     expect(second.entries[0]?.fetchedAt).toBe(NOW)
+    // The run behind the stale figures, as a Claude card reports its own.
+    expect(second.entries[0]?.failure).toEqual({ reason: "upstream_error", consecutiveFailures: 1, lastFailureAt: NOW + 60_000 })
+
+    failing = false
+    const recovered = await getCodexUsage({
+      settings: {}, loadPool: pool([account]), fetchImpl: impl, now: NOW + 120_000,
+    })
+    expect(recovered.entries[0]?.failure).toBeNull()
+    expect(recovered.entries[0]?.stale).toBe(false)
   })
 
   test("withholds stale usage when the credential itself is refused", async () => {
@@ -383,18 +393,22 @@ describe("codex usage service", () => {
       settings: {}, loadPool: pool([account]), fetchImpl: impl, now: NOW,
     })
     expect(first.entries[0]?.error).toBe("rate_limited")
+    expect(first.entries[0]?.failure).toEqual({ reason: "rate_limited", consecutiveFailures: 1, lastFailureAt: NOW })
     expect(calls).toHaveLength(1)
 
     const during = await getCodexUsage({
       settings: {}, loadPool: pool([account]), fetchImpl: impl, now: NOW + 35_000,
     })
     expect(during.entries[0]?.error).toBe("rate_limited")
+    // A poll the cooldown turned away is not a check that failed.
+    expect(during.entries[0]?.failure?.consecutiveFailures).toBe(1)
     expect(calls).toHaveLength(1)
 
-    await getCodexUsage({
+    const after = await getCodexUsage({
       settings: {}, loadPool: pool([account]), fetchImpl: impl, now: NOW + 61_000,
     })
     expect(calls).toHaveLength(2)
+    expect(after.entries[0]?.failure).toEqual({ reason: "rate_limited", consecutiveFailures: 2, lastFailureAt: NOW + 61_000 })
   })
 
   test("names each workspace once, for every seat in it, and asks again only when due", async () => {

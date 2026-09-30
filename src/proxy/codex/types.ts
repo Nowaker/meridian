@@ -110,6 +110,31 @@ export interface CodexResetCredits {
   error: CodexRemoteError | null
 }
 
+/**
+ * Purchased Codex credits: what keeps a seat serving once its plan's windows
+ * are spent - ChatGPT's counterpart of a Claude account's extra usage. The
+ * vendor states the balance as a decimal string, in credits, not currency.
+ */
+export interface CodexCredits {
+  hasCredits: boolean
+  unlimited: boolean
+  overageLimitReached: boolean
+  /** Null when the payload stated no readable balance. */
+  balance: number | null
+}
+
+/**
+ * The run of failed usage checks since the last successful one, in the shape
+ * of Claude's `OAuthUsageFailure`. Only checks that ran count - not polls a
+ * cooldown turned away before they reached the token or upstream.
+ */
+export interface CodexUsageFailure {
+  reason: CodexUsageError
+  /** Always >= 1: a success clears the record rather than zeroing it. */
+  consecutiveFailures: number
+  lastFailureAt: number
+}
+
 export interface CodexUsageEntry {
   /** `accountUserId` — never `accountId`, which is not unique across accounts. */
   id: string
@@ -125,11 +150,14 @@ export interface CodexUsageEntry {
   workspaceName: string | null
   windows: CodexUsageWindow[]
   resetCredits: CodexResetCredits | null
+  credits: CodexCredits | null
   /** Epoch milliseconds when the displayed usage was accepted, or null. */
   fetchedAt: number | null
   /** True when `windows` came from cache after a transient failure. */
   stale: boolean
   error: CodexUsageError | null
+  /** The failing run in progress, or null when the last check succeeded. */
+  failure: CodexUsageFailure | null
 }
 
 export interface CodexUsageResponse {

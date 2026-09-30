@@ -787,6 +787,11 @@ function describeFailedRun(failure) {
   if (!failure) return '';
   var why = failure.reason === 'rate_limited' ? 'rate limited upstream'
     : failure.reason === 'no_token' ? 'no credentials readable'
+    : failure.reason === 'token_expired' ? 'access token expired'
+    : failure.reason === 'unauthorized' ? 'access token refused'
+    : failure.reason === 'invalid_token' ? 'access token unreadable'
+    : failure.reason === 'identity_mismatch' ? 'token filed under another account'
+    : failure.reason === 'invalid_response' ? 'unreadable answer from the usage endpoint'
     : 'usage endpoint unavailable';
   var n = Math.floor(Number(failure.consecutiveFailures));
   if (!isFinite(n) || n < 1) n = 1;
@@ -848,12 +853,13 @@ function renderUsageSection(profileQuota, p) {
   var failedRun = describeFailedRun(profileQuota.failure);
   var usageTag = cachedTag(profileQuota.stale ? 'cached' : 'live');
   var chatgpt = isChatGptProfile(p);
+  var credits = chatgpt ? codexCreditsView(profileQuota.credits) : null;
 
   // No figures at all means this profile has never been read successfully —
   // the route serves the last good reading at any age, so an empty windows
   // array is no longer "the stale window lapsed". Saying so keeps it distinct
   // from a profile genuinely sitting at 0%.
-  if (windows.length === 0 && !extra) {
+  if (windows.length === 0 && !extra && !credits) {
     if (chatgpt) {
       var gap = chatGptUsageGap(profileQuota.error);
       return gap
@@ -922,6 +928,17 @@ function renderUsageSection(profileQuota, p) {
       +   '<div class="usage-bar"><div class="usage-fill" style="width:' + extra.utilizationPct + '%"></div></div>'
       +   '<div class="usage-extra-row" style="margin-top:4px">'
       +     '<span class="usage-reset">' + esc(extra.used) + ' / ' + esc(extra.limit) + '</span>'
+      +   '</div>'
+      + '</div>';
+  } else if (credits) {
+    // A balance has no limit to be a percentage of, so this block has no bar.
+    extraBlock = '<div class="usage-extra status-' + esc(credits.status) + '">'
+      +   '<div class="usage-extra-row">'
+      +     '<span class="usage-label">Codex credits</span>'
+      +     '<span class="usage-pct">' + esc(credits.value) + usageTag + '</span>'
+      +   '</div>'
+      +   '<div class="usage-extra-row" style="margin-top:4px">'
+      +     '<span class="usage-reset">' + esc(credits.note) + '</span>'
       +   '</div>'
       + '</div>';
   }

@@ -21,6 +21,7 @@ import { release } from "node:os"
 import { decodeCodexToken, isCodexTokenExpired, type CodexTokenClaims } from "./token"
 import { codexWindowLabel } from "./windows"
 import type {
+  CodexCredits,
   CodexRemoteError,
   CodexResetCredit,
   CodexResetCredits,
@@ -62,6 +63,7 @@ export interface CodexAccountUsage {
   planType: string | null
   email: string | null
   resetCredits: CodexResetCredits | null
+  credits: CodexCredits | null
   fetchedAt: number
 }
 
@@ -118,9 +120,23 @@ export async function fetchCodexAccountUsage(
       planType: stringOrNull(body.plan_type),
       email: stringOrNull(body.email) ?? credentials.email,
       resetCredits,
+      credits: normalizeCredits(body.credits),
       fetchedAt: now,
     },
     error: null,
+  }
+}
+
+function normalizeCredits(value: unknown): CodexCredits | null {
+  const raw = asRecord(value)
+  if (!raw) return null
+  const stated = typeof raw.balance === "string" ? raw.balance.trim() : typeof raw.balance === "number" ? String(raw.balance) : ""
+  const balance = stated === "" ? Number.NaN : Number(stated)
+  return {
+    hasCredits: raw.has_credits === true,
+    unlimited: raw.unlimited === true,
+    overageLimitReached: raw.overage_limit_reached === true,
+    balance: Number.isFinite(balance) ? balance : null,
   }
 }
 

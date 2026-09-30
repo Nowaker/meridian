@@ -87,7 +87,7 @@ describe("windows", () => {
 
   it("reports a weekly-only seat as having no five_hour window, from the reading", () => {
     const usage: CodexUsageEntry = {
-      id: "s", type: "codex", identity: "x", email: null, plan: null, workspaceName: null, resetCredits: null, stale: false, error: null, fetchedAt: NOW,
+      id: "s", type: "codex", identity: "x", email: null, plan: null, workspaceName: null, resetCredits: null, credits: null, stale: false, error: null, failure: null, fetchedAt: NOW,
       windows: [{ type: "7d", utilization: 0.67, resetsAt: NOW + 86_400_000, limitWindowSeconds: 604_800 }],
     }
     const reading = seatWindows({ usage })
@@ -102,7 +102,7 @@ describe("windows", () => {
 
   it("prefers the newer header reading, anchoring reset_after at the observation", () => {
     const usage: CodexUsageEntry = {
-      id: "s", type: "codex", identity: "x", email: null, plan: null, workspaceName: null, resetCredits: null, stale: false, error: null, fetchedAt: NOW - 60_000,
+      id: "s", type: "codex", identity: "x", email: null, plan: null, workspaceName: null, resetCredits: null, credits: null, stale: false, error: null, failure: null, fetchedAt: NOW - 60_000,
       windows: [{ type: "7d", utilization: 0.1, resetsAt: NOW + 1_000, limitWindowSeconds: 604_800 }],
     }
     const observed = { at: NOW, rateLimit: {
@@ -295,7 +295,7 @@ describe("list entries", () => {
     seat("user-c__ws-cccccc", "c@x.test", { storeIndex: 3 }),
   ]
   const entry = (id: string, extra: Partial<CodexUsageEntry>): CodexUsageEntry => ({
-    id, type: "codex", identity: id, email: null, plan: null, workspaceName: null, windows: [], resetCredits: null, fetchedAt: null, stale: false, error: null, ...extra,
+    id, type: "codex", identity: id, email: null, plan: null, workspaceName: null, windows: [], resetCredits: null, credits: null, fetchedAt: null, stale: false, error: null, failure: null, ...extra,
   })
   const usage = {
     asOf: NOW,
@@ -306,7 +306,7 @@ describe("list entries", () => {
         workspaceName: "Acme Workspace",
         resetCredits: { availableCount: 1, applicableAvailableCount: 0, listedCount: 1, credits: [{ status: "available", expiresAt: NOW + 13 * 86_400_000 }], error: null },
       }),
-      entry("user-b__ws-bbbbbb", { error: "token_expired" }),
+      entry("user-b__ws-bbbbbb", { error: "token_expired", failure: { reason: "token_expired", consecutiveFailures: 3, lastFailureAt: NOW - 5_000 } }),
       entry("user-c__ws-cccccc", { error: "unauthorized" }),
     ],
   }
@@ -327,12 +327,43 @@ describe("list entries", () => {
     })
     expect(a!.removal).toContain("account 1")
     // An expired token behind a quota mark cannot serve, and says so.
-    expect(b).toMatchObject({ loggedIn: false, tokenState: "expired", unavailable: "quota_exhausted", resets: null, organizationName: null, lastSuccessAt: null, lastCheckedAt: NOW })
+    expect(b).toMatchObject({ loggedIn: false, tokenState: "expired", unavailable: "quota_exhausted", resets: null, organizationName: null, lastSuccessAt: null, lastCheckedAt: NOW - 5_000 })
     expect(c).toMatchObject({ loggedIn: false, tokenState: "refused", resets: null })
     expect(b).not.toHaveProperty("aliases")
   })
 
   it("never carries a credential", () => {
     expect(JSON.stringify(surface.listEntries())).not.toMatch(/accessToken|refreshToken|Bearer/)
+  })
+})
+
+describe("quota entries", () => {
+  const seats = [seat("user-a__ws-aaaaaa", "a@x.test", { active: true }), seat("user-b__ws-bbbbbb", "b@x.test")]
+  const credits = { hasCredits: true, unlimited: false, overageLimitReached: false, balance: 12.5 }
+  const failure = { reason: "upstream_error" as const, consecutiveFailures: 2, lastFailureAt: NOW }
+  const entry = (id: string, extra: Partial<CodexUsageEntry>): CodexUsageEntry => ({
+    id, type: "codex", identity: id, email: null, plan: null, workspaceName: null, resetCredits: null, credits: null,
+    stale: false, error: null, failure: null, fetchedAt: NOW - 120_000,
+    windows: [{ type: "7d", utilization: 0.4, resetsAt: NOW + 86_400_000, limitWindowSeconds: 604_800 }], ...extra,
+  })
+  const quota = (observed: ReadonlyMap<string, { at: number; rateLimit: Record<string, unknown> }>) => createChatGptProfileSurface({
+    source: { mode: "follow-external", seats: () => seats } as unknown as ChatGptCredentialSource,
+    observed: () => observed as never,
+    usage: () => ({ asOf: NOW, error: null, entries: [
+      entry("user-a__ws-aaaaaa", { credits, failure, stale: true, error: "upstream_error" }),
+      entry("user-b__ws-bbbbbb", {}),
+    ] }),
+    reserved: () => new Set(), names: () => undefined, activeSeat: () => undefined, excluded: () => [], spent: () => undefined,
+  }).quotaEntries()
+
+  it("carries the seat's purchased credits, and the failing run behind stale figures", () => {
+    const [a, b] = quota(new Map())
+    expect(a).toMatchObject({ credits, failure, stale: true, fetchedAt: NOW - 120_000, windowSource: "usage" })
+    expect(b).toMatchObject({ credits: null, failure: null })
+  })
+
+  it("drops a failed usage check once a response's headers gave newer figures", () => {
+    const [a] = quota(new Map([["user-a__ws-aaaaaa", { at: NOW + 1_000, rateLimit: { primary_window: { used_percent: 45, limit_window_seconds: 604_800, reset_at: (NOW + 86_400_000) / 1000 } } }]]))
+    expect(a).toMatchObject({ windowSource: "headers", failure: null, credits })
   })
 })

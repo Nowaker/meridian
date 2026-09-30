@@ -181,6 +181,24 @@ function chatGptUsageGap(error) {
   return (error && CHATGPT_USAGE_GAP[error]) || '';
 }
 
+// A seat's purchased Codex credits, for the slot where a Claude account's
+// extra usage goes: both keep an account serving once its plan's windows are
+// spent. Null - no block - for a seat that holds none, as a Claude account
+// with extra usage off shows none.
+function codexCreditsView(credits) {
+  if (!credits) return null;
+  var value = credits.unlimited ? 'unlimited'
+    : typeof credits.balance === 'number' && credits.balance > 0
+      ? credits.balance.toLocaleString('en-US', { maximumFractionDigits: 2 }) + ' credits'
+      : credits.hasCredits ? 'available' : null;
+  if (value === null) return null;
+  return {
+    value: value,
+    note: credits.overageLimitReached ? 'overage limit reached' : 'used once the plan\\u2019s limits run out',
+    status: credits.overageLimitReached ? 'high' : 'ok'
+  };
+}
+
 // Which vendor is refusing a profile, and what the page calls it.
 function refusalSubject(p) {
   return isChatGptProfile(p) ? { vendor: 'ChatGPT', noun: 'seat' } : { vendor: 'Anthropic', noun: 'account' };
