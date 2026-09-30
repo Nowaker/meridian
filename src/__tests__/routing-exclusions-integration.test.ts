@@ -115,9 +115,9 @@ async function responseErrorType(response: Response): Promise<string | undefined
   return typeof error.type === "string" ? error.type : undefined
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   queryCalls = []
-  clearSessionCache()
+  await clearSessionCache()
   resetActiveProfile()
   resetFollowActive()
   setSetting("routingExcludedProfiles", [])
