@@ -204,7 +204,9 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           ...(profile.aliases.length > 0 ? { aliases: profile.aliases } : {}),
           email: profile.email,
           subscriptionType: profile.subscriptionType,
-          organizationName: null,
+          // The seat's Business workspace is its organization, as a Claude
+          // Team account's is.
+          organizationName: reading?.workspaceName ?? null,
           rateLimitTier: null,
           seatTier: null,
           allowance: profile.allowance,

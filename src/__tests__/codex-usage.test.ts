@@ -13,7 +13,7 @@
  * those two directly would reject every legitimate account.
  */
 import { describe, test, expect } from "bun:test"
-import { fetchCodexAccountUsage } from "../proxy/codex/usage"
+import { fetchCodexAccountUsage, fetchCodexWorkspaceNames } from "../proxy/codex/usage"
 
 const ACCOUNT_ID = "aaaaaaaa-1111-4111-8111-aaaaaaa1b2c3"
 const USER_ID = "user-ABC"
@@ -381,5 +381,58 @@ describe("fetchCodexAccountUsage — reset credits", () => {
     await fetchCodexAccountUsage(credentials(), { fetchImpl: impl })
 
     expect(calls.filter((c) => c.url.includes("rate-limit-reset-credits"))).toHaveLength(0)
+  })
+})
+
+describe("fetchCodexWorkspaceNames", () => {
+  const answering = (body: unknown, status = 200) => recordingFetch(() => jsonResponse(body, status))
+
+  test("names the Business workspaces the token's user belongs to, by workspace id", async () => {
+    const { impl, calls } = answering({
+      accounts: [
+        { id: ACCOUNT_ID, structure: "workspace", name: "  Acme\u202e\u0007  Corp  " },
+        { id: "personal-1", structure: "personal", name: "Me" },
+        { id: "workspace-2", name: "Beta" },
+        { id: 7, structure: "workspace", name: "No id" },
+        { id: "workspace-3", structure: "workspace", name: " \u200b " },
+      ],
+    })
+
+    const names = await fetchCodexWorkspaceNames(credentials(), { fetchImpl: impl })
+
+    expect(names).toEqual(new Map([[ACCOUNT_ID, "Acme Corp"], ["workspace-2", "Beta"]]))
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.url).toBe("https://chatgpt.com/backend-api/wham/accounts/check")
+    expect(calls[0]!.init?.method).toBe("GET")
+    expect(calls[0]!.init?.redirect).toBe("error")
+    const headers = calls[0]!.init?.headers as Record<string, string>
+    expect(headers.Authorization).toBe(`Bearer ${credentials().accessToken}`)
+    expect(headers["ChatGPT-Account-ID"]).toBe(ACCOUNT_ID)
+    expect(headers.originator).toBe("codex_cli_rs")
+  })
+
+  test("bounds a long name", async () => {
+    const { impl } = answering({ accounts: [{ id: ACCOUNT_ID, structure: "workspace", name: "x".repeat(200) }] })
+    const name = (await fetchCodexWorkspaceNames(credentials(), { fetchImpl: impl }))?.get(ACCOUNT_ID) ?? ""
+    expect([...name]).toHaveLength(64)
+    expect(name.endsWith("\u2026")).toBe(true)
+  })
+
+  test("sends nothing without a usable token, and reports a failed or unreadable answer as unknown", async () => {
+    const expired = recordingFetch(() => jsonResponse({ accounts: [] }))
+    const past = Math.floor(Date.now() / 1000) - 60
+    const header = Buffer.from(JSON.stringify({ alg: "RS256" })).toString("base64url")
+    const body = Buffer.from(JSON.stringify({
+      exp: past,
+      [AUTH_NAMESPACE]: { chatgpt_account_id: ACCOUNT_ID, chatgpt_account_user_id: ACCOUNT_USER_ID, chatgpt_user_id: USER_ID },
+    })).toString("base64url")
+    expect(await fetchCodexWorkspaceNames(credentials({ accessToken: `${header}.${body}.sig` }), { fetchImpl: expired.impl })).toBeNull()
+    expect(await fetchCodexWorkspaceNames(credentials({ accessToken: null }), { fetchImpl: expired.impl })).toBeNull()
+    expect(expired.calls).toHaveLength(0)
+
+    expect(await fetchCodexWorkspaceNames(credentials(), { fetchImpl: answering({ detail: "boom" }, 500).impl })).toBeNull()
+    expect(await fetchCodexWorkspaceNames(credentials(), { fetchImpl: answering({ unexpected: true }).impl })).toBeNull()
+    // A user in no workspace is a known answer, not an unknown one.
+    expect(await fetchCodexWorkspaceNames(credentials(), { fetchImpl: answering({ accounts: [] }).impl })).toEqual(new Map())
   })
 })

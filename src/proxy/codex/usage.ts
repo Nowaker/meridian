@@ -18,7 +18,7 @@
  */
 
 import { release } from "node:os"
-import { decodeCodexToken, isCodexTokenExpired } from "./token"
+import { decodeCodexToken, isCodexTokenExpired, type CodexTokenClaims } from "./token"
 import { codexWindowLabel } from "./windows"
 import type {
   CodexRemoteError,
@@ -32,7 +32,9 @@ import type {
 const CHATGPT_ORIGIN = "https://chatgpt.com"
 const USAGE_URL = `${CHATGPT_ORIGIN}/backend-api/wham/usage`
 const RESET_CREDITS_URL = `${CHATGPT_ORIGIN}/backend-api/wham/rate-limit-reset-credits`
+const WORKSPACES_URL = `${CHATGPT_ORIGIN}/backend-api/wham/accounts/check`
 const DEFAULT_TIMEOUT_MS = 10_000
+const WORKSPACE_NAME_MAX_CHARS = 64
 
 /**
  * The client identity oc-codex-multi-auth's `createCodexHeaders` sends to
@@ -82,22 +84,9 @@ export async function fetchCodexAccountUsage(
   const now = options.now ?? Date.now()
   const doFetch = options.fetchImpl ?? fetch
 
-  const token = credentials.accessToken
-  if (!token) return { usage: null, error: "no_token" }
-
-  const claims = decodeCodexToken(token)
-  if (!claims) return { usage: null, error: "invalid_token" }
-  if (isCodexTokenExpired(claims.expiresAt, now)) return { usage: null, error: "token_expired" }
-
-  // Refuse before the credential leaves the process: if the token is filed
-  // under a different account than the pool record claims, no request should
-  // be made at all.
-  if (disagrees(credentials.accountUserId, claims.accountUserId)) {
-    return { usage: null, error: "identity_mismatch" }
-  }
-  if (disagrees(credentials.accountId, claims.accountId)) {
-    return { usage: null, error: "identity_mismatch" }
-  }
+  const usable = usableToken(credentials, now)
+  if ("error" in usable) return { usage: null, error: usable.error }
+  const { token, claims } = usable
 
   const usageResult = await getJson(doFetch, USAGE_URL, token, credentials.accountId, options.timeoutMs)
   if (usageResult.error) return { usage: null, error: usageResult.error }
@@ -133,6 +122,71 @@ export async function fetchCodexAccountUsage(
     },
     error: null,
   }
+}
+
+/**
+ * Names of the ChatGPT Business workspaces the token's user belongs to, keyed
+ * by workspace (account) id: the `GET /wham/accounts/check` that
+ * oc-codex-multi-auth's `fetchCodexWorkspaceNames` reads for its own
+ * "Business account" line. One answer covers every workspace the user is a
+ * member of; a personal account carries no name and is left out. Null when the
+ * token may not be sent or the read failed, which is not the same as "no
+ * workspace".
+ *
+ * The name is chosen by the workspace owner, so control, bidi and zero-width
+ * characters are dropped and the length is bounded before it reaches a page.
+ */
+export async function fetchCodexWorkspaceNames(
+  credentials: CodexCredentials,
+  options: FetchCodexUsageOptions = {},
+): Promise<Map<string, string> | null> {
+  const usable = usableToken(credentials, options.now ?? Date.now())
+  if ("error" in usable) return null
+  const result = await getJson(options.fetchImpl ?? fetch, WORKSPACES_URL, usable.token, credentials.accountId, options.timeoutMs)
+  if (result.error) return null
+  const accounts = asRecord(result.body)?.accounts
+  if (!Array.isArray(accounts)) return null
+
+  const names = new Map<string, string>()
+  for (const entry of accounts) {
+    const account = asRecord(entry)
+    const id = stringOrNull(account?.id)
+    const name = workspaceDisplayName(account?.name)
+    if (!id || !name) continue
+    if (account?.structure !== undefined && account.structure !== "workspace") continue
+    names.set(id, name)
+  }
+  return names
+}
+
+function workspaceDisplayName(value: unknown): string | null {
+  if (typeof value !== "string") return null
+  const cleaned = value
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+  if (!cleaned) return null
+  const chars = [...cleaned]
+  return chars.length > WORKSPACE_NAME_MAX_CHARS ? `${chars.slice(0, WORKSPACE_NAME_MAX_CHARS - 1).join("")}\u2026` : cleaned
+}
+
+type UsableToken = { token: string; claims: CodexTokenClaims } | { error: CodexUsageError }
+
+/**
+ * The access token, when it may be sent at all: present, decodable, not
+ * expired, and filed under the account it claims. Checked before the
+ * credential leaves the process - if the token belongs to a different account
+ * than the pool record says, no request is made.
+ */
+function usableToken(credentials: CodexCredentials, now: number): UsableToken {
+  const token = credentials.accessToken
+  if (!token) return { error: "no_token" }
+  const claims = decodeCodexToken(token)
+  if (!claims) return { error: "invalid_token" }
+  if (isCodexTokenExpired(claims.expiresAt, now)) return { error: "token_expired" }
+  if (disagrees(credentials.accountUserId, claims.accountUserId)) return { error: "identity_mismatch" }
+  if (disagrees(credentials.accountId, claims.accountId)) return { error: "identity_mismatch" }
+  return { token, claims }
 }
 
 /** Two identifiers disagree only when both are present and differ. */

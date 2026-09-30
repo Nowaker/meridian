@@ -685,7 +685,7 @@ describe("ChatGPT seats on the profile surface", () => {
     })}.sig`
   }
 
-  it("states each seat's banked resets from the list codex-reset reads, never refreshing a token to read them", async () => {
+  it("states each seat's banked resets and workspace from what oc-codex-multi-auth reads, never refreshing a token to read them", async () => {
     resetCodexUsageCache()
     const live = seatToken(0)
     const expired = seatToken(1, Math.floor(NOW / 1000) - 60)
@@ -700,6 +700,9 @@ describe("ChatGPT seats on the profile surface", () => {
           rate_limit: { primary_window: { used_percent: 40, limit_window_seconds: 604_800, reset_at: Math.floor(NOW / 1000) + 3 * 86_400 }, secondary_window: null },
           rate_limit_reset_credits: { available_count: 2, applicable_available_count: 0 },
         })
+      }
+      if (url.endsWith("/wham/accounts/check")) {
+        return Response.json({ accounts: [{ id: "workspace-0", structure: "workspace", name: "Acme Workspace" }] })
       }
       if (url.endsWith("/wham/rate-limit-reset-credits")) {
         return Response.json({
@@ -719,10 +722,10 @@ describe("ChatGPT seats on the profile surface", () => {
     const list = await get<ListBody>(app, "/profiles/list")
     expect(JSON.stringify(list)).not.toContain(live)
     expect(JSON.stringify(list)).not.toContain(expired)
-    expect(list.profiles[0]).toMatchObject({ id: "seat0-pace-0", loggedIn: true, tokenState: "ok", resets: { available: 2, expiresAt: [soon, later] } })
+    expect(list.profiles[0]).toMatchObject({ id: "seat0-pace-0", loggedIn: true, tokenState: "ok", organizationName: "Acme Workspace", resets: { available: 2, expiresAt: [soon, later] } })
     // No valid token, so nothing was asked: the card says "unknown".
-    expect(list.profiles[1]).toMatchObject({ id: "seat1-pace-1", loggedIn: false, tokenState: "expired", resets: null })
-    expect(whamCalls.map(c => c.url.slice(WHAM_PREFIX.length)).sort()).toEqual(["rate-limit-reset-credits", "usage"])
+    expect(list.profiles[1]).toMatchObject({ id: "seat1-pace-1", loggedIn: false, tokenState: "expired", organizationName: null, resets: null })
+    expect(whamCalls.map(c => c.url.slice(WHAM_PREFIX.length)).sort()).toEqual(["accounts/check", "rate-limit-reset-credits", "usage"])
     expect(whamCalls.every(c => c.method === "GET" && c.authorization === `Bearer ${live}`)).toBe(true)
     expect(tokenCalls).toBe(0)
     expect(snapshotPoolDir()).toEqual(before)

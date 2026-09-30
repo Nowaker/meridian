@@ -157,6 +157,13 @@ describe("a ChatGPT seat's card", () => {
     expect(labels({ subscriptionType: "max" })).not.toContain("Owner")
   })
 
+  test("shows a Business seat's workspace where a Claude card shows its organization", () => {
+    const rows = labels(seat({ organizationName: "Acme Workspace" }))
+    expect(rows.slice(0, 4)).toEqual(["Status", "Email", "Organization", "Account"])
+    expect(valueOf(seat({ organizationName: "Acme Workspace" }), "Organization")).toBe("Acme Workspace")
+    expect(labels(seat({ organizationName: null }))).not.toContain("Organization")
+  })
+
   test("says what is wrong with the token rather than 'not logged in'", () => {
     const status = (tokenState: string) => valueOf(seat({ loggedIn: false, tokenState }), "Status")
     expect(status("expired")).toBe("✗ Access token expired")

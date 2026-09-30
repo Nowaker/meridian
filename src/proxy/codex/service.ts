@@ -27,7 +27,7 @@ import { isCodexUsageEnabled, loadSettings, type MeridianSettings } from "../../
 import { codexAccountIdentity, readCodexPool, type CodexPoolAccount, type CodexPoolResult } from "./pool"
 import { describeCodexPlan } from "./plan"
 import { decodeCodexToken, type CodexTokenClaims } from "./token"
-import { fetchCodexAccountUsage, type CodexAccountUsage, type CodexUsageOutcome } from "./usage"
+import { fetchCodexAccountUsage, fetchCodexWorkspaceNames, type CodexAccountUsage, type CodexUsageOutcome } from "./usage"
 import type { CodexPlan, CodexUsageEntry, CodexUsageError, CodexUsageResponse } from "./types"
 
 const SUCCESS_TTL_MS = 30_000
@@ -35,6 +35,14 @@ const STALE_MAX_MS = 15 * 60_000
 const RATE_LIMIT_COOLDOWN_MS = 60_000
 const REFUSED_CREDENTIAL_COOLDOWN_MS = 5 * 60_000
 const MAX_CONCURRENT_FETCHES = 4
+/**
+ * A workspace is renamed far less often than its usage moves, and one answer
+ * names every workspace its user belongs to, so a name is kept for hours and
+ * shared by every seat of that workspace - one whose own token has expired
+ * included. A failed read is tried again sooner.
+ */
+const WORKSPACE_NAME_TTL_MS = 12 * 60 * 60_000
+const WORKSPACE_NAME_RETRY_MS = 10 * 60_000
 
 interface CachedUsage {
   usage: CodexAccountUsage
@@ -44,11 +52,15 @@ interface CachedUsage {
 const lastGood = new Map<string, CachedUsage>()
 const inFlight = new Map<string, Promise<CodexUsageOutcome>>()
 const heldOffUntil = new Map<string, { until: number; error: CodexUsageError }>()
+const workspaceNames = new Map<string, { name: string | null; until: number }>()
+const workspaceLookups = new Map<string, Promise<void>>()
 
 export function resetCodexUsageCache(): void {
   lastGood.clear()
   inFlight.clear()
   heldOffUntil.clear()
+  workspaceNames.clear()
+  workspaceLookups.clear()
 }
 
 /**
@@ -105,7 +117,18 @@ export async function getCodexUsage(deps: CodexUsageDeps = {}): Promise<CodexUsa
   const entries = await Promise.all(
     pool.accounts.map((account) => resolveAccount(account, now, deps.fetchImpl)),
   )
-  return { entries, error: null, asOf: now }
+  // Named once every lookup has settled: a seat whose own token cannot be used
+  // is named through a sibling in its workspace, whose lookup may finish after
+  // that seat's entry was built.
+  return {
+    entries: entries.map((entry, index) => ({ ...entry, workspaceName: workspaceNameOf(pool.accounts[index]!) })),
+    error: null,
+    asOf: now,
+  }
+}
+
+function workspaceNameOf(account: CodexPoolAccount): string | null {
+  return account.accountId ? workspaceNames.get(account.accountId)?.name ?? null : null
 }
 
 async function resolveAccount(
@@ -132,6 +155,8 @@ async function resolveAccount(
 
   if (outcome.usage) {
     lastGood.set(key, { usage: outcome.usage, fetchedAt: outcome.usage.fetchedAt })
+    // Only once a usage read has shown this token good for this account.
+    await learnWorkspaceName(account, now, fetchImpl)
     return toEntry(account, claims, outcome.usage, false, null)
   }
 
@@ -180,6 +205,42 @@ async function obtainUsage(
   return request
 }
 
+/** Look the account's workspace name up when it is not known, or is due again; never throws. */
+async function learnWorkspaceName(
+  account: CodexPoolAccount,
+  now: number,
+  fetchImpl: typeof fetch | undefined,
+): Promise<void> {
+  const workspace = account.accountId
+  if (!workspace) return
+  const known = workspaceNames.get(workspace)
+  if (known && now < known.until) return
+  const pending = workspaceLookups.get(workspace)
+  if (pending) return pending
+
+  const keepUntilRetry = () => {
+    workspaceNames.set(workspace, { name: known?.name ?? null, until: now + WORKSPACE_NAME_RETRY_MS })
+  }
+  const lookup = gate(() => fetchCodexWorkspaceNames(
+    {
+      accountId: account.accountId,
+      accountUserId: account.accountUserId,
+      accessToken: account.accessToken,
+      email: account.email,
+    },
+    { fetchImpl, now },
+  )).then((names) => {
+    if (!names) { keepUntilRetry(); return }
+    for (const [id, name] of names) workspaceNames.set(id, { name, until: now + WORKSPACE_NAME_TTL_MS })
+    if (!names.has(workspace)) workspaceNames.set(workspace, { name: null, until: now + WORKSPACE_NAME_TTL_MS })
+  }, keepUntilRetry).finally(() => {
+    workspaceLookups.delete(workspace)
+  })
+
+  workspaceLookups.set(workspace, lookup)
+  return lookup
+}
+
 function cooldownFor(error: CodexUsageError): number | null {
   if (error === "rate_limited") return RATE_LIMIT_COOLDOWN_MS
   if (error === "unauthorized" || error === "identity_mismatch") return REFUSED_CREDENTIAL_COOLDOWN_MS
@@ -219,6 +280,7 @@ function toEntry(
     // The token names the tier without a network call, so a card whose usage
     // could not be fetched still says which plan it is.
     plan: toPlan(usage?.planType ?? claims?.planType ?? account.planType),
+    workspaceName: workspaceNameOf(account),
     windows: usage?.windows ?? [],
     resetCredits: usage?.resetCredits ?? null,
     fetchedAt: usage?.fetchedAt ?? null,

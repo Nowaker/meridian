@@ -314,12 +314,13 @@ describe("codex usage service", () => {
     const first = await getCodexUsage({
       settings: {}, loadPool: pool([account]), fetchImpl: impl, now: NOW,
     })
-    expect(calls).toHaveLength(2)
+    // Usage, its reset credits, and the workspace names.
+    expect(calls).toHaveLength(3)
 
     const second = await getCodexUsage({
       settings: {}, loadPool: pool([account]), fetchImpl: impl, now: NOW + 5_000,
     })
-    expect(calls).toHaveLength(2)
+    expect(calls).toHaveLength(3)
     expect(second.entries[0]?.windows).toEqual(first.entries[0]?.windows ?? [])
     expect(second.entries[0]?.stale).toBe(false)
     expect(second.entries[0]?.fetchedAt).toBe(NOW)
@@ -334,7 +335,7 @@ describe("codex usage service", () => {
       getCodexUsage({ settings: {}, loadPool: pool([account]), fetchImpl: impl, now: NOW }),
     ])
 
-    expect(calls).toHaveLength(2)
+    expect(calls).toHaveLength(3)
     expect(a.entries[0]?.windows).toEqual(b.entries[0]?.windows ?? [])
   })
 
@@ -394,6 +395,47 @@ describe("codex usage service", () => {
       settings: {}, loadPool: pool([account]), fetchImpl: impl, now: NOW + 61_000,
     })
     expect(calls).toHaveLength(2)
+  })
+
+  test("names each workspace once, for every seat in it, and asks again only when due", async () => {
+    const workspace = "bbbbbbbb-0000-4000-8000-00000000000b"
+    const twoDays = NOW_SECONDS + 2 * 86_400
+    const reader = poolAccount(1, { accountId: workspace, expSeconds: twoDays })
+    const expired = poolAccount(2, { accountId: workspace, expSeconds: NOW_SECONDS - 60 })
+    const personal = poolAccount(3, { expSeconds: twoDays })
+    let failing = false
+    const { impl, calls } = stubFetch((url, headers) => {
+      if (url.endsWith("/wham/accounts/check")) {
+        if (failing) return { status: 503 }
+        return {
+          status: 200,
+          body: {
+            accounts: [
+              { id: workspace, structure: "workspace", name: "Acme Workspace" },
+              { id: personal.accountId, structure: "personal", name: null },
+            ],
+          },
+        }
+      }
+      return serveAll([reader, expired, personal])(url, headers)
+    })
+    const read = (now: number) => getCodexUsage({ settings: {}, loadPool: pool([reader, expired, personal]), fetchImpl: impl, now })
+    const lookups = () => calls.filter((call) => call.url.endsWith("/wham/accounts/check")).length
+
+    const first = await read(NOW)
+    // The expired seat is never asked, yet its workspace is named through its sibling.
+    expect(first.entries.map((entry) => entry.workspaceName)).toEqual(["Acme Workspace", "Acme Workspace", null])
+    expect(lookups()).toBe(2)
+
+    // A usage refresh past its 30 s cache does not ask for names again.
+    await read(NOW + 60_000)
+    expect(lookups()).toBe(2)
+
+    // Past the name's lifetime it is asked again, and a failed read keeps what was known.
+    failing = true
+    const later = await read(NOW + 13 * 60 * 60_000)
+    expect(lookups()).toBe(4)
+    expect(later.entries[0]?.workspaceName).toBe("Acme Workspace")
   })
 
   test("caps how many accounts it asks upstream about at once", async () => {

@@ -118,6 +118,11 @@ export interface CodexUsageEntry {
   identity: string
   email: string | null
   plan: CodexPlan | null
+  /**
+   * The ChatGPT Business workspace the account belongs to, by name - null for
+   * a personal account, or while no seat of that workspace has been read.
+   */
+  workspaceName: string | null
   windows: CodexUsageWindow[]
   resetCredits: CodexResetCredits | null
   /** Epoch milliseconds when the displayed usage was accepted, or null. */
