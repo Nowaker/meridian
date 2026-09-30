@@ -292,26 +292,71 @@ describe("fetchCodexAccountUsage — reset credits", () => {
     expect(result.usage?.resetCredits?.applicableAvailableCount).toBe(2)
   })
 
-  test("keeps only available credits, sorted by expiry", async () => {
+  test("keeps the available credits, soonest expiry first, and one with no readable expiry last", async () => {
     const impl = recordingFetch((url) =>
       url.includes("/wham/usage")
         ? jsonResponse(usagePayload())
         : jsonResponse({
-          available_count: 2,
+          available_count: 3,
           credits: [
             { status: "available", expires_at: "2026-10-05T04:19:17.689022Z" },
             { status: "redeemed", expires_at: "2026-09-01T00:00:00.000Z" },
-            { status: "available", expires_at: "2026-10-04T02:14:20.623942Z" },
             { status: "available", expires_at: "not-a-date" },
+            { status: "available", expires_at: "2026-10-04T02:14:20.623942Z" },
           ],
         })).impl
 
     const result = await fetchCodexAccountUsage(credentials(), { fetchImpl: impl })
     const credits = result.usage?.resetCredits?.credits ?? []
 
-    expect(credits).toHaveLength(2)
-    expect(credits[0]?.expiresAt).toBe(Date.parse("2026-10-04T02:14:20.623942Z"))
-    expect(credits[1]?.expiresAt).toBe(Date.parse("2026-10-05T04:19:17.689022Z"))
+    // A banked reset whose expiry cannot be read is still banked: dropping it
+    // would print one reset fewer than the seat holds.
+    expect(credits.map(credit => credit.expiresAt)).toEqual([
+      Date.parse("2026-10-04T02:14:20.623942Z"),
+      Date.parse("2026-10-05T04:19:17.689022Z"),
+      null,
+    ])
+    expect(result.usage?.resetCredits?.listedCount).toBe(3)
+  })
+
+  test("counts the credits as the list states them, like codex-reset status", async () => {
+    const listed = (body: unknown) => recordingFetch((url) =>
+      url.includes("/wham/usage") ? jsonResponse(usagePayload()) : jsonResponse(body)).impl
+
+    // The list's own count wins over the usage payload's (1 in usagePayload).
+    const stated = await fetchCodexAccountUsage(credentials(), {
+      fetchImpl: listed({ available_count: 2, credits: [{ status: "available", expires_at: "2026-10-04T00:00:00Z" }] }),
+    })
+    expect(stated.usage?.resetCredits).toMatchObject({ availableCount: 1, listedCount: 2 })
+
+    // Without a sane stated count, the available credits it lists are counted.
+    for (const count of [undefined, -1, 1.5, "2"]) {
+      const derived = await fetchCodexAccountUsage(credentials(), {
+        fetchImpl: listed({
+          available_count: count,
+          credits: [{ status: "available", expires_at: "2026-10-04T00:00:00Z" }, { status: "redeemed", expires_at: "2026-09-01T00:00:00Z" }],
+        }),
+      })
+      expect(derived.usage?.resetCredits?.listedCount).toBe(1)
+    }
+  })
+
+  test("reads credits with the plugin's own client identity, and only ever with a GET", async () => {
+    const { impl, calls } = usageOnly(usagePayload())
+    await fetchCodexAccountUsage(credentials(), { fetchImpl: impl })
+
+    const creditCall = calls.find((c) => c.url.includes("rate-limit-reset-credits"))
+    expect(creditCall?.url).toBe("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")
+    expect(creditCall?.init?.method).toBe("GET")
+    expect(creditCall?.init?.redirect).toBe("error")
+    const headers = creditCall?.init?.headers as Record<string, string>
+    expect(headers.Authorization).toBe(`Bearer ${credentials().accessToken}`)
+    expect(headers["ChatGPT-Account-ID"]).toBe(ACCOUNT_ID)
+    expect(headers.originator).toBe("codex_cli_rs")
+    expect(headers["OpenAI-Beta"]).toBe("responses=experimental")
+    expect(headers["User-Agent"]).toMatch(/^codex_cli_rs\/0\.155\.0 \(.+; .+\) unknown$/)
+    // Redeeming a credit is irreversible; nothing here may reach that endpoint.
+    expect(calls.every((c) => c.init?.method === "GET" && !c.url.includes("/consume"))).toBe(true)
   })
 
   test("a failing detail lookup does not sink the card", async () => {
@@ -327,6 +372,7 @@ describe("fetchCodexAccountUsage — reset credits", () => {
     expect(result.usage?.resetCredits?.availableCount).toBe(1)
     // null credits distinguishes "lookup failed" from "successfully empty".
     expect(result.usage?.resetCredits?.credits).toBeNull()
+    expect(result.usage?.resetCredits?.listedCount).toBeNull()
     expect(result.usage?.resetCredits?.error).toBe("upstream_error")
   })
 

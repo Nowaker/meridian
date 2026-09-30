@@ -17,6 +17,7 @@
  * account's card, so a mismatch discards the payload entirely.
  */
 
+import { release } from "node:os"
 import { decodeCodexToken, isCodexTokenExpired } from "./token"
 import { codexWindowLabel } from "./windows"
 import type {
@@ -32,6 +33,20 @@ const CHATGPT_ORIGIN = "https://chatgpt.com"
 const USAGE_URL = `${CHATGPT_ORIGIN}/backend-api/wham/usage`
 const RESET_CREDITS_URL = `${CHATGPT_ORIGIN}/backend-api/wham/rate-limit-reset-credits`
 const DEFAULT_TIMEOUT_MS = 10_000
+
+/**
+ * The client identity oc-codex-multi-auth's `createCodexHeaders` sends to
+ * these endpoints - originator, beta flag and Codex user agent - so Meridian
+ * reads usage and reset credits exactly as `codex-reset status` does. The
+ * version is the plugin's own default (`DEFAULT_CODEX_CLIENT_VERSION`).
+ */
+const CODEX_CLIENT_VERSION = "0.155.0"
+const PLATFORM_LABELS: Record<string, string> = { win32: "Windows", darwin: "Mac OS", linux: "Linux" }
+
+function codexUserAgent(): string {
+  const os = PLATFORM_LABELS[process.platform] ?? process.platform
+  return `codex_cli_rs/${CODEX_CLIENT_VERSION} (${os} ${release().replace(/[^\x20-\x7e]/g, "").trim()}; ${process.arch}) unknown`
+}
 
 export interface CodexCredentials {
   accountId: string | null
@@ -140,6 +155,9 @@ async function getJson(
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
     Accept: "application/json",
+    "OpenAI-Beta": "responses=experimental",
+    originator: "codex_cli_rs",
+    "User-Agent": codexUserAgent(),
   }
   // Without this header the endpoint answers with an empty account_id, which
   // would fail validation below.
@@ -207,10 +225,12 @@ function normalizeWindow(value: unknown): CodexUsageWindow | null {
 
 /**
  * Combine the counts carried by the usage payload with the separate per-credit
- * detail lookup.
+ * list - the `GET /wham/rate-limit-reset-credits` that oc-codex-multi-auth's
+ * `codex-reset status` reads. Only ever a GET: this module has no path to the
+ * endpoint that redeems a credit.
  *
- * The detail endpoint is best-effort: its failure leaves the counts standing
- * and is reported in place rather than failing the whole card. `credits: null`
+ * The list is best-effort: its failure leaves the counts standing and is
+ * reported in place rather than failing the whole card. `credits: null`
  * therefore means "not known", which is distinct from a successful empty list.
  */
 async function collectResetCredits(
@@ -222,15 +242,24 @@ async function collectResetCredits(
 ): Promise<CodexResetCredits> {
   const raw = asRecord(summary)
   const detail = await getJson(doFetch, RESET_CREDITS_URL, token, accountId, timeoutMs)
+  const credits = detail.error ? null : availableCredits(detail.body)
 
   return {
     availableCount: finiteNumberOrNull(raw?.available_count),
     applicableAvailableCount: finiteNumberOrNull(raw?.applicable_available_count),
-    credits: detail.error ? null : availableCredits(detail.body),
+    // The plugin's own rule (parseCodexResetCredits): the list's stated count
+    // when it is a whole number, else the credits it lists as available.
+    listedCount: credits === null ? null : countOrNull(asRecord(detail.body)?.available_count) ?? credits.length,
+    credits,
     error: detail.error,
   }
 }
 
+/**
+ * The credits still available to redeem, soonest expiry first. One whose
+ * expiry cannot be read is kept, last, with a null expiry: it is still a
+ * banked reset, and dropping it would understate what the seat holds.
+ */
 function availableCredits(value: unknown): CodexResetCredit[] {
   const raw = asRecord(value)
   if (!Array.isArray(raw?.credits)) return []
@@ -241,10 +270,13 @@ function availableCredits(value: unknown): CodexResetCredit[] {
     if (credit?.status !== "available") continue
     const expiresAtRaw = stringOrNull(credit.expires_at)
     const parsed = expiresAtRaw ? Date.parse(expiresAtRaw) : Number.NaN
-    if (!Number.isFinite(parsed)) continue
-    credits.push({ status: "available", expiresAt: parsed })
+    credits.push({ status: "available", expiresAt: Number.isFinite(parsed) ? parsed : null })
   }
-  return credits.sort((a, b) => (a.expiresAt ?? 0) - (b.expiresAt ?? 0))
+  return credits.sort((a, b) => (a.expiresAt ?? Number.POSITIVE_INFINITY) - (b.expiresAt ?? Number.POSITIVE_INFINITY))
+}
+
+function countOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

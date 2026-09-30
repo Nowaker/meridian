@@ -100,10 +100,12 @@ export interface CodexResetCredit {
  * a successful empty list.
  */
 export interface CodexResetCredits {
-  /** Total resets the account holds. */
+  /** Total resets the account holds, as the usage payload states it. */
   availableCount: number | null
   /** How many are redeemable right now — normally 0 unless currently limited. */
   applicableAvailableCount: number | null
+  /** Total resets as the credit list states it - what `codex-reset status` reports; null when the list read failed. */
+  listedCount: number | null
   credits: CodexResetCredit[] | null
   error: CodexRemoteError | null
 }

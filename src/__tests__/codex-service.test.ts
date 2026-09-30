@@ -189,6 +189,7 @@ describe("codex usage service", () => {
     expect(result.entries[0]?.resetCredits).toEqual({
       availableCount: 2,
       applicableAvailableCount: 0,
+      listedCount: 0,
       credits: [],
       error: null,
     })
