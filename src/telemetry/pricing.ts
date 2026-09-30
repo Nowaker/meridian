@@ -23,8 +23,9 @@
  * in the Claude-shaped fields, with inputTokens already excluding cached
  * tokens, cacheReadInputTokens holding the cached tokens, and outputTokens
  * including reasoning tokens, so every token is valued exactly once.
- * OpenAI rates are the Standard tier at short context; long-context and Fast
- * mode requests bill higher, so for those the estimate is a floor.
+ * OpenAI rates are the Standard service tier, including the long-context
+ * rate (see ContextTierPricing); Fast mode requests bill higher, so for those
+ * the estimate is a floor.
  *
  * Models without a table entry are excluded from the total and surfaced via
  * `unpricedRequestCount` instead of silently costing $0.
@@ -33,7 +34,7 @@
 import type { RequestMetric, CostEstimate, ModelCostBreakdown } from "./types"
 import { OPENAI_MODEL_PRICING } from "./openaiPricingData"
 
-export interface ModelPricing {
+export interface FlatModelPricing {
   /** USD per 1M uncached input tokens */
   inputPerMTok: number
   /** USD per 1M output tokens */
@@ -42,6 +43,37 @@ export interface ModelPricing {
   cacheReadPerMTok: number
   /** USD per 1M cache-write (creation) input tokens */
   cacheWritePerMTok: number
+}
+
+/**
+ * Long-context rates that replace the base rates for a WHOLE request once its
+ * prompt exceeds `aboveInputTokens`.
+ *
+ * The rule, as OpenAI states it for its 1.05M-context models ("Short context:
+ * <=272K input tokens. Long context: >272K input tokens", and "prompts with
+ * more than 272K input tokens are priced at 2x input and cache rates and 1.5x
+ * output for the full request" - developers.openai.com/api/docs/pricing and
+ * each model's page):
+ *   - the prompt size is every input token of the request: uncached input,
+ *     cache reads and cache writes. Output tokens do not count toward it;
+ *   - the comparison is strictly greater than, so a prompt of exactly
+ *     `aboveInputTokens` still bills at the base rates;
+ *   - past it, ALL of the request's tokens (input, cached, output) bill at the
+ *     tier's rates, not only the tokens beyond the threshold;
+ *   - with several tiers, the highest threshold the prompt exceeds wins.
+ * models.dev carries these as `cost.tiers[{ tier: { type: "context", size } }]`
+ * and opencode applies them the same way (session.ts getUsage).
+ */
+export interface ContextTierPricing extends FlatModelPricing {
+  aboveInputTokens: number
+}
+
+export interface ModelPricing extends FlatModelPricing {
+  /**
+   * Long-context tiers, from the generated OpenAI table. A user override
+   * replaces the built-in rates wholesale, tiers included.
+   */
+  contextTiers?: ContextTierPricing[]
 }
 
 export const CACHE_READ_MULTIPLIER = 0.1
@@ -160,16 +192,33 @@ export function resolveModelPricing(
   return null
 }
 
+/** The rates a request with this many prompt tokens bills at; see ContextTierPricing. */
+export function ratesForPrompt(pricing: ModelPricing, promptTokens: number): FlatModelPricing {
+  let chosen: FlatModelPricing = pricing
+  let chosenAbove = -1
+  for (const tier of pricing.contextTiers ?? []) {
+    if (promptTokens > tier.aboveInputTokens && tier.aboveInputTokens > chosenAbove) {
+      chosen = tier
+      chosenAbove = tier.aboveInputTokens
+    }
+  }
+  return chosen
+}
+
 /** Estimated USD for a single request's token usage at the given rates. */
 export function estimateRequestCostUsd(
   metric: Pick<RequestMetric, "inputTokens" | "outputTokens" | "cacheReadInputTokens" | "cacheCreationInputTokens">,
   pricing: ModelPricing,
 ): number {
+  const input = metric.inputTokens ?? 0
+  const cacheRead = metric.cacheReadInputTokens ?? 0
+  const cacheWrite = metric.cacheCreationInputTokens ?? 0
+  const rates = ratesForPrompt(pricing, input + cacheRead + cacheWrite)
   return (
-    ((metric.inputTokens ?? 0) / 1e6) * pricing.inputPerMTok +
-    ((metric.outputTokens ?? 0) / 1e6) * pricing.outputPerMTok +
-    ((metric.cacheReadInputTokens ?? 0) / 1e6) * pricing.cacheReadPerMTok +
-    ((metric.cacheCreationInputTokens ?? 0) / 1e6) * pricing.cacheWritePerMTok
+    (input / 1e6) * rates.inputPerMTok +
+    ((metric.outputTokens ?? 0) / 1e6) * rates.outputPerMTok +
+    (cacheRead / 1e6) * rates.cacheReadPerMTok +
+    (cacheWrite / 1e6) * rates.cacheWritePerMTok
   )
 }
 

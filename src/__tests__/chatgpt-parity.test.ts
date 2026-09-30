@@ -162,6 +162,29 @@ describe("Max Budget", () => {
     expect(ledger.settle("r1")).toBeUndefined()
   })
 
+  it("admission estimates a long prompt at the long-context input rate", () => {
+    const tiered: ModelPricing = {
+      ...PRICING,
+      contextTiers: [{ aboveInputTokens: 272_000, inputPerMTok: 4, outputPerMTok: 15, cacheReadPerMTok: 0.4, cacheWritePerMTok: 5 }],
+    }
+    const estimateFor = (chars: number) => {
+      const ledger = new ChatGptTurnLedger<object>()
+      const context = {}
+      const notes = ledger.open(context, features(100))
+      const inbound = new Request("http://x", { method: "POST", body: "{}" })
+      ledger.bindInbound(inbound, context)
+      const admit = createChatGptAdmission({ ledger, features: () => features(100), pricing: () => tiered })
+      admit({ requestId: "r", model: "gpt-6.1-sol", body: { input: "x".repeat(chars) }, headers: inbound.headers })
+      return notes
+    }
+    const short = estimateFor(4 * 100_000)
+    expect(short.inputEstimateTokens).toBeLessThan(272_000)
+    expect(short.inputEstimateUsd).toBeCloseTo((short.inputEstimateTokens! / 1e6) * 2, 10)
+    const long = estimateFor(4 * 300_000)
+    expect(long.inputEstimateTokens).toBeGreaterThan(272_000)
+    expect(long.inputEstimateUsd).toBeCloseTo((long.inputEstimateTokens! / 1e6) * 4, 10)
+  })
+
   it("admits an unpriced model rather than guessing it is free", () => {
     const admit = createChatGptAdmission({ ledger: new ChatGptTurnLedger<object>(), features: () => features(0.0000001), pricing: () => null })
     expect(admit({ requestId: "r", model: "gpt-5.6-sol", body: { input: "x".repeat(10_000) }, headers: new Headers() })).toBeUndefined()

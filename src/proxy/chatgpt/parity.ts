@@ -31,7 +31,7 @@
 import type { ChatGptTurnEvent, ChatGptTurnInfo } from "../backends/chatgpt"
 import type { UpstreamBackend } from "../upstream/backend"
 import { retryAfterSeconds } from "../retryAfter"
-import { estimateRequestCostUsd, type ModelPricing } from "../../telemetry/pricing"
+import { estimateRequestCostUsd, ratesForPrompt, type ModelPricing } from "../../telemetry/pricing"
 import type { ChatGptFeatures } from "./features"
 import type { ChatGptUsage } from "./tap"
 
@@ -71,6 +71,8 @@ export interface ChatGptTurnNotes {
   requestedModel?: string
   /** Estimated input cost of the turn being served, for the running budget. */
   inputEstimateUsd?: number
+  /** Estimated prompt tokens of that turn; picks the long-context rate for its output. */
+  inputEstimateTokens?: number
   refusedByBudget?: boolean
   /** Set when a Fallback Model retry served the turn instead of this model. */
   fallbackFrom?: string
@@ -132,9 +134,12 @@ function errorResponse(status: number, type: string, message: string, code: stri
   })
 }
 
-export function estimateInputUsd(body: Readonly<Record<string, unknown>>, pricing: ModelPricing): number {
-  const tokens = Math.ceil(JSON.stringify(body).length / BYTES_PER_TOKEN)
-  return (tokens / 1e6) * pricing.inputPerMTok
+export function estimatePromptTokens(body: Readonly<Record<string, unknown>>): number {
+  return Math.ceil(JSON.stringify(body).length / BYTES_PER_TOKEN)
+}
+
+export function estimateInputUsd(promptTokens: number, pricing: ModelPricing): number {
+  return (promptTokens / 1e6) * ratesForPrompt(pricing, promptTokens).inputPerMTok
 }
 
 /**
@@ -154,8 +159,12 @@ export function createChatGptAdmission<Ctx extends object>(options: {
     if (features.maxBudgetUsd <= 0 || !turn.model) return undefined
     const pricing = options.pricing(turn.model)
     if (!pricing) return undefined
-    const inputUsd = estimateInputUsd(turn.body, pricing)
-    if (notes) notes.inputEstimateUsd = inputUsd
+    const promptTokens = estimatePromptTokens(turn.body)
+    const inputUsd = estimateInputUsd(promptTokens, pricing)
+    if (notes) {
+      notes.inputEstimateUsd = inputUsd
+      notes.inputEstimateTokens = promptTokens
+    }
     if (inputUsd <= features.maxBudgetUsd) return undefined
     if (notes) notes.refusedByBudget = true
     return errorResponse(
@@ -497,7 +506,7 @@ export function createChatGptParityBackend<Ctx extends object>(options: ChatGptP
     return {
       limitUsd,
       inputUsd: notes.inputEstimateUsd ?? 0,
-      outputPerMTok: pricing.outputPerMTok,
+      outputPerMTok: ratesForPrompt(pricing, notes.inputEstimateTokens ?? 0).outputPerMTok,
       model: served,
       onExceeded: () => { notes.budgetExceededFor = served },
     }

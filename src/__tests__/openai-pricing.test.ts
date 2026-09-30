@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
-import { computeCostEstimate, estimateRequestCostUsd, resolveModelPricing, type ModelPricing } from "../telemetry/pricing"
+import { computeCostEstimate, estimateRequestCostUsd, ratesForPrompt, resolveModelPricing, type ModelPricing } from "../telemetry/pricing"
 import { OFFICIAL_OPENAI_PRICING } from "../telemetry/openaiOfficialPricing"
 import { OPENAI_MODEL_PRICING } from "../telemetry/openaiPricingData"
 import {
@@ -14,6 +14,7 @@ import {
   renderOpenAiPricingModule,
   updateOpenAiPricing,
   type CatalogRates,
+  type CatalogTier,
 } from "../telemetry/openaiPricingUpdate"
 import type { RequestMetric } from "../telemetry/types"
 
@@ -38,8 +39,18 @@ function makeMetric(overrides: Partial<RequestMetric> = {}): RequestMetric {
   }
 }
 
-function catalog(input: number, cachedInput: number | null, output: number, cacheWrite: number | null = null): CatalogRates {
-  return { input, cachedInput, output, cacheWrite }
+function catalog(
+  input: number,
+  cachedInput: number | null,
+  output: number,
+  cacheWrite: number | null = null,
+  tiers: CatalogTier[] = [],
+): CatalogRates {
+  return { input, cachedInput, output, cacheWrite, tiers }
+}
+
+function tier(aboveInputTokens: number, input: number, cachedInput: number | null, output: number, cacheWrite: number | null = null): CatalogTier {
+  return { aboveInputTokens, input, cachedInput, output, cacheWrite }
 }
 
 describe("OpenAI pricing lookup", () => {
@@ -50,6 +61,18 @@ describe("OpenAI pricing lookup", () => {
         cacheReadPerMTok: official.cachedInput,
         outputPerMTok: official.output,
       })
+    }
+  })
+
+  it("prices every official long-context rate as a context tier", () => {
+    for (const [id, official] of Object.entries(OFFICIAL_OPENAI_PRICING)) {
+      if (!official.longContext) continue
+      expect(resolveModelPricing(id)?.contextTiers).toEqual([expect.objectContaining({
+        aboveInputTokens: official.longContext.aboveInputTokens,
+        inputPerMTok: official.longContext.input,
+        cacheReadPerMTok: official.longContext.cachedInput,
+        outputPerMTok: official.longContext.output,
+      })])
     }
   })
 
@@ -66,11 +89,14 @@ describe("OpenAI pricing lookup", () => {
   })
 
   it("prices gpt-6.1-sol, released 2026-09-29, at its models.dev and official short-context rate", () => {
-    expect(resolveModelPricing("gpt-6.1-sol")).toEqual({ inputPerMTok: 2, outputPerMTok: 10, cacheReadPerMTok: 0.1, cacheWritePerMTok: 2.5 })
+    expect(resolveModelPricing("gpt-6.1-sol")).toEqual({
+      inputPerMTok: 2, outputPerMTok: 10, cacheReadPerMTok: 0.1, cacheWritePerMTok: 2.5,
+      contextTiers: [{ aboveInputTokens: 272_000, inputPerMTok: 4, outputPerMTok: 15, cacheReadPerMTok: 0.2, cacheWritePerMTok: 5 }],
+    })
     expect(resolveModelPricing("gpt-6.1-sol-high")).toEqual(resolveModelPricing("gpt-6.1-sol"))
-    const metric = makeMetric({ model: "gpt-6.1-sol", inputTokens: 800_000, cacheReadInputTokens: 200_000, outputTokens: 500_000 })
-    // 0.8 * $2 + 0.2 * $0.10 + 0.5 * $10
-    expect(computeCostEstimate([metric]).totalUsd).toBeCloseTo(1.6 + 0.02 + 5, 6)
+    const metric = makeMetric({ model: "gpt-6.1-sol", inputTokens: 80_000, cacheReadInputTokens: 20_000, outputTokens: 50_000 })
+    // 0.08 * $2 + 0.02 * $0.10 + 0.05 * $10
+    expect(computeCostEstimate([metric]).totalUsd).toBeCloseTo(0.16 + 0.002 + 0.5, 6)
   })
 
   it("leaves unknown GPT models unpriced instead of guessing a family rate", () => {
@@ -88,24 +114,78 @@ describe("OpenAI pricing lookup", () => {
 
 describe("OpenAI cost math", () => {
   it("values cached input and reasoning tokens exactly once", () => {
-    // Raw Responses usage: input_tokens 1,000,000 of which cached_tokens
-    // 200,000; output_tokens 500,000 of which reasoning_tokens 300,000.
+    // Raw Responses usage: input_tokens 100,000 of which cached_tokens
+    // 20,000; output_tokens 50,000 of which reasoning_tokens 30,000.
     // Telemetry records the uncached remainder as inputTokens and keeps
     // reasoning inside outputTokens.
-    const metric = makeMetric({ inputTokens: 800_000, cacheReadInputTokens: 200_000, outputTokens: 500_000 })
+    const metric = makeMetric({ inputTokens: 80_000, cacheReadInputTokens: 20_000, outputTokens: 50_000 })
     const cost = estimateRequestCostUsd(metric, resolveModelPricing("gpt-6-sol")!)
-    // 0.8 * $2 + 0.2 * $0.20 + 0.5 * $10
-    expect(cost).toBeCloseTo(1.6 + 0.04 + 5, 10)
+    // 0.08 * $2 + 0.02 * $0.20 + 0.05 * $10
+    expect(cost).toBeCloseTo(0.16 + 0.004 + 0.5, 10)
   })
 
   it("counts GPT requests in the cost estimate instead of as unpriced", () => {
     const estimate = computeCostEstimate([
-      makeMetric({ model: "gpt-6-luna-high", inputTokens: 1_000_000, outputTokens: 1_000_000 }),
-      makeMetric({ model: "gpt-7-nova", inputTokens: 1_000_000 }),
+      makeMetric({ model: "gpt-6-luna-high", inputTokens: 100_000, outputTokens: 100_000 }),
+      makeMetric({ model: "gpt-7-nova", inputTokens: 100_000 }),
     ])
-    expect(estimate.byModel["gpt-6-luna-high"]!.estimatedUsd).toBeCloseTo(0.6, 6)
+    expect(estimate.byModel["gpt-6-luna-high"]!.estimatedUsd).toBeCloseTo(0.06, 6)
     expect(estimate.byModel["gpt-7-nova"]!.estimatedUsd).toBeNull()
     expect(estimate.unpricedRequestCount).toBe(1)
+  })
+})
+
+describe("long-context tier", () => {
+  // gpt-6.1-sol: 2 / 0.10 / 10 per 1M up to 272K prompt tokens, 4 / 0.20 / 15 above.
+  const sol = () => resolveModelPricing("gpt-6.1-sol")!
+  const cost = (inputTokens: number, cacheReadInputTokens: number, outputTokens: number) =>
+    computeCostEstimate([makeMetric({ model: "gpt-6.1-sol", inputTokens, cacheReadInputTokens, outputTokens })]).totalUsd
+
+  it("bills a prompt below the threshold at the base rates", () => {
+    expect(cost(200_000, 71_999, 10_000)).toBeCloseTo(0.2 * 2 + 0.071999 * 0.1 + 0.01 * 10, 6)
+  })
+
+  it("bills a prompt of exactly the threshold at the base rates", () => {
+    expect(cost(200_000, 72_000, 10_000)).toBeCloseTo(0.2 * 2 + 0.072 * 0.1 + 0.01 * 10, 6)
+  })
+
+  it("bills every token of a prompt one over the threshold at the tier rates", () => {
+    expect(cost(200_000, 72_001, 10_000)).toBeCloseTo(0.2 * 4 + 0.072001 * 0.2 + 0.01 * 15, 6)
+  })
+
+  it("counts cached and cache-write tokens toward the threshold, but not output", () => {
+    const cachedHeavy = makeMetric({ inputTokens: 1_000, cacheReadInputTokens: 271_001, outputTokens: 0 })
+    expect(estimateRequestCostUsd(cachedHeavy, sol())).toBeCloseTo((1_000 * 4 + 271_001 * 0.2) / 1e6, 10)
+    const withWrites = makeMetric({ inputTokens: 1_000, cacheCreationInputTokens: 271_001, outputTokens: 0 })
+    expect(estimateRequestCostUsd(withWrites, sol())).toBeCloseTo((1_000 * 4 + 271_001 * 5) / 1e6, 10)
+    const outputHeavy = makeMetric({ inputTokens: 1_000, outputTokens: 500_000 })
+    expect(estimateRequestCostUsd(outputHeavy, sol())).toBeCloseTo((1_000 * 2 + 500_000 * 10) / 1e6, 10)
+  })
+
+  it("picks the highest tier the prompt exceeds", () => {
+    const pricing: ModelPricing = {
+      inputPerMTok: 1, outputPerMTok: 1, cacheReadPerMTok: 1, cacheWritePerMTok: 1,
+      contextTiers: [
+        { aboveInputTokens: 500_000, inputPerMTok: 3, outputPerMTok: 3, cacheReadPerMTok: 3, cacheWritePerMTok: 3 },
+        { aboveInputTokens: 100_000, inputPerMTok: 2, outputPerMTok: 2, cacheReadPerMTok: 2, cacheWritePerMTok: 2 },
+      ],
+    }
+    expect(ratesForPrompt(pricing, 100_000).inputPerMTok).toBe(1)
+    expect(ratesForPrompt(pricing, 100_001).inputPerMTok).toBe(2)
+    expect(ratesForPrompt(pricing, 500_001).inputPerMTok).toBe(3)
+  })
+
+  it("applies the tier to effort-suffixed selectors, and a flat override replaces it", () => {
+    const metric = makeMetric({ model: "gpt-6.1-sol-high", inputTokens: 300_000 })
+    expect(computeCostEstimate([metric]).totalUsd).toBeCloseTo(0.3 * 4, 6)
+    const flat: ModelPricing = { inputPerMTok: 2, outputPerMTok: 10, cacheReadPerMTok: 0.1, cacheWritePerMTok: 2.5 }
+    expect(computeCostEstimate([metric], { "gpt-6.1-sol": flat }).totalUsd).toBeCloseTo(0.3 * 2, 6)
+  })
+
+  it("leaves a model without tiers at its flat rate at any size", () => {
+    expect(resolveModelPricing("gpt-5.3-codex")?.contextTiers).toBeUndefined()
+    const metric = makeMetric({ model: "gpt-5.3-codex", inputTokens: 390_000 })
+    expect(computeCostEstimate([metric]).totalUsd).toBeCloseTo(0.39 * 1.75, 6)
   })
 })
 
@@ -129,9 +209,9 @@ describe("served-model pricing guard", () => {
 
   it("prices an OpenAI fallback at the model that served it", () => {
     const estimate = computeCostEstimate([
-      makeMetric({ model: "gpt-6-sol", requestModel: "gpt-6-astra", inputTokens: 1_000_000 }),
+      makeMetric({ model: "gpt-6-sol", requestModel: "gpt-6-astra", inputTokens: 100_000 }),
     ])
-    expect(estimate.byModel["gpt-6-astra"]!.estimatedUsd).toBeCloseTo(2, 6)
+    expect(estimate.byModel["gpt-6-astra"]!.estimatedUsd).toBeCloseTo(0.2, 6)
   })
 
   it("keeps pricing Claude requests by the client's exact id", () => {
@@ -147,7 +227,16 @@ describe("catalog parsing", () => {
     const parsed = parseModelsDev({
       openai: {
         models: {
-          "gpt-6-sol": { cost: { input: 2, output: 10, cache_read: 0.2, cache_write: 2.5 } },
+          "gpt-6-sol": {
+            cost: {
+              input: 2, output: 10, cache_read: 0.2, cache_write: 2.5,
+              tiers: [
+                { input: 4, output: 15, cache_read: 0.4, cache_write: 5, tier: { type: "context", size: 272000 } },
+                { input: 9, output: 9, tier: { type: "batch", size: 1 } },
+              ],
+              context_over_200k: { input: 99, output: 99, cache_read: 99 },
+            },
+          },
           "gpt-5.4-pro": { cost: { input: 30, output: 180 } },
           "text-embedding-3-small": { cost: { input: 0.02 } },
           broken: { cost: "free" },
@@ -156,7 +245,7 @@ describe("catalog parsing", () => {
       anthropic: { models: { "claude-opus-5": { cost: { input: 5, output: 25 } } } },
     })
     expect(parsed).toEqual({
-      "gpt-6-sol": catalog(2, 0.2, 10, 2.5),
+      "gpt-6-sol": catalog(2, 0.2, 10, 2.5, [tier(272_000, 4, 0.4, 15, 5)]),
       "gpt-5.4-pro": catalog(30, null, 180),
     })
   })
@@ -174,13 +263,17 @@ describe("catalog parsing", () => {
         input_cost_per_token: 1e-7,
         cache_read_input_token_cost: 1e-8,
         output_cost_per_token: 5e-7,
+        input_cost_per_token_above_272k_tokens: 2e-7,
+        cache_read_input_token_cost_above_272k_tokens: 2e-8,
+        output_cost_per_token_above_272k_tokens: 7.5e-7,
+        input_cost_per_token_above_272k_tokens_priority: 1,
       },
       "azure/gpt-6-sol": { litellm_provider: "azure", input_cost_per_token: 1, output_cost_per_token: 1 },
       sample_spec: { note: "not a model" },
     })
     expect(parsed).toEqual({
       "gpt-5.3-codex": catalog(1.75, 0.175, 14),
-      "gpt-6-luna": catalog(0.1, 0.01, 0.5),
+      "gpt-6-luna": catalog(0.1, 0.01, 0.5, null, [tier(272_000, 0.2, 0.02, 0.75)]),
     })
   })
 })
@@ -262,6 +355,76 @@ describe("buildOpenAiPricing", () => {
     expect(Object.keys(build.table).sort()).toEqual(["gpt-5-codex", "gpt-6-sol", "gpt-7"])
     expect(build.notes).toContain("gpt-7: added from models.dev")
     expect(build.notes).toContain("gpt-7-mini: skipped new model without a cached-input price")
+  })
+
+  describe("context tiers", () => {
+    const officialTier = {
+      "gpt-6-sol": { input: 2, cachedInput: 0.2, output: 10, longContext: { aboveInputTokens: 272_000, input: 4, cachedInput: 0.4, output: 15 } },
+    }
+    const tiered = {
+      ...base,
+      modelsDev: { "gpt-6-sol": catalog(2, 0.2, 10, 2.5, [tier(272_000, 4, 0.4, 15, 5)]) },
+      litellm: { ...base.litellm, "gpt-6-sol": catalog(2, 0.2, 10, null, [tier(272_000, 4, 0.4, 15)]) },
+      official: officialTier,
+    }
+
+    it("carries the chosen source's tier into the table", () => {
+      const build = buildOpenAiPricing(tiered)
+      expect(build.errors).toEqual([])
+      expect(build.table["gpt-6-sol"]!.contextTiers).toEqual([
+        { aboveInputTokens: 272_000, inputPerMTok: 4, outputPerMTok: 15, cacheReadPerMTok: 0.4, cacheWritePerMTok: 5 },
+      ])
+      expect(build.table["gpt-5-codex"]!.contextTiers).toBeUndefined()
+    })
+
+    it("defaults a tier's cache-write rate to its input rate", () => {
+      const build = buildOpenAiPricing({ ...tiered, modelsDev: { "gpt-6-sol": catalog(2, 0.2, 10, 2.5, [tier(272_000, 4, 0.4, 15)]) } })
+      expect(build.table["gpt-6-sol"]!.contextTiers![0]!.cacheWritePerMTok).toBe(4)
+    })
+
+    it("fails when the catalogs disagree on a tier", () => {
+      const build = buildOpenAiPricing({
+        ...tiered,
+        litellm: { ...base.litellm, "gpt-6-sol": catalog(2, 0.2, 10, null, [tier(272_000, 4, 0.4, 20)]) },
+      })
+      expect(build.errors).toEqual(["gpt-6-sol: models.dev and LiteLLM context tier above 272000 disagree on output (15 vs 20)"])
+    })
+
+    it("fails when the chosen tier disagrees with the official long-context rate", () => {
+      const build = buildOpenAiPricing({
+        ...tiered,
+        modelsDev: { "gpt-6-sol": catalog(2, 0.2, 10, 2.5, [tier(272_000, 4, 0.2, 15, 5)]) },
+        litellm: base.litellm,
+      })
+      expect(build.errors).toEqual(["gpt-6-sol: catalog and official context tier above 272000 disagree on cachedInput (0.2 vs 0.4)"])
+    })
+
+    it("fails when a tier the official rates or the committed table list disappears", () => {
+      const noTier = { ...tiered, modelsDev: base.modelsDev, litellm: base.litellm }
+      expect(buildOpenAiPricing(noTier).errors).toEqual(["gpt-6-sol: context tier above 272000 missing from the catalog"])
+      const previous = { "gpt-6-sol": buildOpenAiPricing(tiered).table["gpt-6-sol"]! }
+      expect(buildOpenAiPricing({ ...noTier, official, previous }).errors)
+        .toEqual(["gpt-6-sol: context tier above 272000 missing from the catalog"])
+    })
+
+    it("fails when a known model's tier has no cached-input price", () => {
+      const build = buildOpenAiPricing({ ...tiered, modelsDev: { "gpt-6-sol": catalog(2, 0.2, 10, 2.5, [tier(272_000, 4, null, 15)]) } })
+      expect(build.errors).toEqual(["gpt-6-sol: no cached-input price for its context tier above 272000"])
+    })
+
+    it("notes, but does not apply, a tier only the other catalog lists", () => {
+      const build = buildOpenAiPricing({ ...tiered, modelsDev: base.modelsDev, official })
+      expect(build.errors).toEqual([])
+      expect(build.table["gpt-6-sol"]!.contextTiers).toBeUndefined()
+      expect(build.notes).toContain("gpt-6-sol: LiteLLM lists a context tier above 272000 the chosen source lacks; not applied")
+    })
+
+    it("renders tiers into the module", () => {
+      const build = buildOpenAiPricing(tiered)
+      expect(renderOpenAiPricingModule(build.table, build.sources)).toContain(
+        '"gpt-6-sol": { inputPerMTok: 2, outputPerMTok: 10, cacheReadPerMTok: 0.2, cacheWritePerMTok: 2.5, contextTiers: [{ aboveInputTokens: 272000, inputPerMTok: 4, outputPerMTok: 15, cacheReadPerMTok: 0.4, cacheWritePerMTok: 5 }] }, // models.dev',
+      )
+    })
   })
 })
 

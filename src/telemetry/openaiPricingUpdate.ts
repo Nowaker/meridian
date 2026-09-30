@@ -12,16 +12,23 @@
  *   3. OFFICIAL_OPENAI_PRICING (hand-maintained official rates), which both
  *      catalogs must agree with.
  *
+ * Long-context tiers (see ContextTierPricing in pricing.ts) come from the
+ * same source as the model's base rates: models.dev `cost.tiers` entries of
+ * type "context", LiteLLM `*_above_<N>k_tokens` fields.
+ *
  * The update refuses to produce a table, rather than silently shipping a
  * wrong one, when:
- *   - a model has no cached-input price (ChatGPT usage reports cached tokens,
- *     so pricing them at the uncached rate would overstate the value);
+ *   - a model, or one of its context tiers, has no cached-input price
+ *     (ChatGPT usage reports cached tokens, so pricing them at the uncached
+ *     rate would overstate the value);
  *   - a model that is required, or that the committed table already prices,
  *     disappeared from every source;
+ *   - a context tier the committed table or the official rates list is
+ *     missing, which would under-price every long-context request;
  *   - two sources disagree beyond the tolerance.
  */
 
-import type { ModelPricing } from "./pricing"
+import type { ContextTierPricing, FlatModelPricing, ModelPricing } from "./pricing"
 import type { OfficialOpenAiRates } from "./openaiOfficialPricing"
 
 export const MODELS_DEV_URL = "https://models.dev/api.json"
@@ -73,11 +80,20 @@ const EXCLUDED_VARIANT = /-(pro|chat|latest|image|audio|realtime|search|transcri
 
 export type PricingSourceName = "models.dev" | "litellm"
 
-export interface CatalogRates {
+export interface CatalogRateSet {
   input: number
   output: number
   cachedInput: number | null
   cacheWrite: number | null
+}
+
+export interface CatalogTier extends CatalogRateSet {
+  aboveInputTokens: number
+}
+
+export interface CatalogRates extends CatalogRateSet {
+  /** Context tiers, ascending by threshold. */
+  tiers: CatalogTier[]
 }
 
 export interface OpenAiPricingBuild {
@@ -102,6 +118,35 @@ function clean(value: number): number {
   return Number(value.toPrecision(12))
 }
 
+function byThreshold(a: CatalogTier, b: CatalogTier): number {
+  return a.aboveInputTokens - b.aboveInputTokens
+}
+
+/**
+ * models.dev context tiers. `context_over_200k` is a legacy mirror of the
+ * first tier despite its name, so only `tiers` is read.
+ */
+function modelsDevTiers(cost: JsonObject): CatalogTier[] {
+  if (!Array.isArray(cost.tiers)) return []
+  const tiers: CatalogTier[] = []
+  for (const entry of cost.tiers) {
+    if (!isObject(entry) || !isObject(entry.tier)) continue
+    const size = entry.tier.size
+    const input = rate(entry.input)
+    const output = rate(entry.output)
+    if ((entry.tier.type ?? "context") !== "context") continue
+    if (typeof size !== "number" || !Number.isInteger(size) || size < 0 || input === null || output === null) continue
+    tiers.push({
+      aboveInputTokens: size,
+      input,
+      output,
+      cachedInput: rate(entry.cache_read),
+      cacheWrite: rate(entry.cache_write),
+    })
+  }
+  return tiers.sort(byThreshold)
+}
+
 /** OpenAI models from a models.dev api.json payload, rates per 1M tokens. */
 export function parseModelsDev(payload: unknown): Record<string, CatalogRates> {
   const result: Record<string, CatalogRates> = {}
@@ -117,10 +162,19 @@ export function parseModelsDev(payload: unknown): Record<string, CatalogRates> {
       output,
       cachedInput: rate(model.cost.cache_read),
       cacheWrite: rate(model.cost.cache_write),
+      tiers: modelsDevTiers(model.cost),
     }
   }
   return result
 }
+
+/**
+ * LiteLLM long-context fields: `<rate>_above_<N>k_tokens`, N thousand being
+ * the threshold. Service-tier variants (`..._tokens_flex`, `_priority`,
+ * `_batches`) do not end in `_tokens` and are ignored.
+ */
+const LITELLM_TIER_FIELD =
+  /^(input_cost_per_token|output_cost_per_token|cache_read_input_token_cost|cache_creation_input_token_cost)_above_(\d+)k_tokens$/
 
 /** OpenAI models from a LiteLLM price map, converted to rates per 1M tokens. */
 export function parseLiteLlm(payload: unknown): Record<string, CatalogRates> {
@@ -136,11 +190,34 @@ export function parseLiteLlm(payload: unknown): Record<string, CatalogRates> {
     const input = perMTok(model.input_cost_per_token)
     const output = perMTok(model.output_cost_per_token)
     if (input === null || output === null) continue
+    const fieldsByThreshold = new Map<number, Record<string, number | null>>()
+    for (const [key, value] of Object.entries(model)) {
+      const match = LITELLM_TIER_FIELD.exec(key)
+      if (!match) continue
+      const threshold = Number(match[2]) * 1000
+      const fields = fieldsByThreshold.get(threshold) ?? {}
+      fields[match[1]!] = perMTok(value)
+      fieldsByThreshold.set(threshold, fields)
+    }
+    const tiers: CatalogTier[] = []
+    for (const [aboveInputTokens, fields] of fieldsByThreshold) {
+      const tierInput = fields.input_cost_per_token ?? null
+      const tierOutput = fields.output_cost_per_token ?? null
+      if (tierInput === null || tierOutput === null) continue
+      tiers.push({
+        aboveInputTokens,
+        input: tierInput,
+        output: tierOutput,
+        cachedInput: fields.cache_read_input_token_cost ?? null,
+        cacheWrite: fields.cache_creation_input_token_cost ?? null,
+      })
+    }
     result[id] = {
       input,
       output,
       cachedInput: perMTok(model.cache_read_input_token_cost),
       cacheWrite: perMTok(model.cache_creation_input_token_cost),
+      tiers: tiers.sort(byThreshold),
     }
   }
   return result
@@ -168,6 +245,36 @@ function compareRates(
     }
   }
   return errors
+}
+
+function tierLabel(aboveInputTokens: number): string {
+  return `context tier above ${aboveInputTokens}`
+}
+
+/**
+ * Compare the context tiers two catalogs list at the same threshold. A tier
+ * only the other catalog lists is noted, not applied: the chosen source owns
+ * the model's rates.
+ */
+function compareTiers(id: string, chosen: CatalogRates, other: CatalogRates, otherName: string, tolerance: number) {
+  const errors: string[] = []
+  const notes: string[] = []
+  for (const tier of other.tiers) {
+    const match = chosen.tiers.find(t => t.aboveInputTokens === tier.aboveInputTokens)
+    if (match) errors.push(...compareRates(id, `models.dev and LiteLLM ${tierLabel(tier.aboveInputTokens)}`, match, tier, tolerance))
+    else notes.push(`${id}: ${otherName} lists a ${tierLabel(tier.aboveInputTokens)} the chosen source lacks; not applied`)
+  }
+  return { errors, notes }
+}
+
+function toTierPricing(tier: CatalogTier, cachedInput: number): ContextTierPricing {
+  return {
+    aboveInputTokens: tier.aboveInputTokens,
+    inputPerMTok: tier.input,
+    outputPerMTok: tier.output,
+    cacheReadPerMTok: cachedInput,
+    cacheWritePerMTok: tier.cacheWrite ?? tier.input,
+  }
 }
 
 export interface BuildOptions {
@@ -204,12 +311,41 @@ export function buildOpenAiPricing(options: BuildOptions): OpenAiPricingBuild {
       else build.notes.push(`${id}: skipped new model without a cached-input price`)
       continue
     }
+    const contextTiers: ContextTierPricing[] = []
+    const uncachedTiers: string[] = []
+    for (const tier of chosen.tiers) {
+      if (tier.cachedInput === null) uncachedTiers.push(`${id}: no cached-input price for its ${tierLabel(tier.aboveInputTokens)}`)
+      else contextTiers.push(toTierPricing(tier, tier.cachedInput))
+    }
+    if (uncachedTiers.length > 0) {
+      if (known.has(id)) build.errors.push(...uncachedTiers)
+      else build.notes.push(`${id}: skipped new model with a context tier lacking a cached-input price`)
+      continue
+    }
+
+    const other = chosen === fromModelsDev ? fromLiteLlm : undefined
+    const tierCheck = other
+      ? compareTiers(id, chosen, other, "LiteLLM", tolerance)
+      : { errors: [], notes: [] }
+    build.notes.push(...tierCheck.notes)
+
+    const officialTier = official[id]?.longContext
+    const chosenOfficialTier = officialTier && chosen.tiers.find(t => t.aboveInputTokens === officialTier.aboveInputTokens)
+    const missingTiers = new Set([
+      ...(officialTier && !chosenOfficialTier ? [officialTier.aboveInputTokens] : []),
+      ...(previous[id]?.contextTiers ?? [])
+        .map(tier => tier.aboveInputTokens)
+        .filter(above => !chosen.tiers.some(t => t.aboveInputTokens === above)),
+    ])
 
     const errors = [
-      ...(fromModelsDev && fromLiteLlm
-        ? compareRates(id, "models.dev and LiteLLM", fromModelsDev, fromLiteLlm, tolerance)
-        : []),
+      ...(other ? compareRates(id, "models.dev and LiteLLM", chosen, other, tolerance) : []),
+      ...tierCheck.errors,
       ...(official[id] ? compareRates(id, "catalog and official rates", chosen, official[id], tolerance) : []),
+      ...(officialTier && chosenOfficialTier
+        ? compareRates(id, `catalog and official ${tierLabel(officialTier.aboveInputTokens)}`, chosenOfficialTier, officialTier, tolerance)
+        : []),
+      ...[...missingTiers].sort((a, b) => a - b).map(above => `${id}: ${tierLabel(above)} missing from the catalog`),
     ]
     if (errors.length > 0) {
       build.errors.push(...errors)
@@ -223,6 +359,7 @@ export function buildOpenAiPricing(options: BuildOptions): OpenAiPricingBuild {
       // OpenAI usage reports no cache-creation tokens; the write rate only
       // matters for a client that sends them, so default to the input rate.
       cacheWritePerMTok: chosen.cacheWrite ?? chosen.input,
+      ...(contextTiers.length > 0 ? { contextTiers } : {}),
     }
     build.sources[id] = fromModelsDev ? "models.dev" : "litellm"
     if (!previous[id]) build.notes.push(`${id}: added from ${build.sources[id]}`)
@@ -237,6 +374,10 @@ export function buildOpenAiPricing(options: BuildOptions): OpenAiPricingBuild {
   return build
 }
 
+function renderRates(r: FlatModelPricing): string {
+  return `inputPerMTok: ${r.inputPerMTok}, outputPerMTok: ${r.outputPerMTok}, cacheReadPerMTok: ${r.cacheReadPerMTok}, cacheWritePerMTok: ${r.cacheWritePerMTok}`
+}
+
 /** Render the generated module. Deterministic, so an unchanged table is an unchanged file. */
 export function renderOpenAiPricingModule(
   table: Record<string, ModelPricing>,
@@ -246,7 +387,10 @@ export function renderOpenAiPricingModule(
     .sort()
     .map(id => {
       const p = table[id]!
-      return `  ${JSON.stringify(id)}: { inputPerMTok: ${p.inputPerMTok}, outputPerMTok: ${p.outputPerMTok}, cacheReadPerMTok: ${p.cacheReadPerMTok}, cacheWritePerMTok: ${p.cacheWritePerMTok} }, // ${sources[id] ?? "unknown"}`
+      const tiers = p.contextTiers?.length
+        ? `, contextTiers: [${p.contextTiers.map(t => `{ aboveInputTokens: ${t.aboveInputTokens}, ${renderRates(t)} }`).join(", ")}]`
+        : ""
+      return `  ${JSON.stringify(id)}: { ${renderRates(p)}${tiers} }, // ${sources[id] ?? "unknown"}`
     })
   return [
     "// GENERATED by scripts/update-openai-pricing.ts - do not edit by hand.",
