@@ -193,6 +193,16 @@ describe("landing page layout", () => {
     expect(header.slice(0, header.indexOf("}"))).toContain("flex-wrap: wrap")
   })
 
+  test("the intro's address chips wrap on a phone instead of scrolling it sideways", () => {
+    // Measured at 320px on meridian-gpt.desktop.ts.nowaker.net: the chip
+    // holding the instance's own address was 348px wide in a 272px column.
+    const phone = landingHtml.indexOf("@media (max-width: 720px) {\n    .intro code {")
+    expect(phone).toBeGreaterThanOrEqual(0)
+    const rule = landingHtml.slice(phone, landingHtml.indexOf("}", phone))
+    expect(rule).toContain("white-space: normal")
+    expect(rule).toContain("overflow-wrap: anywhere")
+  })
+
   test("accounts can be re-sorted for viewing without touching the saved order", () => {
     // The page carries a copy of the comparator, so the modes it offers are
     // interpolated from the tested module rather than retyped.
