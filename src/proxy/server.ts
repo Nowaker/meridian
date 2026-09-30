@@ -8127,7 +8127,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       ...(usage ? { reasoningOutputTokens: usage.reasoningTokens } : {}),
       ...(decoration.fallbackFromModel ? { fallbackFromModel: decoration.fallbackFromModel } : {}),
     })
-    plog(`[PROXY] ${event.requestId} chatgpt model=${event.model ?? event.requestModel ?? "unknown"} seat=${profileId ?? "none"} status=${event.status} attempts=${event.attempts.length} adapted=${event.adaptations.join(",") || "none"}${usage ? ` in=${usage.inputTokens} cached=${usage.cachedInputTokens} out=${usage.outputTokens} reasoning=${usage.reasoningTokens}` : ""}${decoration.fallbackFromModel ? ` fallback_from=${decoration.fallbackFromModel}` : ""}${decoration.error ? ` error=${decoration.error}` : ""}`)
+    plog(`[PROXY] ${event.requestId} chatgpt model=${event.model ?? event.requestModel ?? "unknown"} seat=${profileId ?? "none"} status=${event.status}${event.servedOnCredits ? " credits=1" : ""} attempts=${event.attempts.length} adapted=${event.adaptations.join(",") || "none"}${usage ? ` in=${usage.inputTokens} cached=${usage.cachedInputTokens} out=${usage.outputTokens} reasoning=${usage.reasoningTokens}` : ""}${decoration.fallbackFromModel ? ` fallback_from=${decoration.fallbackFromModel}` : ""}${decoration.error ? ` error=${decoration.error}` : ""}`)
   }
 
   const chatGptBackend = chatGptSource ? createChatGptBackend<Context>({
@@ -8149,13 +8149,21 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     },
     // ChatGPT seats are benched in their own tracker, never Claude's.
     exhaustion: chatGptExhaustion,
+    credits: (seat) => {
+      const entry = chatGptUsage?.entries.find(candidate => candidate.id === seat)
+      return entry?.credits && entry.fetchedAt !== null ? { credits: entry.credits, at: entry.fetchedAt } : null
+    },
+    refreshCredits: async () => {
+      const pending = refreshChatGptUsage()
+      if (pending) await Promise.race([pending, new Promise(resolve => setTimeout(resolve, CHATGPT_QUOTA_WAIT_MS))])
+    },
     // Only an internal hop carrying this instance's token may claim to be a
     // warm, which is what lets it use a seat excluded from work.
     route: (turn) => {
       const warm = turn.headers.get("x-meridian-internal-hop") === internalHopToken
         && turn.headers.get("x-meridian-routing-purpose") === "warm"
       const route = chatGptProfiles!.route(turn.headers.get("x-meridian-profile") ?? undefined, warm ? "warm" : "work")
-      if (route.kind !== "refuse") return route
+      if (route.kind !== "refuse") return warm ? { ...route, spendCredits: false } : route
       return {
         kind: "refuse",
         error: "profile_excluded",

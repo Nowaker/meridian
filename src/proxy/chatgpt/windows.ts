@@ -21,6 +21,8 @@
  * ever benched at all.
  */
 
+import type { CodexCredits } from "../codex/types"
+
 export interface ChatGptUsageWindow {
   used_percent?: number
   /** Window WIDTH in seconds. The only thing that says what kind of window this is. */
@@ -153,6 +155,38 @@ export function chatGptRateLimitFromHeaders(headers: Headers): ChatGptRateLimit 
     ...(primary ? { primary_window: primary } : {}),
     ...(secondary ? { secondary_window: secondary } : {}),
   }
+}
+
+/**
+ * The seat's Codex credits as an inference response states them, or null
+ * when it did not state them.
+ *
+ * The backend sends `x-codex-credits-has-credits` and
+ * `x-codex-credits-unlimited` as Python-style `True`/`False`, and the balance
+ * as a decimal string that is empty when there is none. Like codex-rs
+ * (`codex-api/src/rate_limits.rs`), both booleans must parse or the snapshot
+ * is discarded. The headers carry no overage flag; only `/wham/usage` does.
+ */
+export function chatGptCreditsFromHeaders(headers: Headers): CodexCredits | null {
+  const flag = (name: string): boolean | undefined => {
+    const raw = headers.get(name)?.trim().toLowerCase()
+    return raw === "true" ? true : raw === "false" ? false : undefined
+  }
+  const hasCredits = flag("x-codex-credits-has-credits")
+  const unlimited = flag("x-codex-credits-unlimited")
+  if (hasCredits === undefined || unlimited === undefined) return null
+  return { hasCredits, unlimited, overageLimitReached: false, balance: headerNumber(headers, "x-codex-credits-balance") ?? null }
+}
+
+/**
+ * Whether these credits can pay for a turn once the plan's windows are spent:
+ * unlimited, or a balance that is not known to be empty and not capped by the
+ * workspace's overage limit.
+ */
+export function creditsCanServe(credits: CodexCredits | null | undefined): boolean {
+  if (!credits) return false
+  if (credits.unlimited) return true
+  return credits.hasCredits && !credits.overageLimitReached && (credits.balance === null || credits.balance > 0)
 }
 
 /**

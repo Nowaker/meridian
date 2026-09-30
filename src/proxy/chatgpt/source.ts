@@ -68,10 +68,19 @@ export interface ChatGptCredentialSource {
   /** Seats that may serve `model` now, best first. */
   candidateSeats(model?: string): string[]
   /**
+   * Seats held back ONLY because the owner recorded their plan quota as spent,
+   * in the owner's order. They can still serve on purchased credits, which is
+   * the backend's call to make (it knows the balances); absent when the source
+   * records no such state.
+   */
+  reserveSeats?(model?: string): string[]
+  /**
    * The seat's current access token. `reread: true` bypasses any cache - it is
    * how the backend asks "has the owner rotated this token since?" after a 401.
+   * `spendCredits: true` lets a seat whose plan quota is recorded as spent
+   * through, because the turn is meant to be paid for with credits.
    */
-  credentials(seat: string, options?: { reread?: boolean; model?: string }): Promise<SeatCredential>
+  credentials(seat: string, options?: { reread?: boolean; model?: string; spendCredits?: boolean }): Promise<SeatCredential>
   /** Whether any request could be served right now (lease held, store readable). */
   isServing(): boolean
   /** The pool as the read-only usage service expects it. */

@@ -31,7 +31,8 @@ import { adaptResponsesBody, type BodyAdaptation } from "../chatgpt/body"
 import { buildCodexRequest } from "../chatgpt/request"
 import { sniffChatGptFailure, type ChatGptFailureKind } from "../chatgpt/stream"
 import { aggregateResponsesStream, tapResponsesStream, type ChatGptUsage, type TapSummary } from "../chatgpt/tap"
-import { chatGptCooldownUntil, chatGptRateLimitFromHeaders, type ChatGptRateLimit } from "../chatgpt/windows"
+import { chatGptCooldownUntil, chatGptCreditsFromHeaders, chatGptRateLimitFromHeaders, creditsCanServe, type ChatGptRateLimit } from "../chatgpt/windows"
+import type { CodexCredits } from "../codex/types"
 import type { ChatGptCredentialSource, SeatUnavailableReason } from "../chatgpt/source"
 
 export type UpstreamFetch = (url: string, init: RequestInit) => Promise<Response>
@@ -69,6 +70,8 @@ export interface ChatGptTurnEvent {
   error: string | null
   reasoningSummaryEvents: number
   requestSource?: string
+  /** Set when the seat served with its plan quota spent, paying with Codex credits. */
+  servedOnCredits?: boolean
 }
 
 /** A seat said no to a turn: benched until `until`. Carries no credential. */
@@ -114,10 +117,14 @@ export interface ChatGptHooks {
  * - `pinned`: that seat only, no failover - an explicit profile header, or a
  *   warm.
  * - `refuse`: answered before any seat is tried.
+ *
+ * `spendCredits: false` keeps the turn off seats that could serve only on
+ * purchased Codex credits (a warm has no business spending them); absent
+ * means they may serve once no seat has plan quota left.
  */
 export type ChatGptRoute =
-  | { kind: "pool"; preferred?: string; excluded: ReadonlySet<string>; order?: readonly string[] }
-  | { kind: "pinned"; seat: string }
+  | { kind: "pool"; preferred?: string; excluded: ReadonlySet<string>; order?: readonly string[]; spendCredits?: boolean }
+  | { kind: "pinned"; seat: string; spendCredits?: boolean }
   | { kind: "refuse"; response: Response; error: string }
 
 export interface ChatGptBackendOptions<Ctx> {
@@ -128,6 +135,13 @@ export interface ChatGptBackendOptions<Ctx> {
   exhaustion: ProfileExhaustion
   /** Seat selection per turn; without it every eligible seat serves in the owner's order. */
   route?: (turn: ChatGptTurnInfo) => ChatGptRoute
+  /**
+   * A seat's Codex credits from the last usage read, with when it was taken;
+   * null when unknown. Response headers observed later take precedence.
+   */
+  credits?: (seat: string) => { credits: CodexCredits; at: number } | null
+  /** Bring `credits` up to date, bounded; awaited only when a credits seat is needed and unknown. */
+  refreshCredits?: () => Promise<void>
   hooks?: ChatGptHooks
   fetchImpl?: UpstreamFetch
   now?: () => number
@@ -213,6 +227,17 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
   const { source, exhaustion, hooks } = options
   const affinity = new AssignmentStore(MAX_CONVERSATIONS)
   const observed = new Map<string, ObservedSeatLimits>()
+  const observedCredits = new Map<string, { credits: CodexCredits; at: number }>()
+  const reserveRefusedUntil = new Map<string, number>()
+  const reserveKey = (seat: string, model: string | undefined) => `${seat}\u0000${model ?? ""}`
+
+  /** The newer of what a response stated and what the usage read found. */
+  const creditsOf = (seat: string): CodexCredits | null => {
+    const seen = observedCredits.get(seat)
+    const read = options.credits?.(seat) ?? null
+    if (seen && (!read || seen.at >= read.at)) return seen.credits
+    return read?.credits ?? null
+  }
 
   const bench = (seat: string, kind: ChatGptFailureKind, rateLimit: ChatGptRateLimit | null): number => {
     const until = kind === "requires_reauth"
@@ -300,14 +325,50 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
         hooks?.onRefusalsSettled?.({ requestId, refused: refusals, servedBy })
       }
 
+      // The credits tier: seats whose plan quota is spent but whose purchased
+      // credits can still pay, offered only once every plan-quota seat above
+      // has been tried. Credits are a finite reserve, so a seat with plan
+      // quota left always serves first. A seat that already answered this
+      // turn is not asked twice, and one that refused a credits turn for this
+      // model sits out until its refusal's reset.
+      const creditReserve = async (dispatched: ReadonlySet<string>): Promise<string[]> => {
+        const spentPlans = source.reserveSeats?.(model) ?? []
+        const listed = route.kind === "pinned" ? [route.seat] : [...source.candidateSeats(model), ...spentPlans]
+        const routable = [...new Set(route.kind === "pool" ? listed.filter(seat => !route.excluded.has(seat)) : listed)]
+        if (routable.some(seat => spentPlans.includes(seat))) reasons.add("quota_exhausted")
+        if (route.spendCredits === false) return []
+        const benched = new Map(exhaustion.snapshot().map(mark => [mark.id, mark.reason]))
+        const held = routable.filter(seat => {
+          if (dispatched.has(seat)) return false
+          const reason = benched.get(seat)
+          if (reason !== undefined && reason !== "quota_spent") return false
+          return (reserveRefusedUntil.get(reserveKey(seat, model)) ?? 0) <= now()
+        })
+        if (held.length === 0) return []
+        if (options.refreshCredits && held.some(seat => creditsOf(seat) === null)) await options.refreshCredits()
+        const payable = held.filter(seat => creditsCanServe(creditsOf(seat)))
+        return route.kind === "pool" && route.order ? inSavedOrder(payable, route.order) : payable
+      }
+
       let spent: Response | undefined
       let spentKind: ChatGptFailureKind | undefined
-      for (const seat of seats) {
-        let credential = await source.credentials(seat, { model })
+      const queue = seats.map(seat => ({ seat, onCredits: false }))
+      const dispatched = new Set<string>()
+      let reserveQueued = false
+      for (let next = 0; ; next++) {
+        if (next === queue.length) {
+          if (reserveQueued) break
+          reserveQueued = true
+          for (const seat of await creditReserve(dispatched)) queue.push({ seat, onCredits: true })
+          if (next === queue.length) break
+        }
+        const { seat, onCredits } = queue[next]!
+        let credential = await source.credentials(seat, { model, spendCredits: onCredits })
         // An expired token may have been rotated by its owner since the last
         // read: look once more before giving up on the seat.
-        if (!credential.ok && credential.reason === "expired") credential = await source.credentials(seat, { model, reread: true })
+        if (!credential.ok && credential.reason === "expired") credential = await source.credentials(seat, { model, reread: true, spendCredits: onCredits })
         if (!credential.ok) { reasons.add(credential.reason); continue }
+        dispatched.add(seat)
 
         let retriedAuth = false
         for (;;) {
@@ -324,6 +385,8 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
           const sniffed = await sniffChatGptFailure(upstream)
           const rateLimit = chatGptRateLimitFromHeaders(upstream.headers)
           if (rateLimit) observed.set(seat, { rateLimit, at: now() })
+          const stated = chatGptCreditsFromHeaders(upstream.headers)
+          if (stated) observedCredits.set(seat, { credits: stated, at: now() })
           attempts.push({ seat, status: upstream.status, failure: sniffed.failure?.kind ?? null })
           const headersOut = forwardHeaders(upstream)
 
@@ -344,6 +407,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
             settle(seat)
             const onDone = (summary: TapSummary) => report({
               status: upstream.status, seat, model: summary.model ?? model ?? null, usage: summary.usage,
+              ...(onCredits ? { servedOnCredits: true } : {}),
               ttfbMs: summary.firstOutputAt === null ? null : summary.firstOutputAt - startedAt,
               reasoningSummaryEvents: summary.reasoningSummaryEvents,
               error: summary.interrupted ?? (summary.outcome && summary.outcome !== "completed" ? `response_${summary.outcome}` : null),
@@ -380,6 +444,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
             until: bench(seat, failureKind, rateLimit), rateLimit,
           }
           refusals.push(refusal)
+          if (onCredits) reserveRefusedUntil.set(reserveKey(seat, model), refusal.until)
           hooks?.onSeatRefused?.(refusal)
           if (failureKind === "requires_reauth") reasons.add("requires_reauth")
           void spent?.body?.cancel().catch(() => {})

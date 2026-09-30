@@ -732,6 +732,26 @@ describe("ChatGPT seats on the profile surface", () => {
     expect(snapshotPoolDir()).toEqual(before)
   })
 
+  it("serves a seat the owner stamped as spent on its Codex credits, learned from the usage read", async () => {
+    resetCodexUsageCache()
+    const live = seatToken(0)
+    writePool([account(0, { accessToken: live, quotaExhaustedUntil: NOW + 3 * 86_400_000 })])
+    wham = (url) => url.endsWith("/wham/usage") ? Response.json({
+      user_id: "user-0", account_id: "workspace-0", email: "seat0@example.test", plan_type: "pro",
+      rate_limit: { allowed: true, limit_reached: false, primary_window: { used_percent: 100, limit_window_seconds: 604_800, reset_at: Math.floor(NOW / 1000) + 3 * 86_400 }, secondary_window: null },
+      credits: { has_credits: true, unlimited: false, overage_limit_reached: false, balance: "62500" },
+    }) : undefined
+    const before = snapshotPoolDir()
+    const { app } = await server("follow-external")
+    const response = await app.fetch(responses(LUNA))
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(upstreamCalls.map(call => call.authorization)).toEqual([`Bearer ${live}`])
+    expect(whamCalls.some(call => call.url.endsWith("/wham/usage"))).toBe(true)
+    expect(tokenCalls).toBe(0)
+    expect(snapshotPoolDir()).toEqual(before)
+  })
+
   it("renames a seat the way a Claude profile is renamed: the old name keeps answering", async () => {
     writePool([account(0), account(1)])
     const before = snapshotPoolDir()

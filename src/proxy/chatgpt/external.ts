@@ -12,7 +12,9 @@
  *   - never reads `refreshToken`, and never calls a token endpoint;
  *   - honours the owner's own state: `enabled: false`, `coolingDownUntil`,
  *     `quotaExhaustedUntil` and per-model `rateLimitResetTimes` all take a
- *     seat out of rotation exactly as they do for the plugin;
+ *     seat out of rotation exactly as they do for the plugin - except that a
+ *     seat held back only by `quotaExhaustedUntil` is offered as a credits
+ *     reserve (`reserveSeats`), served only once no seat has plan quota left;
  *   - re-reads the file whenever its mtime/size/inode change, so a token the
  *     owner rotated is picked up on the next request.
  *
@@ -140,10 +142,15 @@ export function createExternalCredentialSource(options: ExternalSourceOptions = 
     return cached
   }
 
-  const unavailable = (account: ExternalAccount, model: string | undefined, at: number): SeatUnavailableReason | null => {
+  /**
+   * `spendCredits` waives only the owner's account-wide `quotaExhaustedUntil`
+   * stamp: that records a spent PLAN window, which credits pay past. A
+   * per-model `rateLimitResetTimes` block records a refusal and still holds.
+   */
+  const unavailable = (account: ExternalAccount, model: string | undefined, at: number, spendCredits = false): SeatUnavailableReason | null => {
     if (!account.enabled) return "disabled"
     if (account.coolingDownUntil !== null && account.coolingDownUntil > at) return "cooling_down"
-    if (account.quotaExhaustedUntil !== null && account.quotaExhaustedUntil > at) return "quota_exhausted"
+    if (!spendCredits && account.quotaExhaustedUntil !== null && account.quotaExhaustedUntil > at) return "quota_exhausted"
     if (model && (account.rateLimitResetTimes[model] ?? 0) > at) return "quota_exhausted"
     if (!account.accessToken || !account.accountId) return "no_token"
     if (account.expiresAt !== null && account.expiresAt - EXPIRY_SKEW_MS <= at) return "expired"
@@ -194,10 +201,22 @@ export function createExternalCredentialSource(options: ExternalSourceOptions = 
         .map(account => account.accountUserId)
     },
 
+    reserveSeats(model) {
+      const snapshot = read(false)
+      const at = now()
+      return ordered(snapshot, model)
+        .filter(account => {
+          if (unavailable(account, model, at) !== "quota_exhausted") return false
+          const waived = unavailable(account, model, at, true)
+          return waived === null || waived === "expired"
+        })
+        .map(account => account.accountUserId)
+    },
+
     async credentials(seat, opts) {
       const account = read(opts?.reread === true).accounts.find(a => a.accountUserId === seat)
       if (!account) return { ok: false, reason: "unknown" }
-      const reason = unavailable(account, opts?.model, now())
+      const reason = unavailable(account, opts?.model, now(), opts?.spendCredits === true)
       if (reason) return { ok: false, reason }
       return { ok: true, account: { accountUserId: seat, accountId: account.accountId!, accessToken: account.accessToken! } } satisfies SeatCredential
     },
