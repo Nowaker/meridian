@@ -1,7 +1,9 @@
 import { describe, expect, it } from "bun:test"
+import net from "node:net"
+import { createInterface } from "node:readline"
 
-const { guardUpstreamIdle, UpstreamIdleError } = await import("../proxy/streamIdleGuard")
-import type { IdleGuardClock } from "../proxy/streamIdleGuard"
+const { guardUpstreamIdle, UpstreamIdleError, IDLE_DEADLINE_LATE_MS } = await import("../proxy/streamIdleGuard")
+import type { IdleGuardClock, LateIdleDeadline } from "../proxy/streamIdleGuard"
 
 type IdleTimerHandle = ReturnType<typeof setTimeout> | number
 
@@ -191,6 +193,106 @@ describe("guardUpstreamIdle", () => {
     for await (const event of guardUpstreamIdle(source([ping, ...ordinary]), 500)) enabled.push(event)
     expect(enabled).toEqual(ordinary)
   })
+
+  // A blocked event loop (a synchronous fsync, say) makes the idle timer fire
+  // late. The upstream kept sending meanwhile, but when the loop resumes the
+  // expired timer runs before the I/O poll that delivers the waiting bytes.
+  // setImmediate(push) models those bytes: they are delivered on the next
+  // event-loop turn, after the timer callback.
+  function runGuarded(idleMs: number, clock: ReturnType<typeof makeFakeClock>, src: ReturnType<typeof makeSource<number>>) {
+    const out: number[] = []
+    const stalls: number[] = []
+    const lates: LateIdleDeadline[] = []
+    const done = (async () => {
+      for await (const v of guardUpstreamIdle(src.iterable, idleMs, (ms) => stalls.push(ms), clock.clock, (late) => lates.push(late))) out.push(v)
+    })()
+    return { out, stalls, lates, done }
+  }
+
+  it("a late deadline with upstream data waiting behind it does not stall", async () => {
+    const src = makeSource<number>()
+    const clock = makeFakeClock()
+    const run = runGuarded(90_000, clock, src)
+    await clock.waitForScheduled(1)
+    setImmediate(() => src.push(1))
+    clock.advance(105_131)
+    // Chunk 1 reached the consumer and a fresh deadline was armed for the next.
+    await clock.waitForScheduled(2)
+    src.finish()
+    await run.done
+    expect(run.out).toEqual([1])
+    expect(run.stalls).toEqual([])
+    expect(run.lates).toEqual([{ lateMs: 15_131, sinceLastMs: 105_131, resumed: true }])
+  })
+
+  it("a late deadline on a silent stream still stalls", async () => {
+    const src = makeSource<number>()
+    const clock = makeFakeClock()
+    const run = runGuarded(90_000, clock, src)
+    await clock.waitForScheduled(1)
+    clock.advance(105_131)
+    let err: unknown
+    try { await run.done } catch (e) { err = e }
+    expect(err).toBeInstanceOf(UpstreamIdleError)
+    expect((err as InstanceType<typeof UpstreamIdleError>).sinceLastMs).toBe(105_131)
+    expect(run.stalls).toEqual([105_131])
+    expect(run.lates).toEqual([{ lateMs: 15_131, sinceLastMs: 105_131, resumed: false }])
+  })
+
+  it("an on-time deadline stalls at once, without yielding for queued data", async () => {
+    const src = makeSource<number>()
+    const clock = makeFakeClock()
+    const run = runGuarded(90_000, clock, src)
+    await clock.waitForScheduled(1)
+    setImmediate(() => src.push(1))
+    clock.advance(90_000 + IDLE_DEADLINE_LATE_MS)
+    let err: unknown
+    try { await run.done } catch (e) { err = e }
+    expect(err).toBeInstanceOf(UpstreamIdleError)
+    expect((err as InstanceType<typeof UpstreamIdleError>).sinceLastMs).toBe(90_000 + IDLE_DEADLINE_LATE_MS)
+    expect(run.out).toEqual([])
+    expect(run.stalls).toEqual([90_000 + IDLE_DEADLINE_LATE_MS])
+    expect(run.lates).toEqual([])
+  })
+
+  it("a live socket stream survives the loop blocking inside another connection's handler", async () => {
+    const streamer = net.createServer((s) => {
+      let i = 0
+      const t = setInterval(() => s.write(`${i++}\n`), 50)
+      s.on("close", () => clearInterval(t))
+      s.on("error", () => {})
+    })
+    const blockMs = IDLE_DEADLINE_LATE_MS + 500
+    const blocker = net.createServer((s) => {
+      s.on("data", () => {
+        const end = Date.now() + blockMs
+        while (Date.now() < end) { /* a synchronous fsync holding the loop */ }
+        s.end()
+      })
+    })
+    await new Promise<void>((r) => streamer.listen(0, "127.0.0.1", r))
+    await new Promise<void>((r) => blocker.listen(0, "127.0.0.1", r))
+    const port = (s: net.Server) => (s.address() as net.AddressInfo).port
+    const sock = net.connect(port(streamer), "127.0.0.1")
+    const lines = async function* () { for await (const l of createInterface({ input: sock })) yield l }
+
+    let got = 0
+    const lates: LateIdleDeadline[] = []
+    try {
+      for await (const _ of guardUpstreamIdle(lines(), 200, undefined, undefined, (late) => lates.push(late))) {
+        if (++got === 3) net.connect(port(blocker), "127.0.0.1").end("go")
+        if (got === 10) break
+      }
+    } finally {
+      sock.destroy()
+      streamer.close()
+      blocker.close()
+    }
+    expect(got).toBe(10)
+    expect(lates).toHaveLength(1)
+    expect(lates[0]!.resumed).toBe(true)
+    expect(lates[0]!.lateMs).toBeGreaterThan(IDLE_DEADLINE_LATE_MS)
+  }, 15_000)
 
   it("idleMs<=0 disables the guard (pure pass-through)", async () => {
     const src = makeSource<number>()
