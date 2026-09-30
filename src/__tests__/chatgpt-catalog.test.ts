@@ -11,11 +11,13 @@ import {
   parseCodexModelCatalog,
   type CatalogModel,
 } from "../proxy/chatgpt/catalog"
+import { createCodexClientVersion } from "../proxy/chatgpt/clientVersion"
 import type { ChatGptCredentialSource, ChatGptSeatView, SeatCredential } from "../proxy/chatgpt/source"
 import { CHATGPT_MODELS } from "../proxy/upstream/provider"
 
 const NOW = 1_800_000_000_000
 const HOUR = 60 * 60_000
+const DAY = 24 * HOUR
 
 function seat(n: number, extra: Partial<ChatGptSeatView> = {}): ChatGptSeatView {
   return { id: `user-${n}__ws-${n}`, email: null, planType: "pro", eligible: true, expiresAt: NOW + HOUR, ...extra }
@@ -131,6 +133,7 @@ describe("createChatGptModelCatalog", () => {
     expect(catalog.view()).toEqual({
       source: "catalog",
       fetchedAt: NOW,
+      clientVersion: CATALOG_CLIENT_VERSION,
       models: ["gpt-6-luna", "gpt-team-only", "gpt-any-plan"],
       plans: { pro: ["gpt-6-luna", "gpt-any-plan"], team: ["gpt-6-luna", "gpt-team-only", "gpt-any-plan"] },
     })
@@ -232,6 +235,38 @@ describe("createChatGptModelCatalog", () => {
     release()
     await first
     expect(calls).toHaveLength(1)
+  })
+
+  it("reads for the looked-up client version, after the lookup, and re-reads for a newer one once found", async () => {
+    const { source } = fakeSource([seat(0, { expiresAt: NOW + 10 * DAY })])
+    let at = NOW
+    let latest = "0.159.1"
+    const lookups: string[] = []
+    const clientVersion = createCodexClientVersion({
+      pinned: CATALOG_CLIENT_VERSION,
+      now: () => at,
+      fetchImpl: ((input: string | URL | Request) => {
+        lookups.push(input.toString())
+        return Promise.resolve(json({ latest }))
+      }) as typeof fetch,
+    })
+    const { fetchImpl, calls } = catalogFetch(() => json(CATALOG))
+    const catalog = createChatGptModelCatalog({ source, fetchImpl, now: () => at, clientVersion })
+    await catalog.refresh()
+    expect(lookups).toHaveLength(1)
+    expect(calls.map(call => call.url.searchParams.get("client_version"))).toEqual(["0.159.1"])
+    expect(catalog.view().clientVersion).toBe("0.159.1")
+
+    at = NOW + 30 * 60_000
+    expect(catalog.refresh()).toBeUndefined()
+
+    at = NOW + DAY
+    latest = "0.160.0"
+    await catalog.refresh()
+    expect(calls.map(call => call.url.searchParams.get("client_version"))).toEqual(["0.159.1", "0.160.0"])
+
+    at = NOW + DAY + 30 * 60_000
+    expect(catalog.refresh()).toBeUndefined()
   })
 
   it("survives a network error", async () => {

@@ -9,7 +9,8 @@ import { chatGptFeatureCapabilities, getChatGptFeatures, resetChatGptFeatures, u
 import { resolveModelPricing } from '../telemetry/pricing'
 import { getPricingOverrides } from '../telemetry/pricingStore'
 import { computeSummary } from '../telemetry/percentiles'
-import { chatGptModelList, createChatGptModelCatalog, type CatalogModel } from './chatgpt/catalog'
+import { CATALOG_CLIENT_VERSION, chatGptModelList, createChatGptModelCatalog, type CatalogModel } from './chatgpt/catalog'
+import { createCodexClientVersion } from './chatgpt/clientVersion'
 import { CHATGPT_WARM_MODELS, chatGptRefusalDiagnosis, chatGptWarmBody, createChatGptProfileSurface } from './chatgpt/profileSurface'
 import { getCodexUsage } from './codex/service'
 import type { CodexUsageResponse } from './codex/types'
@@ -7996,9 +7997,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
   // What /v1/models, /providers and the Fallback Model choices offer: the
   // backend's own model catalog (chatgpt/catalog.ts), read hourly off the
-  // request path. Routing never consults it.
+  // request path. Routing never consults it. It is read for the newest Codex
+  // release, looked up daily (chatgpt/clientVersion.ts), because the backend
+  // hides every model released for a newer Codex than the one asking.
   const chatGptCatalog = chatGptSource ? createChatGptModelCatalog({
     source: chatGptSource,
+    clientVersion: createCodexClientVersion({ pinned: CATALOG_CLIENT_VERSION, log: plog }),
     planTypes: () => new Map((chatGptUsage?.entries ?? []).map(entry => [entry.id, entry.plan?.slug ?? null])),
   }) : undefined
   void chatGptCatalog?.refresh()

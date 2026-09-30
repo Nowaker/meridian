@@ -31,18 +31,22 @@
  */
 import type { OpenAiModel } from "../openai"
 import { CHATGPT_MODELS } from "../upstream/provider"
+import { fixedCodexClientVersion, type CodexClientVersion } from "./clientVersion"
 import type { ChatGptCredentialSource } from "./source"
 
 /** Fixed by construction, like the responses URL: a bearer token is never aimed at a configurable host. */
 const CATALOG_URL = "https://chatgpt.com/backend-api/codex/models"
 
 /**
- * The Codex CLI version the catalog is asked for: a real release, the newest
- * listed model's `minimal_client_version` on 2026-09-29. The backend answers
- * for that version (measured: 0.100.0 got no usable catalog, so the static
- * list stood in), so a model that needs a newer Codex is not offered until
- * this is raised. That errs toward offering less, never a refused model; an
- * unoffered model still routes to ChatGPT when a client names it.
+ * The Codex CLI version the catalog is asked for until the latest release has
+ * been looked up (chatgpt/clientVersion.ts), and the floor for what a lookup
+ * may find. A real release: the newest listed model's
+ * `minimal_client_version` on 2026-09-29. The backend answers for the version
+ * it is given (measured: 0.100.0 got no usable catalog, so the static list
+ * stood in), so a model that needs a newer Codex is not offered until a
+ * newer version is asked for. That errs toward offering less, never a
+ * refused model; an unoffered model still routes to ChatGPT when a client
+ * names it.
  */
 export const CATALOG_CLIENT_VERSION = "0.155.0"
 
@@ -112,6 +116,8 @@ export interface ChatGptModelCatalogView {
   /** "catalog" once the backend's catalog has been read, else "static". */
   source: "catalog" | "static"
   fetchedAt: number | null
+  /** The `client_version` the catalog was read for; null until a read. */
+  clientVersion: string | null
   models: string[]
   /** Per plan held by a seat: what the catalog offers it. Empty until a read. */
   plans: Record<string, string[]>
@@ -139,6 +145,12 @@ export interface ChatGptModelCatalogOptions {
    * seat moved from one plan to another keeps its old slug there.
    */
   planTypes?: () => ReadonlyMap<string, string | null>
+  /**
+   * The `client_version` to read the catalog for; `CATALOG_CLIENT_VERSION`
+   * when absent. Looked up before each due read, and a newly found version
+   * makes the catalog due at once rather than at the next hourly read.
+   */
+  clientVersion?: CodexClientVersion
 }
 
 export function createChatGptModelCatalog(options: ChatGptModelCatalogOptions): ChatGptModelCatalog {
@@ -146,7 +158,8 @@ export function createChatGptModelCatalog(options: ChatGptModelCatalogOptions): 
   const doFetch = options.fetchImpl ?? fetch
   const now = options.now ?? Date.now
   const fallback = [...(options.fallback ?? CHATGPT_MODELS)]
-  let catalog: { models: CatalogModel[]; fetchedAt: number } | null = null
+  const clientVersion = options.clientVersion ?? fixedCodexClientVersion(CATALOG_CLIENT_VERSION)
+  let catalog: { models: CatalogModel[]; fetchedAt: number; clientVersion: string } | null = null
   let retryAt = 0
   let running: Promise<void> | undefined
 
@@ -164,13 +177,13 @@ export function createChatGptModelCatalog(options: ChatGptModelCatalogOptions): 
     .filter(seat => seat.eligible && seat.expiresAt !== null && seat.expiresAt - at > TOKEN_HEADROOM_MS)
 
   /** `asked` is whether any request left the process; without one there is nothing to back off from. */
-  const read = async (at: number): Promise<{ models: CatalogModel[] | null; asked: boolean }> => {
+  const read = async (at: number, version: string): Promise<{ models: CatalogModel[] | null; asked: boolean }> => {
     let asked = false
     for (const seat of readableSeats(at)) {
       const credential = await source.credentials(seat.id)
       if (!credential.ok) continue
       const url = new URL(CATALOG_URL)
-      url.searchParams.set("client_version", CATALOG_CLIENT_VERSION)
+      url.searchParams.set("client_version", version)
       asked = true
       try {
         const response = await doFetch(url, {
@@ -195,6 +208,12 @@ export function createChatGptModelCatalog(options: ChatGptModelCatalogOptions): 
     return { models: null, asked }
   }
 
+  /** Hourly, or at once when a newer client version has been found; a failed read still waits out its retry. */
+  const due = (at: number): boolean => {
+    if (at < retryAt) return false
+    return !catalog || catalog.clientVersion !== clientVersion.current() || at - catalog.fetchedAt >= CATALOG_TTL_MS
+  }
+
   const entries = (): CatalogModel[] => {
     if (!catalog) return fallback.map(slug => ({ slug, displayName: slug, contextWindow: null, plans: null }))
     return offeredModels(catalog.models, seatPlans())
@@ -211,25 +230,30 @@ export function createChatGptModelCatalog(options: ChatGptModelCatalogOptions): 
       return {
         source: catalog ? "catalog" : "static",
         fetchedAt: catalog?.fetchedAt ?? null,
+        clientVersion: catalog?.clientVersion ?? null,
         models: entries().map(model => model.slug),
         plans,
       }
     },
     refresh() {
       if (running) return running
-      const at = now()
-      if (catalog && at - catalog.fetchedAt < CATALOG_TTL_MS) return undefined
-      if (at < retryAt) return undefined
-      running = read(at)
-        .then(({ models, asked }) => {
-          if (models) {
-            catalog = { models, fetchedAt: at }
-            retryAt = 0
-          } else if (asked) {
-            retryAt = at + FAILED_READ_RETRY_MS
-          }
-        })
-        .finally(() => { running = undefined })
+      // A due version lookup runs first, so the read it precedes already asks
+      // for the version it found instead of reading twice.
+      const lookup = clientVersion.refresh()
+      if (!lookup && !due(now())) return undefined
+      running = (async () => {
+        if (lookup) await lookup
+        const at = now()
+        if (!due(at)) return
+        const version = clientVersion.current()
+        const { models, asked } = await read(at, version)
+        if (models) {
+          catalog = { models, fetchedAt: at, clientVersion: version }
+          retryAt = 0
+        } else if (asked) {
+          retryAt = at + FAILED_READ_RETRY_MS
+        }
+      })().finally(() => { running = undefined })
       return running
     },
   }

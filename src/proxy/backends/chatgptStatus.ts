@@ -37,7 +37,7 @@ function modelsCapability(view: ChatGptModelCatalogView): { name: string; status
   }
   const plans = Object.entries(view.plans).map(([plan, models]) => `${plan} ${models.length}`).join(', ')
   const readAt = view.fetchedAt === null ? 'never' : new Date(view.fetchedAt).toISOString()
-  return { name: 'Models', status: 'catalog', detail: `From the backend's model catalog, read ${readAt}. Models per plan: ${plans || 'none'}.` }
+  return { name: 'Models', status: 'catalog', detail: `From the backend's model catalog, read ${readAt} for Codex ${view.clientVersion ?? 'unknown'}. Models per plan: ${plans || 'none'}.` }
 }
 
 function headerWindows(observed: ObservedSeatLimits | undefined) {
