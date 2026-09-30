@@ -14,11 +14,7 @@ import { join } from "node:path"
 import { CrossProcessTurnCoordinator } from "../proxy/session/crossProcessTurnCoordinator"
 import { captureProcessIncarnation } from "../proxy/session/processIncarnation"
 import { prepareFork } from "../proxy/sessionLifecycle"
-import {
-  lookupSharedSession,
-  setSessionStoreDir,
-  storeSharedSession,
-} from "../proxy/sessionStore"
+import { setSessionStoreDir } from "../proxy/sessionStore"
 
 const roots: string[] = []
 
@@ -54,25 +50,6 @@ describe("Windows-safe durable session storage", () => {
 
     expect(prepared.lifecycleGeneration).toMatch(/^r:[a-f0-9]{64}:1$/)
     expect(JSON.parse(readFileSync(join(root, "session-gc.json"), "utf8")).version).toBe(2)
-    expect(existsSync(lockPath)).toBe(false)
-  }, 30_000)
-
-  it("recovers the synchronous store lock before publishing a mapping", async () => {
-    const root = makeRoot("store")
-    setSessionStoreDir(root, { skipLocking: false })
-    const lockPath = join(root, "sessions.json.lock")
-    writeFileSync(lockPath, JSON.stringify({
-      pid: 999_999_999,
-      hostname: hostname(),
-      token: "dead-store-owner",
-      incarnation: deadIncarnation(999_999_999),
-    }), { mode: 0o600 })
-    makeStale(lockPath)
-
-    await storeSharedSession("platform-store-key", "platform-store-session")
-
-    expect(lookupSharedSession("platform-store-key")?.claudeSessionId)
-      .toBe("platform-store-session")
     expect(existsSync(lockPath)).toBe(false)
   }, 30_000)
 

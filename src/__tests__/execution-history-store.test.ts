@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { lookupSession, rollbackPrioritySessionPublication, storeSession, type PrioritySessionPublication } from "../proxy/session/cache"
 import { computeLineageHash } from "../proxy/session/lineage"
 import { claimPriorityAttempt, lookupPriorityAssignmentResult, lookupSharedSession, lookupSharedSessionResult, setSessionStoreDir } from "../proxy/sessionStore"
+import { commitRawSession, readCommittedSession } from "./storeDatabaseHelpers"
 
 const messages = [{ role: "user", content: "raw original objective" }]
 const continuation = [...messages, { role: "assistant", content: "answer" }, { role: "user", content: "next question" }]
@@ -43,15 +44,15 @@ describe("durable raw proof and execution reuse proof", () => {
     setSessionStoreDir(null)
     setSessionStoreDir(directory)
     expect(lookupSession("ordinary", continuation).type).toBe("continuation")
-    const serialized = JSON.parse(readFileSync(join(directory, "sessions.json"), "utf8"))
-    expect(serialized.ordinary.clientLineageHash).toBe(computeLineageHash(messages))
-    expect(serialized.ordinary.lineageHash).toBe("")
+    const serialized = readCommittedSession(directory, "ordinary")
+    expect(serialized?.clientLineageHash).toBe(computeLineageHash(messages))
+    expect(serialized?.lineageHash).toBe("")
 
     expect(await storeSession("ordinary", continuation, "sdk-full-replay")).not.toBe(false)
     const restored = lookupSharedSession("ordinary")
     expect(restored?.lineageHash).toBe(computeLineageHash(continuation))
     expect(restored?.clientLineageHash).toBeUndefined()
-    expect(JSON.parse(readFileSync(join(directory, "sessions.json"), "utf8")).ordinary.clientLineageHash).toBeUndefined()
+    expect(readCommittedSession(directory, "ordinary")?.clientLineageHash).toBeUndefined()
   })
 
   it("priority atomic publication, reload and rollback retain distinct proofs", async () => {
@@ -92,10 +93,9 @@ describe("durable raw proof and execution reuse proof", () => {
   it("fails closed on malformed persisted raw proof rather than granting SDK resume", async () => {
     await storeSession("malformed", messages, "sdk-malformed", undefined, undefined, undefined,
       undefined, undefined, undefined, undefined, undefined, undefined, false)
-    const file = join(directory, "sessions.json")
-    const document = JSON.parse(readFileSync(file, "utf8"))
-    document.malformed.clientLineageHash = 7
-    writeFileSync(file, JSON.stringify(document))
+    const entry = readCommittedSession(directory, "malformed")
+    if (!entry) throw new Error("fixture mapping missing")
+    commitRawSession(directory, "malformed", { ...entry, clientLineageHash: 7 })
     setSessionStoreDir(null)
     setSessionStoreDir(directory)
     const errors = spyOn(console, "error").mockImplementation(() => {})
