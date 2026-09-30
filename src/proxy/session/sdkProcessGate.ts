@@ -2,19 +2,18 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import {
   closeSync,
-  fsyncSync,
   mkdirSync,
   openSync,
   realpathSync,
-  renameSync,
   rmSync,
-  writeFileSync,
 } from "node:fs"
+import { open, rename, rm, type FileHandle } from "node:fs/promises"
 import { dirname, isAbsolute, join } from "node:path"
 import type {
   SpawnedProcess,
   SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk"
+import { syncDirectoryDurably } from "./durableFileSystem"
 import {
   captureProcessIncarnation,
   type ProcessIncarnation,
@@ -77,27 +76,20 @@ function gateContents(options: SpawnOptions): string {
   })
 }
 
-function publishGate(path: string, contents: string): void {
+async function publishGate(path: string, contents: string): Promise<void> {
   const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`
-  let fd: number | undefined
+  let handle: FileHandle | undefined
   try {
-    fd = openSync(temporary, "wx", 0o600)
-    writeFileSync(fd, contents, "utf8")
-    fsyncSync(fd)
-    closeSync(fd)
-    fd = undefined
-    renameSync(temporary, path)
-    if (process.platform !== "win32") {
-      const parent = openSync(dirname(path), "r")
-      try {
-        fsyncSync(parent)
-      } finally {
-        closeSync(parent)
-      }
-    }
+    handle = await open(temporary, "wx", 0o600)
+    await handle.writeFile(contents, "utf8")
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+    await rename(temporary, path)
+    await syncDirectoryDurably(dirname(path))
   } finally {
-    if (fd !== undefined) closeSync(fd)
-    rmSync(temporary, { force: true })
+    if (handle) await handle.close()
+    await rm(temporary, { force: true })
   }
 }
 
@@ -245,6 +237,7 @@ export async function createSdkProcessGate(
   })
   let attached = false
   let spawned = false
+  let publication: Promise<void> = Promise.resolve()
   try {
     if (!child.pid) throw new Error("SDK gate process has no PID")
     const executor = captureProcessIncarnation(child.pid)
@@ -269,7 +262,14 @@ export async function createSdkProcessGate(
         onAbort()
         throw abortError()
       }
-      publishGate(gatePath, gateContents(options))
+      // The SDK needs the process handle back synchronously, and the wrapper
+      // already waits for the gate, so the publication finishes in the
+      // background instead of holding the event loop through two fsyncs. A
+      // gate that cannot be published must not leave the wrapper waiting.
+      publication = publishGate(gatePath, gateContents(options)).catch((error: unknown) => {
+        console.error("[sdkProcessGate] gate publication failed:", error)
+        killOwned("SIGKILL")
+      })
       return asSpawnedProcess(child, killOwned)
     }
 
@@ -290,11 +290,14 @@ export async function createSdkProcessGate(
           killOwned("SIGKILL")
           joined = await waitForExit(exited, Math.min(2_000, timeoutMs))
         }
+        // The gate holds the CLI's whole environment. A publication still in
+        // flight would rename it into place after the removal below.
         if (joined) {
+          await publication
           rmSync(gatePath, { force: true })
           rmSync(cancelPath, { force: true })
         } else {
-          void exited.then(() => {
+          void Promise.all([exited, publication]).then(() => {
             rmSync(gatePath, { force: true })
             rmSync(cancelPath, { force: true })
           })
