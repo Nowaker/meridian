@@ -9595,7 +9595,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
     } }
   }
   // Refuse to bind a port we cannot serve from (#906). Without a boot identity
-  // every session-store write throws, so every request that touches a session
+  // every session lock acquisition throws, so every request that touches a session
   // returns a 500 — a total, non-transient failure. Binding anyway is what let
   // a container missing /etc/machine-id report healthy to Docker for three days
   // while serving nothing.

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, rmSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { installSdkMock } from "./sdkMock"
@@ -39,6 +39,7 @@ installMcpToolsMock(() => ({ createOpencodeMcpServer: () => ({ type: "sdk", name
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 const { resetActiveProfile } = await import("../proxy/profiles")
 const { setSessionStoreDir, readSessionStoreSnapshot } = await import("../proxy/sessionStore")
+const { commitRawSession } = await import("./storeDatabaseHelpers")
 
 let root: string
 let proxy: ReturnType<typeof createProxyServer> | undefined
@@ -176,8 +177,8 @@ describe("profile-copy pruning consent", () => {
         "personal:policy": { claudeSessionId: "older", createdAt: 1, lastUsedAt: 1, messageCount: 1 },
         "work:policy": { claudeSessionId: "newer", createdAt: 2, lastUsedAt: 2, messageCount: 1 },
       }
-      mkdirSync(join(root, "sessions"), { recursive: true })
-      writeFileSync(join(root, "sessions", "sessions.json"), JSON.stringify(document))
+      readSessionStoreSnapshot()
+      for (const [key, entry] of Object.entries(document)) commitRawSession(join(root, "sessions"), key, entry)
       proxy = createProxyServer({ port: 0, host: "127.0.0.1", profiles: ["personal", "work"].map(id => ({ id, claudeConfigDir: join(root, id) })) })
       await proxy.sweepSessionGc?.()
       expect(Object.keys(readSessionStoreSnapshot()).sort()).toEqual(enabled === "1"

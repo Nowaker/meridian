@@ -1,31 +1,30 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  readdirSync,
-  rmSync,
-  statSync,
-  utimesSync,
-  writeFileSync,
-} from "node:fs"
-import { open, type FileHandle } from "node:fs/promises"
-import { hostname, tmpdir } from "node:os"
+import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { monitorEventLoopDelay } from "node:perf_hooks"
 import {
   clearSharedSessions,
-  evictSharedSession,
   lookupSharedSession,
+  lookupSharedSessionResult,
   readSessionStoreSnapshot,
   setSessionStoreDir,
   storeSharedSession,
 } from "../proxy/sessionStore"
-import { captureProcessIncarnation } from "../proxy/session/processIncarnation"
-import {
-  getRecoveryClaimPath,
-  getRecoveryClaimTombstonePath,
-} from "../proxy/session/recoveryClaim"
+import { holdWriteLock, readCommittedSession, storeIntegrity } from "./storeDatabaseHelpers"
+
+const modulePath = join(import.meta.dir, "../proxy/sessionStore.ts")
+
+/** The error a promise rejects with. `expect(promise).rejects` cannot wait for
+ *  a store write under bun test (see session/storeDatabase.ts). */
+async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
+  try {
+    await promise
+  } catch (error) {
+    return error as Error
+  }
+  throw new Error("expected the promise to reject")
+}
 
 describe("Shared session store locking", () => {
   let tmpDir: string
@@ -33,7 +32,7 @@ describe("Shared session store locking", () => {
 
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "session-store-locking-test-"))
-    setSessionStoreDir(tmpDir, { skipLocking: false })
+    setSessionStoreDir(tmpDir)
     await clearSharedSessions()
   })
 
@@ -47,7 +46,6 @@ describe("Shared session store locking", () => {
   it("preserves every entry from real concurrent writer processes", async () => {
     const workerCount = 8
     const entriesPerWorker = 12
-    const modulePath = join(import.meta.dir, "../proxy/sessionStore.ts")
     const childCode = `
       import { storeSharedSession } from ${JSON.stringify(modulePath)}
       const worker = Number(process.env.WORKER)
@@ -88,159 +86,113 @@ describe("Shared session store locking", () => {
     }
   }, 20_000)
 
-  it("atomically takes over a stale lock", async () => {
-    const sessionsPath = join(tmpDir, "sessions.json")
-    const lockPath = `${sessionsPath}.lock`
+  it("gives exactly one of several processes the compare-and-swap on one generation", async () => {
+    const initial = await storeSharedSession("contended", "claude-initial")
+    expect(initial).not.toBe(false)
+    const go = join(tmpDir, "go")
+    const children = Array.from({ length: 4 }, (_, worker) => Bun.spawn({
+      cmd: [process.execPath, "-e", `
+        import { existsSync } from "node:fs"
+        import { lookupSharedSessionResult, storeSharedSession } from ${JSON.stringify(modulePath)}
+        const armed = lookupSharedSessionResult("contended")
+        if (armed.status !== "found" || armed.generation !== ${JSON.stringify(initial)}) process.exit(2)
+        while (!existsSync(${JSON.stringify(go)})) await Bun.sleep(5)
+        const won = await storeSharedSession(
+          "contended", "claude-worker-${worker}", undefined, undefined, undefined, undefined, undefined,
+          undefined, undefined, undefined, undefined, undefined, armed.generation,
+        )
+        console.log(won === false ? "lost" : "won")
+      `],
+      env: { ...process.env, MERIDIAN_SESSION_DIR: tmpDir },
+      stdout: "pipe",
+      stderr: "pipe",
+    }))
+    await Bun.sleep(200)
+    writeFileSync(go, "")
 
-    writeFileSync(lockPath, JSON.stringify({ pid: 999_999_999, hostname: hostname(), token: "stale", incarnation: deadProcessIncarnation(999_999_999) }), { mode: 0o600 })
-    const staleTime = (Date.now() - 31_000) / 1000
-    utimesSync(lockPath, staleTime, staleTime)
-
-    await storeSharedSession("stale-lock-session", "claude-stale")
-
-    expect(lookupSharedSession("stale-lock-session")?.claudeSessionId).toBe("claude-stale")
-    expect(existsSync(lockPath)).toBe(false)
-    expect(readdirSync(tmpDir).some((name) => name.includes(".lock.stale-"))).toBe(false)
-  })
-
-  it("repeatedly adopts dead recovery claims and cleans tombstones after resolution", async () => {
-    const lockPath = join(tmpDir, "sessions.json.lock")
-    const staleOwner = JSON.stringify({ pid: 999_999_999, hostname: hostname(), token: "stale-generation", incarnation: deadProcessIncarnation(999_999_999) })
-    writeFileSync(lockPath, staleOwner, { mode: 0o600 })
-    const staleTime = (Date.now() - 31_000) / 1000
-    utimesSync(lockPath, staleTime, staleTime)
-
-    const claimPath = getRecoveryClaimPath(lockPath, staleOwner)
-    const firstToken = "first-dead-recoverer"
-    const firstTombstone = getRecoveryClaimTombstonePath(claimPath, firstToken)
-    writeRecoveryClaim(firstTombstone, staleOwner, firstToken, 999_999_998)
-    writeRecoveryClaim(claimPath, staleOwner, "second-dead-recoverer", 999_999_999)
-
-    await storeSharedSession("after-orphaned-recovery", "claude-after-orphan")
-
-    expect(lookupSharedSession("after-orphaned-recovery")?.claudeSessionId).toBe("claude-after-orphan")
-    expect(existsSync(lockPath)).toBe(false)
-    expect(readdirSync(tmpDir).some((name) => name.includes(".recover-"))).toBe(false)
-  })
-
-  it("fails closed for live and remote recovery claim owners", async () => {
-    const lockPath = join(tmpDir, "sessions.json.lock")
-    const staleOwner = JSON.stringify({ pid: 999_999_999, hostname: hostname(), token: "blocked-generation", incarnation: deadProcessIncarnation(999_999_999) })
-    const staleTime = (Date.now() - 31_000) / 1000
-    process.env.MERIDIAN_SESSION_LOCK_TIMEOUT_MS = "20"
-
-    for (const [claimHostname, claimPid] of [[hostname(), process.pid], ["remote.example", 999_999_999]] as const) {
-      writeFileSync(lockPath, staleOwner, { mode: 0o600 })
-      utimesSync(lockPath, staleTime, staleTime)
-      const claimPath = getRecoveryClaimPath(lockPath, staleOwner)
-      writeRecoveryClaim(claimPath, staleOwner, `blocked-${claimHostname}`, claimPid, claimHostname)
-
-      await expect(storeSharedSession(`blocked-${claimHostname}`, "claude-never-written")).rejects
-        .toThrow("timed out waiting for lock")
-      expect(existsSync(join(claimPath, "owner.json"))).toBe(true)
-
-      rmSync(claimPath, { recursive: true, force: true })
-      rmSync(lockPath, { force: true })
+    const outcomes: string[] = []
+    for (const [worker, child] of children.entries()) {
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ])
+      expect(stderr).toBe("")
+      expect(exitCode).toBe(0)
+      outcomes.push(`${worker}:${stdout.trim()}`)
     }
-  })
+    const winners = outcomes.filter((outcome) => outcome.endsWith(":won"))
+    expect(winners).toHaveLength(1)
+    const winner = winners[0]!.split(":")[0]
+    expect(lookupSharedSession("contended")?.claudeSessionId).toBe(`claude-worker-${winner}`)
+  }, 20_000)
 
-  it("waits for an active owner, then throws without deleting its token", async () => {
-    const lockPath = join(tmpDir, "sessions.json.lock")
-    writeFileSync(lockPath, "different-owner-token", { mode: 0o600 })
-    process.env.MERIDIAN_SESSION_LOCK_TIMEOUT_MS = "30"
-
-    await expect(storeSharedSession("lock-contention", "claude-never-written")).rejects
-      .toThrow("timed out waiting for lock")
-    expect(readFileSync(lockPath, "utf8")).toBe("different-owner-token")
-    expect(lookupSharedSession("lock-contention")).toBeUndefined()
-  })
-
-  it("fails all mutations closed when the store is corrupt", async () => {
-    const sessionsPath = join(tmpDir, "sessions.json")
-    const corrupt = "{invalid-json"
-    const errorSpy = spyOn(console, "error").mockImplementation(() => {})
-    writeFileSync(sessionsPath, corrupt)
-
-    expect(lookupSharedSession("broken")).toBeUndefined()
-    await expect(storeSharedSession("write", "claude-write")).rejects.toThrow()
-    await expect(evictSharedSession("broken")).rejects.toThrow()
-    await expect(clearSharedSessions()).rejects.toThrow()
-    expect(readFileSync(sessionsPath, "utf8")).toBe(corrupt)
-    expect(errorSpy).toHaveBeenCalledWith("[sessionStore] read failed:", expect.any(String))
-
-    errorSpy.mockRestore()
-  })
-
-  it("writes through a unique mode-0600 temporary file and leaves no artifacts", async () => {
-    await storeSharedSession("secure", "claude-secure")
-
-    const sessionsPath = join(tmpDir, "sessions.json")
-    expect(statSync(sessionsPath).mode & 0o777).toBe(0o600)
-    expect(readdirSync(tmpDir).filter((name) => name.includes(".tmp-"))).toEqual([])
-    expect(JSON.parse(readFileSync(sessionsPath, "utf8")).secure.claudeSessionId).toBe("claude-secure")
-  })
-
-  it("keeps serving the event loop while a write waits for the disk", async () => {
-    const delayMs = 150
-    let syncs = 0
-    const restore = await delayFileHandleSync(tmpDir, delayMs, () => { syncs++ })
-    let ticks = 0
-    const heartbeat = setInterval(() => { ticks++ }, 5)
+  it("waits for a process holding the write lock, then times out without touching the store", async () => {
+    await storeSharedSession("existing", "claude-existing")
+    const holder = await holdWriteLock(tmpDir)
+    process.env.MERIDIAN_SESSION_LOCK_TIMEOUT_MS = "300"
     try {
-      const write = storeSharedSession("slow-disk", "claude-slow-disk")
-      const ticksBeforeWrite = ticks
-      await write
-      // Lock candidate, the store's temporary file, and the directory.
-      expect(syncs).toBe(3)
-      expect(ticks - ticksBeforeWrite).toBeGreaterThanOrEqual(10)
+      const started = performance.now()
+      const error = await rejectionOf(storeSharedSession("contender", "claude-contender"))
+      expect(error.message).toContain("timed out waiting for lock")
+      expect(performance.now() - started).toBeGreaterThanOrEqual(250)
+      // Reads never wait for a writer.
+      expect(lookupSharedSession("existing")?.claudeSessionId).toBe("claude-existing")
+      expect(lookupSharedSession("contender")).toBeUndefined()
+    } finally {
+      await holder.release()
+    }
+    expect(await storeSharedSession("contender", "claude-contender")).not.toBe(false)
+    expect(readCommittedSession(tmpDir, "contender")?.claudeSessionId).toBe("claude-contender")
+  }, 20_000)
+
+  it("keeps serving the event loop while a write waits for another process's lock", async () => {
+    const holder = await holdWriteLock(tmpDir)
+    const delay = monitorEventLoopDelay({ resolution: 1 })
+    let ticks = 0
+    let collections = 0
+    // Collecting garbage while the write waits is what would stall the loop if
+    // the writer ever let one of its statements be finalized.
+    const heartbeat = setInterval(() => {
+      ticks++
+      if (ticks % 10 === 0) {
+        Bun.gc(true)
+        collections++
+      }
+    }, 5)
+    delay.enable()
+    try {
+      const write = storeSharedSession("waiting-write", "claude-waiting")
+      await Bun.sleep(400)
+      expect(lookupSharedSession("waiting-write")).toBeUndefined()
+      await holder.release()
+      expect(await write).not.toBe(false)
     } finally {
       clearInterval(heartbeat)
-      restore()
+      delay.disable()
     }
-    expect(lookupSharedSession("slow-disk")?.claudeSessionId).toBe("claude-slow-disk")
-  })
+    expect(ticks).toBeGreaterThanOrEqual(40)
+    expect(collections).toBeGreaterThanOrEqual(4)
+    expect(delay.max / 1e6).toBeLessThan(100)
+    expect(lookupSharedSession("waiting-write")?.claudeSessionId).toBe("claude-waiting")
+  }, 20_000)
 
-  it("applies overlapping writes in call order, so the last writer wins", async () => {
-    // Earlier calls get slower syncs: without in-process ordering the last
-    // caller would take the lock first and the first caller's write would land last.
-    let syncCall = 0
-    const restore = await delayFileHandleSync(tmpDir, () => Math.max(0, 120 - 20 * syncCall++))
-    try {
-      const generations = await Promise.all(Array.from({ length: 6 }, (_, i) =>
-        storeSharedSession("contended", `claude-${i}`, i)))
-      expect(new Set(generations).size).toBe(6)
-    } finally {
-      restore()
-    }
-    expect(lookupSharedSession("contended")).toMatchObject({ claudeSessionId: "claude-5", messageCount: 5 })
-  })
-
-  it("leaves the previous store intact when the writer dies between fsync and rename", async () => {
-    const modulePath = join(import.meta.dir, "../proxy/sessionStore.ts")
+  it("keeps what a writer committed, and nothing of the transaction it died in", async () => {
     const child = Bun.spawn({
       cmd: [process.execPath, "-e", `
-        import { open } from "node:fs/promises"
+        import AsyncDatabase from "libsql/promise"
         import { storeSharedSession } from ${JSON.stringify(modulePath)}
         await storeSharedSession("kept", "claude-kept")
-        const probe = await open(process.env.PROBE, "w")
-        const proto = Object.getPrototypeOf(probe)
-        await probe.close()
-        const writeFile = proto.writeFile
-        const sync = proto.sync
-        const storeFiles = new WeakSet()
-        proto.writeFile = async function (data, ...rest) {
-          const head = typeof data === "string" ? data.slice(0, 64) : Buffer.isBuffer(data) ? data.subarray(0, 64).toString("utf8") : ""
-          if (head.includes("meridian-session-store")) storeFiles.add(this)
-          return writeFile.call(this, data, ...rest)
-        }
-        proto.sync = async function () {
-          await sync.call(this)
-          if (storeFiles.has(this)) process.kill(process.pid, "SIGKILL")
+        const exec = AsyncDatabase.prototype.exec
+        AsyncDatabase.prototype.exec = function (sql) {
+          // The rows are written; the transaction dies before it commits.
+          if (sql === "COMMIT") process.kill(process.pid, "SIGKILL")
+          return exec.call(this, sql)
         }
         await storeSharedSession("lost", "claude-lost")
         process.exit(3)
       `],
-      env: { ...process.env, MERIDIAN_SESSION_DIR: tmpDir, PROBE: join(tmpDir, "probe") },
+      env: { ...process.env, MERIDIAN_SESSION_DIR: tmpDir },
       stdout: "ignore",
       stderr: "pipe",
     })
@@ -248,122 +200,95 @@ describe("Shared session store locking", () => {
     expect(child.signalCode).toBe("SIGKILL")
     expect(stderr).toBe("")
 
-    const stored = JSON.parse(readFileSync(join(tmpDir, "sessions.json"), "utf8"))
-    expect(stored.kept?.claudeSessionId).toBe("claude-kept")
-    expect(stored.lost).toBeUndefined()
-    // The replacement reached the disk in full; only the rename never happened.
-    const orphans = readdirSync(tmpDir).filter((name) => name.startsWith("sessions.json.tmp-"))
-    expect(orphans).toHaveLength(1)
-    expect(JSON.parse(readFileSync(join(tmpDir, orphans[0]!), "utf8")).lost?.claudeSessionId).toBe("claude-lost")
+    expect(readCommittedSession(tmpDir, "kept")?.claudeSessionId).toBe("claude-kept")
+    expect(readCommittedSession(tmpDir, "lost")).toBeUndefined()
+    expect(lookupSharedSession("kept")?.claudeSessionId).toBe("claude-kept")
+    expect(storeIntegrity(tmpDir)).toBe("ok")
+    // The dead writer left no lock behind.
+    process.env.MERIDIAN_SESSION_LOCK_TIMEOUT_MS = "1000"
+    expect(await storeSharedSession("after", "claude-after")).not.toBe(false)
   }, 20_000)
 
-  it("keeps a second process out while the lock holder waits for the disk", async () => {
-    const modulePath = join(import.meta.dir, "../proxy/sessionStore.ts")
-    const holding = join(tmpDir, "holding")
-    const release = join(tmpDir, "release")
+  it("takes the lock of a writer that died holding it at once", async () => {
+    const holder = await holdWriteLock(tmpDir)
+    process.kill(holder.pid, "SIGKILL")
+    await Bun.sleep(50)
+    process.env.MERIDIAN_SESSION_LOCK_TIMEOUT_MS = "1000"
+    const started = performance.now()
+    expect(await storeSharedSession("after-dead-holder", "claude-after")).not.toBe(false)
+    expect(performance.now() - started).toBeLessThan(900)
+  }, 20_000)
+
+  it("keeps the database and its write-ahead log private and leaves nothing else", async () => {
+    await storeSharedSession("secure", "claude-secure")
+    expect(readdirSync(tmpDir).sort()).toEqual(["sessions.db", "sessions.db-shm", "sessions.db-wal"])
+    for (const name of readdirSync(tmpDir)) {
+      expect({ name, mode: statSync(join(tmpDir, name)).mode & 0o777 }).toEqual({ name, mode: 0o600 })
+    }
+  })
+
+  it("applies overlapping writes in call order, so the last writer wins", async () => {
+    const generations = await Promise.all(Array.from({ length: 6 }, (_, i) =>
+      storeSharedSession("contended", `claude-${i}`, i)))
+    expect(new Set(generations).size).toBe(6)
+    expect(lookupSharedSession("contended")).toMatchObject({ claudeSessionId: "claude-5", messageCount: 5 })
+    const result = lookupSharedSessionResult("contended")
+    expect(result.status === "found" ? result.generation : undefined).toBe(generations[5] as string)
+  })
+
+  // A slow disk is imitated by delaying every fsync of a child process through
+  // LD_PRELOAD, which needs Linux and a C compiler.
+  const compiler = process.platform === "linux" ? Bun.which("cc") : null
+  it.skipIf(!compiler)("keeps serving the event loop while COMMIT waits for a slow fsync", async () => {
+    const shimSource = join(tmpDir, "slow-fsync.c")
+    const shim = join(tmpDir, "slow-fsync.so")
+    writeFileSync(shimSource, `
+      #define _GNU_SOURCE
+      #include <dlfcn.h>
+      #include <stdlib.h>
+      #include <unistd.h>
+      static void slow(void) { const char *ms = getenv("SLOW_FSYNC_MS"); if (ms) usleep(atoi(ms) * 1000); }
+      int fsync(int fd) { static int (*real)(int); if (!real) real = dlsym(RTLD_NEXT, "fsync"); slow(); return real(fd); }
+      int fdatasync(int fd) { static int (*real)(int); if (!real) real = dlsym(RTLD_NEXT, "fdatasync"); slow(); return real(fd); }
+    `)
+    const build = Bun.spawnSync({ cmd: [compiler!, "-shared", "-fPIC", "-o", shim, shimSource, "-ldl"], stderr: "pipe" })
+    expect(build.exitCode).toBe(0)
+    const storeDir = join(tmpDir, "store")
+
     const child = Bun.spawn({
       cmd: [process.execPath, "-e", `
-        import { existsSync, writeFileSync } from "node:fs"
-        import { open } from "node:fs/promises"
+        import { monitorEventLoopDelay } from "node:perf_hooks"
         import { storeSharedSession } from ${JSON.stringify(modulePath)}
-        const probe = await open(process.env.PROBE, "w")
-        const proto = Object.getPrototypeOf(probe)
-        await probe.close()
-        const writeFile = proto.writeFile
-        const sync = proto.sync
-        const storeFiles = new WeakSet()
-        proto.writeFile = async function (data, ...rest) {
-          const head = typeof data === "string" ? data.slice(0, 64) : Buffer.isBuffer(data) ? data.subarray(0, 64).toString("utf8") : ""
-          if (head.includes("meridian-session-store")) storeFiles.add(this)
-          return writeFile.call(this, data, ...rest)
-        }
-        proto.sync = async function () {
-          if (storeFiles.has(this)) {
-            writeFileSync(process.env.HOLDING, "")
-            while (!existsSync(process.env.RELEASE)) await new Promise((resolve) => setTimeout(resolve, 10))
-          }
-          return sync.call(this)
-        }
-        await storeSharedSession("holder", "claude-holder")
+        await storeSharedSession("warm", "claude-warm")
+        const delay = monitorEventLoopDelay({ resolution: 1 })
+        let ticks = 0
+        const heartbeat = setInterval(() => { ticks++ }, 5)
+        delay.enable()
+        const started = performance.now()
+        for (let i = 0; i < 3; i++) await storeSharedSession("slow-" + i, "claude-slow-" + i)
+        const writesMs = performance.now() - started
+        delay.disable()
+        clearInterval(heartbeat)
+        console.log(JSON.stringify({ writesMs, ticks, maxDelayMs: delay.max / 1e6 }))
       `],
-      env: { ...process.env, MERIDIAN_SESSION_DIR: tmpDir, PROBE: join(tmpDir, "probe"), HOLDING: holding, RELEASE: release },
-      stdout: "ignore",
+      env: { ...process.env, MERIDIAN_SESSION_DIR: storeDir, LD_PRELOAD: shim, SLOW_FSYNC_MS: "250" },
+      stdout: "pipe",
       stderr: "pipe",
     })
-    try {
-      await waitForFile(holding, 10_000)
-      expect(JSON.parse(readFileSync(join(tmpDir, "sessions.json.lock"), "utf8")).pid).toBe(child.pid)
-      process.env.MERIDIAN_SESSION_LOCK_TIMEOUT_MS = "300"
-      await expect(storeSharedSession("contender", "claude-contender")).rejects.toThrow("timed out waiting for lock")
-    } finally {
-      writeFileSync(release, "")
-    }
-    const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ])
     expect(stderr).toBe("")
     expect(exitCode).toBe(0)
+    const measured = JSON.parse(stdout) as { writesMs: number; ticks: number; maxDelayMs: number }
+    // Every write's commit waited for the delayed fsync, and the loop kept running.
+    expect(measured.writesMs).toBeGreaterThanOrEqual(3 * 250)
+    expect(measured.ticks).toBeGreaterThanOrEqual(Math.floor(measured.writesMs / 5 / 2))
+    expect(measured.maxDelayMs).toBeLessThan(100)
 
-    await storeSharedSession("contender", "claude-contender")
-    expect(readSessionStoreSnapshot()).toMatchObject({
-      holder: { claudeSessionId: "claude-holder" },
-      contender: { claudeSessionId: "claude-contender" },
-    })
-  }, 20_000)
+    setSessionStoreDir(storeDir)
+    expect(lookupSharedSession("slow-2")?.claudeSessionId).toBe("claude-slow-2")
+  }, 30_000)
 })
-
-async function delayFileHandleSync(
-  dir: string,
-  delayMs: number | (() => number),
-  onSync?: () => void,
-): Promise<() => void> {
-  const probe = await open(join(dir, "sync-probe"), "w")
-  const prototype = Object.getPrototypeOf(probe) as FileHandle
-  await probe.close()
-  rmSync(join(dir, "sync-probe"), { force: true })
-  const sync = prototype.sync
-  prototype.sync = async function (this: FileHandle) {
-    onSync?.()
-    await Bun.sleep(typeof delayMs === "number" ? delayMs : delayMs())
-    return sync.call(this)
-  }
-  return () => { prototype.sync = sync }
-}
-
-async function waitForFile(path: string, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (!existsSync(path)) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${path}`)
-    await Bun.sleep(10)
-  }
-}
-
-function deadProcessIncarnation(pid: number) {
-  const current = captureProcessIncarnation()
-  if (!current) throw new Error("test process incarnation unavailable")
-  return { ...current, pid, bootId: "00000000-0000-4000-8000-000000000000" }
-}
-
-function writeRecoveryClaim(
-  path: string,
-  generation: string,
-  token: string,
-  pid: number,
-  ownerHostname = hostname(),
-): void {
-  const current = captureProcessIncarnation()
-  if (!current) throw new Error("test process incarnation unavailable")
-  const incarnation = ownerHostname !== hostname()
-    ? { ...current, pid, hostId: "b".repeat(64) }
-    : pid === process.pid
-      ? current
-      : { ...current, pid, bootId: "00000000-0000-4000-8000-000000000000" }
-  mkdirSync(path, { mode: 0o700 })
-  writeFileSync(join(path, "owner.json"), JSON.stringify({
-    version: 2,
-    generation,
-    token,
-    pid,
-    hostname: ownerHostname,
-    createdAt: 1,
-    incarnation,
-  }), { mode: 0o600 })
-}
