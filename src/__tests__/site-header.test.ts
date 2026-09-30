@@ -8,6 +8,7 @@
  */
 
 import { describe, expect, test } from "bun:test"
+import { runInNewContext } from "node:vm"
 import { providerPageHtml } from "../telemetry/providerPage"
 import { landingHtml } from "../telemetry/landing"
 import { dashboardHtml } from "../telemetry/dashboard"
@@ -296,5 +297,84 @@ describe("per-page titles do not repeat the brand", () => {
 
   test("plugins page drops the redundant back-link", () => {
     expect(pluginPageHtml).not.toContain("Back to Meridian")
+  })
+})
+
+describe("header active-profile chip", () => {
+  function stubElement() {
+    const classes = new Set<string>()
+    return {
+      innerHTML: "", title: "", textContent: "", className: "", hidden: false,
+      classes,
+      classList: {
+        add: (name: string) => { classes.add(name) },
+        remove: (name: string) => { classes.delete(name) },
+        toggle: (name: string, on: boolean) => { if (on) classes.add(name); else classes.delete(name) },
+      },
+      removeAttribute: () => undefined,
+      setAttribute: () => undefined,
+      replaceChildren: () => undefined,
+    }
+  }
+  function escapingDiv() {
+    let text = ""
+    return {
+      set textContent(value: string) { text = String(value) },
+      get innerHTML() { return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") },
+    }
+  }
+
+  // The script the page ships, run against a stub DOM with /profiles/list answering `list`.
+  async function chipFor(list: unknown) {
+    const elements = new Map<string, ReturnType<typeof stubElement>>()
+    const byId = (id: string) => {
+      let found = elements.get(id)
+      if (!found) { found = stubElement(); elements.set(id, found) }
+      return found
+    }
+    runInNewContext(profileBarJs, {
+      document: { getElementById: byId, querySelectorAll: () => [], createElement: escapingDiv },
+      location: { pathname: "/" },
+      window: {},
+      fetch: (url: string) => Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve(url === "/profiles/list" ? list : { status: "healthy" }),
+      }),
+      setInterval: () => 0, setTimeout: () => 0, clearTimeout: () => undefined,
+    })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    return byId("mhProfile")
+  }
+
+  const claude = (id: string, isActive: boolean) => ({ id, type: "claude-max", isActive })
+  const seat = (id: string, isActive: boolean) => ({ id, type: "chatgpt", provider: "chatgpt", isActive })
+  const follow = { url: "http://127.0.0.1:3456", activeProfile: "work", stale: false }
+
+  test("names the active profile of each provider, and only those", async () => {
+    const chip = await chipFor({ profiles: [claude("work", true), claude("spare", false), seat("oferty-c487c4", true), seat("damian-989a40", false)], follow: null })
+    expect(chip.innerHTML).toBe('work <span class="mh-profile-type">claude-max</span> \u00b7 oferty-c487c4 <span class="mh-profile-type">chatgpt</span>')
+    expect(chip.title).toBe("Active profiles, one per provider — switch from the home page")
+    expect(chip.classes.has("visible")).toBe(true)
+    expect(chip.classes.has("following")).toBe(false)
+  })
+
+  test("a ChatGPT-only instance shows its active seat", async () => {
+    const chip = await chipFor({ profiles: [seat("oferty-c487c4", false), seat("enriquetrevino1011-e1dde4", true)], follow: null })
+    expect(chip.innerHTML).toBe('enriquetrevino1011-e1dde4 <span class="mh-profile-type">chatgpt</span>')
+    expect(chip.title).toBe("Active profile — switch from the home page")
+  })
+
+  test("follow mode labels the Claude profile it follows, never the seat beside it", async () => {
+    const chip = await chipFor({ profiles: [claude("work", true), seat("oferty-c487c4", true)], follow })
+    expect(chip.innerHTML).toBe('work <span class="mh-profile-type">claude-max</span> <span class="mh-profile-follow">following</span> \u00b7 oferty-c487c4 <span class="mh-profile-type">chatgpt</span>')
+    expect(chip.classes.has("following")).toBe(true)
+    expect(chip.title).toContain("Switching here is refused; switch on the followed instance. The ChatGPT seat beside it is not followed and switches from the home page.")
+  })
+
+  test("follow mode says nothing about following when only a seat is active", async () => {
+    const chip = await chipFor({ profiles: [claude("work", false), seat("oferty-c487c4", true)], follow })
+    expect(chip.innerHTML).toBe('oferty-c487c4 <span class="mh-profile-type">chatgpt</span>')
+    expect(chip.classes.has("following")).toBe(false)
+    expect(chip.title).toBe("Active profile — switch from the home page")
   })
 })
