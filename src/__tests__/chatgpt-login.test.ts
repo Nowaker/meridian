@@ -49,8 +49,8 @@ describe("ChatGPT sign-in", () => {
     const url = new URL(started.authorizeUrl)
     expect(url.origin + url.pathname).toBe("https://auth.openai.com/oauth/authorize")
     expect(url.searchParams.get("client_id")).toBe("app_EMoamEEZ73f0CkXaXp7hrann")
-    expect(url.searchParams.get("redirect_uri")).toBe("http://localhost:1455/auth/callback")
-    expect(url.searchParams.get("scope")).toBe("openid profile email offline_access")
+    expect(url.searchParams.get("redirect_uri")).toBe("http://127.0.0.1:1455/auth/callback")
+    expect(url.searchParams.get("scope")).toBe("openid profile email offline_access api.connectors.read api.connectors.invoke")
     expect(url.searchParams.get("code_challenge_method")).toBe("S256")
     expect(url.searchParams.get("codex_cli_simplified_flow")).toBe("true")
     expect(url.searchParams.get("state")).toBeTruthy()
@@ -85,7 +85,7 @@ describe("ChatGPT sign-in", () => {
     const { login, connected, tokenCalls } = harness()
     const started = await login.start()
     const state = new URL(started.authorizeUrl).searchParams.get("state")!
-    const pasted = `http://localhost:1455/auth/callback?code=code-2&state=${state}`
+    const pasted = `http://127.0.0.1:1455/auth/callback?code=code-2&state=${state}`
     expect(await login.complete(started.connectId, pasted)).toEqual({ ok: true, accountUserId: "user-1__ws-1", email: "seat@example.test" })
     expect((await login.complete(started.connectId, pasted)).ok).toBe(false)
     expect(tokenCalls).toHaveLength(1)
@@ -95,7 +95,7 @@ describe("ChatGPT sign-in", () => {
   it("refuses an address from another sign-in without spending anything, and lets the paste be retried", async () => {
     const { login, connected, tokenCalls } = harness()
     const started = await login.start()
-    const result = await login.complete(started.connectId, "http://localhost:1455/auth/callback?code=x&state=someone-else")
+    const result = await login.complete(started.connectId, "http://127.0.0.1:1455/auth/callback?code=x&state=someone-else")
     expect(result).toMatchObject({ ok: false, code: "state_mismatch", retryable: true })
     expect(await login.complete(started.connectId, "not an address")).toMatchObject({ ok: false, code: "invalid_request", retryable: true })
     expect(tokenCalls).toHaveLength(0)
@@ -143,10 +143,120 @@ describe("ChatGPT sign-in", () => {
   })
 
   it("reads code and state from a full address or a bare query", () => {
-    expect(parseCallbackInput("http://localhost:1455/auth/callback?code=a&state=b")?.get("code")).toBe("a")
+    expect(parseCallbackInput("http://127.0.0.1:1455/auth/callback?code=a&state=b")?.get("code")).toBe("a")
     expect(parseCallbackInput("code=a&state=b")?.get("state")).toBe("b")
     expect(parseCallbackInput("?error=access_denied")?.get("error")).toBe("access_denied")
     expect(parseCallbackInput("   ")).toBeNull()
-    expect(parseCallbackInput("http://localhost:1455/auth/callback")).toBeNull()
+    expect(parseCallbackInput("http://127.0.0.1:1455/auth/callback")).toBeNull()
+  })
+
+  it("closes the redirect listener the moment its only sign-in is cancelled", async () => {
+    const { login, connected, tokenCalls, closed } = harness()
+    const started = await login.start()
+    expect(login.cancel(started.connectId)).toBe(true)
+    await Promise.resolve()
+    expect(closed()).toBe(1)
+    expect(login.status(started.connectId)?.status).toBe("failed")
+    const state = new URL(started.authorizeUrl).searchParams.get("state")!
+    expect((await login.complete(started.connectId, `?code=c&state=${state}`)).ok).toBe(false)
+    expect(tokenCalls).toHaveLength(0)
+    expect(connected).toHaveLength(0)
+    expect(login.cancel(started.connectId)).toBe(false)
+  })
+})
+
+describe("ChatGPT device-code sign-in", () => {
+  interface Call { url: string; body: string }
+
+  function deviceHarness(answers: Record<string, Array<() => Response>>) {
+    const calls: Call[] = []
+    const connected: Array<{ account: ChatGptConnectedAccount; name: string | null }> = []
+    const pending: Array<() => void> = []
+    let cancelled = 0
+    const login = createChatGptLogin({
+      connect: (account, context) => { connected.push({ account, name: context.name }) },
+      renderPage: () => "",
+      fetchImpl: async (url, init) => {
+        calls.push({ url, body: String(init.body) })
+        const queue = answers[url]
+        const next = queue && queue.length > 1 ? queue.shift()! : queue?.[0]
+        return next ? next() : new Response("{}", { status: 500 })
+      },
+      now: () => NOW,
+      listen: async () => { throw new Error("a device sign-in must not bind the redirect listener") },
+      schedule: (run) => { pending.push(run); return { cancel: () => { cancelled++ } } },
+      log: () => {},
+    })
+    const tick = async () => {
+      const run = pending.shift()
+      run?.()
+      for (let i = 0; i < 10; i++) await Promise.resolve()
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
+    return { login, calls, connected, tick, pending: () => pending.length, cancelled: () => cancelled }
+  }
+
+  const USERCODE = "https://auth.openai.com/api/accounts/deviceauth/usercode"
+  const POLL = "https://auth.openai.com/api/accounts/deviceauth/token"
+  const TOKEN = "https://auth.openai.com/oauth/token"
+  const userCode = () => Response.json({ device_auth_id: "dev-1", user_code: "ABCD-1234", interval: "5" })
+
+  it("asks for a code the way the Codex CLI does, keeps polling while it is not entered, then files the seat under the typed name", async () => {
+    const h = deviceHarness({
+      [USERCODE]: [userCode],
+      [POLL]: [() => new Response("", { status: 403 }), () => Response.json({ authorization_code: "auth-1", code_challenge: "ch", code_verifier: "ver-1" })],
+      [TOKEN]: [() => Response.json({ access_token: ACCESS, refresh_token: "rt-dev", id_token: ID_TOKEN, expires_in: 3600 })],
+    })
+    const started = await h.login.startDevice({ name: "work" })
+    expect(started).toMatchObject({ ok: true, userCode: "ABCD-1234", verificationUrl: "https://auth.openai.com/codex/device" })
+    expect(JSON.parse(h.calls[0]!.body)).toEqual({ client_id: "app_EMoamEEZ73f0CkXaXp7hrann" })
+    if (!started.ok) throw new Error("device start failed")
+
+    await h.tick()
+    expect(h.login.status(started.connectId)?.status).toBe("waiting")
+    expect(JSON.parse(h.calls[1]!.body)).toEqual({ device_auth_id: "dev-1", user_code: "ABCD-1234" })
+
+    await h.tick()
+    const exchange = new URLSearchParams(h.calls[3]!.body)
+    expect(h.calls[3]!.url).toBe(TOKEN)
+    expect(exchange.get("grant_type")).toBe("authorization_code")
+    expect(exchange.get("code")).toBe("auth-1")
+    expect(exchange.get("code_verifier")).toBe("ver-1")
+    expect(exchange.get("redirect_uri")).toBe("https://auth.openai.com/deviceauth/callback")
+    expect(h.connected).toEqual([{ account: expect.objectContaining({ accountUserId: "user-1__ws-1", refreshToken: "rt-dev" }), name: "work" }])
+    expect(h.login.status(started.connectId)).toEqual({ status: "completed", accountUserId: "user-1__ws-1", email: "seat@example.test" })
+    expect(h.pending()).toBe(0)
+  })
+
+  it("stops polling on cancel and never exchanges a code", async () => {
+    const h = deviceHarness({ [USERCODE]: [userCode], [POLL]: [() => new Response("", { status: 403 })] })
+    const started = await h.login.startDevice({})
+    if (!started.ok) throw new Error("device start failed")
+    expect(h.login.cancel(started.connectId)).toBe(true)
+    expect(h.cancelled()).toBe(1)
+    expect(h.calls.filter(call => call.url === TOKEN)).toHaveLength(0)
+    expect(h.connected).toHaveLength(0)
+  })
+
+  it("ends the sign-in on a poll the provider refuses outright", async () => {
+    const h = deviceHarness({ [USERCODE]: [userCode], [POLL]: [() => new Response("{}", { status: 400 })] })
+    const started = await h.login.startDevice({})
+    if (!started.ok) throw new Error("device start failed")
+    await h.tick()
+    expect(h.login.status(started.connectId)?.status).toBe("failed")
+    expect(h.pending()).toBe(0)
+    expect(h.connected).toHaveLength(0)
+  })
+
+  it("reports a provider without device sign-in so the page can fall back to the browser sign-in", async () => {
+    const h = deviceHarness({ [USERCODE]: [() => new Response("", { status: 404 })] })
+    expect(await h.login.startDevice({})).toMatchObject({ ok: false, code: "device_unavailable" })
+  })
+
+  it("refuses to paste a redirect address into a device sign-in", async () => {
+    const h = deviceHarness({ [USERCODE]: [userCode] })
+    const started = await h.login.startDevice({})
+    if (!started.ok) throw new Error("device start failed")
+    expect(await h.login.complete(started.connectId, "?code=x&state=y")).toMatchObject({ ok: false, code: "invalid_request" })
   })
 })

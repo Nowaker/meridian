@@ -254,6 +254,20 @@ export function findChatGptProfile(profiles: readonly ChatGptProfile[], idOrSeat
     ?? profiles.find(profile => profile.aliases.includes(idOrSeat))
 }
 
+/**
+ * Why a name typed for a seat about to be signed in cannot be its profile id,
+ * or null when it can. Checked before the sign-in starts, so a person learns
+ * of a bad name before spending a login on it. A name an existing seat already
+ * carries is allowed: signing that seat in again keeps it.
+ */
+export function chatGptNameProblem(name: string, reserved: ReadonlySet<string>): string | null {
+  if (!PROFILE_ID.test(name)) {
+    return `Invalid profile name "${name}". A ChatGPT seat's name uses lowercase letters, numbers, dots, hyphens and underscores, starts with a letter or number, and is at most 64 characters.`
+  }
+  if (reserved.has(name)) return `Profile "${name}" already exists.`
+  return null
+}
+
 export type ChatGptRenamePlan =
   | {
     ok: true

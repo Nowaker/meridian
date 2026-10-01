@@ -195,13 +195,15 @@ export const profilePageHtml = `<!DOCTYPE html>
   .login-reopen { color: var(--accent); font-size: 11px; text-decoration: none; }
   .login-reopen:hover { text-decoration: underline; }
   .add-intro { font-size: 13px; color: var(--muted); margin-bottom: 10px; }
-  .add-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-  .add-tab {
-    background: none; border: 1px solid var(--border); border-radius: 6px; color: var(--muted);
-    font-family: inherit; font-size: 12px; padding: 4px 10px; cursor: pointer;
+  .add-actions { margin-top: 8px; }
+  .add-flow:empty { display: none; }
+  .device-code { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 4px 0; }
+  .device-code code {
+    font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 22px; font-weight: 600;
+    letter-spacing: 2px; color: var(--accent2); background: var(--bg); padding: 6px 14px;
+    border: 1px solid var(--border); border-radius: 6px; overflow-wrap: anywhere;
   }
-  .add-tab:hover { color: var(--text); }
-  .add-tab.active { color: var(--accent); border-color: var(--accent); background: rgba(88,166,255,0.08); }
+  .paste-label { display: block; font-size: 12px; color: var(--text); margin: 10px 0 6px; }
   .cmd-row { margin-top: 10px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .cmd-label { font-size: 11px; color: var(--muted); }
   .cmd-note { font-size: 11px; color: var(--muted); min-width: 0; overflow-wrap: anywhere; }
@@ -290,6 +292,9 @@ export const profilePageHtml = `<!DOCTYPE html>
     .profile-details { grid-template-columns: minmax(0, 1fr); row-gap: 0; }
     .detail-value { margin-bottom: 6px; }
     .empty-state { padding: 32px 16px; }
+    /* Tap targets: every control on this page is at least 40px tall. */
+    .login-btn, .switch-btn, .confirm-btn, .icon-btn, .copy-btn, .link-btn, .login-input { min-height: 40px; }
+    .icon-btn, .copy-btn { min-width: 40px; justify-content: center; }
   }
 ` + profileBarCss + `
 </style>
@@ -328,6 +333,8 @@ ${reorderLiveRegionHtml}
 <div class="section" style="margin-top:32px">
   <h2 class="section-title">Setup Guide</h2>
   <div class="guide">
+    <!-- Claude-only text, hidden on an instance that serves ChatGPT alone. -->
+    <div id="claude-guide">
     <h3>How profiles work</h3>
     <p style="font-size:13px;color:var(--muted);margin-bottom:12px">
       Each profile is a separate Claude account with its own login credentials.
@@ -387,6 +394,7 @@ ${reorderLiveRegionHtml}
       the renamed profile, so nothing breaks mid-flight. That redirect is dropped
       as soon as the old name is taken again by a new profile.
     </p>
+    </div>
     <!-- Filled in once /profiles/list says this instance serves ChatGPT. -->
     <div id="chatgpt-guide" hidden></div>
   </div>
@@ -643,7 +651,7 @@ function renderLoginRows(p) {
     }
     return '<div class="cmd-row"><span class="cmd-label">Token:</span> '
       + '<button class="switch-btn" style="margin-top:0" data-profile="' + attr(p.id) + '" onclick="renewChatGptSeat(this)">Renew now</button>'
-      + '<span class="cmd-note">Meridian renews it by itself before it expires. To sign this seat in again, use Add a profile \\u2192 ChatGPT seat.</span>'
+      + '<span class="cmd-note">Meridian renews it by itself before it expires. To sign this seat in again, type its name under Add a profile and choose Connect with ChatGPT.</span>'
       + '</div>';
   }
   var rows = commandRow('Login', owner.login, '\\u2192 ' + owner.loginMethod + ' \\u2192 ' + (p.label || p.id) + ' \\u2192 Refresh account \\u00b7 at ' + owner.name);
@@ -669,6 +677,8 @@ function renderAccessNote(p) {
 // card and the guide; the seats themselves are ordinary profiles already.
 var chatGptOwnerInfo = null;
 var chatGptAddShown = false;
+// 'chatgpt' only while the steps for a seat signed in elsewhere are open, so
+// noticeNewChatGptSeats knows to name the seat that arrives.
 var addProvider = 'claude';
 // Seats present when the ChatGPT add card was opened, so one that arrives
 // afterwards can be announced (and named) the moment a poll sees it.
@@ -684,17 +694,20 @@ function adoptChatGpt(data) {
   if (!data || !data.chatgpt || !data.chatgpt.owner) return;
   if (!chatGptOwnerInfo) {
     chatGptOwnerInfo = data.chatgpt.owner;
-    document.getElementById('profiles-subtitle').textContent = 'Manage Claude accounts and ChatGPT seats';
     renderChatGptGuide(chatGptOwnerInfo);
   }
-  // The add card is redrawn only while untouched - a half-typed name must not
-  // vanish under a poll - so a later poll retries until it can. ChatGPT is
-  // offered first where it is all the instance has.
+  var claude = (data.profiles || []).some(function (p) { return !isChatGptProfile(p); });
+  document.getElementById('profiles-subtitle').textContent = claude
+    ? 'Manage Claude accounts and ChatGPT seats'
+    : 'Manage ChatGPT seats';
+  document.getElementById('claude-guide').hidden = !claude;
+  // The add form gains its ChatGPT button only once this is known, and is
+  // redrawn only while untouched - a half-typed name must not vanish under a
+  // poll - so a later poll retries until it can.
   if (chatGptAddShown) return;
   var input = addSlot() && addSlot().querySelector('.add-input');
-  if (activeAdd || (input && (input.value || document.activeElement === input))) return;
+  if (activeAdd || activeChatGptConnect || (input && (input.value || document.activeElement === input))) return;
   chatGptAddShown = true;
-  if (!(data.profiles || []).some(function (p) { return !isChatGptProfile(p); })) addProvider = 'chatgpt';
   resetAddForm('');
 }
 
@@ -704,7 +717,9 @@ function renderChatGptGuide(owner) {
     guide.innerHTML = '<h3 style="margin-top:16px">ChatGPT seats</h3>'
       + '<p style="font-size:13px;color:var(--muted);margin-bottom:8px">Meridian holds these seats\\u2019 logins and renews their tokens itself. '
       + (owner.webSignIn
-        ? 'Connect a seat, or sign one in again, under <strong>Add a profile \\u2192 ChatGPT seat \\u2192 Sign in with ChatGPT</strong>.</p>'
+        ? 'Connect a seat under <strong>Add a profile</strong>: type its name, then <strong>Connect with ChatGPT</strong>. '
+          + 'From a browser on another machine Meridian shows a one-time code to enter at auth.openai.com; on this machine it opens the ChatGPT sign-in. '
+          + 'Connecting a seat that is already here signs it in again, and <strong>Renew now</strong> on its card renews its token on the spot.</p>'
         : 'Bring a seat signed in elsewhere into its store with <code>' + esc(owner.importCommand) + '</code>.</p>');
     guide.hidden = false;
     return;
@@ -984,8 +999,11 @@ function render(data, quotaData) {
   if (profiles.length === 0) {
     document.getElementById('content').innerHTML = '<div class="empty-state">'
       + '<h2>No profiles configured</h2>'
-      + '<p style="margin-top:8px">Add your first one above, or from a terminal:</p>'
-      + '<p style="margin-top:8px"><code class="mono" style="background:var(--bg);padding:8px 16px;border-radius:6px;display:inline-block">meridian profile add personal</code></p>'
+      + (chatGptOwnerInfo
+        ? '<p style="margin-top:8px">Add your first one above: type a name, then <strong>Connect with ChatGPT</strong>'
+          + ' (or <strong>Connect with Claude</strong> for a Claude account).</p>'
+        : '<p style="margin-top:8px">Add your first one above, or from a terminal:</p>'
+          + '<p style="margin-top:8px"><code class="mono" style="background:var(--bg);padding:8px 16px;border-radius:6px;display:inline-block">meridian profile add personal</code></p>')
       + '</div>';
     afterRender();
     return;
@@ -1584,92 +1602,72 @@ var activeAdd = null;
 
 function addSlot() { return document.getElementById('add-slot'); }
 
+// One form for every kind of profile: a name, then the account it connects
+// to. The flow a button starts renders below the form, in .add-flow, and the
+// form stays on screen - disabled - so the name being used stays visible.
+function addFlow() { var slot = addSlot(); return slot ? slot.querySelector('.add-flow') : null; }
+
+function addName() {
+  var slot = addSlot();
+  var input = slot ? slot.querySelector('.add-input') : null;
+  return input ? input.value.trim() : '';
+}
+
+function addForm() { var slot = addSlot(); return slot ? slot.querySelector('.add-form') : null; }
+
+function setAddFormMsg(text, kind) { setPanelMsg(addForm(), text, kind); }
+
+function setAddFormLocked(locked) {
+  var form = addForm();
+  if (!form) return;
+  var els = form.querySelectorAll('input, button');
+  for (var i = 0; i < els.length; i++) els[i].disabled = locked;
+}
+
 function renderAddForm(prefill) {
-  return '<div class="add-intro">Sign in to another Claude account and keep it here alongside the others.</div>'
+  var chatgpt = !!chatGptOwnerInfo;
+  return '<div class="add-form">'
+    + '<div class="add-intro">' + (chatgpt
+      ? 'Name the profile, then connect it to a Claude account or a ChatGPT seat.'
+      : 'Sign in to another Claude account and keep it here alongside the others.') + '</div>'
     + '<div class="login-row">'
     +   '<input class="login-input add-input" type="text" autocomplete="off" spellcheck="false"'
-    +     ' placeholder="new profile name" value="' + esc(prefill || '') + '">'
-    +   '<button class="login-btn" onclick="startAdd()">Add profile</button>'
+    +     ' aria-label="New profile name" placeholder="new profile name" value="' + attr(prefill || '') + '">'
     + '</div>'
-    + '<div class="add-note">Letters, numbers, hyphens and underscores.</div>'
-    + '<div class="login-msg"></div>';
-}
-
-function renderAddTabs() {
-  if (!chatGptOwnerInfo) return '';
-  function tab(provider, label) {
-    var on = addProvider === provider;
-    return '<button type="button" class="add-tab' + (on ? ' active' : '') + '" data-add-provider="' + provider + '"'
-      + ' aria-pressed="' + (on ? 'true' : 'false') + '">' + label + '</button>';
-  }
-  return '<div class="add-tabs" role="group" aria-label="Kind of profile to add">'
-    + tab('claude', 'Claude account') + tab('chatgpt', 'ChatGPT seat') + '</div>';
-}
-
-// Meridian cannot sign in a seat it only follows - its owner does - so the
-// card gives the owner's steps, and noticeNewChatGptSeats announces the seat
-// once a poll sees it.
-function renderChatGptAdd() {
-  var owner = chatGptOwnerInfo || {};
-  if (owner.name === 'meridian' && owner.webSignIn) {
-    return '<div class="add-intro">Meridian holds the ChatGPT logins on this instance and renews their tokens itself. '
-      + 'Signing in a seat that is already here signs it in again.</div>'
-      + '<div class="login-row">'
-      +   '<button class="login-btn" onclick="startChatGptConnect()">Sign in with ChatGPT</button>'
-      + '</div>'
-      + '<div class="add-note">For a second ChatGPT account, sign out of chatgpt.com first or copy the sign-in link into a private window.</div>'
-      + '<div class="login-msg"></div>';
-  }
-  if (owner.name === 'meridian') {
-    return '<div class="add-intro">Meridian holds the ChatGPT logins on this instance. Sign the account in with opencode first, then bring it into Meridian\\u2019s store:</div>'
-      + commandRow('Import', owner.importCommand, '')
-      + '<div class="add-note">The seat appears in the list below once the import has finished.</div>'
-      + '<div class="login-msg"></div>';
-  }
-  return '<div class="add-intro">' + esc(owner.name) + ' owns the ChatGPT logins this Meridian serves. Sign the account in there, and Meridian '
-    + 'picks the new seat up from its store by itself.</div>'
-    + '<ol class="login-steps">'
-    +   '<li>In a terminal on the machine running this Meridian:</li>'
-    + '</ol>'
-    + commandRow('Run', owner.login, '')
-    + '<ol class="login-steps" start="2" style="margin-top:10px">'
-    +   '<li>Choose <strong>' + esc(owner.loginMethod) + '</strong>, then <strong>Add account</strong> if it asks, and sign in. '
-    +     'For a second ChatGPT account, sign in from a private browser window.</li>'
-    +   '<li>The seat appears in the list below within ten seconds. Type a name for it here first, and Meridian gives it that name as it arrives.</li>'
-    + '</ol>'
-    + '<div class="login-row">'
-    +   '<input class="login-input add-input" type="text" autocomplete="off" spellcheck="false" placeholder="name for the new seat (optional)">'
+    + '<div class="login-row add-actions">'
+    +   '<button class="login-btn" onclick="startAdd()">Connect with Claude</button>'
+    +   (chatgpt ? '<button class="login-btn" onclick="startChatGptAdd()">Connect with ChatGPT</button>' : '')
     + '</div>'
-    + '<div class="add-note">Lowercase letters, numbers, dots, hyphens and underscores.</div>'
-    + '<div class="login-msg"></div>';
-}
-
-function setAddProvider(provider) {
-  if (addProvider === provider) return;
-  addProvider = provider;
-  chatGptAddBaseline = provider === 'chatgpt' && lastProfiles ? chatGptSeatsOf(lastProfiles.profiles || []) : null;
-  resetAddForm('');
+    + '<div class="add-note">Letters, numbers, hyphens and underscores.'
+    +   (chatgpt ? ' A ChatGPT seat\\u2019s name is lowercase and may also use dots; left empty, the seat is named after its email.' : '')
+    + '</div>'
+    + '<div class="login-msg"></div>'
+    + '</div>'
+    + '<div class="add-flow"></div>';
 }
 
 function resetAddForm(prefill) {
+  stopChatGptConnectPoll();
   activeAdd = null;
+  activeChatGptConnect = null;
+  addProvider = 'claude';
+  chatGptAddBaseline = null;
   var slot = addSlot();
   if (!slot) return;
-  var chatgpt = addProvider === 'chatgpt' && chatGptOwnerInfo;
-  slot.innerHTML = renderAddTabs() + (chatgpt ? renderChatGptAdd() : renderAddForm(prefill));
-  var tabs = slot.querySelectorAll('[data-add-provider]');
-  for (var i = 0; i < tabs.length; i++) {
-    tabs[i].addEventListener('click', function (e) { setAddProvider(e.currentTarget.getAttribute('data-add-provider')); });
-  }
+  slot.innerHTML = renderAddForm(prefill);
+  // Enter means something only while there is one button to mean.
   var input = slot.querySelector('.add-input');
-  if (input && !chatgpt) input.addEventListener('keydown', function (e) { if (e.key === 'Enter') startAdd(); });
+  var buttons = slot.querySelectorAll('.add-actions button');
+  if (input && buttons.length === 1) {
+    input.addEventListener('keydown', function (e) { if (e.key === 'Enter') buttons[0].click(); });
+  }
 }
 
 function renderAddPanel(id, authorizeUrl) {
   return renderOauthPanel({
     title: 'Create ' + esc(id),
     authorizeUrl: authorizeUrl,
-    accountStep: 'Sign in with the Claude account this profile should use \u2014 if a different account is already '
+    accountStep: 'Sign in with the Claude account this profile should use \\u2014 if a different account is already '
       + 'signed in at claude.ai, sign out there first, or Claude will reuse it without asking.',
     submitLabel: 'Create profile',
     onSubmit: 'submitAdd()',
@@ -1678,13 +1676,9 @@ function renderAddPanel(id, authorizeUrl) {
 }
 
 async function startAdd() {
-  var slot = addSlot();
-  if (!slot) return;
-  var nameInput = slot.querySelector('.add-input');
-  var name = nameInput ? nameInput.value.trim() : '';
-  if (!name) { setPanelMsg(slot, 'Name the profile first.', 'err'); return; }
-
-  setPanelMsg(slot, 'Starting\u2026', 'busy');
+  var name = addName();
+  if (!name) { setAddFormMsg('Name the profile first.', 'err'); return; }
+  setAddFormMsg('Starting\\u2026', 'busy');
 
   var res, data;
   try {
@@ -1695,17 +1689,20 @@ async function startAdd() {
     });
     data = await res.json();
   } catch (err) {
-    setPanelMsg(slot, 'Could not reach Meridian.', 'err');
+    setAddFormMsg('Could not reach Meridian.', 'err');
     return;
   }
 
   // The form is left standing on a refusal, name and all: every refusal here
   // is about the name, and retyping it to fix a typo is the wrong ask.
-  if (!res.ok) { setPanelMsg(slot, data.error || 'Could not start.', 'err'); return; }
+  if (!res.ok) { setAddFormMsg(data.error || 'Could not start.', 'err'); return; }
 
+  setAddFormMsg('', '');
+  setAddFormLocked(true);
   activeAdd = { profile: name, addId: data.addId };
-  slot.innerHTML = renderAddPanel(name, data.authorizeUrl);
-  var codeInput = slot.querySelector('.login-input');
+  var flow = addFlow();
+  flow.innerHTML = renderAddPanel(name, data.authorizeUrl);
+  var codeInput = flow.querySelector('.login-input');
   if (codeInput) {
     codeInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitAdd(); });
     codeInput.focus();
@@ -1715,14 +1712,14 @@ async function startAdd() {
 
 async function submitAdd() {
   if (!activeAdd || activeAdd.spent) return;
-  var slot = addSlot();
-  var input = slot ? slot.querySelector('.login-input') : null;
+  var flow = addFlow();
+  var input = flow ? flow.querySelector('.login-input') : null;
   var value = input ? input.value.trim() : '';
-  if (!value) { setPanelMsg(slot, 'Paste the code first.', 'err'); return; }
+  if (!value) { setPanelMsg(flow, 'Paste the code first.', 'err'); return; }
 
-  var buttons = slot ? slot.querySelectorAll('button') : [];
+  var buttons = flow ? flow.querySelectorAll('button') : [];
   for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
-  setPanelMsg(slot, 'Creating\u2026', 'busy');
+  setPanelMsg(flow, 'Creating\\u2026', 'busy');
 
   var res, data;
   try {
@@ -1733,17 +1730,17 @@ async function submitAdd() {
     });
     data = await res.json();
   } catch (err) {
-    setPanelMsg(slot, 'Could not reach Meridian.', 'err');
+    setPanelMsg(flow, 'Could not reach Meridian.', 'err');
     for (var j = 0; j < buttons.length; j++) buttons[j].disabled = false;
     return;
   }
 
   if (!res.ok) {
-    setPanelMsg(slot, data.error || 'Could not create the profile.', 'err');
-    var cancelBtn = slot ? slot.querySelector('.login-cancel') : null;
+    setPanelMsg(flow, data.error || 'Could not create the profile.', 'err');
+    var cancelBtn = flow ? flow.querySelector('.login-cancel') : null;
     if (cancelBtn) cancelBtn.disabled = false;
     if (data.retryable) {
-      var submitBtn = slot ? slot.querySelector('.login-submit') : null;
+      var submitBtn = flow ? flow.querySelector('.login-submit') : null;
       if (submitBtn) submitBtn.disabled = false;
       if (input) input.focus();
     } else {
@@ -1765,30 +1762,96 @@ function cancelAdd() {
   resetAddForm(activeAdd ? activeAdd.profile : '');
 }
 
-// --- Sign a ChatGPT seat in (owned mode) ---
+// --- Connect with ChatGPT ---
 //
-// Meridian listens for OpenAI's fixed redirect, http://localhost:1455, while a
-// sign-in is open. A browser on the same machine lands there and the poll
-// below sees the login finish; a browser elsewhere cannot reach that address,
-// so the page also takes the address it ended on, pasted back.
+// A seat Meridian owns is signed in with the Codex CLI's own two flows. A
+// browser that is not on this host - the usual case behind a vhost - gets the
+// device code: the page shows a one-time code to enter at auth.openai.com, and
+// Meridian finishes once it has been. A browser on this host gets the CLI's
+// browser sign-in, whose redirect to 127.0.0.1:1455 finishes by itself; from
+// anywhere else that tab ends on an address that does not load, which is
+// pasted into the field the panel puts right under the steps.
 var activeChatGptConnect = null;
 var chatGptConnectTimer = null;
 
-function renderChatGptConnectPanel(authorizeUrl, loopback) {
+function browserOnThisHost() {
+  var host = location.hostname;
+  return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1';
+}
+
+function startChatGptAdd() {
+  var owner = chatGptOwnerInfo || {};
+  if (owner.name === 'meridian' && owner.webSignIn) {
+    if (browserOnThisHost()) startChatGptRedirect('');
+    else startChatGptDevice();
+    return;
+  }
+  // Meridian cannot sign in a seat it only follows - its owner does - so the
+  // panel gives the owner's steps, and noticeNewChatGptSeats names the seat
+  // after the name typed above once a poll sees it arrive.
+  addProvider = 'chatgpt';
+  chatGptAddBaseline = lastProfiles ? chatGptSeatsOf(lastProfiles.profiles || []) : null;
+  var flow = addFlow();
+  if (flow) flow.innerHTML = renderChatGptOwnerSteps(owner);
+}
+
+function renderChatGptOwnerSteps(owner) {
+  var close = '<div class="login-row" style="margin-top:10px">'
+    + '<button class="switch-btn current" style="margin-top:0" onclick="resetAddForm(addName())">Close</button></div>';
+  if (owner.name === 'meridian') {
+    return '<div class="login-panel">'
+      + '<div class="add-intro">Meridian holds the ChatGPT logins on this instance. Sign the account in with opencode first, then bring it into Meridian\\u2019s store:</div>'
+      + commandRow('Import', owner.importCommand, '')
+      + '<div class="add-note">The seat appears in the list below once the import has finished.</div>'
+      + close + '</div>';
+  }
   return '<div class="login-panel">'
-    + '<div class="login-panel-title">Sign in with ChatGPT</div>'
+    + '<div class="add-intro">' + esc(owner.name) + ' owns the ChatGPT logins this Meridian serves. Sign the account in there, and Meridian '
+    + 'picks the new seat up from its store by itself.</div>'
+    + '<ol class="login-steps">'
+    +   '<li>In a terminal on the machine running this Meridian:</li>'
+    + '</ol>'
+    + commandRow('Run', owner.login, '')
+    + '<ol class="login-steps" start="2" style="margin-top:10px">'
+    +   '<li>Choose <strong>' + esc(owner.loginMethod) + '</strong>, then <strong>Add account</strong> if it asks, and sign in. '
+    +     'For a second ChatGPT account, sign in from a private browser window.</li>'
+    +   '<li>The seat appears in the list below within ten seconds, under the name typed above if there is one.</li>'
+    + '</ol>'
+    + close + '</div>';
+}
+
+function renderChatGptDevicePanel(data) {
+  var shown = String(data.verificationUrl || '').replace('https://', '');
+  return '<div class="login-panel">'
+    + '<div class="login-panel-title">Connect with ChatGPT</div>'
+    + '<ol class="login-steps">'
+    +   '<li>Open <a class="login-reopen" href="' + attr(data.verificationUrl) + '" target="_blank" rel="noopener noreferrer">' + esc(shown) + '</a>'
+    +     ' in any browser, on any device, and sign in with the ChatGPT account this seat should use.</li>'
+    +   '<li>Enter this one-time code there. It expires in 15 minutes.</li>'
+    + '</ol>'
+    + '<div class="device-code"><code>' + esc(data.userCode) + '</code>' + copyButton(data.userCode) + '</div>'
+    + '<div class="login-row" style="margin-top:12px">'
+    +   '<button class="switch-btn current login-cancel" style="margin-top:0" onclick="cancelChatGptConnect()">Cancel</button>'
+    +   '<button type="button" class="link-btn" onclick="switchChatGptToRedirect()">Use the browser sign-in instead</button>'
+    + '</div>'
+    + '<div class="login-msg busy">Waiting for the code to be entered\\u2026</div>'
+    + '</div>';
+}
+
+function renderChatGptRedirectPanel(authorizeUrl, loopback) {
+  return '<div class="login-panel">'
+    + '<div class="login-panel-title">Connect with ChatGPT</div>'
     + '<ol class="login-steps">'
     +   '<li>A ChatGPT sign-in tab just opened \\u2014 '
-    +     '<a class="login-reopen" href="' + esc(authorizeUrl) + '" target="_blank" rel="noopener noreferrer">open it again</a>'
+    +     '<a class="login-reopen" href="' + attr(authorizeUrl) + '" target="_blank" rel="noopener noreferrer">open it again</a>'
     +     ' if it was blocked. Right-click it to sign in from a private window.</li>'
     +   '<li>Sign in with the ChatGPT account this seat should use.</li>'
-    +   (loopback
-      ? '<li>On this machine that is all \\u2014 the tab ends on a Meridian page saying the seat is connected. '
-        + 'From another machine the tab ends on a page that cannot load; paste its whole address below.</li>'
-      : '<li>The tab ends on a page that cannot load. Paste its whole address below.</li>')
+    +   (loopback ? '<li>On this machine the tab then ends on a Meridian page saying the seat is connected, and this panel finishes by itself.</li>' : '')
     + '</ol>'
+    + '<label class="paste-label" for="chatgpt-paste">' + (loopback ? 'Signed in from another machine? ' : '')
+    +   'Paste the whole address the sign-in tab ended on. It starts with http://127.0.0.1:1455 and that page does not load \\u2014 that is expected.</label>'
     + '<div class="login-row">'
-    +   '<input class="login-input" type="text" autocomplete="off" spellcheck="false" placeholder="http://localhost:1455/auth/callback?code=\\u2026">'
+    +   '<input id="chatgpt-paste" class="login-input" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:1455/auth/callback?code=\\u2026">'
     +   '<button class="login-btn login-submit" onclick="submitChatGptConnect()">Connect</button>'
     +   '<button class="switch-btn current login-cancel" style="margin-top:0" onclick="cancelChatGptConnect()">Cancel</button>'
     + '</div>'
@@ -1796,43 +1859,71 @@ function renderChatGptConnectPanel(authorizeUrl, loopback) {
     + '</div>';
 }
 
+async function postChatGptConnect(path, body) {
+  try {
+    var res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    return { res: res, data: await res.json() };
+  } catch (err) {
+    return null;
+  }
+}
+
+async function startChatGptDevice() {
+  var name = addName();
+  setAddFormMsg('Starting\\u2026', 'busy');
+  var reply = await postChatGptConnect('/profiles/chatgpt/connect/device', { name: name });
+  if (!reply) { setAddFormMsg('Could not reach Meridian.', 'err'); return; }
+  var data = reply.data;
+  if (!reply.res.ok) {
+    if (data.code === 'invalid_profile_id' || data.code === 'chatgpt_signin_unavailable') {
+      setAddFormMsg(data.error || 'Could not start the sign-in.', 'err');
+      return;
+    }
+    // auth.openai.com would not hand out a code; its browser sign-in may still work.
+    startChatGptRedirect((data.error || 'The device sign-in is unavailable.') + ' Using the browser sign-in instead.');
+    return;
+  }
+  setAddFormMsg('', '');
+  setAddFormLocked(true);
+  activeChatGptConnect = { connectId: data.connectId, name: name };
+  addFlow().innerHTML = renderChatGptDevicePanel(data);
+  chatGptConnectTimer = setTimeout(pollChatGptConnect, 1500);
+}
+
+async function startChatGptRedirect(note) {
+  var name = addName();
+  setAddFormMsg('Starting\\u2026', 'busy');
+  var reply = await postChatGptConnect('/profiles/chatgpt/connect/start', { name: name, returnTo: location.origin + '/profiles' });
+  if (!reply) { setAddFormMsg('Could not reach Meridian.', 'err'); return; }
+  var data = reply.data;
+  if (!reply.res.ok) { setAddFormMsg(data.error || 'Could not start the sign-in.', 'err'); return; }
+  setAddFormMsg(note || '', '');
+  setAddFormLocked(true);
+  activeChatGptConnect = { connectId: data.connectId, name: name };
+  var flow = addFlow();
+  flow.innerHTML = renderChatGptRedirectPanel(data.authorizeUrl, data.loopback);
+  var input = flow.querySelector('.login-input');
+  if (input) input.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitChatGptConnect(); });
+  window.open(data.authorizeUrl, '_blank', 'noopener');
+  chatGptConnectTimer = setTimeout(pollChatGptConnect, 1500);
+}
+
 function stopChatGptConnectPoll() {
   if (chatGptConnectTimer) clearTimeout(chatGptConnectTimer);
   chatGptConnectTimer = null;
 }
 
-function finishChatGptConnect(message) {
+function finishChatGptConnect(data) {
   stopChatGptConnectPoll();
   activeChatGptConnect = null;
   resetAddForm('');
-  setPanelMsg(addSlot(), message, '');
+  setAddFormMsg('Connected ' + (data.email || data.accountUserId || data.seat) + (data.profile ? ' as ' + data.profile : '') + '.', '');
   if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
-  refresh();
-}
-
-async function startChatGptConnect() {
-  var slot = addSlot();
-  if (!slot) return;
-  setPanelMsg(slot, 'Starting\\u2026', 'busy');
-  var res, data;
-  try {
-    res = await fetch('/profiles/chatgpt/connect/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ returnTo: location.origin + '/profiles' })
-    });
-    data = await res.json();
-  } catch (err) {
-    setPanelMsg(slot, 'Could not reach Meridian.', 'err');
-    return;
-  }
-  if (!res.ok) { setPanelMsg(slot, data.error || 'Could not start the sign-in.', 'err'); return; }
-  activeChatGptConnect = { connectId: data.connectId };
-  slot.innerHTML = renderChatGptConnectPanel(data.authorizeUrl, data.loopback);
-  var input = slot.querySelector('.login-input');
-  if (input) input.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitChatGptConnect(); });
-  window.open(data.authorizeUrl, '_blank', 'noopener');
-  chatGptConnectTimer = setTimeout(pollChatGptConnect, 1500);
+  refresh().then(function () { if (data.profile) location.hash = encodeURIComponent(data.profile); });
 }
 
 async function pollChatGptConnect() {
@@ -1851,47 +1942,48 @@ async function pollChatGptConnect() {
     chatGptConnectTimer = setTimeout(pollChatGptConnect, 1500);
     return;
   }
-  if (res.ok && data.status === 'completed') {
-    finishChatGptConnect('Connected ' + (data.email || data.accountUserId) + '.');
-    return;
-  }
+  if (res.ok && data.status === 'completed') { finishChatGptConnect(data); return; }
   stopChatGptConnectPoll();
-  setPanelMsg(addSlot(), data.message || data.error || 'The sign-in failed.', 'err');
+  setPanelMsg(addFlow(), data.message || data.error || 'The sign-in failed.', 'err');
 }
 
 async function submitChatGptConnect() {
   var current = activeChatGptConnect;
-  var slot = addSlot();
-  if (!current || !slot) return;
-  var input = slot.querySelector('.login-input');
+  var flow = addFlow();
+  if (!current || !flow) return;
+  var input = flow.querySelector('.login-input');
   var value = input ? input.value.trim() : '';
-  if (!value) { setPanelMsg(slot, 'Paste the address the sign-in tab ended on first.', 'err'); return; }
-  setPanelMsg(slot, 'Connecting\\u2026', 'busy');
-  var res, data;
-  try {
-    res = await fetch('/profiles/chatgpt/connect/complete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ connectId: current.connectId, url: value })
-    });
-    data = await res.json();
-  } catch (err) {
-    setPanelMsg(slot, 'Could not reach Meridian.', 'err');
-    return;
-  }
+  if (!value) { setPanelMsg(flow, 'Paste the address the sign-in tab ended on first.', 'err'); return; }
+  setPanelMsg(flow, 'Connecting\\u2026', 'busy');
+  var reply = await postChatGptConnect('/profiles/chatgpt/connect/complete', { connectId: current.connectId, url: value });
+  if (!reply) { setPanelMsg(flow, 'Could not reach Meridian.', 'err'); return; }
   if (activeChatGptConnect !== current) return;
-  if (!res.ok) {
-    if (!data.retryable) stopChatGptConnectPoll();
-    setPanelMsg(slot, data.error || 'The sign-in failed.', 'err');
+  if (!reply.res.ok) {
+    if (!reply.data.retryable) stopChatGptConnectPoll();
+    setPanelMsg(flow, reply.data.error || 'The sign-in failed.', 'err');
     return;
   }
-  finishChatGptConnect('Connected ' + (data.email || data.seat) + '.');
+  finishChatGptConnect(reply.data);
 }
 
-function cancelChatGptConnect() {
+// Tells Meridian the sign-in is abandoned, so it stops polling for a device
+// code and closes the 127.0.0.1:1455 listener now rather than at its expiry.
+async function releaseChatGptConnect() {
+  var current = activeChatGptConnect;
   stopChatGptConnectPoll();
   activeChatGptConnect = null;
-  resetAddForm('');
+  if (current) await postChatGptConnect('/profiles/chatgpt/connect/cancel', { connectId: current.connectId });
+}
+
+async function cancelChatGptConnect() {
+  var name = activeChatGptConnect ? activeChatGptConnect.name : addName();
+  await releaseChatGptConnect();
+  resetAddForm(name);
+}
+
+async function switchChatGptToRedirect() {
+  await releaseChatGptConnect();
+  startChatGptRedirect('');
 }
 
 async function renewChatGptSeat(button) {

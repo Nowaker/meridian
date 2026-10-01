@@ -13,6 +13,7 @@ import { computeSummary } from '../telemetry/percentiles'
 import { CATALOG_CLIENT_VERSION, chatGptModelList, createChatGptModelCatalog, type CatalogModel } from './chatgpt/catalog'
 import { createCodexClientVersion } from './chatgpt/clientVersion'
 import { CHATGPT_WARM_MODELS, chatGptRefusalDiagnosis, chatGptWarmBody, createChatGptProfileSurface } from './chatgpt/profileSurface'
+import { chatGptNameProblem } from './chatgpt/profiles'
 import { getCodexUsage } from './codex/service'
 import type { CodexUsageResponse } from './codex/types'
 import { createUpstreamRegistry, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
@@ -9301,9 +9302,29 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // flow and its loopback listener live in chatgpt/login.ts; these routes only
   // translate. No response carries a code, verifier or token.
   const connectChatGptAccount = chatGptSource?.connectAccount?.bind(chatGptSource)
+  const chatGptReservedNames = () => new Set(["default", ...getEffectiveProfiles(finalConfig.profiles).flatMap(p => [p.id, ...(p.aliases ?? [])])])
+  // The name typed in the add form becomes the seat's profile id through the
+  // same plan a rename uses, so the id it was derived under keeps answering.
+  // The seat is already stored by then: a name that cannot be applied is
+  // reported, never a reason to fail the sign-in.
+  const nameSignedInSeat = (seat: string, name: string | null) => {
+    if (!name || !chatGptProfiles) return
+    const current = chatGptProfiles.resolve(seat)
+    if (!current || current.id === name) return
+    const plan = chatGptProfiles.planRename(current.id, name)
+    if (!plan.ok) {
+      plog(`[PROXY] ChatGPT seat keeps the name ${current.id}: ${plan.error}`)
+      return
+    }
+    saveSettings({ chatGptProfileNames: plan.names, chatGptProfileAliases: plan.aliasesBySeat })
+    const order = getSetting("profileOrder")
+    if (order?.includes(plan.from)) setSetting("profileOrder", order.map(id => (id === plan.from ? plan.to : id)))
+    plog(`[PROXY] ChatGPT seat named ${plan.to} (still answers to: ${plan.aliases.join(", ")})`)
+  }
   const chatGptLogin = connectChatGptAccount ? createChatGptLogin({
-    connect: (account) => {
+    connect: (account, context) => {
       connectChatGptAccount(account)
+      nameSignedInSeat(account.accountUserId, context.name)
       // The usage view and the catalog read the store; make them see the new
       // seat on the next poll rather than after their own intervals.
       chatGptUsageAt = 0
@@ -9322,14 +9343,27 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     code: "chatgpt_signin_unavailable",
   }, 409)
 
+  const readConnectBody = async (c: Context): Promise<Record<string, unknown>> => {
+    try {
+      const parsed: unknown = await c.req.json()
+      return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
+    } catch {
+      return {}
+    }
+  }
+  // An empty name means "derive one from the account", as before naming existed.
+  const requestedSeatName = (body: Record<string, unknown>): { name: string | null } | { error: string } => {
+    const name = typeof body.name === "string" ? body.name.trim() : ""
+    if (!name) return { name: null }
+    const problem = chatGptNameProblem(name, chatGptReservedNames())
+    return problem ? { error: problem } : { name }
+  }
+
   app.post("/profiles/chatgpt/connect/start", async (c) => {
     if (!chatGptLogin) return chatGptSignInUnavailable(c)
-    let body: { returnTo?: unknown } = {}
-    try {
-      body = await c.req.json() as { returnTo?: unknown }
-    } catch {
-      body = {}
-    }
+    const body = await readConnectBody(c)
+    const named = requestedSeatName(body)
+    if ("error" in named) return c.json({ error: named.error, code: "invalid_profile_id" }, 400)
     // Only ever rendered as a link back from the loopback page.
     let returnTo: string | null = null
     if (typeof body.returnTo === "string") {
@@ -9340,9 +9374,33 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         returnTo = null
       }
     }
-    const started = await chatGptLogin.start({ returnTo })
-    plog(`[PROXY] ChatGPT sign-in started (loopback=${started.loopback})`)
+    const started = await chatGptLogin.start({ returnTo, name: named.name })
+    plog(`[PROXY] ChatGPT sign-in started (browser redirect, loopback=${started.loopback})`)
     return c.json(started)
+  })
+
+  app.post("/profiles/chatgpt/connect/device", async (c) => {
+    if (!chatGptLogin) return chatGptSignInUnavailable(c)
+    const named = requestedSeatName(await readConnectBody(c))
+    if ("error" in named) return c.json({ error: named.error, code: "invalid_profile_id" }, 400)
+    const started = await chatGptLogin.startDevice({ name: named.name })
+    if (!started.ok) {
+      plog(`[PROXY] ChatGPT device sign-in could not start: ${started.code}`)
+      return c.json({ error: started.message, code: started.code }, started.status as 502)
+    }
+    plog("[PROXY] ChatGPT sign-in started (device code)")
+    return c.json(started)
+  })
+
+  app.post("/profiles/chatgpt/connect/cancel", async (c) => {
+    if (!chatGptLogin) return chatGptSignInUnavailable(c)
+    const body = await readConnectBody(c)
+    if (typeof body.connectId !== "string" || !body.connectId) {
+      return c.json({ error: "Missing 'connectId' in request body", code: "invalid_request" }, 400)
+    }
+    const cancelled = chatGptLogin.cancel(body.connectId)
+    if (cancelled) plog("[PROXY] ChatGPT sign-in cancelled")
+    return c.json({ cancelled })
   })
 
   app.get("/profiles/chatgpt/connect/status", (c) => {

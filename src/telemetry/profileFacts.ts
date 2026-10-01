@@ -149,7 +149,7 @@ function profileAccessHelp(p) {
   if (owner.name === 'meridian') {
     var owned = 'Meridian holds this seat\\u2019s login and cannot renew it.';
     if (owner.webSignIn) {
-      return { pill: 'needs login', reason: owned, summary: owned + ' Sign it in again: Add a profile \\u2192 ChatGPT seat \\u2192 Sign in with ChatGPT.' };
+      return { pill: 'needs login', reason: owned, summary: owned + ' Sign it in again: Add a profile \\u2192 type its name \\u2192 Connect with ChatGPT.' };
     }
     return { pill: 'needs login', reason: owned, summary: owned + ' Bring a fresh one in with: ' + owner.importCommand };
   }

@@ -859,17 +859,30 @@ describe("owned mode signs its own seats in", () => {
   let storeDir: string
   let storePath: string
   let codeExchanges = 0
+  let devicePolls = 0
+  let deviceEntered = false
   beforeEach(() => {
     storeDir = join(dir, "meridian-gpt")
     storePath = join(storeDir, "chatgpt-accounts.json")
     process.env.MERIDIAN_CHATGPT_STORE_PATH = storePath
     codeExchanges = 0
+    devicePolls = 0
+    deviceEntered = false
     __setChatGptLoginListenOverride(async () => null)
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
       if (url === TOKEN_URL && new URLSearchParams(String(init?.body)).get("grant_type") === "authorization_code") {
         codeExchanges++
         return new Response(JSON.stringify({ access_token: signedIn, refresh_token: "rt-signed-in", id_token: signedIn, expires_in: 3600 }), { status: 200, headers: { "content-type": "application/json" } })
+      }
+      if (url === "https://auth.openai.com/api/accounts/deviceauth/usercode") {
+        return Promise.resolve(Response.json({ device_auth_id: "dev-9", user_code: "WXYZ-0001", interval: "0" }))
+      }
+      if (url === "https://auth.openai.com/api/accounts/deviceauth/token") {
+        devicePolls++
+        return Promise.resolve(deviceEntered
+          ? Response.json({ authorization_code: "auth-9", code_challenge: "c", code_verifier: "v" })
+          : new Response("", { status: 403 }))
       }
       return mockFetch(input, init)
     }) as typeof fetch
@@ -906,7 +919,7 @@ describe("owned mode signs its own seats in", () => {
       expect(started.loopback).toBe(false)
       const state = new URL(started.authorizeUrl).searchParams.get("state")
       const done = await post(proxy.app, "/profiles/chatgpt/connect/complete", {
-        connectId: started.connectId, url: `http://localhost:1455/auth/callback?code=one-time&state=${state}`,
+        connectId: started.connectId, url: `http://127.0.0.1:1455/auth/callback?code=one-time&state=${state}`,
       })
       const doneText = await done.text()
       expect(done.status).toBe(200)
@@ -936,6 +949,60 @@ describe("owned mode signs its own seats in", () => {
       expect(tokenCalls).toBe(1)
       const rotated = JSON.parse(readFileSync(storePath, "utf8")) as { accounts: Array<Record<string, unknown>> }
       expect(rotated.accounts[0]).toMatchObject({ refreshToken: "rt-rotated", accessToken: "at-refreshed", exchangeStartedAt: null })
+    } finally {
+      proxy.chatGpt!.release()
+    }
+  })
+
+  it("signs a seat in by device code under the name typed for it, keeping the derived id as an alias", async () => {
+    const proxy = await server("owned")
+    await proxy.chatGpt!.acquire()
+    try {
+      const refused = await post(proxy.app, "/profiles/chatgpt/connect/device", { name: "Not Valid!" })
+      expect(refused.status).toBe(400)
+      expect(await refused.json()).toMatchObject({ code: "invalid_profile_id" })
+
+      const startedRes = await post(proxy.app, "/profiles/chatgpt/connect/device", { name: "work-pro" })
+      expect(startedRes.status).toBe(200)
+      const started = await startedRes.json() as { connectId: string; userCode: string; verificationUrl: string }
+      expect(started).toMatchObject({ userCode: "WXYZ-0001", verificationUrl: "https://auth.openai.com/codex/device" })
+
+      const deadline = Date.now() + 10_000
+      while (devicePolls === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 100))
+      expect(devicePolls).toBeGreaterThan(0)
+      expect(codeExchanges).toBe(0)
+      deviceEntered = true
+      let status: { status?: string } = {}
+      while (status.status !== "completed" && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 100))
+        status = await (await proxy.app.fetch(new Request(`http://localhost/profiles/chatgpt/connect/status?connectId=${started.connectId}`))).json() as { status?: string }
+      }
+      expect(status).toMatchObject({ status: "completed", accountUserId: "user-9__workspace-9" })
+      expect(codeExchanges).toBe(1)
+
+      const list = await (await proxy.app.fetch(new Request("http://localhost/profiles/list"))).json() as { profiles: Array<{ id: string; seat?: string; aliases?: string[] }> }
+      const seat = list.profiles.find(p => p.seat === "user-9__workspace-9")!
+      expect(seat.id).toBe("work-pro")
+      expect(seat.aliases).toContain("fresh-pace-9")
+    } finally {
+      proxy.chatGpt!.release()
+    }
+  })
+
+  it("cancels a pending sign-in on request, so its code can no longer be spent", async () => {
+    const proxy = await server("owned")
+    await proxy.chatGpt!.acquire()
+    try {
+      const started = await (await post(proxy.app, "/profiles/chatgpt/connect/start", {})).json() as { connectId: string; authorizeUrl: string }
+      const cancelled = await post(proxy.app, "/profiles/chatgpt/connect/cancel", { connectId: started.connectId })
+      expect(await cancelled.json()).toEqual({ cancelled: true })
+      const state = new URL(started.authorizeUrl).searchParams.get("state")
+      const late = await post(proxy.app, "/profiles/chatgpt/connect/complete", {
+        connectId: started.connectId, url: `http://127.0.0.1:1455/auth/callback?code=late&state=${state}`,
+      })
+      expect(late.status).not.toBe(200)
+      expect(codeExchanges).toBe(0)
+      expect(existsSync(storePath)).toBe(false)
     } finally {
       proxy.chatGpt!.release()
     }

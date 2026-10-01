@@ -39,7 +39,7 @@ export interface OwnedSourceOptions {
 }
 
 export const CHATGPT_NO_ACCOUNT_MESSAGE = "No ChatGPT account is connected to this Meridian. "
-  + "Connect one in its web UI: open /profiles, choose \"ChatGPT seat\" under \"Add a profile\", then \"Sign in with ChatGPT\"."
+  + "Connect one in its web UI: open /profiles, name the profile under \"Add a profile\", then choose \"Connect with ChatGPT\"."
 
 /** Undefined when the store holds no accounts and `allowEmpty` is unset: nothing to own, nothing to serve. */
 export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGptCredentialSource | undefined {
