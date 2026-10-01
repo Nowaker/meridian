@@ -248,7 +248,10 @@ function codexCreditsPace(credits, quota, now) {
   if (typeof credits.balance !== 'number' || !(credits.balance > 0)) return null;
   var lasts = creditsDuration(credits.balance / burn.creditsPerHour);
   if (!lasts) return null;
-  var mix = burn.mix.map(function (m) { return Math.round(m.share * 100) + '% ' + m.model; }).join(' / ');
+  var mix = burn.mix.map(function (m) {
+    var pct = Math.round(m.share * 100);
+    return (pct < 1 && m.share > 0 ? '<1' : pct) + '% ' + m.model;
+  }).join(' / ');
   var approximate = burn.approximate.length > 0;
   var title = Math.round(burn.creditsPerHour).toLocaleString('en-US') + ' credits/h over the last ' + burn.windowMinutes
     + ' minutes, ' + burn.turns + ' turn' + (burn.turns === 1 ? '' : 's') + ' across all seats: ' + mix

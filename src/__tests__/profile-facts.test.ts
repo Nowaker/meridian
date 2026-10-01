@@ -213,6 +213,8 @@ describe("a ChatGPT seat's card", () => {
     const serving = codexCreditsView(credits, { creditsPolicy: "immediately", servingOnCredits: true, creditsBurn: burning })
     expect(serving?.pace?.text).toBe("est. out in 1h34m at current pace")
     expect(serving?.pace?.title).toContain("62% gpt-6-sol / 38% gpt-6-luna")
+    const trace = { ...burning, mix: [{ model: "gpt-6.1-sol", share: 0.9999 }, { model: "gpt-6-luna", share: 0.0001 }] }
+    expect(codexCreditsView(credits, { servingOnCredits: true, creditsBurn: trace })?.pace?.title).toContain("100% gpt-6.1-sol / <1% gpt-6-luna")
     expect(codexCreditsView(credits, { creditsPolicy: "reserve", creditsBurn: burning })?.pace?.text)
       .toBe("starts after every seat\u2019s plan limits; would last ~1h34m at current pace")
     expect(codexCreditsView(credits, { creditsPolicy: "never", creditsBurn: burning })?.pace?.text)
