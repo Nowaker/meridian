@@ -216,9 +216,45 @@ describe("landing page layout", () => {
 
   test("account cards come from configured profiles, not synthetic cost buckets", () => {
     // With profiles configured, only pl.profiles render (no "default" card);
-    // the single-account fallback labels the card with the login email.
+    // the single-account fallback is the ambient Claude login alone. No
+    // telemetry key becomes a card: those were the ghost cards a
+    // ChatGPT-only instance showed for seats it no longer had.
     expect(landingHtml).toContain("configured.length>0")
-    expect(landingHtml).toContain("k==='default'?(email||'account')")
+    expect(landingHtml).toContain("profs.push({id:'default',label:email||'account',configured:false})")
+    expect(landingHtml).not.toContain("for(var k in byProfile){if(!seen[k])profs.push")
+    expect(landingHtml).not.toContain("for(var k in quotaByProfile){profs.push")
+  })
+
+  describe("past usage and the Claude-free intro", () => {
+    const pageFunction = (name: string) => {
+      const start = landingHtml.indexOf(`function ${name}(`)
+      expect(start, name).toBeGreaterThanOrEqual(0)
+      return landingHtml.slice(start, landingHtml.indexOf("\n}\n", start) + 2)
+    }
+    const fns = runInNewContext(
+      "function isChatGptProfile(p){return !!p&&(p.provider==='chatgpt'||p.type==='chatgpt')}\n"
+        + pageFunction("servesClaude") + pageFunction("pastUsage")
+        + ";({servesClaude, pastUsage})",
+    ) as {
+      servesClaude: (h: unknown, pl: unknown) => boolean
+      pastUsage: (byProfile: unknown, cards: unknown) => Array<{ id: string; requests: number }>
+    }
+
+    test("an instance serving only ChatGPT does not serve Claude, whatever its telemetry holds", () => {
+      expect(fns.servesClaude({ auth: { loggedIn: null } }, { profiles: [], chatgpt: { owner: {} } })).toBe(false)
+      expect(fns.servesClaude({}, { profiles: [{ id: "s", type: "chatgpt" }], chatgpt: { owner: {} } })).toBe(false)
+      expect(fns.servesClaude({ auth: { loggedIn: true } }, { profiles: [], chatgpt: { owner: {} } })).toBe(true)
+      expect(fns.servesClaude({}, { profiles: [{ id: "c", type: "claude-max" }], chatgpt: { owner: {} } })).toBe(true)
+      expect(fns.servesClaude({}, { profiles: [] })).toBe(true)
+    })
+
+    test("lists telemetry ids no card shows, a renamed card's former names excepted", () => {
+      const rows = fns.pastUsage(
+        { default: { requests: 100 }, "old-seat": { requests: 27, estimatedUsd: 0.17 }, renamed: { requests: 4 }, live: { requests: 9 }, idle: { requests: 0 } },
+        [{ id: "live", entry: { aliases: ["renamed"] } }],
+      )
+      expect(rows.map(r => [r.id, r.requests])).toEqual([["default", 100], ["old-seat", 27]])
+    })
   })
 })
 

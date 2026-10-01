@@ -165,6 +165,19 @@ export const landingHtml = `<!DOCTYPE html>
   .usage-row .w-pct { width: 38px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
   .usage-row .w-reset { color: var(--muted); font-size: 11px; width: 76px; text-align: right; }
   .no-usage { font-size: 12px; color: var(--muted); padding: 4px 0; }
+  .empty-accounts { font-size: 13px; color: var(--muted); padding: 16px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 10px; }
+  .empty-accounts a { color: var(--accent); }
+  .past-usage { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 16px; }
+  .past-row { display: flex; gap: 12px; align-items: baseline; font-size: 12px; padding: 6px 0;
+    border-bottom: 1px solid var(--border); }
+  .past-row:last-child { border-bottom: none; }
+  .past-id { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; color: var(--muted); }
+  .past-note { font-size: 11px; }
+  .past-req, .past-cost { color: var(--muted); white-space: nowrap; }
+  @media (max-width: 720px) {
+    .sort-tab { min-height: 40px; }
+  }
   .credits-row .w-credits { flex: 1; min-width: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
   .credits-row .w-credits.serving { color: var(--yellow); }
   .credits-row .w-credits-note { color: var(--muted); font-size: 11px; text-align: right; min-width: 0; overflow-wrap: anywhere; }
@@ -328,16 +341,60 @@ function setViewSort(mode){
 ${reorderClientJs}
 ${selectionHoldJs}
 
-function introSection(h){
+// Whether this instance serves Claude at all. An instance that serves ChatGPT
+// and has neither a Claude login nor a Claude profile does not, and its page
+// must not describe a Claude account it never had.
+function servesClaude(h,pl){
+  if(h&&h.auth&&h.auth.loggedIn)return true;
+  var ps=(pl&&Array.isArray(pl.profiles))?pl.profiles:[];
+  for(var i=0;i<ps.length;i++)if(!isChatGptProfile(ps[i]))return true;
+  return !(pl&&pl.chatgpt);
+}
+
+// Telemetry is filed under whatever profile served a request, and under
+// "default" when none did (a refused or failed turn). Ids that match no card
+// on this page - a seat that was removed, a store this instance no longer
+// follows, unattributed turns - are listed here, never drawn as accounts.
+function pastUsage(byProfile,cards){
+  var shown={};
+  for(var i=0;i<cards.length;i++){var c=cards[i];shown[c.id]=1;var al=(c.entry&&c.entry.aliases)||[];for(var j=0;j<al.length;j++)shown[al[j]]=1}
+  var rows=[];
+  for(var k in byProfile){if(shown[k])continue;var u=byProfile[k];if(!u||!u.requests)continue;rows.push({id:k,requests:u.requests,estimatedUsd:u.estimatedUsd||0})}
+  rows.sort(function(a,b){return b.requests-a.requests});
+  return rows;
+}
+
+function pastUsageSection(rows){
+  if(rows.length===0)return '';
+  var items='';
+  for(var i=0;i<rows.length;i++){var r=rows[i];
+    items+='<div class="past-row"><span class="past-id">'+(r.id==='default'?'unattributed <span class="past-note">(served by no account)</span>':esc(r.id))+'</span>'
+      +'<span class="past-req">'+r.requests+' request'+(r.requests===1?'':'s')+'</span><span class="past-cost">'+usd(r.estimatedUsd)+'</span></div>';
+  }
+  return '<div class="section"><div class="section-title">Past usage · not a configured account · 24h</div><div class="past-usage">'+items+'</div></div>';
+}
+
+function introSection(h,pl){
   var meta=[];
   if(h.auth&&h.auth.loggedIn)meta.push(esc(h.auth.email||'')+(h.auth.subscriptionType?' ('+esc(h.auth.subscriptionType)+')':''));
   meta.push(h.mode||'internal');
-  meta.push('port '+location.port);
+  if(location.port)meta.push('port '+location.port);
   var chatgpt=!!h.chatgpt;
+  var claude=servesClaude(h,pl);
+  var base=location.origin;
+  var chatgptLine=' For ChatGPT, point an OpenAI Responses client (opencode’s <code>openai-meridian</code> provider) at <code>'+esc(base)+'/v1</code>: each turn goes to the active seat below, then to the others in their order.';
+  if(chatgpt&&!claude){
+    return '<div class="intro">'
+      +'<h2>ChatGPT, in your tools.</h2>'
+      +'<p>This page manages the ChatGPT seats this Meridian serves.'+chatgptLine
+      +' Connect a seat on <a href="/profiles">Profiles</a>.</p>'
+      +'<div class="intro-meta">'+meta.join(' · ')+'</div>'
+      +'</div>';
+  }
   return '<div class="intro">'
     +'<h2>'+(chatgpt?'Claude, ChatGPT &amp; Antigravity':'Claude &amp; Antigravity')+', in your tools.</h2>'
-    +'<p>This page manages '+(chatgpt?'Claude accounts and ChatGPT seats':'Claude accounts')+'. Use <a href="/providers">Providers</a> to connect Claude or Antigravity. For Claude, point your supported client’s <code>ANTHROPIC_BASE_URL</code> at <code>http://'+esc(location.host)+'</code> and every request routes through the active account below.'
-    +(chatgpt?' For ChatGPT, point an OpenAI Responses client (opencode’s <code>openai-meridian</code> provider) at <code>http://'+esc(location.host)+'/v1</code>: each turn goes to the active seat below, then to the others in their order.':'')
+    +'<p>This page manages '+(chatgpt?'Claude accounts and ChatGPT seats':'Claude accounts')+'. Use <a href="/providers">Providers</a> to connect Claude or Antigravity. For Claude, point your supported client’s <code>ANTHROPIC_BASE_URL</code> at <code>'+esc(base)+'</code> and every request routes through the active account below.'
+    +(chatgpt?chatgptLine:'')
     +' Setup guides for each agent live in the <a href="https://github.com/rynfar/meridian/blob/main/docs/agents.md">Agent Setup guide</a>.</p>'
     +'<div class="intro-meta">'+meta.join(' · ')+'</div>'
     +'</div>';
@@ -390,13 +447,17 @@ function profileSection(q,s,pl,h){
     // The whole entry rides along so the details overlay reads it directly —
     // a copied field list here would have to grow every time profileFacts does.
     for(var i=0;i<configured.length;i++){var p=configured[i];profs.push({id:p.id,label:p.id,type:p.type,isActive:!!p.isActive,loggedIn:p.loggedIn,configured:true,allowance:p.allowance,planLabel:p.planLabel,rateLimitTier:p.rateLimitTier,entry:p});seen[p.id]=1}
-  }else{
-    // Single-account setup: one card, labeled with the logged-in email.
+  }else if(servesClaude(h,pl)){
+    // Single-account setup: the ambient Claude login is the one account,
+    // labeled with its email. Any other id in telemetry is past usage.
     var email=(h&&h.auth&&h.auth.loggedIn&&h.auth.email)||'';
-    for(var k in quotaByProfile){profs.push({id:k,label:k==='default'?(email||'account'):k,configured:false});seen[k]=1}
-    for(var k in byProfile){if(!seen[k])profs.push({id:k,label:k==='default'?(email||'account'):k,configured:false});seen[k]=1}
+    profs.push({id:'default',label:email||'account',configured:false});
   }
-  if(profs.length===0)return '';
+  if(profs.length===0){
+    if(!(pl&&pl.chatgpt))return {html:'',shown:[]};
+    return {shown:[],html:'<div class="section"><div class="section-head"><div class="section-title">Accounts</div></div>'
+      +'<div class="empty-accounts">No ChatGPT seat is connected yet. Name one under <a href="/profiles">Add a profile</a>, then choose <strong>Connect with ChatGPT</strong>.</div></div>'};
+  }
   // The persisted order is the base order everywhere. /profiles writes it;
   // this page read config order instead, so the two disagreed after a drag.
   profs=meridianReorder.sortProfiles(profs);
@@ -407,6 +468,7 @@ function profileSection(q,s,pl,h){
   profs=sortProfilesForView(profs,viewSort,spentOf);
   var reorderable=multi&&!meridianReorder.envPinned()&&viewSort==='configured';
   var cards='';
+  var shown=[];
   var pos=0;
   for(var i=0;i<profs.length;i++){
     var p=profs[i];var cost=profileCost(byProfile,p);
@@ -415,6 +477,7 @@ function profileSection(q,s,pl,h){
     var wins=(quota.windows||[]).filter(function(w){return w.utilization!=null});
     var spend=computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn,provider:p.entry&&p.entry.provider});
     if(!p.configured&&wins.length===0&&!cost)continue;
+    shown.push(p);
     var rows='';
     for(var j=0;j<wins.length;j++){
       var w=wins[j];var pct=Math.round(w.utilization*100);
@@ -515,10 +578,10 @@ function profileSection(q,s,pl,h){
       +spentBanner+rows+'</div>';
     if(p.configured)pos++;
   }
-  if(!cards)return '';
-  return '<div class="section"><div class="section-head"><div class="section-title">'+(profs.length===1?'Account':'Accounts')+'</div>'+sortTabs(profs.length)+'</div>'
+  if(!cards)return {html:'',shown:shown};
+  return {shown:shown,html:'<div class="section"><div class="section-head"><div class="section-title">'+(profs.length===1?'Account':'Accounts')+'</div>'+sortTabs(profs.length)+'</div>'
     +(multi?meridianReorder.noteHtml(reorderable,configured.some(isChatGptProfile)):'')
-    +'<div class="profile-grid">'+cards+'</div></div>';
+    +'<div class="profile-grid">'+cards+'</div></div>'};
 }
 
 function strip(items){
@@ -549,10 +612,11 @@ function render(h,s,q,pl){
   lastData=[h,s,q,pl];
   var refocusId=meridianReorder.focusAnchor();
   let o='';
-  o+=introSection(h);
+  o+=introSection(h,pl);
 
   // Accounts — per-profile usage + est cost; click a card to switch
-  o+=profileSection(q,s,pl,h);
+  var accounts=profileSection(q,s,pl,h);
+  o+=accounts.html;
 
   // Last 24 hours — meaningful signals only. Errors and envelope
   // violations appear only when there is something to report.
@@ -568,6 +632,7 @@ function render(h,s,q,pl){
   ];
   if(s.envelopeViolationCount>0)items.push(['Envelope',String(s.envelopeViolationCount),'red','wire-contract violations']);
   o+='<div class="section"><div class="section-title">Last 24 Hours</div>'+strip(items)+'</div>';
+  o+=pastUsageSection(pastUsage((s.costEstimate&&s.costEstimate.byProfile)||{},accounts.shown));
 
   o+='<div class="footer">Meridian · <a href="https://github.com/rynfar/meridian">GitHub</a> · Built on the <a href="https://github.com/anthropics/claude-agent-sdk-typescript">Claude Agent SDK</a></div>';
   document.getElementById('content').innerHTML=o;
