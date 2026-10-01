@@ -246,6 +246,31 @@ describe("landing page layout", () => {
       expect(fns.servesClaude({ auth: { loggedIn: true } }, { profiles: [], chatgpt: { owner: {} } })).toBe(true)
       expect(fns.servesClaude({}, { profiles: [{ id: "c", type: "claude-max" }], chatgpt: { owner: {} } })).toBe(true)
       expect(fns.servesClaude({}, { profiles: [] })).toBe(true)
+      // /profiles/list failed to load; /health still says ChatGPT.
+      expect(fns.servesClaude({ auth: { loggedIn: null }, chatgpt: { mode: "owned" } }, null)).toBe(false)
+      expect(fns.servesClaude({ auth: { loggedIn: true }, chatgpt: { mode: "owned" } }, null)).toBe(true)
+      expect(fns.servesClaude({ auth: { loggedIn: null } }, null)).toBe(true)
+    })
+
+    test("a ChatGPT-only intro names only ChatGPT and the page's own https base", () => {
+      const intro = runInNewContext(
+        "function isChatGptProfile(p){return !!p&&(p.provider==='chatgpt'||p.type==='chatgpt')}\n"
+          + "function esc(s){return String(s)}\n"
+          + pageFunction("servesClaude") + pageFunction("introSection") + ";introSection",
+        { location: { origin: "https://meridian.example", port: "", host: "meridian.example" } },
+      ) as (h: unknown, pl: unknown) => string
+      const health = { auth: { loggedIn: null }, chatgpt: { mode: "owned" }, mode: "passthrough" }
+      for (const pl of [{ profiles: [{ id: "seat", type: "chatgpt" }], chatgpt: { owner: {} } }, null]) {
+        const text = intro(health, pl)
+        expect(text).toContain("ChatGPT, in your tools.")
+        expect(text).toContain("https://meridian.example/v1")
+        expect(text).not.toContain("ANTHROPIC_BASE_URL")
+        expect(text).not.toContain("Claude")
+        expect(text).not.toContain("http://")
+      }
+      const both = intro({ auth: { loggedIn: true, email: "a@b.test" }, chatgpt: { mode: "owned" } }, { profiles: [], chatgpt: { owner: {} } })
+      expect(both).toContain("ANTHROPIC_BASE_URL")
+      expect(both).toContain("<code>https://meridian.example</code>")
     })
 
     test("lists telemetry ids no card shows, a renamed card's former names excepted", () => {

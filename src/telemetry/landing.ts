@@ -348,7 +348,9 @@ function servesClaude(h,pl){
   if(h&&h.auth&&h.auth.loggedIn)return true;
   var ps=(pl&&Array.isArray(pl.profiles))?pl.profiles:[];
   for(var i=0;i<ps.length;i++)if(!isChatGptProfile(ps[i]))return true;
-  return !(pl&&pl.chatgpt);
+  // /profiles/list can fail on its own; /health says ChatGPT too, so a
+  // failed list does not bring the Claude wording back.
+  return !(pl&&pl.chatgpt)&&!(h&&h.chatgpt);
 }
 
 // Telemetry is filed under whatever profile served a request, and under
