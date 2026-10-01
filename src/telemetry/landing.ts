@@ -445,7 +445,7 @@ function profileSection(q,s,pl,h){
     if(credits)rows+='<div class="usage-row credits-row" title="'+esc(credits.note)+'"><span class="w-label">credits</span>'
       +'<span class="w-credits'+(credits.serving?' serving':'')+'">'+esc(credits.value)+'</span>'
       +'<span class="w-credits-note">'+esc(credits.serving?'serving on credits':credits.policy||credits.note)+'</span></div>'
-      +(credits.pace?'<div class="usage-row credits-row" title="'+esc(credits.pace.title)+'"><span class="w-label">pace</span>'
+      +(credits.pace?'<div class="usage-row credits-row" title="'+esc(credits.pace.title)+'"><span class="w-label">lasts</span>'
         +'<span class="w-credits-note credits-pace">'+esc(credits.pace.text)+'</span></div>':'');
     var isPriority=pl&&pl.routing==='priority';
     // active+priority keeps the active profile meaningful - switching it is how

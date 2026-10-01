@@ -53,15 +53,18 @@ export const settingsPageHtml = `<!DOCTYPE html>
   .badge-active { background: rgba(63, 185, 80, 0.15); color: var(--green); }
   .badge-inactive { background: rgba(139, 148, 158, 0.15); color: var(--muted); }
 
-  .feature-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  @media (max-width: 600px) { .feature-grid { grid-template-columns: 1fr; } }
+  .feature-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+  @media (max-width: 600px) { .feature-grid { grid-template-columns: minmax(0, 1fr); } }
 
   .feature-row {
-    display: flex; align-items: center; justify-content: space-between;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
     padding: 10px 14px; border-radius: 6px;
     background: var(--bg); border: 1px solid var(--border);
   }
-  .feature-info { display: flex; flex-direction: column; }
+  /* A select as wide as its longest option does not fit beside its label on
+     a phone: it goes below the label instead of past the card's edge. */
+  @media (max-width: 600px) { .feature-row { flex-wrap: wrap; } }
+  .feature-info { display: flex; flex-direction: column; min-width: 0; }
   .feature-label { font-size: 13px; font-weight: 500; }
   .feature-desc { font-size: 11px; color: var(--muted); margin-top: 2px; }
 
@@ -86,6 +89,7 @@ export const settingsPageHtml = `<!DOCTYPE html>
   .feature-select {
     background: var(--surface); color: var(--text); border: 1px solid var(--border);
     border-radius: 6px; padding: 4px 8px; font-size: 12px; cursor: pointer;
+    min-width: 0; max-width: 100%;
   }
 
   .save-indicator {
