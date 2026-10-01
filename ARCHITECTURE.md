@@ -190,6 +190,7 @@ src/
 │   ├── admissionHold.ts       ← Bounded per-instance generation reservations for the best-effort POST /drain hold
 │   ├── drainBody.ts           ← Tiny operator body byte/deadline limits and joined reader cancellation
 │   ├── generationAdmission.ts ← Exact combined-provider generation classification and response-reader ownership
+│   ├── upstreamReachability.ts ← Passive "can Anthropic be reached from here" state for /readyz and /health
 │   ├── adapter.ts             ← AgentAdapter interface (extensibility point for multi-agent support)
 │   ├── adapters/
 │   │   ├── opencode.ts        ← OpenCode adapter (session headers, CWD extraction, tool config)
