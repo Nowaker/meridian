@@ -74,6 +74,10 @@ export interface MeridianSettings {
    *  because someone asked it to. The header shows the running version either
    *  way. MERIDIAN_NO_UPDATE_CHECK=1 forces it off regardless. */
   checkForUpdates?: boolean
+  /** Name the machine Meridian runs on beside the site header's status, so
+   *  several instances can be told apart at a glance. Off unless switched on,
+   *  because it also publishes the hostname in the unauthenticated /health. */
+  showHostname?: boolean
 
   /**
    * When `/readyz` concludes Anthropic is unreachable from this host: after at
