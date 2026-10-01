@@ -301,8 +301,9 @@ adapter lets the subprocess run the built-in WebFetch at all.
 | `POST /profiles/add/complete` | Finish that creation — writes the profile only once Anthropic returns credentials |
 | `GET /v1/usage/quota` | Usage windows for the active profile (JSON) |
 | `GET /v1/usage/quota/all` | Usage windows for every profile (JSON) |
-| `GET /settings` | Routing, SDK feature toggles, model pricing, telemetry storage, update-check and page layout UI |
+| `GET /settings` | Routing, SDK feature toggles, model pricing, telemetry storage, update-check, site-header and page layout UI |
 | `GET/PUT /settings/api/updates` | Read or set `checkForUpdates` (JSON `{"checkForUpdates": true}`); takes effect on the running proxy |
+| `GET/PUT /settings/api/header` | Read or set `showHostname` (JSON `{"showHostname": true}`): name the machine beside the header's status; takes effect on the running proxy |
 | `GET/PUT /settings/api/layout` | Read or set the web pages' `layout`: `contained` (default, a centered column) or `wide` (spans the window, more cards per row). JSON `{"layout": "wide"}`, `null` to unset; applies on the next page load |
 | `GET /plugins` | Plugin management page (`/plugins/list`, `POST /plugins/reload` for JSON/actions) |
 
@@ -320,6 +321,12 @@ Illustrative health response excerpt (versions and status vary by installation):
 ```
 
 `plugin.opencode` is `"configured"` when `meridian setup` has been run, `"not-configured"` otherwise.
+
+With `"showHostname": true` in `settings.json` (or the switch under **Site
+Header** at `/settings`), every answer also carries `"hostname"`, the machine's
+name as the OS reports it, and the site header shows it beside the status, e.g.
+`Operational · nwkr-desktop`. It is off by default because `/health` answers
+without the API key.
 
 ## Error reporting
 
