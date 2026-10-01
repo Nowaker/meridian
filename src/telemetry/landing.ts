@@ -165,6 +165,10 @@ export const landingHtml = `<!DOCTYPE html>
   .usage-row .w-pct { width: 38px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
   .usage-row .w-reset { color: var(--muted); font-size: 11px; width: 76px; text-align: right; }
   .no-usage { font-size: 12px; color: var(--muted); padding: 4px 0; }
+  .credits-row .w-credits { flex: 1; min-width: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .credits-row .w-credits.serving { color: var(--yellow); }
+  .credits-row .w-credits-note { color: var(--muted); font-size: 11px; text-align: right; min-width: 0; overflow-wrap: anywhere; }
+  .pool-chip.on-credits { color: var(--yellow); background: rgba(210,153,34,0.15); }
 
   /* Traffic strip — one compact surface */
   .strip { display: flex; flex-wrap: wrap; background: var(--surface); border: 1px solid var(--border);
@@ -435,6 +439,11 @@ function profileSection(q,s,pl,h){
       var gap=chat?chatGptUsageGap(quota.error):'';
       rows='<div class="no-usage">'+(gap?'no reading \u2014 '+esc(gap):'no usage data yet')+'</div>';
     }
+    // The same facts as the /profiles card's credits block, from the same view.
+    var credits=chat?codexCreditsView(quota.credits,quota):null;
+    if(credits)rows+='<div class="usage-row credits-row" title="'+esc(credits.note)+'"><span class="w-label">credits</span>'
+      +'<span class="w-credits'+(credits.serving?' serving':'')+'">'+esc(credits.value)+'</span>'
+      +'<span class="w-credits-note">'+esc(credits.serving?'serving on credits':credits.policy||credits.note)+'</span></div>';
     var isPriority=pl&&pl.routing==='priority';
     // active+priority keeps the active profile meaningful - switching it is how
     // you move traffic, so the card stays clickable, unlike in pure priority.
@@ -468,6 +477,7 @@ function profileSection(q,s,pl,h){
             :' <span class="pool-chip exhausted">exhausted · resets '+resetIn(exh.until)+'</span>';
       }
     }
+    if(credits&&credits.serving)badge+=' <span class="pool-chip on-credits" title="This seat\u2019s plan usage is spent; its turns are paid with Codex credits">on credits</span>';
     var sp=spentByProfile[p.id];
     var spentBanner='';
     if(sp){\n      var spBucket=(sp.diagnosis&&sp.diagnosis.bucket)?winLabel(sp.diagnosis.bucket):'its limit';

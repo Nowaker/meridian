@@ -2,10 +2,10 @@ import { providerPageHtml } from '../telemetry/providerPage'
 import { providerOverview, isProviderFilter } from '../telemetry/providerView'
 import { ClaudeProviderFacts, disabledProvider, providerSnapshot } from './backends/providerStatus'
 import { chatGptProvider, CHATGPT_ADAPTER } from './backends/chatgptStatus'
-import { createChatGptBackend, type ChatGptSeatRefusal, type ChatGptTurnEvent, type ObservedSeatLimits } from './backends/chatgpt'
+import { createChatGptBackend, type ChatGptSeatCreditState, type ChatGptSeatRefusal, type ChatGptTurnEvent, type ObservedSeatLimits } from './backends/chatgpt'
 import { resolveChatGptSource } from './chatgpt/config'
 import { ChatGptTurnLedger, chatGptTokenFields, createChatGptAdmission, createChatGptParityBackend, createUnpricedModelWarning, decorateChatGptTurn, type ChatGptTurnNotes } from './chatgpt/parity'
-import { chatGptFeatureCapabilities, getChatGptFeatures, resetChatGptFeatures, updateChatGptFeatures, validateChatGptFeatureUpdate } from './chatgpt/features'
+import { chatGptFeatureCapabilities, effectiveCreditsPolicy, getChatGptFeatures, resetChatGptFeatures, updateChatGptFeatures, validateChatGptFeatureUpdate } from './chatgpt/features'
 import { resolveModelPricing } from '../telemetry/pricing'
 import { getPricingOverrides } from '../telemetry/pricingStore'
 import { computeSummary } from '../telemetry/percentiles'
@@ -8023,9 +8023,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // (chatgpt/profileSurface.ts). The backend is created below; its observed
   // limits are read lazily.
   let chatGptObserved: () => ReadonlyMap<string, ObservedSeatLimits> = () => new Map()
+  let chatGptCreditState: (seat: string) => ChatGptSeatCreditState = () => ({ planSpent: false, servingOnCredits: false })
   const chatGptProfiles = chatGptSource ? createChatGptProfileSurface({
     source: chatGptSource,
     observed: () => chatGptObserved(),
+    creditsPolicy: (seat) => effectiveCreditsPolicy(getChatGptFeatures(), seat),
+    creditState: (seat) => chatGptCreditState(seat),
     usage: () => chatGptUsage,
     reserved: () => new Set(["default", ...getEffectiveProfiles(finalConfig.profiles).flatMap(p => [p.id, ...(p.aliases ?? [])])]),
     names: () => getSetting("chatGptProfileNames"),
@@ -8157,6 +8160,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       const pending = refreshChatGptUsage()
       if (pending) await Promise.race([pending, new Promise(resolve => setTimeout(resolve, CHATGPT_QUOTA_WAIT_MS))])
     },
+    creditsPolicy: (seat) => effectiveCreditsPolicy(getChatGptFeatures(), seat).policy,
+    planWindows: (seat) => {
+      const entry = chatGptUsage?.entries.find(candidate => candidate.id === seat)
+      return entry && entry.fetchedAt !== null ? { windows: entry.windows, at: entry.fetchedAt } : null
+    },
     // Only an internal hop carrying this instance's token may claim to be a
     // warm, which is what lets it use a seat excluded from work.
     route: (turn) => {
@@ -8181,6 +8189,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   }) : undefined
   if (chatGptBackend) {
     chatGptObserved = () => chatGptBackend.observedLimits()
+    chatGptCreditState = (seat) => chatGptBackend.seatCreditState(seat)
     upstream.registerBackend(createChatGptParityBackend<Context>({
       inner: chatGptBackend,
       ledger: chatGptLedger,
@@ -8535,15 +8544,28 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
   // ChatGPT gateway features (chatgpt/features.ts), re-read per request.
   // `models` is the Fallback Model choice list: what the gateway offers.
+  // `seats` lists every seat with its own credits-policy override (null =
+  // the instance's policy), for the per-seat controls.
   app.get("/settings/api/chatgpt", async (c) => {
     const models = (await chatGptOfferedModels()).map(model => model.slug)
-    return c.json({ enabled: chatGptSource !== undefined, features: getChatGptFeatures(), models })
+    const features = getChatGptFeatures()
+    const seats = (chatGptProfiles?.profiles() ?? []).map(profile => ({
+      id: profile.id,
+      label: profile.label,
+      creditsPolicy: features.seatCreditsPolicy[profile.seat] ?? null,
+    }))
+    return c.json({ enabled: chatGptSource !== undefined, features, models, seats })
   })
   app.patch("/settings/api/chatgpt", async (c) => {
     try {
       const body = await c.req.json()
       const offered = (await chatGptOfferedModels()).map(model => model.slug)
-      const features = updateChatGptFeatures(validateChatGptFeatureUpdate(body, offered))
+      const update = validateChatGptFeatureUpdate(body, offered, (id) => chatGptProfiles?.resolve(id)?.seat)
+      const features = updateChatGptFeatures(update)
+      if (update.creditsPolicy || update.seatCreditsPolicy) {
+        const overrides = Object.entries(features.seatCreditsPolicy).map(([seat, policy]) => `${chatGptProfiles?.profileIdFor(seat) ?? seat}=${policy}`)
+        plog(`[PROXY] ChatGPT credits policy: ${features.creditsPolicy}${overrides.length > 0 ? ` overrides=${overrides.join(",")}` : ""}`)
+      }
       return c.json({ ok: true, features })
     } catch (e) {
       return c.json({ error: (e as Error).message }, 400)

@@ -243,6 +243,12 @@ const CHATGPT_FEATURES = [
   { key: 'thinkingPassthrough', label: 'Thinking Passthrough', desc: 'Forward ChatGPT reasoning summaries to the client. ChatGPT is secretive about reasoning: it never shows the raw chain of thought, only short reasoning summary headers, and only when the client asks for a summary. Off removes those summaries; the encrypted reasoning the client must send back is always kept', type: 'toggle' },
   { key: 'maxBudgetUsd', label: 'Max Budget (USD)', desc: 'Per-request cost cap from OpenAI pricing (0 = disabled). Refused before sending when the input alone is over it, stopped mid-stream when the estimate passes it. Hidden reasoning tokens are only counted when the response ends', type: 'number' },
   { key: 'fallbackModel', label: 'Fallback Model', desc: 'Retry once on this ChatGPT model when the requested one fails before any output was sent: a server error, every account rate limited, or the model refused. Never on a sign-in problem', type: 'select' },
+  { key: 'creditsPolicy', label: 'Codex Credits', desc: 'When a seat whose plan usage is used up may keep serving on its purchased Codex credits. Credits may be real money: ChatGPT spends them by itself once a seat\u2019s plan runs out, and an account with automatic reload is charged again every time its balance runs low. Meridian cannot see whether reload is on. Seats with plan usage left are never affected', type: 'policy' },
+];
+const CREDITS_POLICY_OPTIONS = [
+  { value: 'never', label: 'Never use credits' },
+  { value: 'reserve', label: 'Only when no seat has plan usage left' },
+  { value: 'immediately', label: 'As soon as the seat\u2019s plan usage is drained' },
 ];
 let chatgptState = null;
 
@@ -337,6 +343,8 @@ function renderChatGpt() {
       input.value = String(features[feat.key] ?? 0);
       input.addEventListener('change', function () { saveChatGpt(feat.key, parseFloat(input.value) || 0); });
       row.appendChild(input);
+    } else if (feat.type === 'policy') {
+      row.appendChild(policySelect(CREDITS_POLICY_OPTIONS, features[feat.key], function (value) { saveChatGpt(feat.key, value); }));
     } else {
       const select = document.createElement('select');
       select.className = 'feature-select';
@@ -352,6 +360,46 @@ function renderChatGpt() {
     }
     grid.appendChild(row);
   }
+  // Auto-reload is a property of each account, so each seat may differ from
+  // the instance's policy - stricter for one that reloads, looser for one
+  // whose credits are meant to be spent.
+  var seats = chatgptState.seats || [];
+  for (const seat of seats) {
+    const row = document.createElement('div');
+    row.className = 'feature-row';
+    const info = document.createElement('div');
+    info.className = 'feature-info';
+    const label = document.createElement('span');
+    label.className = 'feature-label';
+    label.textContent = 'Credits: ' + seat.id;
+    const desc = document.createElement('span');
+    desc.className = 'feature-desc';
+    desc.textContent = seat.label + ' \u2014 overrides the Codex Credits policy for this seat only';
+    info.append(label, desc);
+    row.appendChild(info);
+    const options = [{ value: 'inherit', label: 'Same as above (' + features.creditsPolicy + ')' }].concat(CREDITS_POLICY_OPTIONS);
+    row.appendChild(policySelect(options, seat.creditsPolicy || 'inherit', function (value) {
+      const patch = {};
+      patch[seat.id] = value;
+      saveChatGpt('seatCreditsPolicy', patch);
+    }));
+    grid.appendChild(row);
+  }
+}
+
+function policySelect(options, current, onChange) {
+  const select = document.createElement('select');
+  select.className = 'feature-select';
+  select.style.maxWidth = '100%';
+  options.forEach(function (choice) {
+    const option = document.createElement('option');
+    option.value = choice.value;
+    option.textContent = choice.label;
+    option.selected = current === choice.value;
+    select.appendChild(option);
+  });
+  select.addEventListener('change', function () { onChange(select.value); });
+  return select;
 }
 
 async function saveChatGpt(key, value) {

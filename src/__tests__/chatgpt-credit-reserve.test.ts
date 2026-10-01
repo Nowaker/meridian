@@ -15,7 +15,8 @@ import { join } from "node:path"
 import { createChatGptBackend, type ChatGptRoute, type ChatGptTurnEvent } from "../proxy/backends/chatgpt"
 import { createExternalCredentialSource } from "../proxy/chatgpt/external"
 import { chatGptCreditsFromHeaders, creditsCanServe } from "../proxy/chatgpt/windows"
-import type { CodexCredits } from "../proxy/codex/types"
+import type { ChatGptCreditsPolicy } from "../proxy/chatgpt/features"
+import type { CodexCredits, CodexUsageWindow } from "../proxy/codex/types"
 import { ProfileExhaustion } from "../proxy/routing"
 
 const NOW = 1_800_000_000_000
@@ -78,8 +79,13 @@ function harness(options: {
   /** Credits the usage read would find once refreshed. */
   refreshTo?: Record<string, CodexCredits>
   route?: ChatGptRoute
+  /** Policy per seat, or one for all; null = the backend's own default. Defaults to reserve. */
+  policy?: ChatGptCreditsPolicy | Record<string, ChatGptCreditsPolicy> | null
+  /** Plan windows from the usage read, per seat. */
+  windows?: Record<string, CodexUsageWindow[]>
 } = {}): Harness {
   const credits: Record<string, CodexCredits> = { ...options.credits }
+  const policy = options.policy === undefined ? "reserve" : options.policy
   const exhaustion = new ProfileExhaustion(() => NOW)
   const h: Harness = {
     calls: [], events: [], refreshes: 0, exhaustion,
@@ -95,6 +101,8 @@ function harness(options: {
     route: options.route ? () => options.route! : undefined,
     credits: (seat) => credits[seat] ? { credits: credits[seat]!, at: NOW - 60_000 } : null,
     refreshCredits: options.refreshTo ? async () => { h.refreshes++; Object.assign(credits, options.refreshTo) } : undefined,
+    creditsPolicy: policy === null ? undefined : (seat) => typeof policy === "string" ? policy : policy[seat] ?? "never",
+    planWindows: options.windows ? (seat) => options.windows![seat] ? { windows: options.windows![seat]!, at: NOW - 60_000 } : null : undefined,
     hooks: { onTurn: (event) => h.events.push(event) },
     fetchImpl: async (_url, init) => {
       const token = new Headers(init.headers).get("authorization")!.replace("Bearer ", "")
@@ -215,6 +223,139 @@ describe("Codex credits reserve", () => {
     expect(h.calls).toEqual(["at-0"])
     expect((await h.turn()).status).toBe(429)
     expect(h.calls).toEqual(["at-0"])
+  })
+})
+
+describe("Codex credits policy", () => {
+  const spentWindow = (): CodexUsageWindow[] => [{ type: "weekly", utilization: 1, resetsAt: NOW + 3 * 86_400_000, limitWindowSeconds: WEEK_S }]
+  const freshWindow = (): CodexUsageWindow[] => [{ type: "weekly", utilization: 0.4, resetsAt: NOW + 3 * 86_400_000, limitWindowSeconds: WEEK_S }]
+
+  it("spends no credits when no policy is configured: the default is never", async () => {
+    writePool([stamped(0)])
+    const h = harness({ credits: { [seatId(0)]: PAYABLE }, policy: null })
+    expect((await h.turn()).status).toBe(429)
+    expect(h.calls).toEqual([])
+  })
+
+  it("never: a plan-exhausted seat with credits is not sent work, even with nothing else left", async () => {
+    writePool([stamped(0)])
+    const h = harness({ credits: { [seatId(0)]: PAYABLE }, policy: "never" })
+    expect((await h.turn()).status).toBe(429)
+    expect(h.calls).toEqual([])
+  })
+
+  it("never: a seat the usage read shows drained is kept off, though its owner never stamped it", async () => {
+    writePool([account(0), account(1)])
+    const h = harness({
+      credits: { [seatId(0)]: PAYABLE }, policy: "never",
+      windows: { [seatId(0)]: spentWindow(), [seatId(1)]: freshWindow() },
+      route: { kind: "pool", excluded: new Set(), preferred: seatId(0) },
+    })
+    await drain(await h.turn())
+    expect(h.calls).toEqual(["at-1"])
+  })
+
+  it("never: a seat Meridian benched after its plan ran out stays benched", async () => {
+    writePool([account(0)])
+    const h = harness({ policy: "never", respond: () => served({ ...spentWeekly(), ...creditHeaders(true, "62500") }) })
+    await drain(await h.turn())
+    expect((await h.turn()).status).toBe(429)
+    expect(h.calls).toEqual(["at-0"])
+  })
+
+  it("reserve: credits only after every seat with plan quota", async () => {
+    writePool([stamped(0), account(1)])
+    const h = harness({ credits: { [seatId(0)]: PAYABLE }, policy: "reserve", respond: (token) => token === "at-1" ? usageLimit() : served() })
+    await drain(await h.turn())
+    expect(h.calls).toEqual(["at-1", "at-0"])
+    expect(h.events[0]).toMatchObject({ seat: seatId(0), servedOnCredits: true })
+  })
+
+  it("immediately: a drained seat serves on credits in normal routing order, before a seat with plan quota behind it", async () => {
+    writePool([stamped(0), account(1)])
+    const h = harness({ credits: { [seatId(0)]: PAYABLE }, policy: "immediately" })
+    await drain(await h.turn())
+    expect(h.calls).toEqual(["at-0"])
+    expect(h.events[0]).toMatchObject({ seat: seatId(0), servedOnCredits: true })
+  })
+
+  it("immediately: still needs credits that can pay", async () => {
+    writePool([stamped(0), account(1)])
+    const h = harness({ credits: { [seatId(0)]: EMPTY }, policy: "immediately" })
+    await drain(await h.turn())
+    expect(h.calls).toEqual(["at-1"])
+    expect(h.events[0]?.servedOnCredits).toBeUndefined()
+  })
+
+  it("a per-seat override decides for that seat alone", async () => {
+    writePool([stamped(0), stamped(1), account(2)])
+    const h = harness({
+      credits: { [seatId(0)]: PAYABLE, [seatId(1)]: PAYABLE },
+      policy: { [seatId(0)]: "never", [seatId(1)]: "immediately" },
+    })
+    await drain(await h.turn())
+    expect(h.calls).toEqual(["at-1"])
+  })
+
+  it("leaves seats with plan quota alone under every policy", async () => {
+    for (const policy of ["never", "reserve", "immediately"] as const) {
+      writePool([account(0), account(1)])
+      const h = harness({ credits: { [seatId(0)]: PAYABLE, [seatId(1)]: PAYABLE }, policy })
+      await drain(await h.turn())
+      expect(h.calls).toEqual(["at-0"])
+      expect(h.events[0]?.servedOnCredits).toBeUndefined()
+    }
+  })
+
+  it("keeps a warm off credits even under immediately", async () => {
+    writePool([stamped(0)])
+    const h = harness({ credits: { [seatId(0)]: PAYABLE }, policy: "immediately", route: { kind: "pinned", seat: seatId(0), spendCredits: false } })
+    expect((await h.turn()).status).toBe(429)
+    expect(h.calls).toEqual([])
+  })
+
+  it("does not lead with an active seat that may not spend its credits", async () => {
+    writePool([stamped(0), account(1)])
+    const h = harness({ credits: { [seatId(0)]: PAYABLE }, policy: "reserve", route: { kind: "pool", excluded: new Set(), preferred: seatId(0) } })
+    await drain(await h.turn())
+    expect(h.calls).toEqual(["at-1"])
+  })
+
+  it("reads usage before routing to a seat it never read when that seat may not spend credits", async () => {
+    writePool([account(0)])
+    let reads = 0
+    const windows: Record<string, CodexUsageWindow[]> = {}
+    const backend = createChatGptBackend<object>({
+      source: createExternalCredentialSource({ path: poolPath, now: () => NOW }),
+      exhaustion: new ProfileExhaustion(() => NOW),
+      now: () => NOW,
+      inboundRequest: () => new Request("http://localhost/v1/responses", { method: "POST", body: JSON.stringify({ model: "gpt-5.6-luna", stream: true, input: "Hi" }) }),
+      creditsPolicy: () => "never",
+      planWindows: (seat) => windows[seat] ? { windows: windows[seat]!, at: NOW } : null,
+      refreshCredits: async () => { reads++; windows[seatId(0)] = spentWindow() },
+      fetchImpl: async () => served(),
+    })
+    const response = await backend.handle({ context: {}, endpoint: "responses", route: "/v1/responses" })
+    expect(reads).toBe(1)
+    expect(response.status).toBe(429)
+  })
+
+  it("states on the seat's card whether its plan is spent and whether it is serving on credits", async () => {
+    writePool([stamped(0), account(1)])
+    const exhaustion = new ProfileExhaustion(() => NOW)
+    const backend = createChatGptBackend<object>({
+      source: createExternalCredentialSource({ path: poolPath, now: () => NOW }),
+      exhaustion,
+      now: () => NOW,
+      inboundRequest: () => new Request("http://localhost/v1/responses", { method: "POST", body: JSON.stringify({ model: "gpt-5.6-luna", stream: true, input: "Hi" }) }),
+      creditsPolicy: () => "immediately",
+      credits: () => ({ credits: PAYABLE, at: NOW }),
+      fetchImpl: async () => served(),
+    })
+    expect(backend.seatCreditState(seatId(0))).toEqual({ planSpent: true, servingOnCredits: false })
+    await drain(await backend.handle({ context: {}, endpoint: "responses", route: "/v1/responses" }))
+    expect(backend.seatCreditState(seatId(0))).toEqual({ planSpent: true, servingOnCredits: true })
+    expect(backend.seatCreditState(seatId(1))).toEqual({ planSpent: false, servingOnCredits: false })
   })
 })
 

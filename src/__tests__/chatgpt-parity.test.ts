@@ -14,6 +14,7 @@ import {
 } from "../proxy/chatgpt/parity"
 import {
   CHATGPT_FEATURE_DEFAULTS,
+  effectiveCreditsPolicy,
   getChatGptFeatures,
   resetChatGptFeatures,
   updateChatGptFeatures,
@@ -303,15 +304,37 @@ describe("Fallback Model", () => {
 })
 
 describe("ChatGPT feature settings", () => {
-  it("defaults to thinking passthrough on, no budget, no fallback", () => {
+  it("defaults to thinking passthrough on, no budget, no fallback, and never spending credits", () => {
     resetChatGptFeatures()
-    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: true, maxBudgetUsd: 0, fallbackModel: "" })
+    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: true, maxBudgetUsd: 0, fallbackModel: "", creditsPolicy: "never", seatCreditsPolicy: {} })
   })
 
   it("round-trips through settings.json", () => {
     updateChatGptFeatures({ thinkingPassthrough: false, maxBudgetUsd: 0.5 })
-    updateChatGptFeatures({ fallbackModel: "gpt-5.4" })
-    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: false, maxBudgetUsd: 0.5, fallbackModel: "gpt-5.4" })
+    updateChatGptFeatures({ fallbackModel: "gpt-5.4", creditsPolicy: "reserve" })
+    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: false, maxBudgetUsd: 0.5, fallbackModel: "gpt-5.4", creditsPolicy: "reserve", seatCreditsPolicy: {} })
+    resetChatGptFeatures()
+  })
+
+  it("accepts the three credits policies, and a per-seat override that inherit removes", () => {
+    const resolve = (id: string) => id === "pro-abc123" ? "user-1__workspace-1" : undefined
+    expect(() => validateChatGptFeatureUpdate({ creditsPolicy: "always" })).toThrow("creditsPolicy must be one of: never, reserve, immediately")
+    expect(() => validateChatGptFeatureUpdate({ seatCreditsPolicy: { nobody: "never" } }, [], resolve)).toThrow('unknown ChatGPT profile "nobody"')
+    expect(() => validateChatGptFeatureUpdate({ seatCreditsPolicy: { "pro-abc123": "sometimes" } }, [], resolve)).toThrow()
+
+    updateChatGptFeatures(validateChatGptFeatureUpdate({ creditsPolicy: "reserve", seatCreditsPolicy: { "pro-abc123": "immediately" } }, [], resolve))
+    expect(getChatGptFeatures()).toMatchObject({ creditsPolicy: "reserve", seatCreditsPolicy: { "user-1__workspace-1": "immediately" } })
+    expect(effectiveCreditsPolicy(getChatGptFeatures(), "user-1__workspace-1")).toEqual({ policy: "immediately", source: "seat" })
+    expect(effectiveCreditsPolicy(getChatGptFeatures(), "user-2__workspace-2")).toEqual({ policy: "reserve", source: "default" })
+
+    updateChatGptFeatures(validateChatGptFeatureUpdate({ seatCreditsPolicy: { "pro-abc123": "inherit" } }, [], resolve))
+    expect(getChatGptFeatures().seatCreditsPolicy).toEqual({})
+    resetChatGptFeatures()
+  })
+
+  it("falls back to never for a saved policy this build does not know", () => {
+    updateChatGptFeatures({ creditsPolicy: "bogus" as never })
+    expect(getChatGptFeatures().creditsPolicy).toBe("never")
     resetChatGptFeatures()
   })
 

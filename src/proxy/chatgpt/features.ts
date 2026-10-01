@@ -23,12 +23,49 @@ export interface ChatGptFeatures {
   maxBudgetUsd: number
   /** A ChatGPT model to retry on when the requested one cannot serve, "" = off. */
   fallbackModel: string
+  /** When a seat whose plan quota is spent may serve on its purchased Codex credits. */
+  creditsPolicy: ChatGptCreditsPolicy
+  /** Per-seat overrides of `creditsPolicy`, keyed by seat id (accountUserId). */
+  seatCreditsPolicy: Record<string, ChatGptCreditsPolicy>
+}
+
+/**
+ * When a seat whose plan windows are spent may be served on its Codex credits.
+ *
+ * Credits can be real money: they are bought, and a workspace with automatic
+ * reload is charged again whenever the balance runs low. The backend spends
+ * them by itself once a seat's plan is drained - nothing in the request opts
+ * in - so the only control is whether Meridian sends that seat the turn.
+ *
+ * - `never`: a plan-exhausted seat is never sent work.
+ * - `reserve`: only once no seat has plan quota left.
+ * - `immediately`: as soon as the seat's own plan is drained, in normal
+ *   routing order, as if its plan were still running.
+ *
+ * None of these touches a seat that still has plan quota.
+ */
+export type ChatGptCreditsPolicy = "never" | "reserve" | "immediately"
+export const CHATGPT_CREDITS_POLICIES: readonly ChatGptCreditsPolicy[] = ["never", "reserve", "immediately"]
+/** What a seat override set to this means: follow the instance's policy. */
+export const CHATGPT_CREDITS_INHERIT = "inherit"
+
+export function isChatGptCreditsPolicy(value: unknown): value is ChatGptCreditsPolicy {
+  return typeof value === "string" && (CHATGPT_CREDITS_POLICIES as readonly string[]).includes(value)
+}
+
+/** The policy a seat runs under, and whether it is the seat's own or the instance's. */
+export function effectiveCreditsPolicy(features: ChatGptFeatures, seat: string): { policy: ChatGptCreditsPolicy; source: "seat" | "default" } {
+  const own = features.seatCreditsPolicy[seat]
+  return own ? { policy: own, source: "seat" } : { policy: features.creditsPolicy, source: "default" }
 }
 
 export const CHATGPT_FEATURE_DEFAULTS: Readonly<ChatGptFeatures> = {
   thinkingPassthrough: true,
   maxBudgetUsd: 0,
   fallbackModel: "",
+  // A fresh install must not spend money nobody agreed to spend.
+  creditsPolicy: "never",
+  seatCreditsPolicy: {},
 }
 
 /**
@@ -50,7 +87,26 @@ export function getChatGptFeatures(): ChatGptFeatures {
     fallbackModel: typeof saved.fallbackModel === "string" && providerForModel(saved.fallbackModel) === "chatgpt"
       ? saved.fallbackModel
       : CHATGPT_FEATURE_DEFAULTS.fallbackModel,
+    creditsPolicy: isChatGptCreditsPolicy(saved.creditsPolicy) ? saved.creditsPolicy : CHATGPT_FEATURE_DEFAULTS.creditsPolicy,
+    seatCreditsPolicy: savedSeatPolicies(saved.seatCreditsPolicy),
   }
+}
+
+function savedSeatPolicies(value: unknown): Record<string, ChatGptCreditsPolicy> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {}
+  const result: Record<string, ChatGptCreditsPolicy> = {}
+  for (const [seat, policy] of Object.entries(value as Record<string, unknown>)) {
+    if (isChatGptCreditsPolicy(policy)) result[seat] = policy
+  }
+  return result
+}
+
+/**
+ * A validated update. `seatCreditsPolicy` is a patch of its own: each named
+ * seat is set, and one set to `inherit` loses its override.
+ */
+export type ChatGptFeatureUpdate = Partial<Omit<ChatGptFeatures, "seatCreditsPolicy">> & {
+  seatCreditsPolicy?: Record<string, ChatGptCreditsPolicy | typeof CHATGPT_CREDITS_INHERIT>
 }
 
 /**
@@ -61,9 +117,14 @@ export function getChatGptFeatures(): ChatGptFeatures {
  * same list the settings page shows): a Claude id, or a ChatGPT id no seat can
  * serve, would send the retry to a model that refuses it.
  */
-export function validateChatGptFeatureUpdate(raw: unknown, fallbackChoices: readonly string[] = CHATGPT_MODELS): Partial<ChatGptFeatures> {
+export function validateChatGptFeatureUpdate(
+  raw: unknown,
+  fallbackChoices: readonly string[] = CHATGPT_MODELS,
+  /** A profile id, former id or seat id to its seat id; undefined = not a ChatGPT seat. */
+  resolveSeat: (idOrSeat: string) => string | undefined = () => undefined,
+): ChatGptFeatureUpdate {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw new Error("body must be a JSON object")
-  const result: Partial<ChatGptFeatures> = {}
+  const result: ChatGptFeatureUpdate = {}
   for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
     if (key === "thinkingPassthrough") {
       if (typeof value !== "boolean") throw new Error("thinkingPassthrough must be a boolean")
@@ -76,6 +137,21 @@ export function validateChatGptFeatureUpdate(raw: unknown, fallbackChoices: read
         throw new Error(`fallbackModel must be "" or one of: ${fallbackChoices.join(", ")}`)
       }
       result.fallbackModel = value
+    } else if (key === "creditsPolicy") {
+      if (!isChatGptCreditsPolicy(value)) throw new Error(`creditsPolicy must be one of: ${CHATGPT_CREDITS_POLICIES.join(", ")}`)
+      result.creditsPolicy = value
+    } else if (key === "seatCreditsPolicy") {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("seatCreditsPolicy must be an object of profile id -> policy")
+      const seats: NonNullable<ChatGptFeatureUpdate["seatCreditsPolicy"]> = {}
+      for (const [id, policy] of Object.entries(value as Record<string, unknown>)) {
+        const seat = resolveSeat(id)
+        if (!seat) throw new Error(`seatCreditsPolicy: unknown ChatGPT profile "${id}"`)
+        if (policy !== CHATGPT_CREDITS_INHERIT && !isChatGptCreditsPolicy(policy)) {
+          throw new Error(`seatCreditsPolicy.${id} must be one of: ${[CHATGPT_CREDITS_INHERIT, ...CHATGPT_CREDITS_POLICIES].join(", ")}`)
+        }
+        seats[seat] = policy
+      }
+      result.seatCreditsPolicy = seats
     } else {
       throw new Error(`Unknown ChatGPT setting: ${key}`)
     }
@@ -102,11 +178,33 @@ export function chatGptFeatureCapabilities(features: ChatGptFeatures): Array<{ n
       status: features.fallbackModel || "off",
       detail: "Retried once on this model when the requested one fails before any output was sent.",
     },
+    {
+      name: "Codex Credits",
+      status: features.creditsPolicy + (Object.keys(features.seatCreditsPolicy).length > 0 ? ` (+${Object.keys(features.seatCreditsPolicy).length} seat overrides)` : ""),
+      detail: CREDITS_POLICY_DETAIL[features.creditsPolicy],
+    },
   ]
 }
 
-export function updateChatGptFeatures(patch: Partial<ChatGptFeatures>): ChatGptFeatures {
-  setSetting("chatgpt", { ...(getSetting("chatgpt") ?? {}), ...patch })
+const CREDITS_POLICY_DETAIL: Record<ChatGptCreditsPolicy, string> = {
+  never: "A seat whose plan quota is spent is never served on its purchased Codex credits.",
+  reserve: "A seat whose plan quota is spent serves on its Codex credits only once no seat has plan quota left.",
+  immediately: "A seat serves on its Codex credits as soon as its own plan quota is spent, in normal routing order.",
+}
+
+export function updateChatGptFeatures(patch: ChatGptFeatureUpdate): ChatGptFeatures {
+  const saved = getSetting("chatgpt") ?? {}
+  const { seatCreditsPolicy: seatPatch, ...rest } = patch
+  const next = { ...saved, ...rest }
+  if (seatPatch) {
+    const seats: Record<string, ChatGptCreditsPolicy> = savedSeatPolicies(saved.seatCreditsPolicy)
+    for (const [seat, policy] of Object.entries(seatPatch)) {
+      if (policy === CHATGPT_CREDITS_INHERIT) delete seats[seat]
+      else seats[seat] = policy
+    }
+    next.seatCreditsPolicy = seats
+  }
+  setSetting("chatgpt", next)
   return getChatGptFeatures()
 }
 

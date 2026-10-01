@@ -84,6 +84,10 @@ export type ChatGptFeatureSettings = {
   thinkingPassthrough?: boolean
   maxBudgetUsd?: number
   fallbackModel?: string
+  /** "never" | "reserve" | "immediately"; see ChatGptCreditsPolicy. */
+  creditsPolicy?: string
+  /** Seat id (accountUserId) -> policy overriding `creditsPolicy` for that seat. */
+  seatCreditsPolicy?: Record<string, string>
 }
 
 /**

@@ -22,7 +22,7 @@ const evaluated = new Function(
   profileAccessHelp: (p: Record<string, unknown>) => AccessHelp
   chatGptUsageGap: (error: string | null | undefined) => string
   refusalSubject: (p: Record<string, unknown> | undefined) => { vendor: string; noun: string }
-  codexCreditsView: (credits: unknown) => { value: string; note: string; status: string } | null
+  codexCreditsView: (credits: unknown, quota?: unknown) => { value: string; note: string; status: string; serving?: boolean; policy?: string | null } | null
 }
 
 const { profileFacts, timeAgo, formatResets, profileAccessHelp, chatGptUsageGap, refusalSubject, codexCreditsView } = evaluated
@@ -188,13 +188,23 @@ describe("a ChatGPT seat's card", () => {
   test("states purchased Codex credits where a Claude card states extra usage, and nothing without them", () => {
     const credits = (extra: Record<string, unknown>) => ({ hasCredits: false, unlimited: false, overageLimitReached: false, balance: null, ...extra })
     expect(codexCreditsView(credits({ hasCredits: true, balance: 1234.5 })))
-      .toEqual({ value: "1,234.5 credits", note: "used once the plan’s limits run out", status: "ok" })
+      .toMatchObject({ value: "1,234.5 credits", note: "used once the plan’s limits run out", status: "ok" })
     expect(codexCreditsView(credits({ unlimited: true }))?.value).toBe("unlimited")
     expect(codexCreditsView(credits({ hasCredits: true }))?.value).toBe("available")
     expect(codexCreditsView(credits({ hasCredits: true, balance: 3, overageLimitReached: true })))
       .toMatchObject({ note: "overage limit reached", status: "high" })
     expect(codexCreditsView(credits({ balance: 0 }))).toBeNull()
     expect(codexCreditsView(null)).toBeNull()
+  })
+
+  test("states the seat's credits policy, and flags a seat serving on its credits now", () => {
+    const credits = { hasCredits: true, unlimited: false, overageLimitReached: false, balance: 62500 }
+    expect(codexCreditsView(credits, { creditsPolicy: "never", creditsPolicySource: "default" }))
+      .toMatchObject({ value: "62,500 credits", note: "never used \u2014 credits policy is never", status: "ok", serving: false, policy: "policy: never" })
+    expect(codexCreditsView(credits, { creditsPolicy: "reserve", creditsPolicySource: "seat" }))
+      .toMatchObject({ note: "used only when no seat has plan usage left", policy: "policy: reserve (this seat)" })
+    expect(codexCreditsView({ ...credits, unlimited: true }, { creditsPolicy: "immediately", servingOnCredits: true }))
+      .toMatchObject({ value: "unlimited", note: "plan usage spent \u2014 serving on credits now", status: "warn", serving: true, policy: "policy: immediately" })
   })
 
   test("explains a missing reading and names who is refusing", () => {

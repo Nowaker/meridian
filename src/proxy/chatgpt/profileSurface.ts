@@ -34,6 +34,7 @@ import {
   type ChatGptProfile,
   type ObservedRateLimit,
 } from "./profiles"
+import type { ChatGptCreditsPolicy } from "./features"
 import type { ChatGptCredentialSource } from "./source"
 import type { ChatGptRateLimit, ChatGptUsageWindow } from "./windows"
 
@@ -63,6 +64,10 @@ export function chatGptWarmBody(model: string): Record<string, unknown> {
 export interface ChatGptProfileSurfaceDeps {
   source: ChatGptCredentialSource
   observed: () => ReadonlyMap<string, ObservedRateLimit>
+  /** The seat's effective credits policy and where it comes from. */
+  creditsPolicy?: (seat: string) => { policy: ChatGptCreditsPolicy; source: "seat" | "default" }
+  /** Whether the seat's plan is spent and whether it is serving on credits now (the backend's view). */
+  creditState?: (seat: string) => { planSpent: boolean; servingOnCredits: boolean }
   usage: () => CodexUsageResponse | null
   /** Ids a ChatGPT profile must not take: the Claude profiles', and `default`. */
   reserved: () => ReadonlySet<string>
@@ -123,8 +128,15 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
     const excluded = excludedSeats(list)
     const pointer = findChatGptProfile(list, deps.activeSeat())
     if (pointer && !excluded.has(pointer.seat)) return pointer
-    return list.find(profile => profile.ownerActive && !excluded.has(profile.seat))
-      ?? list.find(profile => profile.eligible && !excluded.has(profile.seat))
+    // Without a pointer, the pick is the seat a turn would go to first: one
+    // with plan quota, or one whose policy spends its credits at once.
+    const servesFirst = (profile: ChatGptProfile) => !deps.creditState?.(profile.seat).planSpent
+      || deps.creditsPolicy?.(profile.seat).policy === "immediately"
+    const candidates = list.filter(profile => !excluded.has(profile.seat))
+    return candidates.find(profile => profile.ownerActive && servesFirst(profile))
+      ?? candidates.find(profile => profile.eligible && servesFirst(profile))
+      ?? candidates.find(profile => profile.ownerActive)
+      ?? candidates.find(profile => profile.eligible)
   }
 
   return {
@@ -238,6 +250,8 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
       return list.map(profile => {
         const usage = usageById.get(profile.seat)
         const reading = seatWindows({ usage, observed: observed.get(profile.seat) })
+        const policy = deps.creditsPolicy?.(profile.seat)
+        const creditState = deps.creditState?.(profile.seat)
         // A failed usage check explains the figures only if it came after
         // them: a response's headers may have given newer ones since.
         const failure = usage?.failure && (reading.fetchedAt === null || usage.failure.lastFailureAt > reading.fetchedAt)
@@ -253,6 +267,10 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           windowSource: reading.source,
           extraUsage: null,
           credits: usage?.credits ?? null,
+          creditsPolicy: policy?.policy ?? null,
+          creditsPolicySource: policy?.source ?? null,
+          planSpent: creditState?.planSpent ?? false,
+          servingOnCredits: creditState?.servingOnCredits ?? false,
           fetchedAt: reading.fetchedAt,
           stale: reading.stale,
           error: chatGptQuotaError(profile.unavailable, usage?.error, reading.windows.length > 0),

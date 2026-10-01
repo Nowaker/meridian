@@ -188,17 +188,35 @@ function chatGptUsageGap(error) {
 // extra usage goes: both keep an account serving once its plan's windows are
 // spent. Null - no block - for a seat that holds none, as a Claude account
 // with extra usage off shows none.
-function codexCreditsView(credits) {
+//
+// \`quota\` is the seat's /v1/usage/quota/all entry: its credits policy says
+// when the balance may be spent, and \`servingOnCredits\` that it is being
+// spent now - a seat paying for turns with what may be real money is the one
+// thing on the card that must not be missed, so it takes the warning tone.
+var CODEX_CREDITS_POLICY_NOTE = {
+  never: 'never used \\u2014 credits policy is never',
+  reserve: 'used only when no seat has plan usage left',
+  immediately: 'used as soon as this seat\\u2019s plan usage is drained'
+};
+
+function codexCreditsView(credits, quota) {
   if (!credits) return null;
   var value = credits.unlimited ? 'unlimited'
     : typeof credits.balance === 'number' && credits.balance > 0
       ? credits.balance.toLocaleString('en-US', { maximumFractionDigits: 2 }) + ' credits'
       : credits.hasCredits ? 'available' : null;
   if (value === null) return null;
+  var policy = quota && CODEX_CREDITS_POLICY_NOTE[quota.creditsPolicy] ? quota.creditsPolicy : null;
+  var serving = !!(quota && quota.servingOnCredits);
   return {
     value: value,
-    note: credits.overageLimitReached ? 'overage limit reached' : 'used once the plan\\u2019s limits run out',
-    status: credits.overageLimitReached ? 'high' : 'ok'
+    note: credits.overageLimitReached ? 'overage limit reached'
+      : serving ? 'plan usage spent \\u2014 serving on credits now'
+      : policy ? CODEX_CREDITS_POLICY_NOTE[policy]
+      : 'used once the plan\\u2019s limits run out',
+    status: credits.overageLimitReached ? 'high' : serving ? 'warn' : 'ok',
+    serving: serving,
+    policy: policy ? 'policy: ' + policy + (quota.creditsPolicySource === 'seat' ? ' (this seat)' : '') : null
   };
 }
 

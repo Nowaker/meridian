@@ -181,7 +181,7 @@ afterEach(() => {
   __setFetchOAuthUsageOverride(null)
   saveSettings({
     chatGptActiveSeat: undefined, chatGptProfileNames: undefined, chatGptProfileAliases: undefined, profileOrder: undefined,
-    routingExcludedProfiles: undefined, routingManagedExcludedProfiles: undefined,
+    routingExcludedProfiles: undefined, routingManagedExcludedProfiles: undefined, chatgpt: undefined,
   })
   globalThis.fetch = realFetch
   delete process.env.MERIDIAN_CHATGPT_CREDENTIALS
@@ -732,7 +732,7 @@ describe("ChatGPT seats on the profile surface", () => {
     expect(snapshotPoolDir()).toEqual(before)
   })
 
-  it("serves a seat the owner stamped as spent on its Codex credits, learned from the usage read", async () => {
+  const stampedSeatWithCredits = () => {
     resetCodexUsageCache()
     const live = seatToken(0)
     writePool([account(0, { accessToken: live, quotaExhaustedUntil: NOW + 3 * 86_400_000 })])
@@ -741,6 +741,13 @@ describe("ChatGPT seats on the profile surface", () => {
       rate_limit: { allowed: true, limit_reached: false, primary_window: { used_percent: 100, limit_window_seconds: 604_800, reset_at: Math.floor(NOW / 1000) + 3 * 86_400 }, secondary_window: null },
       credits: { has_credits: true, unlimited: false, overage_limit_reached: false, balance: "62500" },
     }) : undefined
+    return live
+  }
+  type CreditsQuota = { profiles: Array<{ id: string; credits: { balance: number | null } | null; creditsPolicy: string | null; creditsPolicySource: string | null; planSpent: boolean; servingOnCredits: boolean }> }
+
+  it("serves a seat the owner stamped as spent on its Codex credits under the reserve policy, and says so on its card", async () => {
+    const live = stampedSeatWithCredits()
+    saveSettings({ chatgpt: { creditsPolicy: "reserve" } })
     const before = snapshotPoolDir()
     const { app } = await server("follow-external")
     const response = await app.fetch(responses(LUNA))
@@ -750,6 +757,23 @@ describe("ChatGPT seats on the profile surface", () => {
     expect(whamCalls.some(call => call.url.endsWith("/wham/usage"))).toBe(true)
     expect(tokenCalls).toBe(0)
     expect(snapshotPoolDir()).toEqual(before)
+
+    const quota = await (await app.fetch(new Request("http://localhost/v1/usage/quota/all"))).json() as CreditsQuota
+    expect(quota.profiles[0]).toMatchObject({
+      credits: { balance: 62_500 }, creditsPolicy: "reserve", creditsPolicySource: "default", planSpent: true, servingOnCredits: true,
+    })
+  })
+
+  it("leaves a plan-exhausted seat idle by default, however many credits it holds", async () => {
+    stampedSeatWithCredits()
+    const { app } = await server("follow-external")
+    const response = await app.fetch(responses(LUNA))
+    expect(response.status).toBe(429)
+    await response.text()
+    expect(upstreamCalls).toEqual([])
+
+    const quota = await (await app.fetch(new Request("http://localhost/v1/usage/quota/all"))).json() as CreditsQuota
+    expect(quota.profiles[0]).toMatchObject({ creditsPolicy: "never", planSpent: true, servingOnCredits: false })
   })
 
   it("renames a seat the way a Claude profile is renamed: the old name keeps answering", async () => {

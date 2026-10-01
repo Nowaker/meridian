@@ -275,6 +275,11 @@ export const profilePageHtml = `<!DOCTYPE html>
     border-radius: 6px; font-size: 11px;
   }
   .usage-extra-row { display: flex; justify-content: space-between; gap: 8px; }
+  .usage-extra.status-warn { border-color: var(--yellow); }
+  .usage-extra.status-warn .usage-pct { color: var(--yellow); }
+  .usage-extra.status-high .usage-pct { color: var(--red); }
+  .usage-extra .usage-note { font-size: 10px; color: var(--muted); line-height: 1.4; overflow-wrap: anywhere; min-width: 0; }
+  .badge-credits { background: rgba(210,153,34,0.15); color: var(--yellow); }
   .usage-empty {
     font-size: 11px; color: var(--muted); padding: 6px 0; font-style: italic;
   }
@@ -861,7 +866,7 @@ function renderUsageSection(profileQuota, p) {
   var failedRun = describeFailedRun(profileQuota.failure);
   var usageTag = cachedTag(profileQuota.stale ? 'cached' : 'live');
   var chatgpt = isChatGptProfile(p);
-  var credits = chatgpt ? codexCreditsView(profileQuota.credits) : null;
+  var credits = chatgpt ? codexCreditsView(profileQuota.credits, profileQuota) : null;
 
   // No figures at all means this profile has never been read successfully —
   // the route serves the last good reading at any age, so an empty windows
@@ -946,7 +951,8 @@ function renderUsageSection(profileQuota, p) {
       +     '<span class="usage-pct">' + esc(credits.value) + usageTag + '</span>'
       +   '</div>'
       +   '<div class="usage-extra-row" style="margin-top:4px">'
-      +     '<span class="usage-reset">' + esc(credits.note) + '</span>'
+      +     '<span class="usage-note">' + esc(credits.note) + '</span>'
+      +     (credits.policy ? '<span class="usage-note" style="text-align:right">' + esc(credits.policy) + '</span>' : '')
       +   '</div>'
       + '</div>';
   }
@@ -1009,6 +1015,7 @@ function render(data, quotaData) {
       if (isActive) html += "<span class=\\"profile-badge badge-active\\">active</span>";
       html += "<span class=\\"profile-badge badge-type\\">" + esc(p.type || "claude-max") + "</span>";
       html += renderSpentBadge((quotaById[p.id] || {}).spent);
+      if ((quotaById[p.id] || {}).servingOnCredits) html += '<span class="profile-badge badge-credits" title="This seat\u2019s plan usage is spent; its turns are paid with Codex credits">on credits</span>';
       html += "<span class=\\"profile-card-actions\\">";
       html += "<button class=\\"icon-btn\\" title=\\"Rename profile\\" onclick=\\"startRename(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_PENCIL + "</button>";
       html += "<button class=\\"icon-btn danger\\" title=\\"Remove profile\\" onclick=\\"startRemove(&quot;"+esc(p.id)+"&quot;)\\">" + ICON_TRASH + "</button>";
