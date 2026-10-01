@@ -168,6 +168,7 @@ export const landingHtml = `<!DOCTYPE html>
   .credits-row .w-credits { flex: 1; min-width: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
   .credits-row .w-credits.serving { color: var(--yellow); }
   .credits-row .w-credits-note { color: var(--muted); font-size: 11px; text-align: right; min-width: 0; overflow-wrap: anywhere; }
+  .credits-row .w-credits-note.credits-pace { flex: 1; text-align: left; }
   .pool-chip.on-credits { color: var(--yellow); background: rgba(210,153,34,0.15); }
 
   /* Traffic strip — one compact surface */
@@ -443,7 +444,9 @@ function profileSection(q,s,pl,h){
     var credits=chat?codexCreditsView(quota.credits,quota):null;
     if(credits)rows+='<div class="usage-row credits-row" title="'+esc(credits.note)+'"><span class="w-label">credits</span>'
       +'<span class="w-credits'+(credits.serving?' serving':'')+'">'+esc(credits.value)+'</span>'
-      +'<span class="w-credits-note">'+esc(credits.serving?'serving on credits':credits.policy||credits.note)+'</span></div>';
+      +'<span class="w-credits-note">'+esc(credits.serving?'serving on credits':credits.policy||credits.note)+'</span></div>'
+      +(credits.pace?'<div class="usage-row credits-row" title="'+esc(credits.pace.title)+'"><span class="w-label">pace</span>'
+        +'<span class="w-credits-note credits-pace">'+esc(credits.pace.text)+'</span></div>':'');
     var isPriority=pl&&pl.routing==='priority';
     // active+priority keeps the active profile meaningful - switching it is how
     // you move traffic, so the card stays clickable, unlike in pure priority.

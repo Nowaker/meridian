@@ -208,7 +208,9 @@ function codexCreditsView(credits, quota) {
   if (value === null) return null;
   var policy = quota && CODEX_CREDITS_POLICY_NOTE[quota.creditsPolicy] ? quota.creditsPolicy : null;
   var serving = !!(quota && quota.servingOnCredits);
+  var pace = codexCreditsPace(credits, quota, Date.now());
   return {
+    pace: pace,
     value: value,
     note: credits.overageLimitReached ? 'overage limit reached'
       : serving ? 'plan usage spent \\u2014 serving on credits now'
@@ -218,6 +220,47 @@ function codexCreditsView(credits, quota) {
     serving: serving,
     policy: policy ? 'policy: ' + policy + (quota.creditsPolicySource === 'seat' ? ' (this seat)' : '') : null
   };
+}
+
+// "45m", "1h35m", "3d4h": how long a balance lasts at a pace.
+function creditsDuration(hours) {
+  if (!(hours > 0) || !isFinite(hours)) return null;
+  if (hours >= 24 * 365) return 'over a year';
+  var minutes = Math.max(1, Math.round(hours * 60));
+  if (minutes < 60) return minutes + 'm';
+  if (minutes < 48 * 60) return Math.floor(minutes / 60) + 'h' + (minutes % 60 ? (minutes % 60) + 'm' : '');
+  var wholeHours = Math.round(hours);
+  return Math.floor(wholeHours / 24) + 'd' + (wholeHours % 24 ? (wholeHours % 24) + 'h' : '');
+}
+
+// How long a seat's balance would last at this instance's pace of credits
+// (\`quota.creditsBurn\`, every seat's traffic priced on the credits rate
+// card). A seat not paying with credits now gets the same figure framed as
+// hypothetical, so it is never read as live burn. Null where nothing is known.
+function codexCreditsPace(credits, quota, now) {
+  if (credits.unlimited) return { text: 'unlimited', title: 'Unlimited credits: no balance to run out', approximate: false };
+  var burn = quota && quota.creditsBurn;
+  if (!burn) return null;
+  if (burn.status === 'idle') return { text: 'idle', title: 'No ChatGPT traffic in the last ' + burn.windowMinutes + ' minutes', approximate: false };
+  if (burn.status === 'unknown_rate') {
+    return { text: 'no estimate', title: 'No credit rate for ' + burn.models.join(', ') + ', so the pace is unknown', approximate: false };
+  }
+  if (typeof credits.balance !== 'number' || !(credits.balance > 0)) return null;
+  var lasts = creditsDuration(credits.balance / burn.creditsPerHour);
+  if (!lasts) return null;
+  var mix = burn.mix.map(function (m) { return Math.round(m.share * 100) + '% ' + m.model; }).join(' / ');
+  var approximate = burn.approximate.length > 0;
+  var title = Math.round(burn.creditsPerHour).toLocaleString('en-US') + ' credits/h over the last ' + burn.windowMinutes
+    + ' minutes, ' + burn.turns + ' turn' + (burn.turns === 1 ? '' : 's') + ' across all seats: ' + mix
+    + (approximate ? '. Approximate: ' + burn.approximate.join('; ') : '');
+  var mark = approximate ? '~' : '';
+  var serving = !!(quota && quota.servingOnCredits);
+  if (serving) return { text: 'est. out in ' + mark + lasts + ' at current pace', title: title, approximate: approximate };
+  var policy = quota && quota.creditsPolicy;
+  var start = policy === 'never' ? 'not spent (policy never)'
+    : policy === 'reserve' ? 'starts after every seat\\u2019s plan limits'
+    : 'starts after plan limits';
+  return { text: start + '; would last ~' + lasts + ' at current pace', title: title, approximate: approximate };
 }
 
 // Which vendor is refusing a profile, and what the page calls it.

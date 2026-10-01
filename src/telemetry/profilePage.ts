@@ -954,6 +954,9 @@ function renderUsageSection(profileQuota, p) {
       +     '<span class="usage-note">' + esc(credits.note) + '</span>'
       +     (credits.policy ? '<span class="usage-note" style="text-align:right">' + esc(credits.policy) + '</span>' : '')
       +   '</div>'
+      +   (credits.pace ? '<div class="usage-extra-row" style="margin-top:4px">'
+      +     '<span class="usage-note credits-pace" title="' + attr(credits.pace.title) + '">' + esc(credits.pace.text) + '</span>'
+      +   '</div>' : '')
       + '</div>';
   }
 

@@ -5,6 +5,7 @@ import { chatGptProvider, CHATGPT_ADAPTER } from './backends/chatgptStatus'
 import { createChatGptBackend, type ChatGptSeatCreditState, type ChatGptSeatRefusal, type ChatGptTurnEvent, type ObservedSeatLimits } from './backends/chatgpt'
 import { resolveChatGptSource } from './chatgpt/config'
 import { ChatGptTurnLedger, chatGptTokenFields, createChatGptAdmission, createChatGptParityBackend, createUnpricedModelWarning, decorateChatGptTurn, type ChatGptTurnNotes } from './chatgpt/parity'
+import { BURN_SPARSE_WINDOW_MS, creditBurn } from './chatgpt/creditRates'
 import { chatGptFeatureCapabilities, effectiveCreditsPolicy, getChatGptFeatures, resetChatGptFeatures, updateChatGptFeatures, validateChatGptFeatureUpdate } from './chatgpt/features'
 import { resolveModelPricing } from '../telemetry/pricing'
 import { getPricingOverrides } from '../telemetry/pricingStore'
@@ -8024,11 +8025,21 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // limits are read lazily.
   let chatGptObserved: () => ReadonlyMap<string, ObservedSeatLimits> = () => new Map()
   let chatGptCreditState: (seat: string) => ChatGptSeatCreditState = () => ({ planSpent: false, servingOnCredits: false })
+  const unpricedCreditModels = new Set<string>()
   const chatGptProfiles = chatGptSource ? createChatGptProfileSurface({
     source: chatGptSource,
     observed: () => chatGptObserved(),
     creditsPolicy: (seat) => effectiveCreditsPolicy(getChatGptFeatures(), seat),
     creditState: (seat) => chatGptCreditState(seat),
+    creditBurn: () => creditBurn(
+      telemetryStore.getRecent({ limit: 100_000, since: Date.now() - BURN_SPARSE_WINDOW_MS }).filter(metric => metric.adapter === CHATGPT_ADAPTER),
+      Date.now(),
+      (model, reason) => {
+        if (unpricedCreditModels.has(model)) return
+        unpricedCreditModels.add(model)
+        plog(`[PROXY] ChatGPT credits pace: no credit rate for ${model} (${reason}); no estimate while it is in the window`)
+      },
+    ),
     usage: () => chatGptUsage,
     reserved: () => new Set(["default", ...getEffectiveProfiles(finalConfig.profiles).flatMap(p => [p.id, ...(p.aliases ?? [])])]),
     names: () => getSetting("chatGptProfileNames"),

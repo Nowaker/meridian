@@ -34,6 +34,7 @@ import {
   type ChatGptProfile,
   type ObservedRateLimit,
 } from "./profiles"
+import type { CreditBurn } from "./creditRates"
 import type { ChatGptCreditsPolicy } from "./features"
 import type { ChatGptCredentialSource } from "./source"
 import type { ChatGptRateLimit, ChatGptUsageWindow } from "./windows"
@@ -68,6 +69,8 @@ export interface ChatGptProfileSurfaceDeps {
   creditsPolicy?: (seat: string) => { policy: ChatGptCreditsPolicy; source: "seat" | "default" }
   /** Whether the seat's plan is spent and whether it is serving on credits now (the backend's view). */
   creditState?: (seat: string) => { planSpent: boolean; servingOnCredits: boolean }
+  /** This instance's pace of credits across all seats (chatgpt/creditRates.ts). */
+  creditBurn?: () => CreditBurn
   usage: () => CodexUsageResponse | null
   /** Ids a ChatGPT profile must not take: the Claude profiles', and `default`. */
   reserved: () => ReadonlySet<string>
@@ -245,6 +248,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
     quotaEntries() {
       const list = profiles()
       const activeId = active(list)?.id
+      const creditsBurn = deps.creditBurn?.() ?? null
       const usageById = new Map((deps.usage()?.entries ?? []).map(entry => [entry.id, entry]))
       const observed = deps.observed()
       return list.map(profile => {
@@ -271,6 +275,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           creditsPolicySource: policy?.source ?? null,
           planSpent: creditState?.planSpent ?? false,
           servingOnCredits: creditState?.servingOnCredits ?? false,
+          creditsBurn,
           fetchedAt: reading.fetchedAt,
           stale: reading.stale,
           error: chatGptQuotaError(profile.unavailable, usage?.error, reading.windows.length > 0),

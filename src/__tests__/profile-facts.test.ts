@@ -22,7 +22,7 @@ const evaluated = new Function(
   profileAccessHelp: (p: Record<string, unknown>) => AccessHelp
   chatGptUsageGap: (error: string | null | undefined) => string
   refusalSubject: (p: Record<string, unknown> | undefined) => { vendor: string; noun: string }
-  codexCreditsView: (credits: unknown, quota?: unknown) => { value: string; note: string; status: string; serving?: boolean; policy?: string | null } | null
+  codexCreditsView: (credits: unknown, quota?: unknown) => { value: string; note: string; status: string; serving?: boolean; policy?: string | null; pace?: { text: string; title: string; approximate: boolean } | null } | null
 }
 
 const { profileFacts, timeAgo, formatResets, profileAccessHelp, chatGptUsageGap, refusalSubject, codexCreditsView } = evaluated
@@ -205,6 +205,25 @@ describe("a ChatGPT seat's card", () => {
       .toMatchObject({ note: "used only when no seat has plan usage left", policy: "policy: reserve (this seat)" })
     expect(codexCreditsView({ ...credits, unlimited: true }, { creditsPolicy: "immediately", servingOnCredits: true }))
       .toMatchObject({ value: "unlimited", note: "plan usage spent \u2014 serving on credits now", status: "warn", serving: true, policy: "policy: immediately" })
+  })
+
+  test("estimates how long a balance lasts at the instance's pace, and frames it by whether the seat is paying now", () => {
+    const credits = { hasCredits: true, unlimited: false, overageLimitReached: false, balance: 62500 }
+    const burning = { status: "burning", creditsPerHour: 40000, windowMinutes: 60, turns: 12, mix: [{ model: "gpt-6-sol", share: 0.62 }, { model: "gpt-6-luna", share: 0.38 }], approximate: [] }
+    const serving = codexCreditsView(credits, { creditsPolicy: "immediately", servingOnCredits: true, creditsBurn: burning })
+    expect(serving?.pace?.text).toBe("est. out in 1h34m at current pace")
+    expect(serving?.pace?.title).toContain("62% gpt-6-sol / 38% gpt-6-luna")
+    expect(codexCreditsView(credits, { creditsPolicy: "reserve", creditsBurn: burning })?.pace?.text)
+      .toBe("starts after every seat\u2019s plan limits; would last ~1h34m at current pace")
+    expect(codexCreditsView(credits, { creditsPolicy: "never", creditsBurn: burning })?.pace?.text)
+      .toBe("not spent (policy never); would last ~1h34m at current pace")
+    expect(codexCreditsView(credits, { servingOnCredits: true, creditsBurn: { ...burning, approximate: ["promo"] } })?.pace?.text)
+      .toBe("est. out in ~1h34m at current pace")
+    expect(codexCreditsView(credits, { creditsBurn: { status: "idle", windowMinutes: 60 } })?.pace?.text).toBe("idle")
+    expect(codexCreditsView(credits, { creditsBurn: { status: "unknown_rate", windowMinutes: 180, models: ["gpt-9"] } })?.pace)
+      .toMatchObject({ text: "no estimate", title: expect.stringContaining("gpt-9") })
+    expect(codexCreditsView({ ...credits, unlimited: true, balance: null }, { creditsBurn: burning })?.pace?.text).toBe("unlimited")
+    expect(codexCreditsView(credits, {})?.pace).toBeNull()
   })
 
   test("explains a missing reading and names who is refusing", () => {
