@@ -126,11 +126,8 @@ export const profileBarCss = `
   .meridian-header .mh-profile .mh-profile-type {
     color: var(--muted, #8b949e); font-size: 10px;
   }
-  /* Version chips, then the update badge beside them. The colours are not a
-     style choice: "update available" is a link to the releases page, so it
-     is blue (interactive); a local/dev build's identity is the violet .mh-prov
-     meta pill below; an npm install's version is neither, so it is muted
-     chrome. Swapping these would break the DESIGN.md rule. */
+  /* npm update chip — a link to the releases page, so it is blue
+     (interactive). Local/dev provenance is the separate .mh-prov pill. */
   .meridian-header .mh-build {
     display: none; align-items: center; gap: 6px;
     font-size: 11px; font-weight: 500; white-space: nowrap;
@@ -232,11 +229,11 @@ export const profileBarHtml = `
     <a href="/plugins" id="nav-plugins">Plugins</a>
   </nav>
   <div class="mh-right">
+    <span class="mh-prov" id="mhProv" role="group"></span>
+    <span class="mh-drift" id="mhDrift" role="status" hidden></span>
     <a class="mh-profile" id="mhProfile" href="/" title="Active profile — switch from the home page"></a>
     <span class="mh-status" id="mhStatus"><span class="mh-dot" id="mhDot"></span><span class="mh-status-text" id="mhStatusText"></span></span>
     <span class="mh-build" id="mhBuild"></span>
-    <span class="mh-prov" id="mhProv" role="group"></span>
-    <span class="mh-drift" id="mhDrift" role="status" hidden></span>
     <a class="mh-update" id="mhUpdate" href="https://github.com/rynfar/meridian/releases" target="_blank" rel="noopener"></a>
   </div>
 </header>
@@ -269,18 +266,23 @@ export const profileBarJs = `
   var provKey = '';
   var driftKey = '';
 
-  // Build chips, right of the health pill. The version is a muted chip for an
-  // npm install and the violet provenance pill for a local/dev build. The pill
-  // is rebuilt only when the view changes, so a poll never yanks a link out
-  // from under the pointer or keyboard focus.
+  // Build chips. Hidden entirely for a current npm install, which is the case
+  // that needs no comment. Rebuilt only when the view changes, so a poll never
+  // yanks a link out from under the pointer or keyboard focus.
   function renderBuild(build) {
     var view = buildIdentityView(build);
-    if (view.mode === 'release') {
-      buildChip.textContent = view.text;
-      buildChip.title = view.title;
-      buildChip.className = 'mh-build visible';
+    var known = build && build.version && build.version !== 'unknown';
+    buildChip.textContent = known ? 'v' + build.version : '';
+    buildChip.title = known ? 'Running Meridian ' + build.version : '';
+    // Local provenance already includes release/package version and run identity.
+    buildChip.className = known && build.source === 'npm' ? 'mh-build visible' : 'mh-build';
+    if (build && build.updateAvailable && build.latest) {
+      updateChip.textContent = 'update available';
+      updateChip.title = build.latest + ' is published, running ' + build.version + ' — ' +
+        (build.source === 'npm' ? 'update with:\\nnpm install -g @rynfar/meridian@latest' : 'pull and rebuild this checkout');
+      updateChip.className = 'mh-update visible';
     } else {
-      buildChip.className = 'mh-build';
+      updateChip.className = 'mh-update';
     }
     var key = JSON.stringify(view);
     if (key !== provKey) {
@@ -305,7 +307,6 @@ export const profileBarJs = `
       }
     }
     setDriftTracking(view.mode === 'local');
-    renderUpdate(build);
   }
 
   // Drift comes from /build-status, which only local/dev builds serve. It has
@@ -357,22 +358,6 @@ export const profileBarJs = `
     driftKey = '';
     driftChip.hidden = true;
     driftChip.textContent = '';
-  }
-
-  // The update badge answers a separate question: is a newer release
-  // published? It shows once an enabled update check has resolved one, for
-  // every build source. A checkout compares its package.json version, so it
-  // is told too, with advice it can actually follow.
-  function renderUpdate(build) {
-    if (build && build.updateAvailable && build.latest) {
-      updateChip.textContent = 'update available';
-      updateChip.title = build.latest + ' is published, running ' + build.version + ' — ' +
-        (build.source === 'npm' ? 'update with:\\nnpm install -g @rynfar/meridian@latest'
-          : build.kind === 'source' ? 'pull and restart this checkout' : 'pull and rebuild this checkout');
-      updateChip.className = 'mh-update visible';
-    } else {
-      updateChip.className = 'mh-update';
-    }
   }
 
   function loadHeader() {

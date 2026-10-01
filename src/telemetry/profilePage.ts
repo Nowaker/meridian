@@ -54,14 +54,20 @@ export const profilePageHtml = `<!DOCTYPE html>
     padding: 20px; margin-bottom: 12px; transition: border-color 0.2s;
   }
   .profile-card[hidden] { display: none; }
-  .profile-card.active { border-color: var(--accent); }
   /* Arriving from a /profiles#<name> link: one short pulse says which card. */
   .profile-card.anchor-flash { animation: profile-anchor-flash 0.5s ease-out; }
   @keyframes profile-anchor-flash {
     0% { box-shadow: 0 0 0 0 rgba(88,166,255,0); background: var(--surface); }
-    35% { box-shadow: 0 0 0 4px rgba(88,166,255,0.55); background: rgba(88,166,255,0.12); }
+    35% { box-shadow: 0 0 0 4px rgba(88,166,255,0.35); background: rgba(88,166,255,0.12); }
     100% { box-shadow: 0 0 0 0 rgba(88,166,255,0); background: var(--surface); }
   }
+  @media (prefers-reduced-motion: reduce) {
+    .profile-card.anchor-flash { animation: none; }
+  }
+  /* The name links to its own card. */
+  a.profile-name { color: inherit; text-decoration: none; }
+  a.profile-name:hover { color: var(--accent); }
+  .profile-card.active { border-color: var(--accent); }
   /* The header row carries the reorder handle, the name, every badge the
      card can earn - active, the type, out of a limit - and the actions. On a
      phone they do not fit on one line, and a row that cannot wrap pushed the
@@ -72,8 +78,7 @@ export const profilePageHtml = `<!DOCTYPE html>
      the layout. */
   .profile-card-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 12px; }
   ${reorderCss}
-  .profile-name { font-size: 16px; font-weight: 600; min-width: 0; overflow-wrap: anywhere; color: inherit; text-decoration: none; }
-  a.profile-name:hover { color: var(--accent); }
+  .profile-name { font-size: 16px; font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
   .profile-card-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
   .icon-btn {
     background: var(--bg); color: var(--muted); border: 1px solid var(--border);
@@ -886,7 +891,7 @@ function writeProfilesUrl(hashId) {
 
 function applyProfileFilter() {
   var profiles = profilesForFind();
-  var byId = {};
+  var byId = Object.create(null);
   for (var i = 0; i < profiles.length; i++) byId[profiles[i].id] = profiles[i];
   var cards = document.querySelectorAll('#content .profile-card[data-id]');
   var shown = 0;

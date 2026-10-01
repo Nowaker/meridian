@@ -1,5 +1,218 @@
 # Upstream review handoff
 
+## Active authorized backlog (2026-10-01)
+
+**Nowaker priority checkpoint (2026-10-01).** #1171 incorporated with corrections
+as [#1225](https://github.com/rynfar/meridian/pull/1225), merge
+`bd00c164d198a368956c79658897a6360a0cd5ea`; #1190 incorporated with corrections
+as [#1218](https://github.com/rynfar/meridian/pull/1218), merge
+`310dd95698b27484ff5bc0feb88f59f365ef58c0`. Both merged trees equal their
+validated heads, all executed exact-head CI passed, Nowaker co-author credit
+verified, original heads unchanged before closure. Durable records:
+[evidence/1171-build-provenance.md](evidence/1171-build-provenance.md) and
+[evidence/1190-request-activity.md](evidence/1190-request-activity.md).
+#792 draft [#1217](https://github.com/rynfar/meridian/pull/1217) proves new-account
+creation and real OpenCode use; re-authentication still awaits a completed
+human Claude authorization. #1187 remains under concurrency/client review;
+#1176 remains under official-rate/product-flow review. #1175 correction and
+actual bundled HTTP/browser proof are recorded in
+[evidence/1175-update-setting.md](evidence/1175-update-setting.md); final-head
+CI is required before integration. No release authorized.
+
+Owner requested a persistent goal covering PRs/issues, authored cherry-picks,
+maintainer corrections and headless actual-client evidence. Initial paginated
+inventory: Meridian 18 PRs / 11 issues; OpenCode scrub 2 PRs; Pi scrub issue #13;
+Hermes scrub, OpenClaw scrub and hudscrub empty. Accessible owner/org repository
+discovery found no additional scrub candidates. No release or community-message
+authorization. Preserve the dirty desktop checkout at `446a0f163`.
+
+**#1191 accepted and integrated as #1196.** Refreshed exact source/base/head and
+all required CI before squash. Merge `c04a861ba8a4fb71d105065afa9b73019d9985f4`
+has tree `0f62d771d385bcbd619725072a449811524177c8`, identical to validated
+`84902f520bfa70f85227369b40f1cde0518070e5`. Explicit verified Nowaker human
+co-author trailer present. Source head unchanged at closure. Existing independent
+browser proof and local/CI gates remain valid: base did not change before merge.
+The collaborative preview initially failed, then recovered. Its repeated live
+phone/desktop probe matched the retained measurements exactly: 375px page/client
+360/360, internal table scroll 311px; desktop 1265/1265 with no inner scroll;
+rule-removal control 626/360. No unrelated model calls for CSS.
+
+**#1197 accepted and delivered as [#1203](https://github.com/rynfar/meridian/pull/1203).**
+Source `3baf6f59` cherry-picked as `e97c6f61`; Author/AuthorDate preserved.
+[Durable proof](evidence/1197-auth-refresh.md) includes the committed real-CLI
+delay harness: unchanged baseline health probes 2258 ms, fixed 2–4 ms, one
+refresh. Actual headless OpenCode 1.18.33 / Opus 5.5 / SDK 0.2.141 / scrub
+0.2.3 same-session continuation passes. Final local suite and exact-head CI
+passed: final npm test 4949 pass / 0 fail / 4 skip, standalone typecheck and build;
+all six executed CI checks passed, including
+[test](https://github.com/rynfar/meridian/actions/runs/36820232911/job/110234024099).
+Merge `98c48c03ff65f0b8ce428c8b60718655c49f85dd`, tree
+`40110cc03377380c1a9ef4568ef28a4079880e89`, identical to validated head
+`96aaac51`. Nowaker co-author trailer verified; source unchanged at closure.
+
+**#1186 corrected and incorporated in #1204, merged.** Source `9d33e45f` maps
+to authored cherry `3849868f`; ownership/immutability correction `1ec6f47e`,
+proof `e74eb796`, process-isolated timing gate `1cefadb3`.
+Merge `2404eae1eafbc530e472a0bf28b775f2b7956689`, tree
+`167c4031cb95ca8e6113c2279909d322bc0b3936` equals validated tree.
+4967 tests, all ten executed CI checks, typecheck/build and two real OpenCode
+1.18.33 / Opus 5.5 clients with independent tool-result receipts/continuations
+pass on final rebased tree. Four-mode E41 passes on the identical store blob.
+Nowaker credit verified; source unchanged at closure.
+[Evidence](evidence/1186-store-mutation.md) records failing shallow-freeze tests,
+lazy exposure, benchmark noise and initial full-suite isolation failure.
+
+**#1198/#1199 incorporated with correction in #1205, merged.** Source SHAs
+`959dc6c5`/`b6cb22e0` map to authored cherries `01d37638`/`503ba3c0`.
+Maintainer sort-control correction and probes `5851f8d1`. Merge
+`dedb55564aedccb9e207167f4ae148aeac112e0d`, tree
+`eb04d210092729c37e2e52ea44f8a765772a6729` equals validated tree. 4958 tests,
+all six executed CI checks, 28 real browser baseline/final cases and compiled
+Node asset HTTP gate pass. Nowaker credit verified; both sources unchanged at
+closure. [Evidence](evidence/1198-1199-mobile-layout.md); local media captured,
+no durable GitHub media upload claimed because no uploader was available.
+
+**#1189 accepted with correction and merged as #1206.**
+Source `c2f4b67f` maps to authored cherry `6baaf143`; correction `632445c4`.
+Real Node processes confirm authored reporter makes warn/none fatal and aborts
+warn-with-error-code before its timer. Error.name leaks a synthetic Bearer value.
+Corrected policy preserves all five modes, CLI-over-NODE_OPTIONS precedence
+and strict-mode exact-once reporting; names scrubbed/bounded before spool.
+Retained headless gate: 22 Node/Bun paired configurations and four actual
+compiled test-error-report CLI cases pass against local collector.
+[Evidence](evidence/1189-error-reporting.md). Final npm test 4985 pass / 0 fail / 4 skip, typecheck/build and all six
+executed CI checks pass. Merge `cc74cd2dd65ec3a246512179fc7958a79a1bccd6`, tree
+`aace784e254fe63e4646563c06d9174aac41ac94` matches validated head `a9d1112d`.
+Nowaker co-author credit verified; source unchanged at closure. No third-party collector claimed.
+
+**Pi scrub issue #13 resolved by merged plugin PR #14.**
+Exact Pi 0.87.1 found under renamed package @earendil-works/pi-coding-agent.
+Published scrub 0.2.2 and current scrub main `23c98fac` reproduce two test
+failures. Complete header-scoped <docs> removal corrects both (17 pass/0 fail),
+preserving adjacent foreign documentation and project context.
+Actual headless Pi 0.87.1 / Opus 5.5 / SDK 0.2.141 macOS flow through an
+independently installed fixed tarball removes all docs, retains project
+instructions and completes a read with random client-only tool-result receipt
+and a continuation. Both turns have zero errors. Pi arrives as adapter=opencode
+in this real custom-provider flow; content-scoped scrubbing correctly applies.
+Baseline also observed billing_error, which is not claimed as universal billing
+causation or a guaranteed billing remedy. Final-head build CI passes; merge
+`188115f355f423cbff50b20a2e5fd7d932ec1746` tree
+`e4002e54eb2ed3c9822f27425befabf9a8a9b347` matches tested head `adc3b140`.
+Issue closed. No publication authorized.
+
+**#1200 accepted with design corrections and merged as #1207.**
+Source `517c91bd` maps to authored cherry `f90db029`. Shared-header profile
+anchors/search preserve routing. Restore DESIGN.md section micro-labels, bound
+pulse tint and add reduced-motion CSS. Actual browser matrix with 14 synthetic
+accounts passes 320/375/800/1280 widths, header content growth, aliases, polling
+focus/scroll, filter/reorder controls and zero mutations following a home link.
+[Evidence](evidence/1200-profile-find.md) explicitly corrects an initial padding
+probe: no application timing defect claimed, speculative timing change removed.
+Final full local gates: 5010 pass / 0 fail / 4 skip, typecheck/build. All six
+executed CI checks pass. Merge `4c5e602e2640348a0fa32668e30e2e621eea700c`,
+tree `6256b0e41b9171250164acc895373ae67be371e0`, matches validated head
+`8aef41ba`. Nowaker credit and unchanged source head verified before closure.
+An unchanged Antigravity one-second probe failed once under full-suite load;
+baseline/final focused probes pass and the repeated full suite passes.
+
+**#1192 delivered as #1208, merged.** Source `4e55f7de` unchanged at
+closure. Authored cherry `b636e878` and maintainer harnesses preserve credit.
+Merge `b4d23428ea6b7dd9d7f4878e3fd59ad92bcb4e9f`, tree
+`152e52dac326451533d7e8636111ebc75d4352b5`, equals validated head
+`72a82eaabe32a52b52d7fb05d47d06ee4dc5f208`. All six executed CI checks pass,
+including [test](https://github.com/rynfar/meridian/actions/runs/36829379659/job/110262244694).
+5014 local tests / zero failures / four skips, typecheck/build and actual
+macOS/Linux headless OpenCode controlled rejection plus live Opus 5.5 receipts
+and continuations pass. Nowaker co-author verified. Detailed proof in
+[evidence](evidence/1192-deferred-tool-recovery.md) after rebasing this checkpoint.
+
+**#1177 critical idle regression advanced ahead of remaining feature proposals.**
+Reason: ping-only SDK events can indefinitely postpone a stalled client's error.
+Fresh issue/discussion confirms reported macOS arm64, SDK 0.2.141, Claude Code
+2.1.283 and Pi; exact Pi/model version omitted. Fork checkpoint `b004b952` is
+only packaging; actual authored fix is `f261fc9e0259f6ac92157051e1bec38a19eeac77`
+by Nate Berkopec, cherry-picked as `5f488d8e` with Author/AuthorDate retained.
+Resolve conflicting fork version metadata by retaining main 1.79.0; separate
+maintainer commit `70385c83` removes fork-only packaging workflow. Current main
+and published 1.76.5 share guard blob `b93ea333e1263b903dac074baf30942a480f5607`.
+Authored reproduction exits 1 before (120 seconds of ping-only events), 0 after
+(timeout at 90 seconds); focused controls pass 8 tests. Full suite and actual
+client/model evidence are recorded below; a unit replay alone is insufficient.
+A disposable real SDK / CLI 2.1.284 local API probe filters transport pings
+before message_start and ends with no_events, rather than reproducing the nested
+SDK event. The longer 2.1.283 probe observed six actual nested SDK pings. Its duration
+differs from the short 2.1.284 probe, so no version-dependent fix is inferred.
+The compiled real Pi 0.87.1 / SDK 0.2.141 / Claude Code 2.1.283 / Node 26.8.2
+on macOS arm64 before/after passes: unchanged 15-second idle limit waits
+35178 ms for synthetic output; corrected times out at 15007 ms, zero completed
+answers. Separate actual Opus 5.5 read result and same Pi session continuation
+pass with that CLI/platform. [Durable proof](evidence/1177-sdk-ping-idle.md). Initial probe used a nonexistent
+cli.js and then misclassified /messages?beta=true; corrected pathname/binary
+selection, no product defect claimed for those setup errors.
+
+**#1201 pending actual-client proof.** Source `30e01969`. Public implicated
+client is `XInTheDark/meowbert-ai-agent`. Its own commit `08e771a9` (2026-10-01
+01:07:50 UTC) identifies Opus and fixes interleaving by recording all response
+calls before outputs. Current client already uses that ordering. Original
+affected model/version and before-code live path still need establishing;
+owner does not know them. Do not call a synthetic HTTP-only success actual
+Meowbert E2E. Continue independent work while that gate is open.
+
+**Final behavior deliveries and queue dispositions (2026-10-01).**
+#1177 merged as [#1209](https://github.com/rynfar/meridian/pull/1209), merge
+`0f2a4a541b3b7b14022317ecd9ffe14c149b8f1d`, tree
+`d1250b1c059860ff994ef0cf9b86f046eee64788` equals tested head
+`d08011f8624d62ef8f66d261cc9b1295eaf7883d`. Final local suite 5017 pass /
+zero fail / four skip, standalone typecheck/build and all six executed CI checks
+including [test](https://github.com/rynfar/meridian/actions/runs/36831203611/job/110267982115)
+pass. Nate Berkopec co-author trailer verified; issue closed by validated fix.
+
+OpenCode scrub #5 accepted with correction in merged
+[scrub #19](https://github.com/rynfar/meridian-plugin-opencode-scrub/pull/19).
+Source `40094cd9adaef32456befa54c1b969d611785395` retained as authored cherry
+`eddcf85a40701b94c6b95cfbe16b7cd644d57350`, maintainer correction `a2c479c`.
+Restore current guards/OMO fixes and remove environment preamble in minimal
+mode while keeping cwd, policy and optional identity rewrite. 28 tests / zero
+fail, typecheck/build/pack, two default fixtures byte-identical to main; actual
+OpenCode 1.18.33 / Opus 5.5 / SDK 0.2.141 / Code 2.1.284 on macOS arm64 passes
+actual read receipts/same-session continuation in both modes, independent
+installed tarball. Final escrowed minimal harness rerun also passes. Final-head
+[build CI](https://github.com/rynfar/meridian-plugin-opencode-scrub/actions/runs/36832792431/job/110273021200)
+passes. Merge `77316d2ba4ed77ef3d5f12e40256ba1c3699d85a`, tree
+`fbb9c0a4e44ab2161a0854fe93c305db30cc3b2d` equals tested `a2c479c`.
+briankeefe human co-author verified; source unchanged before closure. No
+publication. [Durable plugin proof](https://github.com/rynfar/meridian-plugin-opencode-scrub/blob/main/docs/evidence/5-minimal-mode.md).
+
+[Complete refreshed dispositions](BACKLOG_DISPOSITIONS_2026-10-01.md) record
+all remaining source heads, product-fit/regression findings and observable
+revisit triggers, including reproduced #792 prototype-dictionary skip. Current
+owner closure of #1009 does not supply historical missing abort-window proof.
+No release or external message performed. The queue retains explicit public
+contract, actual-client evidence, dedicated-lane and credential gates; it is not
+empty. Refresh live status before resuming any deferred item.
+
+## Historical PR review and plan (2026-09-29)
+
+Live inventory: 12 Meridian PRs and two OpenCode scrub PRs, refreshed against
+`0ec52a28d9c70d0f9aa84767613c7a08125d25e4`. See the
+[prioritized plan](PR_REVIEW_PLAN_2026-09-29.md) for each source head,
+disposition, correction and E2E gate. This supersedes historical ready/draft
+status for #792 (now ready); #1192 remains draft under author observation.
+
+Delivery [#1196](https://github.com/rynfar/meridian/pull/1196) was open at this checkpoint; it is now merged as recorded above.
+Local gates passed: 4,943 tests, 0 failures, 4 skips; typecheck/build and the
+retained browser probe passed. Required final-head CI remains tracked on the PR.
+
+#1191 is incorporated as authored commit `de0f00329ce0468e3b3bc274e197fbbd199fa407`
+in `/tmp/meridian-review-20260929`, branch `codex/pr-review-plan-20260929`.
+[Independent browser evidence](evidence/1191-settings-overflow.md) proves the
+pricing overflow fix at 375px with a failing rule-removal control and desktop
+parity. Other viewport overflow remains outside the pricing table. The larger
+PRs have a triage plan, not completed independent acceptance validation.
+No merge/release/comment/source closure is authorized or performed by this entry.
+
+
 ## Contributor fix batch #1174/#1178/#1172/#1173/#1169 (2026-09-28)
 
 Live queue at start: 9 contributor PRs plus release PR #1167 and own #1050, from

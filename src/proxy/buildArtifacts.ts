@@ -1,8 +1,9 @@
-import { createHash, randomUUID } from "node:crypto"
-import { existsSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs"
-import { join, resolve } from "node:path"
+import { randomUUID } from "node:crypto"
+import { existsSync, opendirSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
 import { z } from "zod"
 import { BuildProvenanceError, gitOutput, snapshotSource } from "./buildSnapshot"
+import { fingerprintBudget, fingerprintFile, readProvenanceText } from "./buildFingerprint"
 import { acquireBuildLock, buildBusy } from "./buildLock"
 export { acquireBuildLock } from "./buildLock"
 
@@ -22,20 +23,30 @@ export const buildManifestSchema = z.object({
 export type BuildManifest = z.infer<typeof buildManifestSchema>
 
 export function buildStore(root: string): string {
-  if (resolve(gitOutput(root, ["rev-parse", "--show-toplevel"])) !== resolve(root)) throw new BuildProvenanceError("invalid")
+  if (realpathSync(gitOutput(root, ["rev-parse", "--show-toplevel"])) !== realpathSync(root)) throw new BuildProvenanceError("invalid")
   return join(gitOutput(root, ["rev-parse", "--absolute-git-dir"]), "meridian-builds")
 }
 
 export function artifactInventory(directory: string): Record<string, string> {
-  const entries: Record<string, string> = {}
-  function visit(relative: string): void {
-    for (const item of readdirSync(join(directory, relative), { withFileTypes: true })) {
-      const name = relative ? `${relative}/${item.name}` : item.name
-      if (name === "build-provenance.json") continue
-      if (item.isDirectory()) visit(name)
-      else if (item.isFile()) entries[name] = createHash("sha256").update(readFileSync(join(directory, name))).digest("hex")
-      else throw new BuildProvenanceError("invalid")
-    }
+  const entries: Record<string, string> = Object.create(null)
+  const budget = fingerprintBudget()
+  function visit(relative: string, depth = 0): void {
+    budget.check()
+    if (depth > 32) throw new BuildProvenanceError("invalid")
+    const directoryHandle = opendirSync(join(directory, relative))
+    try {
+      for (;;) {
+        budget.check()
+        const item = directoryHandle.readSync()
+        if (!item) break
+        budget.entry()
+        const name = relative ? `${relative}/${item.name}` : item.name
+        if (name === "build-provenance.json") continue
+        if (item.isDirectory()) visit(name, depth + 1)
+        else if (item.isFile()) entries[name] = fingerprintFile(join(directory, name), budget)
+        else throw new BuildProvenanceError("invalid")
+      }
+    } finally { directoryHandle.closeSync() }
   }
   visit("")
   return Object.fromEntries(Object.entries(entries).sort(([a], [b]) => a.localeCompare(b)))
@@ -44,12 +55,12 @@ export function artifactInventory(directory: string): Record<string, string> {
 export function readCertifiedBuild(root: string): BuildManifest {
   const store = buildStore(root)
   if (buildBusy(store)) throw new BuildProvenanceError("building")
-  const raw = readFileSync(join(root, "dist/build-provenance.json"), "utf8")
+  const raw = readProvenanceText(join(root, "dist/build-provenance.json"))
   const manifest = buildManifestSchema.parse(JSON.parse(raw))
-  const scope = z.string().uuid().parse(readFileSync(join(store, "scope"), "utf8"))
-  const record = readFileSync(join(store, `${manifest.build.counter}.json`), "utf8")
+  const scope = z.string().uuid().parse(readProvenanceText(join(store, "scope"), 128))
+  const record = readProvenanceText(join(store, `${manifest.build.counter}.json`))
   if (scope !== manifest.build.counterScope || record !== raw || JSON.stringify(artifactInventory(join(root, "dist"))) !== JSON.stringify(manifest.artifacts)) throw new BuildProvenanceError("invalid")
-  if (buildBusy(store) || readFileSync(join(root, "dist/build-provenance.json"), "utf8") !== raw) throw new BuildProvenanceError("building")
+  if (buildBusy(store) || readProvenanceText(join(root, "dist/build-provenance.json")) !== raw) throw new BuildProvenanceError("building")
   return manifest
 }
 
@@ -59,10 +70,10 @@ export function certifyBuild(root: string, gates: (identity: BuildManifest["buil
   try {
     const scopePath = join(store, "scope")
     if (!existsSync(scopePath)) writeFileSync(scopePath, randomUUID(), { flag: "wx", mode: 0o600 })
-    const counterScope = z.string().uuid().parse(readFileSync(scopePath, "utf8"))
+    const counterScope = z.string().uuid().parse(readProvenanceText(scopePath, 128))
     const counters = readdirSync(store).filter(name => /^\d+\.json$/.test(name)).map(name => Number(name.slice(0, -5)))
     for (const completed of counters) {
-      const record = buildManifestSchema.parse(JSON.parse(readFileSync(join(store, `${completed}.json`), "utf8")))
+      const record = buildManifestSchema.parse(JSON.parse(readProvenanceText(join(store, `${completed}.json`))))
       if (record.build.counter !== completed || record.build.counterScope !== counterScope) throw new BuildProvenanceError("invalid")
     }
     const counter = Math.max(0, ...counters) + 1

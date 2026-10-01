@@ -125,7 +125,10 @@ describe("terminal publication under a stalled lifecycle lock", () => {
       it(`delivers the answered ${stream ? "stream" : "non-stream"} turn when ${step} cannot be admitted`, async () => {
         const { app, sweepSessionGc } = createProxyServer({ port: 0, host: "127.0.0.1", silent: true, profiles })
         const key = `degrade-${stream ? "stream" : "json"}-${step}`
-        expect((await app.fetch(turn(key, FIRST_TURN, false))).status).toBe(200)
+        const first = await app.fetch(turn(key, FIRST_TURN, false))
+        expect(first.status).toBe(200)
+        // GET /inflight counts a request until its response body is consumed.
+        await first.text()
         const before = lookupSharedSession(`personal:${key}`)
         expect(before).toBeDefined()
 

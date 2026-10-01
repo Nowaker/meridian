@@ -691,7 +691,7 @@ async function loadUpdates() {
     state,
     cfg.envOptOut ? ' <span style="font-size:11px;color:var(--yellow)">(MERIDIAN_NO_UPDATE_CHECK=1 wins over this setting)</span>' : '')
     + '<div class="pricing-note" style="margin-top:4px">Running ' + telemetryEsc(build.version || 'unknown')
-      + (build.source && build.source !== 'npm' ? ' from a ' + telemetryEsc(build.source) + ' build, so that version is the release its tree descends from' : '')
+      + (build.source && build.source !== 'npm' ? ' from a ' + telemetryEsc(build.source) + ' build; the header shows its separate release and runtime provenance' : '')
       + '.</div>';
 
   const box = document.getElementById('upd-enabled');

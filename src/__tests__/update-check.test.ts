@@ -54,6 +54,13 @@ function countingFetch(value: string | undefined) {
 }
 
 describe("checkForUpdate", () => {
+  test("disabling while the disk cache is being read prevents a later network request", async () => {
+    const { state, fetchLatest } = countingFetch("1.99.0")
+    const pending = checkForUpdate({ cachePath, fetchLatest })
+    setSetting("checkForUpdates", false)
+    expect(await pending).toBeUndefined()
+    expect(state.calls).toBe(0)
+  })
   test("fetches and caches on a cold start", async () => {
     const { state, fetchLatest } = countingFetch("1.63.0")
     expect(await checkForUpdate({ cachePath, fetchLatest })).toBe("1.63.0")

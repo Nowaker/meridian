@@ -26,9 +26,16 @@ const SECRETS = `Bearer bearermarkerbearermarker sk-ant-oat01-OATMARKEROATMARKER
 
 for (const failure of (process.env.REPORTER_FAIL ?? "").split(",").filter(Boolean)) {
   if (failure === "throw") setTimeout(() => { throw new Error(`thrown ${SECRETS}`) }, 10)
-  if (failure === "reject") void Promise.reject(new Error(`rejected ${SECRETS}`))
+  if (failure === "reject") {
+    const error = new Error(`rejected ${SECRETS}`)
+    if (process.env.REPORTER_NAME) error.name = process.env.REPORTER_NAME
+    void Promise.reject(error)
+  }
   if (failure === "reject-undefined") void Promise.reject(undefined)
 }
 
 const lingerMs = Number(process.env.REPORTER_LINGER_MS ?? "0")
-if (lingerMs > 0) setTimeout(() => process.exit(0), lingerMs)
+if (lingerMs > 0) setTimeout(() => {
+  if (process.env.REPORTER_NATURAL_EXIT === "1") console.error("Reporter probe survived")
+  else process.exit(0)
+}, lingerMs)

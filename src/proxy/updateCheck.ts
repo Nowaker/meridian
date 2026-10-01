@@ -100,6 +100,9 @@ export async function checkForUpdate(options: UpdateCheckOptions = {}): Promise<
   const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS
   const now = options.now ?? Date.now
   const cached = await readCache(cachePath)
+  // The operator can disable the check while filesystem I/O is pending.
+  // Recheck before either returning cache state or starting a new connection.
+  if (!isUpdateCheckEnabled()) return undefined
 
   if (cached && now() - cached.checkedAt < ttlMs && now() >= cached.checkedAt) {
     return cached.latest

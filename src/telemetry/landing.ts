@@ -124,12 +124,12 @@ export const landingHtml = `<!DOCTYPE html>
   .prof-pop-type { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
     color: var(--accent2); margin-bottom: 8px; }
   .prof-pop-grid { display: grid; grid-template-columns: auto 1fr; gap: 5px 14px; font-size: 11px; }
+  .prof-pop-link { display: block; margin-top: 10px; font-size: 11px; color: var(--accent); text-decoration: none; }
+  .prof-pop-link:hover { text-decoration: underline; }
   .prof-pop-label { color: var(--muted); white-space: nowrap; }
   .prof-pop-value { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; word-break: break-word; }
   .prof-pop-value.status-ok { color: var(--green); }
   .prof-pop-value.status-err { color: var(--red); }
-  .prof-pop-link { display: block; margin-top: 10px; font-size: 11px; color: var(--accent); text-decoration: none; }
-  .prof-pop-link:hover { text-decoration: underline; }
   /* A hidden overlay still counts toward the page's scroll width, and one
      hung off the icon at 256px or more reaches past a phone's right edge.
      On a narrow screen it spans the card's header row instead. */
@@ -177,10 +177,10 @@ export const landingHtml = `<!DOCTYPE html>
 
   /* Tabs rather than a dropdown: the current order stays legible without
      opening anything, which is the whole job of this page. */
-  .section-head { display: flex; align-items: baseline; justify-content: space-between;
+  .section-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
     gap: 12px; margin-bottom: 12px; }
   .section-head .section-title { margin-bottom: 0; }
-  .sort-tabs { display: flex; gap: 2px; flex-shrink: 0; }
+  .sort-tabs { display: flex; flex-wrap: wrap; gap: 2px; min-width: 0; max-width: 100%; }
   .sort-tab { background: none; border: none; border-bottom: 2px solid transparent;
     color: var(--muted); font-family: inherit; font-size: 11px; font-weight: 500;
     letter-spacing: 0.3px; padding: 2px 8px 3px; cursor: pointer; }

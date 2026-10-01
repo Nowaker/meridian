@@ -6,6 +6,50 @@ Live tests against the real proxy + Claude Max SDK. These verify the full reques
 
 > **Droid tests (D1–D10)** additionally require `droid` installed (`droid --version` ≥ 0.89.0) and a Factory AI account for BYOK configuration. Tests D1–D10 cover internal mode (the default). Passthrough mode for Droid is opt-in via `MERIDIAN_PASSTHROUGH=1` and requires `droid` ≥ 0.109 — see "Droid passthrough mode" below.
 
+## Large session-store mutation and actual OpenCode continuation
+
+```sh
+bun scripts/e2e-session-store-cost.mjs
+E2E_SESSION_STORE_FIXTURE=<printed-artifact>/sessions.json \
+E2E_TOOL_RECEIPT=1 E2E_CONCURRENCY=2 E2E_MODEL=claude-opus-5-5 \
+E2E_PLUGIN_PATH=<installed-opencode-scrub>/dist/index.js \
+bun scripts/e2e-opencode-lifecycle-admission.mjs
+```
+
+The first harness measures 30 writes against a disposable 19.3 MB / 856-entry
+store and asserts retained history; compare the same script on unchanged main.
+It reports timing without enforcing a noisy benchmark threshold.
+`--trace-freeze` measures cold-lookup freeze work when diagnosing overhead.
+The actual headless OpenCode gate runs two isolated clients against that large
+store. Each must execute a real read whose random client-only file receipt
+reaches the SDK through a tool-result request, then complete a same-session
+follow-up. This opt-in fixture enables client tools inside disposable projects;
+normal admission-gate runs retain their existing denied-tool configuration.
+Run all four live E41 modes alongside it for changes to store/resume behavior.
+See [review and before/after evidence](docs/maintenance/evidence/1186-store-mutation.md).
+
+## Auth-status refresh responsiveness
+
+```sh
+bun scripts/e2e-auth-status-refresh.mjs
+```
+
+Requires actual Claude login on macOS/Linux. The gate forwards to the installed
+Claude CLI, delaying only `auth status` by two seconds. Five concurrent warm
+`/health` probes must answer within one second while a single refresh remains
+in flight; `/v1/models` must also answer during that refresh. It asserts healthy
+actual login and that fresh probes do not start another subprocess. Disposable
+configuration/session/work directories and read-only credentials isolate state.
+No authentication payload is fabricated. On an unchanged pre-fix checkout,
+the same harness with `--expect-blocking` must exhibit the two-second stall.
+
+Verified macOS arm64 with Claude Code 2.1.284: baseline five probes 2258 ms
+each; fixed probes 2–4 ms, one real refresh. Adjacent actual headless OpenCode
+1.18.33 / Opus 5.5 / scrub 0.2.3 same-session continuation passed.
+See [durable evidence](docs/maintenance/evidence/1197-auth-refresh.md).
+This demonstrates a controlled auth-subprocess delay, not a reproduction of
+the contributor's entire overloaded Linux deployment or Windows behavior.
+
 ## Local build provenance
 
 ```sh
@@ -849,8 +893,7 @@ curl -s -X PUT -H 'Content-Type: application/json' -d '{"checkForUpdates":false}
 - Switching on returns `build.latest: "1.99.0"` and `updateAvailable: true` for a 1.x checkout, and writes `"checkForUpdates": true` to `$BASE/config/settings.json`.
 - Switching off returns no `build.latest`, and `/health` drops it too.
 - In a browser at 375 and 1280 px, the header reads Operational, then the
-  running version (the violet provenance pill for a checkout, e.g.
-  `v1.77.1 · local #3 · <branch> · <sha>`), then a blue **update available**
+  version (`v1.77.1 local` for a checkout), then a blue **update available**
   link to the releases page. Clearing the Updates toggle on `/settings` hides
   the link and leaves the version.
 
@@ -6884,3 +6927,174 @@ disk 1,400-resource / 800-pin / 24-registration test in
 The [sanitized #1152 Linux evidence](docs/maintenance/evidence/1152-opencode-admission.json)
 records the matching baseline, six-client pass, disk contention and four E41
 results without publishing credentials or raw transcripts.
+
+## Desktop Dock preference and account sign-in UX (2026-09-29)
+
+Baseline: `446a0f163` / Meridian Desktop 1.78.0 on macOS arm64. The released
+app had no Dock visibility preference; sign-in prepended a panel without moving
+the viewport, cancellation surfaced as failure, and completion removed the
+panel without a persistent result.
+
+The local `1.78.0-local.1` app was built with Electron 44.3.0, signed with the
+owner's Developer ID, signature-verified, and installed in Applications. It is
+not a notarized/public release. The original signed 1.78.0 app was retained as a
+local backup. No service package or credential format changed.
+
+Reproduce the native Dock gate (no model calls or credentials required):
+
+```sh
+npm ci --prefix apps/desktop
+npm run build --prefix apps/desktop
+env -u ELECTRON_RUN_AS_NODE apps/desktop/node_modules/.bin/electron scripts/e2e-desktop-dock.cjs
+env -u ELECTRON_RUN_AS_NODE E2E_HIDE_DOCK=0 apps/desktop/node_modules/.bin/electron scripts/e2e-desktop-dock.cjs
+```
+
+Both modes passed: native `app.dock.isVisible()` matches saved settings,
+dashboard and tray panel load, background launch keeps windows hidden,
+activation/second launch reopen the dashboard without changing Dock visibility,
+and closing the dashboard keeps the application alive. The harness uses
+disposable preferences and never starts a managed service.
+
+Actual packaged-app UI checks: enabled Hide Dock icon, retained Open at login,
+enabled managed-service autostart, relaunched, and observed the existing managed
+1.78.0 service healthy. The real installed 1.78.0 CLI prepared a Claude sign-in
+link for an existing account. The final two-step panel is visible immediately
+above account controls; its code field is masked. Cancelling produced the
+persistent neutral cancellation state and restored the account sign-in actions.
+Before/after native screenshots were inspected in the working session; they
+are not public artifacts. No authorization code or OAuth URL was exported.
+
+`desktop-manager.test.ts` passes all 16 tests, including real fixture-child
+link preparation, premature/duplicate-code rejection, persistent success,
+failure/retry, cancellation/retry, and Dock preference persistence. Full
+`npm test`, root typecheck/build, and desktop typecheck/build passed. Focused
+manager checks and desktop build were repeated after review corrections.
+
+Adversarial review found and corrected the off-screen sign-in panel, focus
+blocking asynchronous completion feedback, duplicate code submission, cancellation
+being treated as failure, and a potential repeated Dock-show retry on failure.
+Default Dock behavior and non-macOS presentation remain unchanged. The preference
+is applied only after the tray exists, and delayed hide handles Electron's
+one-second native hide limitation. External services retain ownership; their
+account actions only copy validated CLI commands.
+
+Remaining acceptance evidence: complete a successful browser OAuth sign-in in
+the final app with the intended account, then verify identity/usage refresh.
+Success/failure completion is covered by real fixture subprocesses, not a claim
+of live OAuth completion. The PR remains draft pending that check. No model call
+is implicated by this desktop-only change, and no release was published.
+
+
+### Menu-bar readability follow-up (2026-09-29)
+
+The user's screenshot of `1.78.0-local.1` showed a clipped account name/action
+and horizontal scrolling because organization, plan and allowance badges all
+refused to shrink in the same flex row. The follow-up separates account identity,
+metadata and organization; primary limits remain side by side and secondary
+limits use an accessible disclosure. Activity numbers use equal visual weight
+and compact formatting, with exact counts in tooltips. Service controls remain
+outside the account scroll area. Colors come from the desktop theme tokens.
+
+A signed `1.78.0-local.2` app was installed and signature-verified on macOS arm64.
+Actual native screenshots confirmed both real accounts, organization lines,
+active/switch controls, primary limits, reset text, footer and service controls
+fit without horizontal or vertical scrolling in the default 420px panel. Opening
+additional limits leaves only the account list scrollable. Inspection caught and
+corrected nested outer/list scrollbars before the final local install. Native
+expand/collapse and service health checks passed; the selected account was not
+changed during live verification. Model calls are not implicated by this layout.
+
+Reproduce the overflow checks without credentials:
+
+```sh
+npm run build --prefix apps/desktop
+node scripts/preview-desktop-tray.mjs
+# Open http://127.0.0.1:4319/review (420 × 640 iframe).
+# In the review page console:
+# document.querySelector('iframe').contentWindow.assertTrayLayout()
+```
+
+The fixture uses the actual bundled tray renderer/styles and synthetic account
+metadata. Checks passed in dark/light appearances, with long organization/name
+strings, large counts, cached data, followed accounts, expanded limits and a
+420 × 400 viewport. Assertions detect horizontal overflow, identity/action
+overlap, clipped outer controls, and unnecessary default two-account scrolling.
+The extra-limit disclosure stayed open through refresh, and simulated switching
+updated the active account. Native macOS verification supplements these browser
+layout checks; it does not replace them with a different client's UI.
+
+The fixture and documented assertions are durable evidence. Screenshots were
+visually inspected in the session and kept free of OAuth URLs/codes; no public
+media upload or release was performed. Focused organization/follow rendering
+tests and desktop build passed; full validation results are recorded in the PR.
+
+### Release acceptance confirmation (2026-09-29)
+
+The owner confirmed successful account sign-in and subsequent identity/usage
+refresh in the updated installed desktop app. This is owner-observed live OAuth
+evidence, supplementing the agent-observed preparation/cancellation and native
+layout checks above; it closes the previously recorded OAuth acceptance gate.
+Final implementation `d244cc45` passed all required CI, including `test`, both
+desktop builds, Windows smoke and Docker smoke. Release publication is authorized
+by the owner and is tracked separately from local installation.
+
+### Mobile account layout and packaged favicon
+
+Use `scripts/e2e-mobile-layout.mjs` with `E2E_BASELINE_ROOT` pointing at unchanged
+main. Open its synthetic fixture URL in the collaborative browser and evaluate
+`scripts/e2e-mobile-layout-browser.js`. The real DOM matrix asserts baseline
+overflow, final page bounds, keyboard details, sort focus and rename at seven
+widths. No credentials or model calls are needed for static page layout.
+After building, `node scripts/e2e-packaged-favicon.mjs` verifies real HTTP asset
+resolution and all six page links through the bundled Node entrypoint.
+
+### Opt-in error reporting process policy
+
+After building, run `bun scripts/e2e-error-reporting-policy.mjs`. This headless
+gate compares real Node/Bun processes with reporting off/on, preserves all five
+Node rejection policies (CLI and NODE_OPTIONS), checks actual Meridian recovery
+handlers, exact-once scrubbed envelopes, and compiled `test-error-report`
+wiring. It uses an isolated local collector and synthetic errors, not a model
+or third-party ingestion account. See the retained evidence for its limits.
+
+For profile navigation and search, serve actual templates with
+`E2E_BASELINE_ROOT=<unchanged-main> bun scripts/e2e-profile-find.mjs`, open the
+reported URL in the collaborative browser, and evaluate the full expression in
+`scripts/e2e-profile-find-browser.js`. Require PASS for the mobile/desktop matrix,
+anchor/header growth, polling/focus, filter/reorder and no-routing-mutation
+controls. See `docs/maintenance/evidence/1200-profile-find.md` for evidence limits.
+
+## SDK ping idle regression (#1177)
+
+See [durable evidence](docs/maintenance/evidence/1177-sdk-ping-idle.md).
+`node scripts/repro-sdk-ping-idle.mjs` directly asserts the deadline.
+`E2E_PI_CLI=<cli.js> E2E_CLAUDE_BIN=<2.1.283> node scripts/e2e-pi-sdk-ping-idle.mjs`
+drives actual Pi/SDK/CLI against a controlled ping-only API;
+`E2E_EXPECT_STALL=0` asserts the unchanged baseline waits past its deadline.
+Use the live companion with the same client/CLI and installed Pi scrub entry:
+`E2E_MERIDIAN_ROOT=<built checkout> E2E_PI_CLI=<cli.js> E2E_CLAUDE_BIN=<2.1.283> E2E_PLUGIN_PATH=<entrypoint> node scripts/e2e-pi-live-idle-control.mjs`.
+The controlled upstream is not a live model; the companion uses actual Opus 5.5
+and proves a real read receipt and Pi session continuation.
+
+For synthetic build-header state inspection, run
+`bun scripts/e2e-build-header-fixture.ts` and open loopback port 42213 with
+`?state=current`, `behind`, `rollback`, `source-changed`, `invalid`, `unknown`,
+`failure` or `npm`. Inspect identity, drift, health, safe links and focus after
+a repeated poll. `/fixture-observations` counts drift requests; the npm state
+must stay at zero. This fixture uses the actual shared header but supplies
+synthetic API states; it does not prove real artifact certification, which
+requires `node scripts/e2e-build-provenance.mjs` separately. It uses no model or
+credentials. [Incorporation evidence](docs/maintenance/evidence/1171-build-provenance.md)
+records the platform and measured preview viewport.
+
+## Client HTTP activity (#1190)
+
+After build, run `E2E_AUTH_FILE=<private access-only JSON snapshot>
+E2E_PLUGIN_PATH=<independently installed scrub entrypoint> bun
+scripts/e2e-inflight-client.mjs`. The actual OpenCode/SDK/model gate launches two
+independent clients, observes active/queued/idle counts over real sockets, checks
+forwarding refusal, and resumes one client's conversation. The snapshot contains
+`accessToken` and `expiresAt`, never a refresh token, and must stay mode 0600.
+The proxy uses a read-only isolated OAuth-token profile. The endpoint describes
+`scope: client-http`; zero cannot establish background-job, pending-continuation
+or post-probe restart safety. See the durable [evidence](docs/maintenance/evidence/1190-request-activity.md).

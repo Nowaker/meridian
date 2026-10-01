@@ -100,6 +100,11 @@ describe("update settings routes", () => {
     expect(state.enabled).toBe(false)
   })
 
+  it("refuses a null settings body without changing the disabled setting", async () => {
+    expect((await put(null)).status).toBe(400)
+    expect((await get()).enabled).toBe(false)
+  })
+
   it("makes no registry request while off, whatever reads the state", async () => {
     await startUpdateCheck()
     await get()

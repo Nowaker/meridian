@@ -371,13 +371,9 @@ indistinguishable from one serving the published version.
 | `latest` | Newest published version, from the cached registry check. Absent until the check resolves, and on the first run of a fresh install. |
 | `updateAvailable` | `latest` is strictly newer than `version`. Absent — not `false` — while `latest` is unknown, because "not checked" and "current" are different claims. |
 
-The site header renders this to the right of the health pill. An npm install
-shows its version (`v1.77.1`). A local build shows its release base, build
-number (or explicit source/unnumbered status), branch, short commit and dirty
-marker; branch/commit links are blue and metadata is violet. A blue **update
-available** badge follows either one when a newer release is published. A
-checkout compares its `package.json` version too, so it is told as well; its
-tooltip says to pull and rebuild rather than to run `npm install -g`.
+The site header always shows the running npm version. Local builds show their
+release base, build number (or explicit source/unnumbered status), branch, short
+commit and dirty marker. Branch/commit links are blue; metadata is violet.
 
 `GET /build-status` is available only for local/dev execution and uses the
 existing optional API-key protection. It returns `{runtime, latest?, state,
@@ -506,11 +502,12 @@ The idle exit setting is optional. It starts a graceful shutdown after the confi
 
 ## Restarting when idle
 
-`GET /inflight` tells a supervisor on the same host whether restarting
-Meridian now would cut a client off:
+`GET /inflight` lets a supervisor on the same host observe admitted client
+HTTP requests before requesting a graceful shutdown:
 
 ```json
 {
+  "scope": "client-http",
   "at": "2026-09-28T11:02:03.456Z",
   "total": 3,
   "oldestStartedAt": "2026-09-28T11:01:40.012Z",
@@ -521,15 +518,19 @@ Meridian now would cut a client off:
 }
 ```
 
-- `total` is every client request Meridian is working on or holding; `0`
-  means a restart interrupts nobody. Each request counts once: in `queued`
+- `scope` is `"client-http"`. `total` counts admitted Claude Messages requests
+  (including internal OpenAI translations) and combined Antigravity POSTs; zero
+  means that none of those requests is currently admitted. It does not mean
+  that restarting will interrupt no work. Each request counts once: in `queued`
   while it waits for its session's turn or a free SDK slot, otherwise in
   `streams` or `requests` by whether the client asked for a stream. A request
-  stays counted until its response has been fully delivered or abandoned.
+  stays counted until its application response body is consumed by the HTTP
+  adapter, cancelled or failed. This is not an acknowledgement of remote receipt.
 - `oldestStartedAt` is when the longest-running of them arrived, or `null`.
 - `antigravity` appears only with `MERIDIAN_BACKEND=combined` and counts
   `POST /antigravity/*` requests. Background Responses jobs that keep running
-  after their `POST` returned are not counted. The standalone
+  after their `POST` returned and processes waiting for a client tool result
+  are not counted. The standalone
   `MERIDIAN_BACKEND=antigravity` server does not serve `/inflight`.
 - Meridian's own background work (token refresh, usage polling, session
   cleanup) is never counted.
@@ -539,7 +540,10 @@ Meridian now would cut a client off:
   counts only: no session ids, prompts, profiles or accounts.
 
 A request arriving between a probe and the restart is not covered by the
-probe; pair it with the [graceful shutdown](#graceful-shutdown) drain.
+probe. Use the [graceful shutdown](#graceful-shutdown) drain; this endpoint
+is not an admission barrier. Background Responses jobs are not restart
+resumable, so a supervisor must also wait for those jobs and pending client
+tool continuations to finish through their own lifecycle APIs.
 
 ### Draining for a restart
 
@@ -556,6 +560,10 @@ can restart.
   shutting down. At shutdown the held requests get the shutdown `503` with
   `Retry-After`, as any new request does.
 - Held requests are not in `total`; `drain.held` counts them.
+- It holds the requests `/inflight` counts: Claude Messages (including the
+  OpenAI translations) and combined Antigravity POSTs. Background Responses
+  jobs and pending client tool continuations keep running and are not held, so
+  a supervisor still waits for them through their own lifecycle APIs.
 - Body (optional JSON): `holdMs` (default 60000, 1000-240000) and `timeoutMs`
   (default 600000, 10000-3600000). A `POST` while a drain is active changes
   nothing and answers `started: false`.
@@ -567,6 +575,7 @@ can restart.
 
 ```json
 {
+  "scope": "client-http",
   "total": 0,
   "draining": true,
   "drain": {
@@ -1155,3 +1164,11 @@ $env:ANTHROPIC_API_KEY = "x" # Use your Meridian API key if protection is enable
 
 Then follow the [setup instructions for your client](agents.md). The desktop app
 is currently a Mac preview; it is not required for Windows headless use.
+
+Local provenance verification accepts complete fingerprints only. Source and
+artifact scans allow at most 64 MiB per file, 256 MiB total, 10,000 entries,
+and two seconds of scan work; artifact traversal additionally caps depth at 32.
+Git output is capped at 2 MiB, metadata at 4 MiB (package metadata 1 MiB).
+Oversized or unavailable inputs report unavailable/invalid provenance rather
+than certifying a partial hash. A local certified build refuses such inputs;
+Git-less archives retain their uncertified build path.

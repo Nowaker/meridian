@@ -7940,6 +7940,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     let leaseWatchdog: ReturnType<typeof setTimeout> | undefined
     inFlightRequests++
     const inflightEntry = inflight.begin("claude", queueEnteredAt)
+    const finishHttpEntry = () => {
+      inflightEntry.end()
+      c.req.raw.signal.removeEventListener("abort", finishHttpEntry)
+    }
+    if (c.req.raw.signal.aborted) finishHttpEntry()
+    else c.req.raw.signal.addEventListener("abort", finishHttpEntry, { once: true })
+    const trackedResponse = (response: Response) => {
+      const tracked = onResponseDone(response, finishHttpEntry)
+      // Internal OpenAI/priority relays still await the SDK publication promise.
+      const completion = responseCompletions.get(response)
+      if (completion) responseCompletions.set(tracked, completion)
+      return tracked
+    }
     // Releasing the lease is deliberately separate from finishing the request:
     // the watchdog must be able to unblock the session without also corrupting
     // the in-flight count that the shutdown drain reads.
@@ -7987,7 +8000,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       activeRequestAborts.delete(turnWatchdogAbort)
       activeShutdownLabels.delete(turnWatchdogAbort)
       inFlightRequests--
-      inflightEntry.end()
     }
 
     let body: any
@@ -7999,16 +8011,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       } catch (error) {
         if (c.req.raw.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
           finishRequest()
-          return new Response(JSON.stringify({
+          return trackedResponse(new Response(JSON.stringify({
             type: "error",
             error: { type: "request_cancelled", message: "The request was cancelled" },
-          }), { status: 499, headers: { "Content-Type": "application/json" } })
+          }), { status: 499, headers: { "Content-Type": "application/json" } }))
         }
         finishRequest()
-        return new Response(JSON.stringify({
+        return trackedResponse(new Response(JSON.stringify({
           type: "error",
           error: { type: "invalid_request_error", message: "Request body must be valid JSON" },
-        }), { status: 400, headers: { "Content-Type": "application/json" } })
+        }), { status: 400, headers: { "Content-Type": "application/json" } }))
       }
       inflightEntry.setStream(body?.stream === true)
 
@@ -8120,23 +8132,23 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 error: "request_cancelled",
               })
               finishRequest()
-              return new Response(JSON.stringify({
+              return trackedResponse(new Response(JSON.stringify({
                 type: "error",
                 error: { type: "request_cancelled", message: "The request was cancelled" },
-              }), { status: 499, headers: { "Content-Type": "application/json" } })
+              }), { status: 499, headers: { "Content-Type": "application/json" } }))
             }
             // The local lease may already be held when the cross-process
             // acquisition fails. Never leave it wedged until the watchdog.
             releaseSessionTurn(false)
             if (error instanceof CrossProcessTurnAcquireTimeoutError) {
               finishRequest()
-              return new Response(JSON.stringify({
+              return trackedResponse(new Response(JSON.stringify({
                 type: "error",
                 error: {
                   type: "overloaded_error",
                   message: "Timed out waiting for another process to finish this session turn",
                 },
-              }), { status: 529, headers: { "Content-Type": "application/json", ...TRANSIENT_RETRY_AFTER_HEADERS } })
+              }), { status: 529, headers: { "Content-Type": "application/json", ...TRANSIENT_RETRY_AFTER_HEADERS } }))
             }
             throw error
           }
@@ -8171,9 +8183,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       } else {
         finishRequest()
       }
-      return response
+      return trackedResponse(response)
     } catch (error) {
       finishRequest()
+      finishHttpEntry()
       throw error
     }
   }
@@ -8411,8 +8424,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
   app.get("/settings/api/updates", (c) => c.json(updateSettingsState()))
   app.put("/settings/api/updates", async (c) => {
-    let body: { checkForUpdates?: unknown }
-    try { body = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
+    let input: unknown
+    try { input = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
+    if (typeof input !== "object" || input === null || Array.isArray(input)) {
+      return c.json({ error: "Settings must be a JSON object" }, 400)
+    }
+    const body = input as Record<string, unknown>
 
     if (body.checkForUpdates !== undefined) {
       if (body.checkForUpdates !== null && typeof body.checkForUpdates !== "boolean") {
@@ -8468,8 +8485,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     })
   })
 
-  // Would restarting this process now cut a client off? Counts only, for a
-  // supervisor on the same host that restarts when `total` is 0. Open like
+  // Observed client HTTP requests only, not an atomic restart/drain barrier.
+  // Background jobs and pending backend continuations are outside this scope. Open like
   // /health (no API key), but answered only to a loopback peer: the counts say
   // when this machine is being used, which nobody off the host needs to know.
   const refuseUnlessLoopback = (c: Context, route: string): Response | undefined => {

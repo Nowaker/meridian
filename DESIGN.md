@@ -175,8 +175,8 @@ account card on the home page (or the Profiles page). The header chip only
 - **Inline code chip:** mono, `--surface`/`--bg` fill, 1px border, radius
   4–5px, **violet text** (`--accent2`).
 - **Empty states:** calm centered `--muted` text in a card — never red.
-- **Header build badge:** sits right of the health pill. An npm install
-  shows its version as a muted chip (`v1.77.1`). A local or
+- **Header build badge:** a current npm install shows nothing; an
+  outdated one shows the blue update chip linking to releases. A local or
   dev build shows one violet metadata pill (release · build number or
   "source run" · branch · short commit · dirty) on a single line, with the
   branch ellipsized first and full values in the tooltip. Branch and commit
@@ -185,8 +185,6 @@ account card on the home page (or the Profiles page). The header chip only
   separate chip: muted for current or unknown states, yellow only for real
   drift ("3 builds behind", "rolled back", "source changed"). A failed
   drift refresh shows "drift unknown" and never changes the health pill.
-  Last comes the blue **update available** badge linking to releases, shown
-  for any build once the opt-in update check finds a newer release.
 
 ## 7. Principles
 
@@ -235,10 +233,15 @@ missing or stale quota data never looks like unused capacity.
 Menu-bar accounts use compact rows with side-by-side quota bars, so multiple
 accounts and their switch controls remain visible together. The active account
 shows its next reset; each limit retains full reset detail in its tooltip and
-accessible name. Account lists scroll only when they exceed the available space.
+accessible name. Account lists scroll only when they exceed the available space. Each account
+reserves a separate line for its name and action; plan/allowance and organization
+are secondary text, never a row of non-shrinking badges. The 5-hour and weekly
+limits are primary; model-specific limits live in a disclosure that stays open
+through refresh. Service controls stay outside the scrolling account list.
 
 The macOS menu-bar icon uses a transparent monochrome Meridian template, tinted
-by the system. The Dock retains the full-color app icon. Committed 18-point
+by the system. The Dock retains the full-color app icon unless the macOS **Hide Dock icon**
+preference is enabled; the menu-bar icon and dashboard remain available. Committed 18-point
 assets include 1x, 2x and 3x representations; regenerate them with
 `swift scripts/render-tray-icon.swift`.
 

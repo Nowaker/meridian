@@ -136,7 +136,7 @@ function truncate(text: string): string {
 function describe(value: unknown): { type: string; value: string; stack?: string } {
   if (value instanceof Error) {
     return {
-      type: value.name || "Error",
+      type: truncate(scrubSecrets(value.name || "Error")),
       value: truncate(scrubSecrets(value.message)),
       ...(typeof value.stack === "string" ? { stack: value.stack } : {}),
     }

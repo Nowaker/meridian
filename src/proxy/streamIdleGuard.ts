@@ -4,7 +4,8 @@
  * Wraps the provider SDK's streaming async iterable and enforces a maximum gap
  * between *real* upstream messages. If the source goes silent for longer than
  * `idleMs` — before the first chunk (slow TTFB) or mid-stream — the guard
- * aborts iteration and throws `UpstreamIdleError`.
+ * aborts iteration and throws `UpstreamIdleError`. SDK `stream_event/ping`
+ * messages are discarded: they prove transport liveness, not model progress.
  *
  * Why this is needed: the proxy emits downstream SSE heartbeats (`: ping`) on a
  * fixed interval, which resets the *client's* (pi's) byte-level idle timer. A
@@ -89,6 +90,13 @@ function yieldToIo(): Promise<void> {
   return new Promise((resolve) => setImmediate(() => setImmediate(resolve)))
 }
 
+function isSdkStreamPing(value: unknown): boolean {
+  return typeof value === "object" && value !== null
+    && "type" in value && value.type === "stream_event"
+    && "event" in value && typeof value.event === "object" && value.event !== null
+    && "type" in value.event && value.event.type === "ping"
+}
+
 export async function* guardUpstreamIdle<T>(
   source: AsyncIterable<T>,
   idleMs: number,
@@ -147,6 +155,7 @@ export async function* guardUpstreamIdle<T>(
         }
       }
       if (res.done) return
+      if (isSdkStreamPing(res.value)) continue
       lastAt = clock.now()
       yield res.value
     }

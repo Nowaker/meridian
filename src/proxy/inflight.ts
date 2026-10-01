@@ -2,9 +2,10 @@
  * Live bookkeeping of the client requests this process is working on or
  * holding, per upstream, for `GET /inflight`.
  *
- * The question it answers is "would restarting this process now cut somebody
- * off?", so an entry lives from the moment a request is admitted until its
- * response, streamed or not, has been fully delivered or abandoned. Each entry
+ * This is an observation of admitted client HTTP requests, not a restart
+ * authorization or atomic drain barrier. Background Responses jobs and pending
+ * client-tool continuations can outlive their HTTP request. An entry lives from the moment a request is admitted until its
+ * application response body, streamed or not, is consumed, cancelled or failed. Each entry
  * is counted exactly once: `queued` while it waits for its session's turn or
  * for an SDK slot, otherwise `streams` or `requests` by what the client asked
  * for. Meridian's own background work (token refresh, usage polling, session
@@ -24,6 +25,7 @@ export interface InflightCounts {
 }
 
 export interface InflightSnapshot {
+  readonly scope: "client-http"
   readonly at: string
   readonly total: number
   readonly oldestStartedAt: string | null
@@ -88,6 +90,7 @@ export class InflightRegistry {
       if (oldest === undefined || entry.startedAt < oldest) oldest = entry.startedAt
     }
     return {
+      scope: "client-http",
       at: new Date(now).toISOString(),
       total: this.entries.size,
       oldestStartedAt: oldest === undefined ? null : new Date(oldest).toISOString(),

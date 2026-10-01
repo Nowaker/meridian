@@ -1,6 +1,5 @@
 /**
- * GET /inflight: the per-upstream count of client requests a restart would
- * cut off, answered only to loopback peers.
+ * GET /inflight: observed client HTTP requests, answered only to loopback peers.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import { installSdkMock } from "./sdkMock"
@@ -10,6 +9,7 @@ import { mkdtempSync, rmSync } from "node:fs"
 import type { AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { setSessionStoreDir } from "../proxy/sessionStore"
 import { InflightRegistry, isLoopbackPeer, onResponseDone } from "../proxy/inflight"
 import {
@@ -78,9 +78,9 @@ function messages(sessionId: string, stream: boolean): Request {
   })
 }
 
-async function waitFor(predicate: () => boolean, what: string, timeoutMs = 5000): Promise<void> {
+async function waitFor(predicate: () => boolean | Promise<boolean>, what: string, timeoutMs = 5000): Promise<void> {
   const deadline = Date.now() + timeoutMs
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`)
     await Bun.sleep(2)
   }
@@ -98,6 +98,7 @@ describe("InflightRegistry", () => {
     registry.begin("antigravity", 500).setStream(true)
 
     expect(registry.snapshot(["claude"], 10_000)).toEqual({
+      scope: "client-http",
       at: new Date(10_000).toISOString(),
       total: 4,
       oldestStartedAt: new Date(500).toISOString(),
@@ -118,6 +119,7 @@ describe("InflightRegistry", () => {
     entry.end()
     entry.end()
     expect(registry.snapshot(["claude", "antigravity"], 0)).toEqual({
+      scope: "client-http",
       at: new Date(0).toISOString(),
       total: 0,
       oldestStartedAt: null,
@@ -185,7 +187,7 @@ describe("GET /inflight", () => {
       const allowed = await app.fetch(new Request("http://localhost/inflight"), LOOPBACK)
       expect(allowed.status).toBe(200)
       expect(allowed.headers.get("cache-control")).toBe("no-store")
-      expect(await allowed.json()).toMatchObject({ total: 0, oldestStartedAt: null, upstreams: { claude: { streams: 0, requests: 0, queued: 0 } } })
+      expect(await allowed.json()).toMatchObject({ scope: "client-http", total: 0, oldestStartedAt: null, upstreams: { claude: { streams: 0, requests: 0, queued: 0 } } })
 
       expect((await app.fetch(new Request("http://localhost/inflight"))).status).toBe(403)
       expect((await app.fetch(new Request("http://localhost/inflight"), { incoming: { socket: { remoteAddress: "192.168.1.20" } } })).status).toBe(403)
@@ -224,6 +226,9 @@ describe("GET /inflight", () => {
     await streamed.text()
     await waitFor(() => controls.length === 2, "the next request to reach the SDK")
     await controls[1]!.started
+    // Another request can briefly leave its turn queue before entering the SDK
+    // queue. Reaching the SDK in one request does not synchronize that transition.
+    await waitFor(async () => (await snapshot()).upstreams.claude!.queued === 1, "the remaining SDK waiter")
     seen = await snapshot()
     expect(seen.total).toBe(2)
     expect(seen.upstreams.claude).toEqual({ streams: 0, requests: 1, queued: 1 })
@@ -234,10 +239,46 @@ describe("GET /inflight", () => {
       for (const control of controls) control.release()
       await Bun.sleep(5)
     }
-    await both
+    const buffered = await both
+    expect((await snapshot()).total).toBe(2)
+    await Promise.all(buffered.map(response => response.text()))
     seen = await snapshot()
     expect(seen.total).toBe(0)
     expect(seen.upstreams.claude).toEqual({ streams: 0, requests: 0, queued: 0 })
+  }, 20_000)
+
+  for (const stream of [false, true]) {
+    it(`retains a ${stream ? "streamed" : "buffered"} HTTP response after SDK work settles until its body is consumed`, async () => {
+      const backend = createProxyServer({ silent: true })
+      const pending = backend.app.fetch(messages("retained-body", stream))
+      await waitFor(() => controls.length === 1, "the SDK request")
+      controls[0]!.release()
+      const response = await pending
+      await waitFor(() => backend.getInFlightCount?.() === 0, "SDK work settlement")
+      const snapshot = async () => (await (await backend.app.fetch(new Request("http://localhost/inflight"), LOOPBACK)).json()) as { total: number }
+      expect((await snapshot()).total).toBe(1)
+      await response.text()
+      expect((await snapshot()).total).toBe(0)
+    })
+  }
+
+  it.skipIf(process.platform === "win32")("reports HTTP idle while an explicitly out-of-scope background response still runs", async () => {
+    const backend = createProxyServer({ backend: "combined", silent: true,
+      antigravity: { executable: fileURLToPath(new URL("./fixtures/agy-cli.cjs", import.meta.url)), allowToolBridge: true } })
+    const post = await backend.app.fetch(new Request("http://localhost/antigravity/v1/responses", {
+      method: "POST", body: JSON.stringify({ model: "fixture-model", input: "HANG", background: true }),
+    }))
+    try {
+      expect(post.status).toBe(200)
+      const job = await post.json() as { id: string; status: string }
+      const work = await (await backend.app.fetch(new Request(`http://localhost/antigravity/v1/responses/${job.id}`))).json() as { status: string }
+      expect(["queued", "in_progress"]).toContain(work.status)
+      const observed = await (await backend.app.fetch(new Request("http://localhost/inflight"), LOOPBACK)).json()
+      expect(observed).toMatchObject({ scope: "client-http", total: 0 })
+      expect(JSON.stringify(observed)).not.toContain(job.id)
+      const cancel = await backend.app.fetch(new Request(`http://localhost/antigravity/v1/responses/${job.id}/cancel`, { method: "POST" }))
+      expect((await cancel.json() as {status:string}).status).toBe("cancelled")
+    } finally { await backend.closeBackend?.() }
   }, 20_000)
 
   it("reads the real socket peer when served over HTTP", async () => {

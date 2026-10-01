@@ -63,18 +63,17 @@ export interface MeridianSettings {
   /** Entries the in-memory diagnostic log ring holds. MERIDIAN_DIAGNOSTIC_LOG_SIZE wins. */
   diagnosticLogSize?: number
 
-  /** Ask the npm registry once a day whether a newer Meridian is published.
-   *  Off unless switched on: an instance only reaches a third party on a timer
-   *  because someone asked it to. The header shows the running version either
-   *  way. MERIDIAN_NO_UPDATE_CHECK=1 forces it off regardless. */
-  checkForUpdates?: boolean
-
   /**
    * Sentry-protocol DSN (GlitchTip, Sentry) that Meridian's own uncaught
    * exceptions and unhandled rejections are reported to. Unset means off.
    * MERIDIAN_ERROR_REPORTING_DSN wins. Read once at startup.
    */
   errorReportingDsn?: string
+  /** Ask the npm registry once a day whether a newer Meridian is published.
+   *  Off unless switched on: an instance only reaches a third party on a timer
+   *  because someone asked it to. The header shows the running version either
+   *  way. MERIDIAN_NO_UPDATE_CHECK=1 forces it off regardless. */
+  checkForUpdates?: boolean
 }
 
 /**

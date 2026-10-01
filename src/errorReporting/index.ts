@@ -11,8 +11,9 @@
  * observes an uncaught exception without handling it: the Meridian CLI's own
  * recovering handler still recovers, and a process without one still crashes.
  * `unhandledRejection` is different: ANY listener suppresses the runtime's
- * default crash. So when this listener is the only one it rethrows the reason
- * after recording it, which exits exactly as an unobserved rejection does; when
+ * default behavior. With no other listener it honors Node's rejection policy:
+ * fatal modes rethrow, warning/none modes survive, and warn-with-error-code
+ * retains exit code 1. CLI options override NODE_OPTIONS. When
  * somebody else also listens (the CLI does) it records and leaves the decision
  * to them. The rethrow reaches the monitor, which recognises it and does not
  * record it twice.
@@ -28,6 +29,7 @@
  * error with its own.
  */
 
+import { nodeRejectionPolicy } from "./rejectionPolicy"
 import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import * as fs from "node:fs"
@@ -64,6 +66,7 @@ interface ReporterState {
   readonly release?: string
   /** The rejection this module is rethrowing, boxed so `undefined` reasons still match. */
   rethrowing: { readonly value: unknown } | undefined
+  strictRejectionObserved: boolean
   windowStart: number
   windowCount: number
   flushing: boolean
@@ -231,24 +234,33 @@ export function installErrorReporter(options: ErrorReporterOptions = {}): boolea
       },
       ...(options.version ? { release: `meridian@${options.version}` } : {}),
       rethrowing: undefined,
+      strictRejectionObserved: false,
       windowStart: 0,
       windowCount: 0,
       flushing: false,
       flushAgain: false,
     }
+    const policy = process.versions.bun ? "throw" : nodeRejectionPolicy(process.execArgv, process.env.NODE_OPTIONS)
     slot[STATE] = state
     process.on("uncaughtExceptionMonitor", (error, origin) => {
       if (state.rethrowing !== undefined && error === state.rethrowing.value) {
         state.rethrowing = undefined
         return
       }
+      if (policy === "strict" && origin === "unhandledRejection") {
+        state.strictRejectionObserved = true
+        queueMicrotask(() => { state.strictRejectionObserved = false })
+      }
       const survives = process.listenerCount("uncaughtException") > 0
       capture(state, error, origin === "unhandledRejection" ? "onunhandledrejection" : "onuncaughtexception", survives)
     })
     process.on("unhandledRejection", (reason) => {
+      if (state.strictRejectionObserved) { state.strictRejectionObserved = false; return }
       const sole = process.listenerCount("unhandledRejection") === 1
-      capture(state, reason, "onunhandledrejection", !sole)
-      if (sole) {
+      const fatal = sole && (policy === "throw" || policy === "strict")
+      capture(state, reason, "onunhandledrejection", !fatal)
+      if (sole && policy === "warn-with-error-code") process.exitCode = 1
+      if (fatal) {
         state.rethrowing = { value: reason }
         throw reason
       }
