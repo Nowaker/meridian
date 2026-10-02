@@ -87,6 +87,20 @@ export type LoopbackHandler = (query: URLSearchParams) => Promise<{ status: numb
 /** What the caller attached to a sign-in when starting it, handed back with the account. */
 export interface ChatGptLoginContext {
   name: string | null
+  /** The seat this sign-in renews, when it was started from that seat's card; null for a new seat. */
+  seat: string | null
+}
+
+/**
+ * The seat a sign-in must come back as. A re-login started from a seat's card
+ * is refused when ChatGPT hands back a different account or workspace, so the
+ * person who picked the wrong account learns that instead of finding a second
+ * seat filed under the wrong name.
+ */
+export interface ChatGptExpectedSeat {
+  seat: string
+  /** How the page names the seat, for the refusal. */
+  label: string
 }
 
 export interface ChatGptLoginOptions {
@@ -104,8 +118,8 @@ export interface ChatGptLoginOptions {
 }
 
 export interface ChatGptLogin {
-  start(options?: { returnTo?: string | null; name?: string | null }): Promise<ChatGptLoginStart>
-  startDevice(options?: { name?: string | null }): Promise<ChatGptDeviceStart>
+  start(options?: { returnTo?: string | null; name?: string | null; expect?: ChatGptExpectedSeat | null }): Promise<ChatGptLoginStart>
+  startDevice(options?: { name?: string | null; expect?: ChatGptExpectedSeat | null }): Promise<ChatGptDeviceStart>
   status(connectId: string): ChatGptLoginState | undefined
   /** Finish a browser-redirect sign-in from the address the browser landed on, pasted into the page. */
   complete(connectId: string, pasted: string): Promise<ChatGptLoginCompletion>
@@ -122,6 +136,7 @@ interface PendingLogin {
   expiresAt: number
   returnTo: string | null
   name: string | null
+  expect: ChatGptExpectedSeat | null
   outcome: ChatGptLoginState
   stopPolling?: () => void
 }
@@ -278,6 +293,13 @@ export function createChatGptLogin(options: ChatGptLoginOptions): ChatGptLogin {
     if (!accountUserId || !accountId) return fail(502, "no_chatgpt_seat", "This sign-in carries no ChatGPT workspace seat. Sign in with an account that has a ChatGPT plan.")
     const expiresIn = typeof body?.expires_in === "number" && Number.isFinite(body.expires_in) ? body.expires_in : null
     const email = emailFrom(idToken, accessToken)
+    // The new tokens are dropped, never filed: saving them would add a seat
+    // the person did not ask for, under the account they picked by mistake.
+    if (login.expect && login.expect.seat !== accountUserId) {
+      return fail(409, "wrong_account",
+        `You signed in as ${email ?? "a different account"} (workspace id:${accountUserId.slice(-6)}), not as ${login.expect.label}. `
+        + "Nothing was saved. Sign in again with the ChatGPT account and workspace this seat belongs to.")
+    }
     try {
       options.connect({
         accountUserId,
@@ -286,7 +308,7 @@ export function createChatGptLogin(options: ChatGptLoginOptions): ChatGptLogin {
         refreshToken,
         accessToken,
         expiresAt: claims?.expiresAt ?? (expiresIn === null ? null : now() + expiresIn * 1000),
-      }, { name: login.name })
+      }, { name: login.name, seat: login.expect?.seat ?? null })
     } catch (error) {
       console.error("[chatgpt] could not save a signed-in seat:", (error as Error).message)
       return fail(500, "store_write_failed", `Meridian could not save the sign-in: ${(error as Error).message}`)
@@ -392,6 +414,7 @@ export function createChatGptLogin(options: ChatGptLoginOptions): ChatGptLogin {
         expiresAt,
         returnTo: startOptions?.returnTo ?? null,
         name: startOptions?.name ?? null,
+        expect: startOptions?.expect ?? null,
         outcome: { status: "waiting", expiresAt },
       }
       logins.set(login.id, login)
@@ -450,6 +473,7 @@ export function createChatGptLogin(options: ChatGptLoginOptions): ChatGptLogin {
         expiresAt,
         returnTo: null,
         name: startOptions?.name ?? null,
+        expect: startOptions?.expect ?? null,
         outcome: { status: "waiting", expiresAt },
       }
       logins.set(login.id, login)

@@ -1007,6 +1007,52 @@ describe("owned mode signs its own seats in", () => {
     }
   })
 
+  it("signs a dead seat in again from its card under the same name, and refuses a sign-in as another seat", async () => {
+    const proxy = await server("owned")
+    await proxy.chatGpt!.acquire()
+    const signIn = async (body: Record<string, unknown>) => {
+      const started = await (await post(proxy.app, "/profiles/chatgpt/connect/start", body)).json() as { connectId: string; authorizeUrl: string }
+      const state = new URL(started.authorizeUrl).searchParams.get("state")
+      return post(proxy.app, "/profiles/chatgpt/connect/complete", { connectId: started.connectId, url: `?code=c&state=${state}` })
+    }
+    const listed = async () => (await (await proxy.app.fetch(new Request("http://localhost/profiles/list"))).json() as {
+      profiles: Array<{ id: string; seat?: string; aliases?: string[]; unavailable?: string | null }>
+    }).profiles
+    try {
+      expect((await signIn({ name: "work-pro" })).status).toBe(200)
+      const stored = () => JSON.parse(readFileSync(storePath, "utf8")) as { version: number; accounts: Array<Record<string, unknown>> }
+      const doc = stored()
+      // A refresh that died mid-exchange leaves the seat needing a login, as on the live host.
+      doc.accounts[0]!.exchangeStartedAt = 1
+      doc.accounts.push({ ...doc.accounts[0], accountUserId: "user-1__ws-1", accountId: "ws-1", email: "other@example.test", refreshToken: "rt-other", exchangeStartedAt: null })
+      writeFileSync(storePath, JSON.stringify(doc))
+      expect((await listed()).find(p => p.id === "work-pro")?.unavailable).toBe("requires_reauth")
+      const other = (await listed()).find(p => p.seat === "user-1__ws-1")!
+
+      const unknown = await post(proxy.app, "/profiles/chatgpt/connect/start", { profile: "no-such-seat" })
+      expect(unknown.status).toBe(404)
+      expect(await unknown.json()).toMatchObject({ code: "unknown_profile" })
+
+      const wrong = await signIn({ profile: other.id })
+      expect(wrong.status).toBe(409)
+      const refusal = await wrong.json() as { code: string; error: string }
+      expect(refusal.code).toBe("wrong_account")
+      expect(refusal.error).toContain("fresh@example.test")
+      expect(refusal.error).toContain(other.id)
+      expect(stored().accounts.find(a => a.accountUserId === "user-1__ws-1")).toMatchObject({ refreshToken: "rt-other", email: "other@example.test" })
+
+      const again = await signIn({ profile: "work-pro" })
+      expect(again.status).toBe(200)
+      expect(await again.json()).toEqual({ success: true, seat: "user-9__workspace-9", email: "fresh@example.test" })
+      expect(stored().accounts.map(a => [a.accountUserId, a.exchangeStartedAt])).toEqual([["user-9__workspace-9", null], ["user-1__ws-1", null]])
+      const seat = (await listed()).find(p => p.seat === "user-9__workspace-9")!
+      expect(seat).toMatchObject({ id: "work-pro", unavailable: null })
+      expect(seat.aliases).toContain("fresh-pace-9")
+    } finally {
+      proxy.chatGpt!.release()
+    }
+  })
+
   it("cancels a pending sign-in on request, so its code can no longer be spent", async () => {
     const proxy = await server("owned")
     await proxy.chatGpt!.acquire()

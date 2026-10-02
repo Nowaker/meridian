@@ -150,6 +150,37 @@ describe("ChatGPT sign-in", () => {
     expect(parseCallbackInput("http://127.0.0.1:1455/auth/callback")).toBeNull()
   })
 
+  it("signs a seat in again from its card when ChatGPT hands back that same seat", async () => {
+    const contexts: Array<{ name: string | null; seat: string | null }> = []
+    const login = createChatGptLogin({
+      connect: (_account, context) => { contexts.push(context) },
+      renderPage: () => "",
+      fetchImpl: async () => Response.json({ access_token: ACCESS, refresh_token: "rt", id_token: ID_TOKEN, expires_in: 3600 }),
+      now: () => NOW,
+      listen: async () => null,
+      log: () => {},
+    })
+    const started = await login.start({ expect: { seat: "user-1__ws-1", label: "work (seat@example.test · id:_ws-1)" } })
+    const state = new URL(started.authorizeUrl).searchParams.get("state")!
+    expect(await login.complete(started.connectId, `?code=c&state=${state}`)).toEqual({ ok: true, accountUserId: "user-1__ws-1", email: "seat@example.test" })
+    expect(contexts).toEqual([{ name: null, seat: "user-1__ws-1" }])
+  })
+
+  it("refuses a re-login that comes back as another account or workspace, and files nothing", async () => {
+    const { login, connected } = harness()
+    const started = await login.start({ expect: { seat: "user-1__ws-2", label: "dh (seat@example.test · id:_ws-2)" } })
+    const state = new URL(started.authorizeUrl).searchParams.get("state")!
+    const result = await login.complete(started.connectId, `?code=c&state=${state}`)
+    expect(result).toMatchObject({ ok: false, status: 409, code: "wrong_account" })
+    if (result.ok) throw new Error("expected a refusal")
+    expect(result.message).toContain("seat@example.test")
+    expect(result.message).toContain("id:__ws-1")
+    expect(result.message).toContain("dh (seat@example.test · id:_ws-2)")
+    expect(result.retryable).toBeUndefined()
+    expect(connected).toHaveLength(0)
+    expect(login.status(started.connectId)).toMatchObject({ status: "failed" })
+  })
+
   it("closes the redirect listener the moment its only sign-in is cancelled", async () => {
     const { login, connected, tokenCalls, closed } = harness()
     const started = await login.start()
@@ -226,6 +257,21 @@ describe("ChatGPT device-code sign-in", () => {
     expect(h.connected).toEqual([{ account: expect.objectContaining({ accountUserId: "user-1__ws-1", refreshToken: "rt-dev" }), name: "work" }])
     expect(h.login.status(started.connectId)).toEqual({ status: "completed", accountUserId: "user-1__ws-1", email: "seat@example.test" })
     expect(h.pending()).toBe(0)
+  })
+
+  it("refuses a device re-login that comes back as another seat, and the page's poll reads why", async () => {
+    const h = deviceHarness({
+      [USERCODE]: [userCode],
+      [POLL]: [() => Response.json({ authorization_code: "auth-1", code_challenge: "ch", code_verifier: "ver-1" })],
+      [TOKEN]: [() => Response.json({ access_token: ACCESS, refresh_token: "rt-dev", id_token: ID_TOKEN, expires_in: 3600 })],
+    })
+    const started = await h.login.startDevice({ expect: { seat: "user-9__ws-9", label: "other" } })
+    if (!started.ok) throw new Error("device start failed")
+    await h.tick()
+    const state = h.login.status(started.connectId)
+    expect(state?.status).toBe("failed")
+    expect(state && "message" in state ? state.message : "").toContain("not as other")
+    expect(h.connected).toHaveLength(0)
   })
 
   it("stops polling on cancel and never exchanges a code", async () => {

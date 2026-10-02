@@ -9352,18 +9352,26 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     }
   }
   // An empty name means "derive one from the account", as before naming existed.
-  const requestedSeatName = (body: Record<string, unknown>): { name: string | null } | { error: string } => {
+  // `profile` instead signs an existing seat in again from its card: it keeps
+  // its id, and ChatGPT must hand back that same account and workspace.
+  type SeatRequest = { name: string | null; expect: { seat: string; label: string } | null }
+  const requestedSeat = (body: Record<string, unknown>): SeatRequest | { error: string; code: string; status: 400 | 404 } => {
+    if (typeof body.profile === "string" && body.profile) {
+      const profile = chatGptProfiles?.resolve(body.profile)
+      if (!profile) return { error: `No ChatGPT seat is called "${body.profile}".`, code: "unknown_profile", status: 404 }
+      return { name: null, expect: { seat: profile.seat, label: `${profile.id} (${profile.label})` } }
+    }
     const name = typeof body.name === "string" ? body.name.trim() : ""
-    if (!name) return { name: null }
+    if (!name) return { name: null, expect: null }
     const problem = chatGptNameProblem(name, chatGptReservedNames())
-    return problem ? { error: problem } : { name }
+    return problem ? { error: problem, code: "invalid_profile_id", status: 400 } : { name, expect: null }
   }
 
   app.post("/profiles/chatgpt/connect/start", async (c) => {
     if (!chatGptLogin) return chatGptSignInUnavailable(c)
     const body = await readConnectBody(c)
-    const named = requestedSeatName(body)
-    if ("error" in named) return c.json({ error: named.error, code: "invalid_profile_id" }, 400)
+    const named = requestedSeat(body)
+    if ("error" in named) return c.json({ error: named.error, code: named.code }, named.status)
     // Only ever rendered as a link back from the loopback page.
     let returnTo: string | null = null
     if (typeof body.returnTo === "string") {
@@ -9374,16 +9382,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         returnTo = null
       }
     }
-    const started = await chatGptLogin.start({ returnTo, name: named.name })
-    plog(`[PROXY] ChatGPT sign-in started (browser redirect, loopback=${started.loopback})`)
+    const started = await chatGptLogin.start({ returnTo, name: named.name, expect: named.expect })
+    plog(`[PROXY] ChatGPT sign-in started (browser redirect, loopback=${started.loopback}${named.expect ? `, again for ${chatGptProfiles?.profileIdFor(named.expect.seat)}` : ""})`)
     return c.json(started)
   })
 
   app.post("/profiles/chatgpt/connect/device", async (c) => {
     if (!chatGptLogin) return chatGptSignInUnavailable(c)
-    const named = requestedSeatName(await readConnectBody(c))
-    if ("error" in named) return c.json({ error: named.error, code: "invalid_profile_id" }, 400)
-    const started = await chatGptLogin.startDevice({ name: named.name })
+    const named = requestedSeat(await readConnectBody(c))
+    if ("error" in named) return c.json({ error: named.error, code: named.code }, named.status)
+    const started = await chatGptLogin.startDevice({ name: named.name, expect: named.expect })
     if (!started.ok) {
       plog(`[PROXY] ChatGPT device sign-in could not start: ${started.code}`)
       return c.json({ error: started.message, code: started.code }, started.status as 502)

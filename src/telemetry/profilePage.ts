@@ -649,9 +649,10 @@ function renderLoginRows(p) {
     if (!owner.webSignIn) {
       return owner.importCommand ? commandRow('Import', owner.importCommand, 'Meridian holds this seat\\u2019s login') : '';
     }
-    return '<div class="cmd-row"><span class="cmd-label">Token:</span> '
+    return '<div class="cmd-row"><span class="cmd-label">Login:</span> '
+      + '<button class="login-btn" data-profile="' + attr(p.id) + '" onclick="startChatGptRelogin(this)">Sign in again</button> '
       + '<button class="switch-btn" style="margin-top:0" data-profile="' + attr(p.id) + '" onclick="renewChatGptSeat(this)">Renew now</button>'
-      + '<span class="cmd-note">Meridian renews it by itself before it expires. To sign this seat in again, type its name under Add a profile and choose Connect with ChatGPT.</span>'
+      + '<span class="cmd-note">Meridian renews the token by itself before it expires. Sign in again when the seat needs a login.</span>'
       + '</div>';
   }
   var rows = commandRow('Login', owner.login, '\\u2192 ' + owner.loginMethod + ' \\u2192 ' + (p.label || p.id) + ' \\u2192 Refresh account \\u00b7 at ' + owner.name);
@@ -719,7 +720,7 @@ function renderChatGptGuide(owner) {
       + (owner.webSignIn
         ? 'Connect a seat under <strong>Add a profile</strong>: type its name, then <strong>Connect with ChatGPT</strong>. '
           + 'From a browser on another machine Meridian shows a one-time code to enter at auth.openai.com; on this machine it opens the ChatGPT sign-in. '
-          + 'Connecting a seat that is already here signs it in again, and <strong>Renew now</strong> on its card renews its token on the spot.</p>'
+          + '<strong>Sign in again</strong> on a seat\\u2019s card signs that seat in again under the same name, and <strong>Renew now</strong> renews its token on the spot.</p>'
         : 'Bring a seat signed in elsewhere into its store with <code>' + esc(owner.importCommand) + '</code>.</p>');
     guide.hidden = false;
     return;
@@ -1820,40 +1821,52 @@ function renderChatGptOwnerSteps(owner) {
     + close + '</div>';
 }
 
-function renderChatGptDevicePanel(data) {
+var CHATGPT_ADD_PANEL = {
+  title: 'Connect with ChatGPT',
+  account: 'the ChatGPT account this seat should use',
+  inputId: 'chatgpt-paste',
+  submitLabel: 'Connect',
+  onSubmit: 'submitChatGptConnect()',
+  onCancel: 'cancelChatGptConnect()',
+  onSwitch: 'switchChatGptToRedirect()'
+};
+
+function renderChatGptDevicePanel(data, o) {
   var shown = String(data.verificationUrl || '').replace('https://', '');
   return '<div class="login-panel">'
-    + '<div class="login-panel-title">Connect with ChatGPT</div>'
+    + '<div class="login-panel-title">' + esc(o.title) + '</div>'
+    + (o.note ? '<div class="login-note">' + esc(o.note) + '</div>' : '')
     + '<ol class="login-steps">'
     +   '<li>Open <a class="login-reopen" href="' + attr(data.verificationUrl) + '" target="_blank" rel="noopener noreferrer">' + esc(shown) + '</a>'
-    +     ' in any browser, on any device, and sign in with the ChatGPT account this seat should use.</li>'
+    +     ' in any browser, on any device, and sign in with ' + esc(o.account) + '.</li>'
     +   '<li>Enter this one-time code there. It expires in 15 minutes.</li>'
     + '</ol>'
     + '<div class="device-code"><code>' + esc(data.userCode) + '</code>' + copyButton(data.userCode) + '</div>'
     + '<div class="login-row" style="margin-top:12px">'
-    +   '<button class="switch-btn current login-cancel" style="margin-top:0" onclick="cancelChatGptConnect()">Cancel</button>'
-    +   '<button type="button" class="link-btn" onclick="switchChatGptToRedirect()">Use the browser sign-in instead</button>'
+    +   '<button class="switch-btn current login-cancel" style="margin-top:0" onclick="' + o.onCancel + '">Cancel</button>'
+    +   '<button type="button" class="link-btn" onclick="' + o.onSwitch + '">Use the browser sign-in instead</button>'
     + '</div>'
     + '<div class="login-msg busy">Waiting for the code to be entered\\u2026</div>'
     + '</div>';
 }
 
-function renderChatGptRedirectPanel(authorizeUrl, loopback) {
+function renderChatGptRedirectPanel(authorizeUrl, loopback, o) {
   return '<div class="login-panel">'
-    + '<div class="login-panel-title">Connect with ChatGPT</div>'
+    + '<div class="login-panel-title">' + esc(o.title) + '</div>'
+    + (o.note ? '<div class="login-note">' + esc(o.note) + '</div>' : '')
     + '<ol class="login-steps">'
     +   '<li>A ChatGPT sign-in tab just opened \\u2014 '
     +     '<a class="login-reopen" href="' + attr(authorizeUrl) + '" target="_blank" rel="noopener noreferrer">open it again</a>'
     +     ' if it was blocked. Right-click it to sign in from a private window.</li>'
-    +   '<li>Sign in with the ChatGPT account this seat should use.</li>'
+    +   '<li>Sign in with ' + esc(o.account) + '.</li>'
     +   (loopback ? '<li>On this machine the tab then ends on a Meridian page saying the seat is connected, and this panel finishes by itself.</li>' : '')
     + '</ol>'
-    + '<label class="paste-label" for="chatgpt-paste">' + (loopback ? 'Signed in from another machine? ' : '')
+    + '<label class="paste-label" for="' + o.inputId + '">' + (loopback ? 'Signed in from another machine? ' : '')
     +   'Paste the whole address the sign-in tab ended on. It starts with http://127.0.0.1:1455 and that page does not load \\u2014 that is expected.</label>'
     + '<div class="login-row">'
-    +   '<input id="chatgpt-paste" class="login-input" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:1455/auth/callback?code=\\u2026">'
-    +   '<button class="login-btn login-submit" onclick="submitChatGptConnect()">Connect</button>'
-    +   '<button class="switch-btn current login-cancel" style="margin-top:0" onclick="cancelChatGptConnect()">Cancel</button>'
+    +   '<input id="' + o.inputId + '" class="login-input" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:1455/auth/callback?code=\\u2026">'
+    +   '<button class="login-btn login-submit" onclick="' + o.onSubmit + '">' + esc(o.submitLabel) + '</button>'
+    +   '<button class="switch-btn current login-cancel" style="margin-top:0" onclick="' + o.onCancel + '">Cancel</button>'
     + '</div>'
     + '<div class="login-msg busy">Waiting for you to finish signing in\\u2026</div>'
     + '</div>';
@@ -1890,7 +1903,7 @@ async function startChatGptDevice() {
   setAddFormMsg('', '');
   setAddFormLocked(true);
   activeChatGptConnect = { connectId: data.connectId, name: name };
-  addFlow().innerHTML = renderChatGptDevicePanel(data);
+  addFlow().innerHTML = renderChatGptDevicePanel(data, CHATGPT_ADD_PANEL);
   chatGptConnectTimer = setTimeout(pollChatGptConnect, 1500);
 }
 
@@ -1905,7 +1918,7 @@ async function startChatGptRedirect(note) {
   setAddFormLocked(true);
   activeChatGptConnect = { connectId: data.connectId, name: name };
   var flow = addFlow();
-  flow.innerHTML = renderChatGptRedirectPanel(data.authorizeUrl, data.loopback);
+  flow.innerHTML = renderChatGptRedirectPanel(data.authorizeUrl, data.loopback, CHATGPT_ADD_PANEL);
   var input = flow.querySelector('.login-input');
   if (input) input.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitChatGptConnect(); });
   window.open(data.authorizeUrl, '_blank', 'noopener');
@@ -1986,6 +1999,158 @@ async function switchChatGptToRedirect() {
   startChatGptRedirect('');
 }
 
+// --- Signing a seat in again, from its card ---
+//
+// The add flow's sign-in, aimed at one seat: Meridian refuses the result
+// unless ChatGPT hands back that same account and workspace, so the seat keeps
+// its id, order, former names and overrides. The panel lives in the card's
+// login slot inside #content, so the card poll pauses while it is open.
+var activeChatGptRelogin = null;
+var chatGptReloginTimer = null;
+
+function chatGptReloginPanel(id, note) {
+  return {
+    title: 'Sign ' + id + ' in again',
+    account: 'the ChatGPT account and workspace ' + id + ' belongs to',
+    note: note || '',
+    inputId: 'chatgpt-relogin-paste',
+    submitLabel: 'Sign in',
+    onSubmit: 'submitChatGptRelogin()',
+    onCancel: 'cancelChatGptRelogin()',
+    onSwitch: 'switchChatGptReloginToRedirect()'
+  };
+}
+
+function startChatGptRelogin(button) {
+  var id = button.getAttribute('data-profile');
+  if (activeChatGptRelogin) releaseChatGptRelogin();
+  if (browserOnThisHost()) startChatGptReloginRedirect(id, '');
+  else startChatGptReloginDevice(id);
+}
+
+async function startChatGptReloginDevice(id) {
+  showLoginMessage(id, 'Starting\\u2026', 'busy');
+  var reply = await postChatGptConnect('/profiles/chatgpt/connect/device', { profile: id });
+  if (!reply) { showLoginMessage(id, 'Could not reach Meridian.', 'err'); return; }
+  if (!reply.res.ok) {
+    if (reply.data.code === 'unknown_profile' || reply.data.code === 'chatgpt_signin_unavailable') {
+      showLoginMessage(id, reply.data.error || 'Could not start the sign-in.', 'err');
+      return;
+    }
+    startChatGptReloginRedirect(id, (reply.data.error || 'The device sign-in is unavailable.') + ' Using the browser sign-in instead.');
+    return;
+  }
+  activeChatGptRelogin = { profile: id, connectId: reply.data.connectId };
+  var slot = loginSlot(id);
+  if (slot) slot.innerHTML = renderChatGptDevicePanel(reply.data, chatGptReloginPanel(id, ''));
+  scheduleChatGptReloginPoll();
+}
+
+async function startChatGptReloginRedirect(id, note) {
+  showLoginMessage(id, 'Starting\\u2026', 'busy');
+  var reply = await postChatGptConnect('/profiles/chatgpt/connect/start', {
+    profile: id,
+    returnTo: location.origin + '/profiles#' + encodeURIComponent(id)
+  });
+  if (!reply) { showLoginMessage(id, 'Could not reach Meridian.', 'err'); return; }
+  if (!reply.res.ok) { showLoginMessage(id, reply.data.error || 'Could not start the sign-in.', 'err'); return; }
+  activeChatGptRelogin = { profile: id, connectId: reply.data.connectId };
+  var slot = loginSlot(id);
+  if (slot) {
+    slot.innerHTML = renderChatGptRedirectPanel(reply.data.authorizeUrl, reply.data.loopback, chatGptReloginPanel(id, note));
+    var input = slot.querySelector('.login-input');
+    if (input) input.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitChatGptRelogin(); });
+  }
+  window.open(reply.data.authorizeUrl, '_blank', 'noopener');
+  scheduleChatGptReloginPoll();
+}
+
+function scheduleChatGptReloginPoll() {
+  stopChatGptReloginPoll();
+  chatGptReloginTimer = setTimeout(pollChatGptRelogin, 1500);
+}
+
+function stopChatGptReloginPoll() {
+  if (chatGptReloginTimer) clearTimeout(chatGptReloginTimer);
+  chatGptReloginTimer = null;
+}
+
+// A failed sign-in keeps its panel, and with it the paused card poll, so the
+// reason stays on screen until Cancel closes it.
+function failChatGptRelogin(current, message) {
+  stopChatGptReloginPoll();
+  current.spent = true;
+  setPanelMsg(loginSlot(current.profile), message || 'The sign-in failed.', 'err');
+}
+
+async function pollChatGptRelogin() {
+  var current = activeChatGptRelogin;
+  if (!current || current.spent) return;
+  var res, data;
+  try {
+    res = await fetch('/profiles/chatgpt/connect/status?connectId=' + encodeURIComponent(current.connectId));
+    data = await res.json();
+  } catch (err) {
+    scheduleChatGptReloginPoll();
+    return;
+  }
+  if (activeChatGptRelogin !== current) return;
+  if (res.ok && (data.status === 'waiting' || data.status === 'exchanging')) { scheduleChatGptReloginPoll(); return; }
+  if (res.ok && data.status === 'completed') { finishChatGptRelogin(data); return; }
+  failChatGptRelogin(current, data.message || data.error);
+}
+
+async function submitChatGptRelogin() {
+  var current = activeChatGptRelogin;
+  var slot = current ? loginSlot(current.profile) : null;
+  if (!current || current.spent || !slot) return;
+  var input = slot.querySelector('.login-input');
+  var value = input ? input.value.trim() : '';
+  if (!value) { setPanelMsg(slot, 'Paste the address the sign-in tab ended on first.', 'err'); return; }
+  setPanelMsg(slot, 'Signing in\\u2026', 'busy');
+  var reply = await postChatGptConnect('/profiles/chatgpt/connect/complete', { connectId: current.connectId, url: value });
+  if (activeChatGptRelogin !== current) return;
+  if (!reply) { setPanelMsg(slot, 'Could not reach Meridian.', 'err'); return; }
+  if (!reply.res.ok) {
+    if (reply.data.retryable) setPanelMsg(slot, reply.data.error || 'The sign-in failed.', 'err');
+    else failChatGptRelogin(current, reply.data.error);
+    return;
+  }
+  finishChatGptRelogin(reply.data);
+}
+
+function finishChatGptRelogin(data) {
+  var id = activeChatGptRelogin ? activeChatGptRelogin.profile : null;
+  stopChatGptReloginPoll();
+  activeChatGptRelogin = null;
+  if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
+  refresh().then(function () {
+    if (id) showLoginMessage(id, 'Signed in again' + (data.email ? ' as ' + data.email : '') + '.', '');
+  });
+}
+
+// Tells Meridian the sign-in is abandoned, so it stops polling for a device
+// code and closes the 127.0.0.1:1455 listener now rather than at its expiry.
+function releaseChatGptRelogin() {
+  var current = activeChatGptRelogin;
+  stopChatGptReloginPoll();
+  activeChatGptRelogin = null;
+  if (!current) return Promise.resolve();
+  var slot = loginSlot(current.profile);
+  if (slot) slot.innerHTML = '';
+  return postChatGptConnect('/profiles/chatgpt/connect/cancel', { connectId: current.connectId });
+}
+
+function cancelChatGptRelogin() {
+  releaseChatGptRelogin();
+}
+
+async function switchChatGptReloginToRedirect() {
+  var id = activeChatGptRelogin ? activeChatGptRelogin.profile : null;
+  await releaseChatGptRelogin();
+  if (id) startChatGptReloginRedirect(id, '');
+}
+
 async function renewChatGptSeat(button) {
   var id = button.getAttribute('data-profile');
   button.disabled = true;
@@ -2019,7 +2184,7 @@ resetAddForm('');
 // keeps its own state, so each needs its own term - resetAddForm nulls
 // activeAdd, which is the addId the paste is about to be sent with.
 setInterval(function () {
-  if (!meridianReorder.dragging() && !activeLogin && !activeAdd
+  if (!meridianReorder.dragging() && !activeLogin && !activeAdd && !activeChatGptRelogin
     && !meridianSelection.holdsRedraw()) refresh();
 }, 10000);
 ` + profileBarJs + `
