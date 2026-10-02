@@ -5,7 +5,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { parse as parseJsonc } from "jsonc-parser"
@@ -19,6 +19,7 @@ import { addPluginEntry, pointProviderAtMeridian, providerBefore, removePluginEn
 import { createOwnedStoreAdapter } from "../proxy/chatgpt/migrate/ownedStore"
 import { DEFAULT_PLUGIN_SPEC, runReverseMigration, type ReverseOptions } from "../proxy/chatgpt/migrate/reverse"
 import type { MeridianHeldAccount } from "../proxy/chatgpt/migrate/strip"
+import { changedFromPluginConfig } from "../proxy/chatgpt/migrate/processes"
 import { createChatGptCredentialStore } from "../proxy/chatgpt/credentials"
 import { acquireWriterLease } from "../proxy/chatgpt/lease"
 import { chatGptLockPath } from "../proxy/chatgpt/paths"
@@ -402,17 +403,21 @@ describe("round trip: forward, then --reverse", () => {
     expect(createChatGptCredentialStore({ path: meridianStore() }).readAccounts()).toHaveLength(2)
   })
 
-  it("skips a seat whose renewal was interrupted unless --force", async () => {
+  it("skips a seat whose renewal was interrupted, under --force too, unless --include-interrupted", async () => {
     seedPlugin()
     await forward()
     const lease = await acquireWriterLease({ lockPath: chatGptLockPath(meridianStore()), waitMs: 0 })
     createChatGptCredentialStore({ path: meridianStore(), lease }).commitAccount("bob", current => ({ ...current!, exchangeStartedAt: 5 }))
     lease.release()
     const lines: string[] = []
-    const result = await runReverseMigration(reverseOptions({ steps: ["handback"], store: adapter() }, lines))
+    const result = await runReverseMigration(reverseOptions({ steps: ["handback"], force: true, store: adapter() }, lines))
     expect(result.exitCode).toBe(1)
     expect(lines.join("\n")).toContain("a renewal was interrupted")
     expect(createChatGptCredentialStore({ path: meridianStore() }).readAccounts().map(seat => seat.accountUserId)).toEqual(["bob"])
+
+    const included: string[] = []
+    expect((await runReverseMigration(reverseOptions({ steps: ["handback"], includeInterrupted: true, store: adapter() }, included))).exitCode).toBe(0)
+    expect(createChatGptCredentialStore({ path: meridianStore() }).readAccounts()).toEqual([])
   })
 
   it("loads the plugin from a checkout with --plugin-path", async () => {
@@ -456,6 +461,97 @@ describe("round trip: forward, then --reverse", () => {
     expect((await runReverseMigration(reverseOptions({ store: adapter() }, lines))).exitCode).toBe(0)
     expect(parseJsonc(readFileSync(tuiPath, "utf8"))).toEqual(parseJsonc(tuiText))
     expect(lines.join("\n")).toContain("opencode's global TUI config loads the plugin's status bar")
+  })
+})
+
+describe("a config file that changed after a process started", () => {
+  const started = 1_700_000_000_000
+  const at = (path: string, ms: number) => utimesSync(path, ms / 1000, ms / 1000)
+  let config: string
+
+  beforeEach(() => {
+    config = join(home, ".config", "opencode", "opencode.jsonc")
+    mkdirSync(join(config, ".."), { recursive: true })
+    writeFileSync(config, `{ "plugin": ["other-plugin"] }`)
+    at(config, started + 60_000)
+  })
+
+  function backup(suffix: string, text: string, takenAt: number) {
+    const path = `${config}.meridian-backup${suffix}`
+    writeFileSync(path, text)
+    at(path, takenAt)
+  }
+
+  it("is a holder's when the plugin was removed after it started", () => {
+    backup("", `{ "plugin": ["other-plugin", "oc-codex-multi-auth"] }`, started + 30_000)
+    expect(changedFromPluginConfig([config], started)).toBe(true)
+  })
+
+  it("is not when the plugin was removed before it started and the file changed for another reason", () => {
+    backup("", `{ "plugin": ["other-plugin", "oc-codex-multi-auth"] }`, started - 30_000)
+    backup(".20261002T224213Z", `{ "plugin": ["older-other-plugin"] }`, started + 30_000)
+    expect(changedFromPluginConfig([config], started)).toBe(false)
+  })
+
+  it("is not when the migration only ever saw the file without the plugin", () => {
+    backup("", `{ "model": "x" }`, started + 30_000)
+    expect(changedFromPluginConfig([config], started)).toBe(false)
+  })
+
+  it("is unknown, and so counts, without any backup; and never when the file did not change", () => {
+    expect(changedFromPluginConfig([config], started)).toBe(true)
+    at(config, started - 1_000)
+    expect(changedFromPluginConfig([config], started)).toBe(false)
+  })
+})
+
+describe("--force overrides the process gate and nothing else", () => {
+  function holder() {
+    writeFileSync(join(procRoot, "stat"), "btime 1700000000\n")
+    const dir = join(procRoot, "200")
+    mkdirSync(dir)
+    symlinkSync("/usr/bin/opencode", join(dir, "exe"))
+    symlinkSync(root, join(dir, "cwd"))
+    writeFileSync(join(dir, "cmdline"), "opencode\0")
+    writeFileSync(join(dir, "environ"), `HOME=${home}\0`)
+    writeFileSync(join(dir, "stat"), `200 (opencode) S 1 ${Array.from({ length: 17 }, () => "0").join(" ")} 100\n`)
+  }
+
+  function seed() {
+    writeJson(join(home, ".opencode", ACCOUNTS_FILE_NAME), store([account("alice", "rt-SECRET-alice-1", 2_000_000)]))
+    mkdirSync(join(home, ".config", "opencode"), { recursive: true })
+    writeFileSync(join(home, ".config", "opencode", "opencode.json"), `{ "plugin": ["oc-codex-multi-auth"] }`)
+  }
+
+  it("a forced strip still refuses a seat Meridian does not hold; --strip-unowned strips it", async () => {
+    seed()
+    holder()
+    const pluginStore = join(home, ".opencode", ACCOUNTS_FILE_NAME)
+    const memory = new MemoryStore(join(root, "meridian.json"))
+    const lines: string[] = []
+    const result = await runMigration(forwardOptions({ steps: ["processes", "strip"], force: true, store: memory }, lines))
+    expect(result.exitCode).toBe(1)
+    expect(lines.join("\n")).toContain("--force: running strip anyway")
+    expect(lines.join("\n")).toContain("--strip-unowned strips them anyway")
+    expect(readFileSync(pluginStore, "utf8")).toContain("rt-SECRET-alice-1")
+
+    const unowned: string[] = []
+    await runMigration(forwardOptions({ steps: ["strip"], force: true, stripUnowned: true, store: memory }, unowned))
+    expect(unowned.join("\n")).toContain("--strip-unowned overrides")
+    expect(readFileSync(pluginStore, "utf8")).not.toContain("rt-SECRET")
+  })
+
+  it("a forced run that succeeds exits 0, holders reported; unforced, the processes step fails it", async () => {
+    seed()
+    holder()
+    const memory = new MemoryStore(join(root, "meridian.json"))
+    const forced: string[] = []
+    expect((await runMigration(forwardOptions({ steps: ["processes", "import", "strip"], force: true, store: memory }, forced))).exitCode).toBe(0)
+    expect(forced.join("\n")).toContain("pid 200 opencode")
+    expect(forced.join("\n")).toContain("--force: continuing past them.")
+
+    const plain: string[] = []
+    expect((await runMigration(forwardOptions({ steps: ["processes"], store: memory }, plain))).exitCode).toBe(1)
   })
 })
 
@@ -530,10 +626,14 @@ describe("chatgpt-migrate --reverse arguments", () => {
     expect(parsed.pluginStorePath).toBe("/s.json")
     expect(parseMigrateArgs(["--reverse"], {}).reverseSteps).toHaveLength(5)
     expect(parseMigrateArgs(["--skip-possible-duplicates"], {}).skipPossibleDuplicates).toBe(true)
+    expect(parseMigrateArgs(["--strip-unowned"], {}).stripUnowned).toBe(true)
+    expect(parseMigrateArgs(["--reverse", "--include-interrupted"], {}).includeInterrupted).toBe(true)
   })
 
   it("rejects options and steps of the other direction", () => {
     expect(() => parseMigrateArgs(["--plugin-path", "/repo"], {})).toThrow(MigrateUsageError)
+    expect(() => parseMigrateArgs(["--reverse", "--strip-unowned"], {})).toThrow(MigrateUsageError)
+    expect(() => parseMigrateArgs(["--include-interrupted"], {})).toThrow(MigrateUsageError)
     expect(() => parseMigrateArgs(["--reverse", "--skip-possible-duplicates"], {})).toThrow(MigrateUsageError)
     expect(() => parseMigrateArgs(["--reverse", "--step", "import"], {})).toThrow(MigrateUsageError)
     expect(() => parseMigrateArgs(["--step", "handback"], {})).toThrow(MigrateUsageError)

@@ -36,8 +36,11 @@ Steps, run in this order (default: all):
 Options:
   --dry-run               Report what would change; write nothing
   --step <a,b>            Run only these steps (repeatable)
-  --force                 Run import/strip although processes hold the tokens,
-                          or strip seats Meridian does not hold yet
+  --force                 Run import/strip although opencode processes may hold
+                          the tokens. Overrides nothing else.
+  --strip-unowned         strip: also strip sources whose seat Meridian does not
+                          hold, or holds an older token for (that token's only
+                          working copy is then a .meridian-backup)
   --provider <id>         opencode provider to point at Meridian (default: openai)
   --meridian-url <url>    Meridian's address (default: http://127.0.0.1:$MERIDIAN_PORT or :3456)
   --base-url <url>        Exact provider baseURL (default: <meridian-url>/v1)
@@ -84,13 +87,17 @@ Steps, run in this order (default: all):
 
 Reverse options:
   --seat <id>             Hand back only this profile id or seat id (repeatable)
+  --include-interrupted   Also hand back seats whose last renewal was interrupted
+                          (their refresh token may already be spent)
+  --force                 Run handback although opencode processes may hold plugin
+                          tokens. Overrides nothing else.
   --plugin-path <repo>    Load the plugin as file://<repo> (a checkout of
                           oc-codex-multi-auth) instead of the spec the preserved
                           config names (else oc-codex-multi-auth@latest)
   --plugin-store <path>   The plugin store to write (default: the global store,
                           ~/.opencode/oc-codex-multi-auth-accounts.json)
   --provider, --meridian-url, --base-url, --api-key-env, --project,
-  --no-opencode-db, --store, --config-dir, --dry-run, --force  as above
+  --no-opencode-db, --store, --config-dir, --dry-run  as above
 
 Both directions also edit oc-codex-multi-auth's entries in opencode's TUI
 config (tui.json), which loads its quota status bar.
@@ -108,6 +115,8 @@ export interface ParsedMigrateArgs {
   pluginPath: string | null
   pluginStorePath: string | null
   skipPossibleDuplicates: boolean
+  stripUnowned: boolean
+  includeInterrupted: boolean
   dryRun: boolean
   force: boolean
   providerId: string
@@ -134,7 +143,7 @@ export function parseMigrateArgs(argv: readonly string[], env: NodeJS.ProcessEnv
   const reverseOnly: string[] = []
   const forwardOnly: string[] = []
   const parsed: ParsedMigrateArgs = {
-    help: false, reverse: false, steps: [], reverseSteps: [], seats: [], pluginPath: null, pluginStorePath: null, skipPossibleDuplicates: false, dryRun: false, force: false, providerId: "openai", baseURL: "", meridianUrl: "", storePath: null, configDir: null, testModel: null, apiKey: "meridian",
+    help: false, reverse: false, steps: [], reverseSteps: [], seats: [], pluginPath: null, pluginStorePath: null, skipPossibleDuplicates: false, stripUnowned: false, includeInterrupted: false, dryRun: false, force: false, providerId: "openai", baseURL: "", meridianUrl: "", storePath: null, configDir: null, testModel: null, apiKey: "meridian",
     projectDirs: [], useOpencodeDatabase: true, includeBackupOnly: false, keychain: false, testPrompt: false,
   }
   const value = (index: number, flag: string): string => {
@@ -152,6 +161,8 @@ export function parseMigrateArgs(argv: readonly string[], env: NodeJS.ProcessEnv
       case "--include-backup-only": parsed.includeBackupOnly = true; forwardOnly.push(arg); break
       case "--skip-possible-duplicates": parsed.skipPossibleDuplicates = true; forwardOnly.push(arg); break
       case "--test-prompt": parsed.testPrompt = true; forwardOnly.push(arg); break
+      case "--strip-unowned": parsed.stripUnowned = true; forwardOnly.push(arg); break
+      case "--include-interrupted": parsed.includeInterrupted = true; reverseOnly.push(arg); break
       case "--seat": parsed.seats.push(value(i, arg)); reverseOnly.push(arg); i++; break
       case "--plugin-path": parsed.pluginPath = resolve(value(i, arg)); reverseOnly.push(arg); i++; break
       case "--plugin-store": parsed.pluginStorePath = resolve(value(i, arg)); reverseOnly.push(arg); i++; break
@@ -275,6 +286,7 @@ export async function runMigrateCli(argv: readonly string[]): Promise<number> {
       steps: args.reverseSteps,
       dryRun: args.dryRun,
       force: args.force,
+      includeInterrupted: args.includeInterrupted,
       seats: args.seats,
       pluginStorePath: args.pluginStorePath,
       pluginPath: args.pluginPath,
@@ -302,6 +314,7 @@ export async function runMigrateCli(argv: readonly string[]): Promise<number> {
     projectDirs: args.projectDirs,
     opencodeDatabasePath: args.useOpencodeDatabase ? defaultOpencodeDatabasePath(env) : null,
     includeBackupOnly: args.includeBackupOnly,
+    stripUnowned: args.stripUnowned,
     skipPossibleDuplicates: args.skipPossibleDuplicates,
     testPrompt: args.testPrompt,
     store,

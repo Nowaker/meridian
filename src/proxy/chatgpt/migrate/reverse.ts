@@ -21,7 +21,7 @@ import { planImportNaming } from "./duplicates"
 import { backupsOf, preserveOriginal, replaceFileAtomically, withPluginLocks } from "./files"
 import { mergeIntoPluginStore, PluginStoreFormatError, seatsWithRefreshTokens, type HandbackOutcome } from "./handback"
 import { ACCOUNTS_FILE_NAME, PLUGIN_PACKAGE_NAME, pluginConfigDir, type MigrationEnvironment } from "./layout"
-import { contexts, gateAllows, printableUrl, reportProcesses, type ChatGptStoreAdapter, type ProcessGate } from "./migrate"
+import { contexts, gateAllows, printableUrl, processStepResult, reportProcesses, type ChatGptStoreAdapter, type ProcessGate } from "./migrate"
 import {
   addPluginEntry,
   configLayers,
@@ -54,7 +54,10 @@ export interface ReverseOptions {
   env: MigrationEnvironment
   steps: readonly ReverseStep[]
   dryRun: boolean
+  /** Run handback although opencode processes may hold plugin tokens. Nothing else. */
   force: boolean
+  /** Hand back seats whose last renewal was interrupted, so their refresh token may already be spent. */
+  includeInterrupted?: boolean
   /** Profile ids or seat ids to hand back; empty means every seat Meridian holds. */
   seats: readonly string[]
   /** The plugin store to write; the global store when null. */
@@ -160,9 +163,9 @@ async function runHandback(options: ReverseOptions, gate: ProcessGate): Promise<
   let seats = selection.seats
   if (interrupted.length > 0) {
     for (const seat of interrupted) {
-      log(`  ${options.force ? "--force: handing back" : "skip"} ${describeSeat(seat, selection.profileIds)}: a renewal was interrupted, so its refresh token may already be spent${options.force ? "" : "; sign it in again with the plugin instead"}`)
+      log(`  ${options.includeInterrupted ? "--include-interrupted: handing back" : "skip"} ${describeSeat(seat, selection.profileIds)}: a renewal was interrupted, so its refresh token may already be spent${options.includeInterrupted ? "" : "; sign it in again with the plugin instead, or pass --include-interrupted"}`)
     }
-    if (!options.force) seats = seats.filter(seat => !seat.exchangeStartedAt)
+    if (!options.includeInterrupted) seats = seats.filter(seat => !seat.exchangeStartedAt)
   }
 
   const storePath = globalStorePath(options)
@@ -236,7 +239,7 @@ async function runHandback(options: ReverseOptions, gate: ProcessGate): Promise<
   log(`  Wrote ${written.length} seat(s) into ${storePath}${storeBackup ? `; the store as it was is at ${storeBackup}` : ""}.`)
   log(`  Removed ${removed.length} seat(s) from Meridian's store${meridianBackup ? `; it was preserved at ${meridianBackup}` : ""}. Meridian no longer renews them.`)
   log("  The plugin restores opencode's own openai login (auth.json) from its store when it loads; the moved-aside backups/ directory holds spent tokens and stays aside.")
-  return interrupted.length === 0 || options.force
+  return interrupted.length === 0 || options.includeInterrupted === true
 }
 
 // ---------------------------------------------------------------------------
@@ -527,7 +530,7 @@ export async function runReverseMigration(options: ReverseOptions): Promise<{ ex
           log(`  ${restart.length} other opencode process(es) keep the config they started with; restart them after the plugin and provider steps:`)
           for (const candidate of restart) log(`    pid ${candidate.pid} ${candidate.command}${candidate.cwd ? ` in ${candidate.cwd}` : ""}`)
         }
-        return gate.supported && gate.blocking.length === 0
+        return processStepResult(gate, options)
       }
       case "handback":
         if (!steps.includes("processes")) reportProcesses(gate, options)

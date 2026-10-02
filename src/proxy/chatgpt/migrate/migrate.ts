@@ -12,7 +12,10 @@
  *
  * Each step can run alone, and all of them honour `dryRun`, which reads
  * everything and writes nothing. `import` and `strip` refuse while a process
- * that could spend the same single-use tokens is alive, unless `force`.
+ * that could spend the same single-use tokens is alive, unless `force`; strip
+ * also refuses a source whose seat Meridian does not hold the live token of,
+ * unless `stripUnowned` - a separate override, so forcing past a process that
+ * merely looks like a holder never destroys a token's only working copy.
  *
  * NOTHING HERE PRINTS A TOKEN. Reports carry emails, seat ids, the last six
  * characters of workspace ids, paths and counts. Token values stay inside the
@@ -96,7 +99,10 @@ export interface MigrationOptions {
   env: MigrationEnvironment
   steps: readonly MigrationStep[]
   dryRun: boolean
+  /** Run import and strip although opencode processes may hold the tokens. Nothing else. */
   force: boolean
+  /** Strip a source although Meridian does not hold its seat, or holds an older token: that token's only working copy goes. */
+  stripUnowned?: boolean
   providerId: string
   baseURL: string
   apiKey: string
@@ -210,6 +216,18 @@ export function reportProcesses(gate: ProcessGate, options: Pick<MigrationOption
     log("  Quit the other opencode sessions (their state is kept and they can be reopened after the migration).")
   }
   log("  Each keeps its refresh tokens in memory and keeps rotating them; Meridian and it would invalidate each other's single-use tokens.")
+}
+
+/**
+ * The processes step's own result. Holders fail it, unless --force says the
+ * operator accepts them: the steps that act on that are then run, and their
+ * result is the one that counts.
+ */
+export function processStepResult(gate: ProcessGate, options: Pick<MigrationOptions, "force" | "log">): boolean {
+  if (gate.supported && gate.blocking.length === 0) return true
+  if (!options.force) return false
+  options.log("  --force: continuing past them.")
+  return true
 }
 
 export function gateAllows(gate: ProcessGate, options: Pick<MigrationOptions, "force" | "log">, step: string): boolean {
@@ -334,9 +352,11 @@ async function runStrip(discovery: Discovery, options: MigrationOptions): Promis
   const { log } = options
   const held = readHeld(options)
   const blockers = ownershipBlockers(discovery.candidates, held)
-  const items = planStrip(discovery, options.env, options.force ? new Map() : blockers)
-  if (options.force && blockers.size > 0) {
-    for (const reason of new Set(blockers.values())) log(`  --force overrides: ${reason}`)
+  const items = planStrip(discovery, options.env, options.stripUnowned ? new Map() : blockers)
+  if (options.stripUnowned && blockers.size > 0) {
+    for (const reason of new Set(blockers.values())) log(`  --strip-unowned overrides: ${reason}`)
+  } else if (blockers.size > 0) {
+    log("  Blocked sources are left alone; --strip-unowned strips them anyway (--force does not).")
   }
   if (items.length === 0) {
     log("  Nothing holds a refresh token.")
@@ -559,7 +579,7 @@ export async function runMigration(options: MigrationOptions): Promise<Migration
     switch (step) {
       case "processes":
         reportProcesses(gate, options)
-        return gate.supported && gate.blocking.length === 0
+        return processStepResult(gate, options)
       case "import":
       case "strip":
         if (!steps.includes("processes")) reportProcesses(gate, options)

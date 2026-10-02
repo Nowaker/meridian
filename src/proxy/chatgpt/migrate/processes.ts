@@ -21,10 +21,13 @@ import { readdirSync, readFileSync, readlinkSync, statSync } from "node:fs"
 import { basename, join } from "node:path"
 import Database from "libsql"
 import { isTruthyFlag, type MigrationEnvironment } from "./layout"
+import { backupsOf } from "./files"
 import {
   contextFor,
   loadsPlugin,
+  pluginEntriesIn,
   resolvePlugins,
+  UnparseableOpencodeConfigError,
   type PluginResolution,
 } from "./opencodeConfig"
 
@@ -50,7 +53,7 @@ export interface OpencodeProcess {
   plugins: PluginResolution | null
   /** Effective config loads oc-codex-multi-auth now. */
   loadsPlugin: boolean
-  /** A config file it reads changed after it started: what it loaded is not what is on disk. */
+  /** A config file it reads changed after it started, and may have listed the plugin then (see changedFromPluginConfig). */
   configChangedSinceStart: boolean
   /** This process is an ancestor of the one running the migration. */
   isAncestor: boolean
@@ -195,13 +198,54 @@ function ancestorsOf(procRoot: string, pid: number): Set<number> {
   return ancestors
 }
 
-function modifiedAfter(paths: readonly string[], instant: number): boolean {
+function listsPlugin(backup: string, configPath: string): boolean | null {
+  const text = readText(backup)
+  if (text === null) return null
+  try {
+    return pluginEntriesIn(text, configPath).length > 0
+  } catch (error) {
+    if (error instanceof UnparseableOpencodeConfigError) return null
+    throw error
+  }
+}
+
+/**
+ * Whether a config file that changed after `startedAt` may have listed the
+ * plugin when the process read it.
+ *
+ * Every edit the migration makes keeps the file's previous bytes as a
+ * `.meridian-backup`, written at the moment of the edit. A backup listing the
+ * plugin and written after the start means the plugin was removed after the
+ * process loaded it. One written before the start means it was already gone,
+ * so a later change - any tool rewriting the file - says nothing about the
+ * plugin. Backups that never list it mean the migration found the file without
+ * it. Only a file with no backup at all, or one that cannot be read, is
+ * unknown, and unknown counts as loaded.
+ */
+export function changedFromPluginConfig(paths: readonly string[], startedAt: number): boolean {
   return paths.some(path => {
+    let modified: number
     try {
-      return statSync(path).mtimeMs > instant
+      modified = statSync(path).mtimeMs
     } catch {
       return false
     }
+    if (modified <= startedAt) return false
+    const backups = backupsOf(path)
+    if (backups.length === 0) return true
+    for (const backup of backups) {
+      const listed = listsPlugin(backup, path)
+      if (listed === null) return true
+      if (!listed) continue
+      let takenAt: number
+      try {
+        takenAt = statSync(backup).mtimeMs
+      } catch {
+        return true
+      }
+      if (takenAt > startedAt) return true
+    }
+    return false
   })
 }
 
@@ -246,7 +290,7 @@ export function scanOpencodeProcesses(options: ProcessScanOptions): ProcessScan 
       environment,
       plugins,
       loadsPlugin: loadsPlugin(plugins),
-      configChangedSinceStart: startedAt !== null && modifiedAfter(configPaths, startedAt),
+      configChangedSinceStart: startedAt !== null && changedFromPluginConfig(configPaths, startedAt),
       isAncestor: ancestors.has(pid),
     })
   }
