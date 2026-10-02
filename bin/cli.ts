@@ -16,7 +16,7 @@ if (args.includes("--version") || args.includes("-v")) {
   process.exit(0)
 }
 
-if (args.includes("--help") || args.includes("-h")) {
+if ((args.includes("--help") || args.includes("-h")) && args[0] !== "chatgpt-migrate") {
   console.log(`meridian v${version}
 
 Local API bridge for Claude and Antigravity subscriptions.
