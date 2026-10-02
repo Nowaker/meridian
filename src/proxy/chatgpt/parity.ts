@@ -33,6 +33,7 @@ import type { UpstreamBackend } from "../upstream/backend"
 import { retryAfterSeconds } from "../retryAfter"
 import { estimateRequestCostUsd, ratesForPrompt, type ModelPricing } from "../../telemetry/pricing"
 import type { ChatGptFeatures } from "./features"
+import { isModelRefusal } from "./stream"
 import type { ChatGptUsage } from "./tap"
 
 export const MAX_BUDGET_ERROR_CODE = "max_budget_exceeded"
@@ -415,8 +416,6 @@ export function transformResponsesStream(
 
 // --- Fallback Model ------------------------------------------------------
 
-const MODEL_REFUSAL = /(not supported|unsupported|not available|unavailable|does not exist|not found|unknown|not allowed|no access)/i
-
 /**
  * Why this unanswered response should be retried on the fallback model, or
  * null. Reads the body only for a 400/404, which is a short JSON error; the
@@ -428,7 +427,7 @@ export async function fallbackTrigger(response: Response): Promise<{ trigger: st
   if (response.status !== 400 && response.status !== 404) return { trigger: null, response }
   const text = (await response.text()).slice(0, MAX_ERROR_BODY_BYTES)
   const rebuilt = new Response(text, { status: response.status, headers: response.headers })
-  return { trigger: /\bmodel\b/i.test(text) && MODEL_REFUSAL.test(text) ? "model_refused" : null, response: rebuilt }
+  return { trigger: isModelRefusal(response.status, text) ? "model_refused" : null, response: rebuilt }
 }
 
 // --- The wrapping backend --------------------------------------------------

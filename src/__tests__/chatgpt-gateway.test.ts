@@ -253,7 +253,7 @@ describe("ChatGPT gateway routing", () => {
     expect(metric).toMatchObject({ adapter: "chatgpt", requestModel: "gpt-5.4-nano" })
   })
 
-  it("returns the backend's refusal of a model in OpenAI's error shape, without benching or trying another seat", async () => {
+  it("returns a model every seat refuses in OpenAI's error shape, asking each seat once and benching none", async () => {
     writePool([account(0), account(1)])
     const detail = "The 'gpt-5.4-nano' model is not supported when using Codex with a ChatGPT account."
     respond = () => new Response(JSON.stringify({ detail }), { status: 400, headers: { "content-type": "application/json" } })
@@ -263,10 +263,28 @@ describe("ChatGPT gateway routing", () => {
       expect(res.status).toBe(400)
       expect(await res.json()).toEqual({ error: { type: "invalid_request_error", message: detail, code: null } })
     }
-    expect(upstreamCalls.map(call => call.accountId)).toEqual(["workspace-0", "workspace-0"])
+    // The second turn finds both seats sitting the model out and asks one, for the backend's own answer.
+    expect(upstreamCalls.map(call => call.accountId)).toEqual(["workspace-0", "workspace-1", "workspace-0"])
     expect(sdkCalls).toBe(0)
     expect(telemetryStore.getRecent({ limit: 2 }).map(m => [m.adapter, m.status, m.error])).toEqual([
       ["chatgpt", 400, "request_refused"], ["chatgpt", 400, "request_refused"],
+    ])
+  })
+
+  it("serves a model one seat's plan refuses from the next seat, and stops asking that seat for it", async () => {
+    writePool([account(0), account(1)])
+    respond = call => call.accountId === "workspace-0" && call.body.model === "gpt-6.1-sol"
+      ? new Response(JSON.stringify({ detail: "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account." }), { status: 400, headers: { "content-type": "application/json" } })
+      : completed()
+    const { app } = await server("follow-external")
+    const { prompt_cache_key: _conversation, ...uncached } = LUNA
+    for (let turn = 0; turn < 2; turn++) {
+      expect((await app.fetch(responses({ ...uncached, model: "gpt-6.1-sol", stream: false }))).status).toBe(200)
+    }
+    // Not benched: the seat that refused gpt-6.1-sol still leads for every other model.
+    expect((await app.fetch(responses({ ...uncached, stream: false }))).status).toBe(200)
+    expect(upstreamCalls.map(call => [call.accountId, call.body.model])).toEqual([
+      ["workspace-0", "gpt-6.1-sol"], ["workspace-1", "gpt-6.1-sol"], ["workspace-1", "gpt-6.1-sol"], ["workspace-0", "gpt-6-luna"],
     ])
   })
 

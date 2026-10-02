@@ -120,6 +120,19 @@ function failureForStatus(status: number): ChatGptFailure | null {
   return null
 }
 
+const MODEL_REFUSAL = /(not supported|unsupported|not available|unavailable|does not exist|not found|unknown|not allowed|no access)/i
+
+/**
+ * Whether a 400/404 refuses the requested MODEL, rather than another part of
+ * the request: "The 'gpt-6.1-sol' model is not supported when using Codex
+ * with a ChatGPT account." Which models a seat may use follows its plan
+ * (measured 2026-10-02: a free seat refuses gpt-6.1-sol, a Business seat
+ * serves it), so another seat - or another model - may still serve the turn.
+ */
+export function isModelRefusal(status: number, text: string): boolean {
+  return (status === 400 || status === 404) && /\bmodel\b/i.test(text) && MODEL_REFUSAL.test(text)
+}
+
 function emptyStream(): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({ start(controller) { controller.close() } })
 }

@@ -29,7 +29,7 @@ import { AssignmentStore, type ProfileExhaustion } from "../routing"
 import type { UpstreamBackend, UpstreamRequest } from "../upstream/backend"
 import { adaptResponsesBody, type BodyAdaptation } from "../chatgpt/body"
 import { buildCodexRequest } from "../chatgpt/request"
-import { sniffChatGptFailure, type ChatGptFailureKind } from "../chatgpt/stream"
+import { isModelRefusal, sniffChatGptFailure, type ChatGptFailureKind } from "../chatgpt/stream"
 import { aggregateResponsesStream, tapResponsesStream, type ChatGptUsage, type TapSummary } from "../chatgpt/tap"
 import { chatGptCooldownUntil, chatGptCreditsFromHeaders, chatGptRateLimitFromHeaders, creditsCanServe, type ChatGptRateLimit } from "../chatgpt/windows"
 import type { CodexCredits, CodexUsageWindow } from "../codex/types"
@@ -185,6 +185,12 @@ const DEFAULT_COOLDOWN_MS = 10 * 60_000
  * refresh it at any moment, and the next request re-reads it anyway.
  */
 const REAUTH_COOLDOWN_MS = 60_000
+/**
+ * How long a seat that refused a model sits that model out. Which models a
+ * seat may use follows its plan, which rarely changes; a model later opened to
+ * that plan is picked up once this runs out, for the price of one refusal.
+ */
+const MODEL_REFUSAL_MS = 6 * 60 * 60_000
 const MAX_CONVERSATIONS = 5_000
 
 const FORWARDED_RESPONSE_HEADERS = ["content-type", "cache-control", "retry-after"] as const
@@ -228,8 +234,7 @@ function inSavedOrder(seats: readonly string[], order: readonly string[]): strin
  * the backend's status and its own words; anything else is returned verbatim.
  * This touches the RESPONSE only, and only on a refusal.
  */
-async function requestRefusal(status: number, body: ReadableStream<Uint8Array>, headers: Headers): Promise<Response> {
-  const text = await new Response(body).text()
+function refusalResponse(status: number, text: string, headers: Headers): Response {
   let detail: string | undefined
   try {
     const parsed = asRecord(JSON.parse(text) as unknown)
@@ -250,6 +255,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
   const observed = new Map<string, ObservedSeatLimits>()
   const observedCredits = new Map<string, { credits: CodexCredits; at: number }>()
   const reserveRefusedUntil = new Map<string, number>()
+  const modelRefusedUntil = new Map<string, number>()
   const reserveKey = (seat: string, model: string | undefined) => `${seat}\u0000${model ?? ""}`
 
   /** The newer of what a response stated and what the usage read found. */
@@ -427,16 +433,24 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
 
       let spent: Response | undefined
       let spentKind: ChatGptFailureKind | undefined
-      const queue = seats.map(seat => ({ seat, onCredits: onCreditsNow.has(seat) }))
+      let modelRefusal: { seat: string; status: number; text: string; headers: Headers } | undefined
+      // A seat that refused this model sits it out (MODEL_REFUSAL_MS). It is
+      // asked again only when no other seat was, so a model that every seat
+      // refuses still gets the backend's own answer, not "unavailable".
+      const refusesModel = (seat: string) => (modelRefusedUntil.get(reserveKey(seat, model)) ?? 0) > now()
+      const queue: Array<{ seat: string; onCredits: boolean }> = []
+      const sittingOut: Array<{ seat: string; onCredits: boolean }> = []
+      const enqueue = (seat: string, onCredits: boolean) => (refusesModel(seat) ? sittingOut : queue).push({ seat, onCredits })
+      for (const seat of seats) enqueue(seat, onCreditsNow.has(seat))
       const dispatched = new Set<string>()
       let reserveQueued = false
       for (let next = 0; ; next++) {
-        if (next === queue.length) {
-          if (reserveQueued) break
+        if (next === queue.length && !reserveQueued) {
           reserveQueued = true
-          for (const seat of await creditReserve(dispatched)) queue.push({ seat, onCredits: true })
-          if (next === queue.length) break
+          for (const seat of await creditReserve(dispatched)) enqueue(seat, true)
         }
+        if (next === queue.length && dispatched.size === 0 && sittingOut.length > 0) queue.push(sittingOut.shift()!)
+        if (next === queue.length) break
         const { seat, onCredits } = queue[next]!
         let credential = await source.credentials(seat, { model, spendCredits: onCredits })
         // An expired token may have been rotated by its owner since the last
@@ -469,10 +483,19 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
           // refused, and every other seat would refuse it the same way, so
           // no seat is benched and none is tried. Treating it as a success
           // would hand a non-stream client a bogus "stream ended" 502.
+          // A refusal of the model itself is the exception: which models a
+          // seat may use follows its plan, so the next seat is asked, and
+          // this one sits out that model alone.
           if (!sniffed.failure && upstream.status >= 400) {
+            const text = await new Response(sniffed.body).text()
+            if (isModelRefusal(upstream.status, text)) {
+              modelRefusedUntil.set(reserveKey(seat, model), now() + MODEL_REFUSAL_MS)
+              modelRefusal = { seat, status: upstream.status, text, headers: headersOut }
+              break
+            }
             settle(null)
             report({ status: upstream.status, seat, error: "request_refused" })
-            return await requestRefusal(upstream.status, sniffed.body, headersOut)
+            return refusalResponse(upstream.status, text, headersOut)
           }
 
           if (!sniffed.failure) {
@@ -539,6 +562,11 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
         return spent
       }
       void spent?.body?.cancel().catch(() => {})
+
+      if (modelRefusal) {
+        report({ status: modelRefusal.status, seat: modelRefusal.seat, error: "request_refused" })
+        return refusalResponse(modelRefusal.status, modelRefusal.text, modelRefusal.headers)
+      }
 
       const fallback = await hooks?.onPoolExhausted?.({ ...turn, reasons })
       if (fallback) return fallback
