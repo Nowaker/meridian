@@ -26,7 +26,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs"
 import { dirname, isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
-import { applyEdits, modify, parse as parseJsonc, type ParseError } from "jsonc-parser"
+import { applyEdits, findNodeAtLocation, modify, parse as parseJsonc, parseTree, type ParseError } from "jsonc-parser"
 import {
   GLOBAL_CONFIG_FILE_NAMES,
   PLUGIN_PACKAGE_NAME,
@@ -331,6 +331,23 @@ function detectIndent(text: string): { insertSpaces: boolean; tabSize: number } 
   return { insertSpaces: true, tabSize: line.length - line.trimStart().length }
 }
 
+/**
+ * jsonc-parser 3.3.1 `modify` corrupts the text when it deletes the last of
+ * several elements and the closing bracket follows it on the same line:
+ * `["a", "b"]` becomes `["a""]`. That element is cut out here instead, from
+ * the end of the one before it, which also takes the comma.
+ */
+function removeArrayElement(text: string, path: (string | number)[], index: number, formattingOptions: ReturnType<typeof detectIndent>): string {
+  const array = findNodeAtLocation(parseTree(text, [], { allowTrailingComma: true })!, path)
+  const elements = array?.type === "array" ? array.children ?? [] : []
+  const target = elements[index]
+  const previous = elements[index - 1]
+  if (target && previous && index === elements.length - 1) {
+    return `${text.slice(0, previous.offset + previous.length)}${text.slice(target.offset + target.length)}`
+  }
+  return applyEdits(text, modify(text, [...path, index], undefined, { formattingOptions }))
+}
+
 export interface PluginRemoval {
   text: string
   removed: string[]
@@ -352,11 +369,125 @@ export function removePluginEntries(text: string, path: string): PluginRemoval {
   let next = text
   const formattingOptions = detectIndent(text)
   // Highest index first, so each removal leaves the earlier indices valid.
-  for (const index of indices.reverse()) {
-    next = applyEdits(next, modify(next, ["plugin", index], undefined, { formattingOptions }))
-  }
+  for (const index of indices.reverse()) next = removeArrayElement(next, ["plugin"], index, formattingOptions)
   parseConfigText(next, path)
   return { text: next, removed }
+}
+
+export function pluginEntriesIn(text: string, path: string): Array<{ index: number; spec: string }> {
+  const list = parseConfigText(text, path).plugin
+  if (!Array.isArray(list)) return []
+  return list.flatMap((raw, index) => {
+    const spec = specifierOf(raw)
+    return spec !== null && matchPluginSpec(spec, path) ? [{ index, spec }] : []
+  })
+}
+
+export interface PluginAddition {
+  text: string
+  /** `added`: a new entry; `replaced`: an entry for the plugin now names `spec`; `present`: nothing to do. */
+  outcome: "added" | "replaced" | "present"
+  previousSpec?: string
+}
+
+/**
+ * Put oc-codex-multi-auth back in a `plugin` array, at `index` when the
+ * array is still that long, else at its end. An entry that already loads the
+ * plugin is left alone, unless `replace` asks for it to name `spec` instead.
+ */
+export function addPluginEntry(text: string, path: string, spec: string, options: { index?: number; replace?: boolean } = {}): PluginAddition {
+  const config = parseConfigText(text, path)
+  const formattingOptions = detectIndent(text)
+  const existing = pluginEntriesIn(text, path)[0]
+  if (existing) {
+    if (!options.replace || existing.spec === spec) return { text, outcome: "present" }
+    const raw = (config.plugin as unknown[])[existing.index]
+    const target = Array.isArray(raw) ? ["plugin", existing.index, 0] : ["plugin", existing.index]
+    const next = applyEdits(text, modify(text, target, spec, { formattingOptions }))
+    parseConfigText(next, path)
+    return { text: next, outcome: "replaced", previousSpec: existing.spec }
+  }
+  const list = Array.isArray(config.plugin) ? config.plugin : null
+  const next = list === null
+    ? applyEdits(text, modify(text, ["plugin"], [spec], { formattingOptions }))
+    : applyEdits(text, modify(text, ["plugin", Math.min(options.index ?? list.length, list.length)], spec, { formattingOptions, isArrayInsertion: true }))
+  parseConfigText(next, path)
+  return { text: next, outcome: "added" }
+}
+
+/** What `provider.<id>` looked like before the forward migration pointed it at Meridian. */
+export interface ProviderBefore {
+  baseURL: string | undefined
+  hadApiKey: boolean
+  hadOptions: boolean
+  hadProvider: boolean
+  hadProviderMap: boolean
+}
+
+export function providerBefore(text: string, path: string, providerId: string): ProviderBefore {
+  const config = parseConfigText(text, path)
+  const providers = isRecord(config.provider) ? config.provider : null
+  const provider = providers && isRecord(providers[providerId]) ? providers[providerId] : null
+  const options = provider && isRecord(provider.options) ? provider.options : null
+  return {
+    baseURL: typeof options?.baseURL === "string" ? options.baseURL : undefined,
+    hadApiKey: options !== null && options.apiKey !== undefined,
+    hadOptions: options !== null,
+    hadProvider: provider !== null,
+    hadProviderMap: providers !== null,
+  }
+}
+
+export interface ProviderRestore {
+  text: string
+  /** `not-meridian`: the provider does not point at Meridian, so nothing was touched. */
+  outcome: "restored" | "removed" | "not-meridian"
+  restoredBaseURL: string | null
+  apiKeyRemoved: boolean
+}
+
+/**
+ * Undo `pointProviderAtMeridian`. The baseURL goes back to `before.baseURL`,
+ * or away when there was none. The apiKey is removed only when it is the
+ * placeholder the forward step writes and the provider had none before, so a
+ * key the operator added is never dropped. Containers the forward step
+ * created and that are now empty go too.
+ */
+export function restoreProvider(
+  text: string,
+  path: string,
+  input: { providerId: string; meridianBaseURL: string; placeholderApiKey: string; before: ProviderBefore | null },
+): ProviderRestore {
+  const config = parseConfigText(text, path)
+  const current = providerOptions(config, input.providerId)
+  const unchanged: ProviderRestore = { text, outcome: "not-meridian", restoredBaseURL: null, apiKeyRemoved: false }
+  if (!current || typeof current.baseURL !== "string" || current.baseURL.replace(/\/+$/, "") !== input.meridianBaseURL.replace(/\/+$/, "")) return unchanged
+
+  const formattingOptions = detectIndent(text)
+  const edit = (next: string, path: (string | number)[], value: unknown) => applyEdits(next, modify(next, path, value, { formattingOptions }))
+  const key = ["provider", input.providerId, "options"]
+  const previous = input.before?.baseURL
+  let next = edit(text, [...key, "baseURL"], previous)
+  const apiKeyRemoved = !(input.before?.hadApiKey ?? false) && current.apiKey === input.placeholderApiKey
+  if (apiKeyRemoved) next = edit(next, [...key, "apiKey"], undefined)
+
+  const after = parseConfigText(next, path)
+  const providers = isRecord(after.provider) ? after.provider : null
+  const provider = providers && isRecord(providers[input.providerId]) ? providers[input.providerId] as Record<string, unknown> : null
+  if (provider && isRecord(provider.options) && Object.keys(provider.options).length === 0 && !input.before?.hadOptions) {
+    next = edit(next, key, undefined)
+  }
+  const afterOptions = parseConfigText(next, path)
+  const providerNow = isRecord(afterOptions.provider) ? afterOptions.provider[input.providerId] : undefined
+  if (isRecord(providerNow) && Object.keys(providerNow).length === 0 && !input.before?.hadProvider) {
+    next = edit(next, ["provider", input.providerId], undefined)
+  }
+  const final = parseConfigText(next, path)
+  if (isRecord(final.provider) && Object.keys(final.provider).length === 0 && !input.before?.hadProviderMap) {
+    next = edit(next, ["provider"], undefined)
+  }
+  parseConfigText(next, path)
+  return { text: next, outcome: previous === undefined ? "removed" : "restored", restoredBaseURL: previous ?? null, apiKeyRemoved }
 }
 
 export interface ProviderPointing {

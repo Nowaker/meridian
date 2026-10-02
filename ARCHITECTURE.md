@@ -78,9 +78,11 @@ or conflicting input, creates private backups and uses per-file atomic replaceme
 `chatgpt/migrate/` implements `meridian chatgpt-migrate`: credential discovery
 (`sources.ts`), /proc scanning (`processes.ts`), opencode config resolution and
 jsonc editing (`opencodeConfig.ts`), stripping under oc-codex-multi-auth's own
-locks (`strip.ts`, `files.ts`) and the owned-store adapter (`ownedStore.ts`),
-which writes only through `chatgpt/credentials.ts` under the writer lease. The
-server never imports it.
+locks (`strip.ts`, `files.ts`), duplicate detection and naming on import
+(`duplicates.ts`), the `--reverse` hand-back to the plugin (`reverse.ts`, with
+the pure store merge in `handback.ts`) and the owned-store adapter
+(`ownedStore.ts`), which writes only through `chatgpt/credentials.ts` under the
+writer lease. The server never imports it.
 `telemetry/providerSetup.ts` shares pure command generation and setup presentation
 between the web provider page and desktop. Desktop clipboard requests contain
 choices rather than arbitrary text; the main process validates them against its

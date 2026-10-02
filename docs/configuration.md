@@ -803,7 +803,7 @@ ANTHROPIC_API_KEY=your-secret-key ANTHROPIC_BASE_URL=http://meridian-host:3456 o
 | `meridian profile login <name> [--headless]` | Re-authenticate an expired profile, adding it first if that name has no profile yet (browser-login profiles only); `--headless` uses the URL/code flow |
 | `meridian profile remove <name>` | Remove a profile and its credentials |
 | `meridian refresh-token` | Manually refresh the Claude OAuth token (exits 0/1) |
-| `meridian chatgpt-migrate [--dry-run] [--step <steps>]` | Move ChatGPT accounts from oc-codex-multi-auth and opencode's OpenAI login into Meridian's store. See [ChatGPT migration](#chatgpt-migration) |
+| `meridian chatgpt-migrate [--reverse] [--dry-run] [--step <steps>]` | Move ChatGPT accounts from oc-codex-multi-auth and opencode's OpenAI login into Meridian's store, or with `--reverse` hand them back. See [ChatGPT migration](#chatgpt-migration) |
 
 ## ChatGPT migration
 
@@ -819,6 +819,30 @@ ANTHROPIC_API_KEY=your-secret-key ANTHROPIC_BASE_URL=http://meridian-host:3456 o
 | `validate` | Checks through the running Meridian that each account reports its quota; `--test-prompt` also sends one short prompt on the cheapest model |
 
 Steps run in that order; `--step import,strip` runs a subset. `import` and `strip` refuse while a process holds the tokens unless `--force`. Run with `--dry-run` first: it reads everything, writes nothing, and never prints a token. After `import`, run Meridian with `MERIDIAN_CHATGPT_CREDENTIALS=owned` (or unset) so it refreshes the accounts, and restart opencode after `plugin` and `provider`.
+
+### Duplicates on import
+
+`import` compares every seat with the ChatGPT profiles Meridian already holds:
+
+- **Same seat** (same `accountUserId`): never a second profile. The one record keeps whichever token is fresher, and its profile name. Two records for one seat would hold one single-use refresh token twice, and the second renewal would fail.
+- **Possible duplicate** (another `accountUserId` with the same email in the same workspace): imported under `<name> (possibly duplicate of <existing profile>)`, spelled as a profile id, e.g. `alice-shared-3b18-possibly-duplicate-of-alice-shared`. The name is saved in `chatGptProfileNames`; rename it on `/profiles` once checked. `--skip-possible-duplicates` leaves these seats out. Each such seat has its own refresh token, so importing it renews nothing twice.
+- A seat whose refresh token Meridian already holds under another seat is refused.
+
+Email alone is not identity (one person holds seats in several workspaces), and neither is the workspace (a Business workspace holds many people). The dry run prints every match.
+
+### Reverse: handing seats back to oc-codex-multi-auth
+
+`meridian chatgpt-migrate --reverse` undoes the migration, step by step:
+
+| Step | What it does |
+|------|--------------|
+| `processes` | Lists opencode processes that still hold plugin tokens (refused for `handback` without `--force`), and the ones that need a restart to load the plugin again |
+| `handback` | Writes Meridian's seats into the plugin's global store (`--plugin-store` for another), merged by `accountUserId`: every other account is kept, and the store as it was is preserved as `.meridian-backup`. A `.meridian-backup` original whose refresh token Meridian never renewed is restored whole; otherwise Meridian's current token is laid over the plugin's own record. Then the seats are removed from Meridian's store, under its writer lease, so exactly one program renews each. Stop Meridian first; a seat with an interrupted renewal is skipped unless `--force`. `--seat <profile or seat id>` hands back only some |
+| `plugin` | Puts oc-codex-multi-auth back in every config whose preserved original listed it, at its old position, and in the global file whose plugin list opencode uses. The spec is the one the original named, else `oc-codex-multi-auth@latest`; `--plugin-path <repo>` writes `file://<repo>` instead (it must be a checkout of the plugin; build it with `npm ci && npm run build`) |
+| `provider` | Undoes the `provider` step: `baseURL` goes back to its value before the migration (or away), and the placeholder `apiKey` goes only if the provider had none before |
+| `verify` | Checks that no seat is renewed by both, that opencode's global config loads the plugin, and that the provider no longer points at Meridian |
+
+The plugin restores opencode's own `openai` login in `auth.json` from its store when it loads; the `backups/` directory the forward `strip` moved aside holds spent tokens and stays aside. Restart opencode afterwards.
 
 ## SDK Feature Toggles (Experimental)
 

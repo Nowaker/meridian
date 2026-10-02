@@ -29,8 +29,9 @@ import {
   writeFileSync,
   existsSync,
   chmodSync,
+  readdirSync,
 } from "node:fs"
-import { dirname } from "node:path"
+import { basename, dirname, join } from "node:path"
 import { syncDirectoryDurablySync } from "../../session/durableFileSystem"
 import { MERIDIAN_BACKUP_SUFFIX } from "./layout"
 
@@ -49,7 +50,13 @@ export function plannedBackupPath(path: string, content: Buffer | string, now: D
   if (!existsSync(primary)) return { path: primary, reused: false }
   const bytes = typeof content === "string" ? Buffer.from(content) : content
   if (readFileSync(primary).equals(bytes)) return { path: primary, reused: true }
-  return { path: `${primary}.${backupStamp(now)}`, reused: false }
+  // One run may preserve the same file twice within a second (the plugin and provider steps both edit it).
+  const stamped = `${primary}.${backupStamp(now)}`
+  for (let n = 1; ; n++) {
+    const candidate = n === 1 ? stamped : `${stamped}-${n}`
+    if (!existsSync(candidate)) return { path: candidate, reused: false }
+    if (readFileSync(candidate).equals(bytes)) return { path: candidate, reused: true }
+  }
 }
 
 function writeExclusive(path: string, content: Buffer | string, mode: number): void {
@@ -77,6 +84,23 @@ export function preserveOriginal(path: string, content: Buffer | string, now: Da
   }
   syncDirectoryDurablySync(dirname(planned.path))
   return planned
+}
+
+/**
+ * Every original preserved for `path`, oldest first: `<name>.meridian-backup`
+ * is the first one taken, and the timestamped ones sort in the order they were.
+ */
+export function backupsOf(path: string): string[] {
+  const primary = `${basename(path)}${MERIDIAN_BACKUP_SUFFIX}`
+  let names: string[]
+  try {
+    names = readdirSync(dirname(path))
+  } catch (error) {
+    if (errnoCode(error) === "ENOENT" || errnoCode(error) === "ENOTDIR") return []
+    throw error
+  }
+  const stamped = names.filter(name => name.startsWith(`${primary}.`)).sort()
+  return [...(names.includes(primary) ? [primary] : []), ...stamped].map(name => join(dirname(path), name))
 }
 
 /** Replace `path` with `content` all at once, keeping its permission bits. */

@@ -289,6 +289,7 @@ describe("ChatGPT refresh - an exchange whose outcome was never recorded", () =>
         if (dispatched()) throw new Error("the process died before the write landed")
         return inner.commitAccount(id, mutate)
       },
+      removeAccounts: ids => inner.removeAccounts(ids),
     }
   }
 

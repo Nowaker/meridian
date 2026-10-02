@@ -14,7 +14,9 @@
  */
 
 import { chatGptSeatLabel } from "../../backends/chatgptStatus"
-import { createChatGptCredentialStore } from "../credentials"
+import { getSetting, saveSettings } from "../../../settings"
+import { loadProfilesFromDisk } from "../../profiles"
+import { createChatGptCredentialStore, type ChatGptAccount } from "../credentials"
 import { acquireWriterLease, WriterLeaseUnavailableError } from "../lease"
 import { chatGptLockPath } from "../paths"
 import type { ChatGptStoreAdapter, ImportAccount, SeatValidation } from "./migrate"
@@ -44,6 +46,30 @@ export interface OwnedStoreAdapterOptions {
   apiKey?: string
   testModels?: readonly string[]
   fetchImpl?: typeof fetch
+  /** Where profile names live; Meridian's settings file when absent. */
+  settings?: {
+    names(): Readonly<Record<string, unknown>>
+    reserved(): ReadonlySet<string>
+    saveNames(names: ReadonlyMap<string, string>): void
+  }
+}
+
+function asHeld(account: ChatGptAccount): MeridianHeldAccount {
+  return {
+    accountUserId: account.accountUserId,
+    accountId: account.accountId,
+    email: account.email,
+    refreshToken: account.refreshToken,
+    accessToken: account.accessToken,
+    tokenRotatedAt: account.tokenRotatedAt,
+    expiresAt: account.expiresAt,
+    exchangeStartedAt: account.exchangeStartedAt,
+  }
+}
+
+/** The ids a ChatGPT seat may not take, as the server computes them: `default` and every Claude profile id and alias. */
+function claudeProfileIds(): Set<string> {
+  return new Set(["default", ...loadProfilesFromDisk().flatMap(profile => [profile.id, ...(profile.aliases ?? [])])])
 }
 
 interface ProviderAccount {
@@ -76,6 +102,14 @@ export function createOwnedStoreAdapter(options: OwnedStoreAdapterOptions): Chat
     ...(options.apiKey ? { "x-api-key": options.apiKey } : {}),
   })
   const reader = createChatGptCredentialStore({ path: storePath })
+  const takeLease = async () => {
+    try {
+      return await acquireWriterLease({ lockPath: chatGptLockPath(storePath), waitMs: 0 })
+    } catch (error) {
+      if (error instanceof WriterLeaseUnavailableError) throw new MeridianOwnsStoreError(error.lockPath)
+      throw error
+    }
+  }
 
   let serving: Promise<{ accounts: ProviderAccount[] } | { error: string }> | undefined
   const readServing = () => {
@@ -106,23 +140,34 @@ export function createOwnedStoreAdapter(options: OwnedStoreAdapterOptions): Chat
     storePath,
 
     readHeld(): MeridianHeldAccount[] {
-      return reader.readAccounts().map(account => ({
-        accountUserId: account.accountUserId,
-        refreshToken: account.refreshToken,
-        accessToken: account.accessToken,
-        tokenRotatedAt: account.tokenRotatedAt,
-        expiresAt: account.expiresAt,
-      }))
+      return reader.readAccounts().map(asHeld)
+    },
+
+    profileNames: () => options.settings?.names() ?? getSetting("chatGptProfileNames") ?? {},
+
+    reservedProfileIds: () => options.settings?.reserved() ?? claudeProfileIds(),
+
+    saveProfileNames(names) {
+      if (options.settings) return options.settings.saveNames(names)
+      saveSettings({ chatGptProfileNames: { ...(getSetting("chatGptProfileNames") ?? {}), ...Object.fromEntries(names) } })
+    },
+
+    async handBack(accountUserIds, write) {
+      const lease = await takeLease()
+      try {
+        const writer = createChatGptCredentialStore({ path: storePath, lease })
+        const wanted = new Set(accountUserIds)
+        const accounts = writer.readAccounts().filter(account => wanted.has(account.accountUserId)).map(asHeld)
+        if (accounts.length === 0) return []
+        write(accounts)
+        return writer.removeAccounts(accounts.map(account => account.accountUserId)).map(asHeld)
+      } finally {
+        lease.release()
+      }
     },
 
     async importAccounts(accounts: readonly ImportAccount[]): Promise<void> {
-      let lease
-      try {
-        lease = await acquireWriterLease({ lockPath: chatGptLockPath(storePath), waitMs: 0 })
-      } catch (error) {
-        if (error instanceof WriterLeaseUnavailableError) throw new MeridianOwnsStoreError(error.lockPath)
-        throw error
-      }
+      const lease = await takeLease()
       try {
         const writer = createChatGptCredentialStore({ path: storePath, lease })
         for (const account of accounts) {

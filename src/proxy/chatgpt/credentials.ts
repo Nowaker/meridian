@@ -114,6 +114,12 @@ export interface ChatGptCredentialStore {
     accountUserId: string,
     mutate: (current: ChatGptAccount | undefined) => ChatGptAccount,
   ): ChatGptAccount
+  /**
+   * Durably drop these seats, returning the records removed. Used only when a
+   * seat's refresh authority is handed to another program: the record must be
+   * gone before that program renews, or both would spend one token.
+   */
+  removeAccounts(accountUserIds: readonly string[]): ChatGptAccount[]
 }
 
 export interface ChatGptCredentialStoreOptions {
@@ -273,6 +279,18 @@ export function createChatGptCredentialStore(
       lease.assertValid()
       publishDocument(path, { version: STORE_VERSION, accounts })
       return next
+    },
+
+    removeAccounts(accountUserIds) {
+      if (!lease) throw new WriterLeaseRequiredError(path)
+      lease.assertValid()
+      const drop = new Set(accountUserIds)
+      const document = readDocument(path)
+      const removed = document.accounts.filter(account => drop.has(account.accountUserId))
+      if (removed.length === 0) return []
+      lease.assertValid()
+      publishDocument(path, { version: STORE_VERSION, accounts: document.accounts.filter(account => !drop.has(account.accountUserId)) })
+      return removed
     },
   }
 }

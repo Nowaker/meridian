@@ -45,6 +45,7 @@ import {
 import { compareFreshness, discoverCredentials, planAccounts, type AccountPlan, type Discovery } from "./sources"
 import { executeStrip, heldAsCandidate, ownershipBlockers, planStrip, type MeridianHeldAccount } from "./strip"
 import { preserveOriginal, replaceFileAtomically } from "./files"
+import { planImportNaming, possibleDuplicateSentence } from "./duplicates"
 
 export const MIGRATION_STEPS = ["processes", "import", "strip", "plugin", "provider", "validate"] as const
 export type MigrationStep = (typeof MIGRATION_STEPS)[number]
@@ -75,6 +76,19 @@ export interface ChatGptStoreAdapter {
   validateSeat?(accountUserId: string): Promise<SeatValidation>
   /** Send one short prompt on the cheapest model through the running Meridian. */
   testPrompt?(): Promise<SeatValidation>
+  /** The `chatGptProfileNames` setting: seat -> operator-chosen profile id. */
+  profileNames?(): Readonly<Record<string, unknown>>
+  /** Profile ids a ChatGPT seat may not take (Claude profiles and their aliases). */
+  reservedProfileIds?(): ReadonlySet<string>
+  /** Add seat -> profile id entries to `chatGptProfileNames`, keeping the rest. */
+  saveProfileNames?(names: ReadonlyMap<string, string>): void
+  /**
+   * Hand seats back to another refresher. Under the writer lease: reads the
+   * seats, lets `write` put them where the new owner reads them, and only
+   * then drops them from Meridian's store. `write` throwing leaves Meridian's
+   * store untouched. Returns the seats removed.
+   */
+  handBack?(accountUserIds: readonly string[], write: (accounts: readonly MeridianHeldAccount[]) => void): Promise<MeridianHeldAccount[]>
 }
 
 export interface MigrationOptions {
@@ -90,6 +104,8 @@ export interface MigrationOptions {
   /** opencode's database, for every project directory it has seen. Null skips it. */
   opencodeDatabasePath: string | null
   includeBackupOnly: boolean
+  /** Leave out seats that look like another account Meridian holds, instead of importing them under a flagged name. */
+  skipPossibleDuplicates?: boolean
   testPrompt: boolean
   store: ChatGptStoreAdapter | null
   keychain: KeychainBackend | null
@@ -106,7 +122,7 @@ export interface MigrationResult {
 
 const ACCOUNT_ID_TAIL = 6
 
-function seatLabel(plan: Pick<AccountPlan, "email" | "accountUserId">): string {
+export function seatLabel(plan: Pick<AccountPlan, "email" | "accountUserId">): string {
   return plan.email ? `${plan.email} (${plan.accountUserId})` : plan.accountUserId
 }
 
@@ -149,7 +165,7 @@ function reportDiscovery(discovery: Discovery, plans: readonly AccountPlan[], op
 // Processes
 // ---------------------------------------------------------------------------
 
-interface ProcessGate {
+export interface ProcessGate {
   blocking: OpencodeProcess[]
   supported: boolean
 }
@@ -170,7 +186,7 @@ function describeProcess(candidate: OpencodeProcess): string {
   return `pid ${candidate.pid} ${candidate.command}${where}${ancestor}: ${why}`
 }
 
-function reportProcesses(gate: ProcessGate, options: MigrationOptions): void {
+export function reportProcesses(gate: ProcessGate, options: Pick<MigrationOptions, "log">): void {
   const { log } = options
   if (!gate.supported) {
     log("Running processes: cannot be checked on this platform (no /proc). Stop every opencode process yourself.")
@@ -195,7 +211,7 @@ function reportProcesses(gate: ProcessGate, options: MigrationOptions): void {
   log("  Each keeps its refresh tokens in memory and keeps rotating them; Meridian and it would invalidate each other's single-use tokens.")
 }
 
-function gateAllows(gate: ProcessGate, options: MigrationOptions, step: MigrationStep): boolean {
+export function gateAllows(gate: ProcessGate, options: Pick<MigrationOptions, "force" | "log">, step: string): boolean {
   if (gate.supported && gate.blocking.length === 0) return true
   if (options.force) {
     options.log(`  --force: running ${step} anyway.`)
@@ -229,7 +245,15 @@ async function runImport(plans: readonly AccountPlan[], options: MigrationOption
   if (held === null) return false
   log(`  Meridian's store: ${options.store.storePath} (${held.length} seat(s) now)`)
   const heldBySeat = new Map(held.map(account => [account.accountUserId, account]))
+  const importable = plans.filter(plan => plan.accountId && !(plan.onlyInBackups && !options.includeBackupOnly))
+  const naming = planImportNaming({
+    held: held.map(account => ({ accountUserId: account.accountUserId, accountId: account.accountId ?? null, email: account.email ?? null })),
+    incoming: importable.map(plan => ({ accountUserId: plan.accountUserId, accountId: plan.accountId, email: plan.email })),
+    names: options.store.profileNames?.(),
+    reserved: options.store.reservedProfileIds?.(),
+  })
   const accounts: ImportAccount[] = []
+  const newNames = new Map<string, string>()
   for (const plan of plans) {
     const label = seatLabel(plan)
     if (plan.onlyInBackups && !options.includeBackupOnly) {
@@ -240,16 +264,37 @@ async function runImport(plans: readonly AccountPlan[], options: MigrationOption
       log(`  skip ${label}: no workspace id`)
       continue
     }
+    const match = naming.matches.get(plan.accountUserId)
+    const profileId = naming.ids.get(plan.accountUserId) ?? plan.accountUserId
+    // One refresh token in two records would be renewed twice, and the second renewal fails.
+    const sharer = held.find(account => account.accountUserId !== plan.accountUserId && account.refreshToken === plan.winner.refreshToken)
+    if (sharer) {
+      log(`  skip ${label}: Meridian holds this refresh token for another seat (${naming.ids.get(sharer.accountUserId) ?? sharer.accountUserId}); two profiles must not renew one token`)
+      continue
+    }
     const mine = heldBySeat.get(plan.accountUserId)
     if (mine?.refreshToken === plan.winner.refreshToken) {
-      log(`  keep ${label}: already imported`)
+      log(`  keep ${label}: already imported as ${profileId}`)
       continue
     }
     if (mine && compareFreshness(plan.winner, heldAsCandidate(mine, plan.winner)) >= 0) {
-      log(`  keep ${label}: Meridian's copy is newer`)
+      log(`  keep ${label}: Meridian's copy (${profileId}) is newer`)
       continue
     }
-    log(`  ${options.dryRun ? "would import" : "import"} ${label} from ${plan.winner.source.location}${mine ? " (replacing an older copy)" : ""}`)
+    let as = `as ${profileId}`
+    if (match?.kind === "possible") {
+      if (options.skipPossibleDuplicates) {
+        log(`  skip ${label}: possibly a duplicate of ${match.profileId} (same email and workspace, another user id; --skip-possible-duplicates)`)
+        continue
+      }
+      const sentence = possibleDuplicateSentence(naming.derived.get(plan.accountUserId) ?? profileId, match.profileId)
+      const flagged = naming.names.get(plan.accountUserId)
+      if (flagged) newNames.set(plan.accountUserId, flagged)
+      as = flagged ? `as ${profileId}: "${sentence}"` : `as ${profileId}, the name it was given ("${sentence}")`
+    } else if (match?.kind === "same-seat") {
+      as = `into ${profileId}, the profile Meridian already has for this seat`
+    }
+    log(`  ${options.dryRun ? "would import" : "import"} ${label} ${as} from ${plan.winner.source.location}${mine ? " (replacing an older copy)" : ""}`)
     accounts.push({
       accountUserId: plan.accountUserId,
       accountId: plan.accountId,
@@ -268,6 +313,14 @@ async function runImport(plans: readonly AccountPlan[], options: MigrationOption
     return false
   }
   log(`  Imported ${accounts.length} seat(s) into ${options.store.storePath}.`)
+  if (newNames.size > 0) {
+    if (options.store.saveProfileNames) {
+      options.store.saveProfileNames(newNames)
+      log(`  Named ${newNames.size} possible duplicate(s); rename any of them on /profiles once you have checked.`)
+    } else {
+      log("  ! this build cannot save profile names; the possible duplicates keep their derived names")
+    }
+  }
   log("  Meridian refreshes them from now on, once it runs with this store (MERIDIAN_CHATGPT_CREDENTIALS=owned or unset).")
   return true
 }
@@ -315,7 +368,7 @@ async function runStrip(discovery: Discovery, options: MigrationOptions): Promis
 // opencode config
 // ---------------------------------------------------------------------------
 
-function contexts(options: MigrationOptions, processes: readonly OpencodeProcess[]): OpencodeContext[] {
+export function contexts(options: Pick<MigrationOptions, "projectDirs" | "opencodeDatabasePath" | "log">, processes: readonly OpencodeProcess[]): OpencodeContext[] {
   const directories = new Set<string>(options.projectDirs)
   for (const candidate of processes) if (candidate.cwd) directories.add(candidate.cwd)
   if (options.opencodeDatabasePath && existsSync(options.opencodeDatabasePath)) {

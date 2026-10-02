@@ -76,6 +76,11 @@ export interface MeridianHeldAccount {
   accessToken: string | null
   tokenRotatedAt: number | null
   expiresAt: number | null
+  /** The workspace and email, for naming seats and spotting duplicates. Absent where the adapter does not know them. */
+  accountId?: string | null
+  email?: string | null
+  /** Set while an exchange's result was never recorded: the refresh token may already be spent. */
+  exchangeStartedAt?: number | null
 }
 
 export function heldAsCandidate(account: MeridianHeldAccount, template: CandidateCredential): CandidateCredential {
@@ -236,7 +241,7 @@ export function stripAccountsText(raw: string): { text: string; removed: number 
   return { text: `${JSON.stringify(parsed, null, 2)}\n`, removed }
 }
 
-function locksFor(lockedStorePath: string, options: StripExecutionOptions) {
+export function locksFor(lockedStorePath: string, options: Pick<StripExecutionOptions, "refreshLock" | "transactionLock">) {
   // The refresh lease belongs to the main accounts file of the directory, and
   // is taken first: the plugin holds it around the exchange and opens the
   // storage transaction inside it.

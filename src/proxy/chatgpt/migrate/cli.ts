@@ -9,6 +9,7 @@ import { loadNativeKeychainBackend } from "./keychain"
 import { environmentFromProcess } from "./layout"
 import { createOwnedStoreAdapter } from "./ownedStore"
 import { chatGptStorePath } from "../paths"
+import { REVERSE_STEPS, runReverseMigration, type ReverseStep } from "./reverse"
 import {
   MIGRATION_STEPS,
   defaultOpencodeDatabasePath,
@@ -45,10 +46,43 @@ Options:
   --store <path>          Meridian's ChatGPT store (default: $MERIDIAN_CHATGPT_STORE_PATH,
                           else chatgpt-accounts.json in Meridian's config directory)
   --include-backup-only   Import accounts found only in plugin backups
+  --skip-possible-duplicates
+                          Leave out seats that look like an account Meridian
+                          already holds (same email and workspace, another user
+                          id) instead of importing them as
+                          "<name> (possibly duplicate of <profile>)"
   --keychain              Read the OS keychain even without CODEX_KEYCHAIN=1
   --test-prompt           validate: also send one short prompt on the cheapest model
   --test-model <id>       Model for --test-prompt (default: the cheapest one served)
   -h, --help              This text
+
+A seat Meridian already holds (same user id) is never imported twice: its one
+record keeps the fresher token and its profile name.
+
+Hand seats back to oc-codex-multi-auth (reverse):
+
+  meridian chatgpt-migrate --reverse [--dry-run] [--step <steps>] [options]
+
+Steps, run in this order (default: all):
+  processes   List opencode processes that hold plugin tokens or need a restart
+  handback    Write Meridian's seats into the plugin's store (merged, the old
+              store kept as .meridian-backup; an original whose refresh token
+              Meridian never renewed is restored whole), then remove them from
+              Meridian's store so only the plugin renews them. Stop Meridian first.
+  plugin      Put oc-codex-multi-auth back in the opencode configs that listed it,
+              and in the global file whose plugin list opencode uses
+  provider    Undo the provider step: the provider goes back to the plugin
+  verify      Check no seat is renewed by both, and opencode loads the plugin
+
+Reverse options:
+  --seat <id>             Hand back only this profile id or seat id (repeatable)
+  --plugin-path <repo>    Load the plugin as file://<repo> (a checkout of
+                          oc-codex-multi-auth) instead of the spec the preserved
+                          config names (else oc-codex-multi-auth@latest)
+  --plugin-store <path>   The plugin store to write (default: the global store,
+                          ~/.opencode/oc-codex-multi-auth-accounts.json)
+  --provider, --meridian-url, --base-url, --api-key-env, --project,
+  --no-opencode-db, --store, --dry-run, --force  as above
 
 No token value is ever printed.`
 
@@ -56,7 +90,13 @@ export class MigrateUsageError extends Error {}
 
 export interface ParsedMigrateArgs {
   help: boolean
+  reverse: boolean
   steps: MigrationStep[]
+  reverseSteps: ReverseStep[]
+  seats: string[]
+  pluginPath: string | null
+  pluginStorePath: string | null
+  skipPossibleDuplicates: boolean
   dryRun: boolean
   force: boolean
   providerId: string
@@ -72,18 +112,17 @@ export interface ParsedMigrateArgs {
   testPrompt: boolean
 }
 
-function isStep(value: string): value is MigrationStep {
-  return (MIGRATION_STEPS as readonly string[]).includes(value)
-}
 
 export function parseMigrateArgs(argv: readonly string[], env: NodeJS.ProcessEnv): ParsedMigrateArgs {
   const port = env.MERIDIAN_PORT ?? env.CLAUDE_PROXY_PORT ?? "3456"
   let meridianUrl = `http://127.0.0.1:${port}`
   let baseURL: string | undefined
   let apiKeyEnv: string | undefined
-  const steps: MigrationStep[] = []
+  const requested: string[] = []
+  const reverseOnly: string[] = []
+  const forwardOnly: string[] = []
   const parsed: ParsedMigrateArgs = {
-    help: false, steps, dryRun: false, force: false, providerId: "openai", baseURL: "", meridianUrl: "", storePath: null, testModel: null, apiKey: "meridian",
+    help: false, reverse: false, steps: [], reverseSteps: [], seats: [], pluginPath: null, pluginStorePath: null, skipPossibleDuplicates: false, dryRun: false, force: false, providerId: "openai", baseURL: "", meridianUrl: "", storePath: null, testModel: null, apiKey: "meridian",
     projectDirs: [], useOpencodeDatabase: true, includeBackupOnly: false, keychain: false, testPrompt: false,
   }
   const value = (index: number, flag: string): string => {
@@ -97,15 +136,17 @@ export function parseMigrateArgs(argv: readonly string[], env: NodeJS.ProcessEnv
       case "-h": case "--help": parsed.help = true; break
       case "--dry-run": parsed.dryRun = true; break
       case "--force": parsed.force = true; break
-      case "--include-backup-only": parsed.includeBackupOnly = true; break
+      case "--reverse": parsed.reverse = true; break
+      case "--include-backup-only": parsed.includeBackupOnly = true; forwardOnly.push(arg); break
+      case "--skip-possible-duplicates": parsed.skipPossibleDuplicates = true; forwardOnly.push(arg); break
+      case "--test-prompt": parsed.testPrompt = true; forwardOnly.push(arg); break
+      case "--seat": parsed.seats.push(value(i, arg)); reverseOnly.push(arg); i++; break
+      case "--plugin-path": parsed.pluginPath = resolve(value(i, arg)); reverseOnly.push(arg); i++; break
+      case "--plugin-store": parsed.pluginStorePath = resolve(value(i, arg)); reverseOnly.push(arg); i++; break
       case "--keychain": parsed.keychain = true; break
-      case "--test-prompt": parsed.testPrompt = true; break
       case "--no-opencode-db": parsed.useOpencodeDatabase = false; break
       case "--step":
-        for (const step of value(i, arg).split(",").map(part => part.trim()).filter(Boolean)) {
-          if (!isStep(step)) throw new MigrateUsageError(`unknown step "${step}" (steps: ${MIGRATION_STEPS.join(", ")})`)
-          steps.push(step)
-        }
+        requested.push(...value(i, arg).split(",").map(part => part.trim()).filter(Boolean))
         i++
         break
       case "--provider": parsed.providerId = value(i, arg); i++; break
@@ -124,7 +165,16 @@ export function parseMigrateArgs(argv: readonly string[], env: NodeJS.ProcessEnv
         throw new MigrateUsageError(`unknown option "${arg}"`)
     }
   }
-  if (steps.length === 0) steps.push(...MIGRATION_STEPS)
+  const known: readonly string[] = parsed.reverse ? REVERSE_STEPS : MIGRATION_STEPS
+  for (const step of requested) {
+    if (!known.includes(step)) {
+      throw new MigrateUsageError(`unknown ${parsed.reverse ? "reverse " : ""}step "${step}" (steps: ${known.join(", ")})`)
+    }
+  }
+  const misplaced = parsed.reverse ? forwardOnly : reverseOnly
+  if (misplaced.length > 0) throw new MigrateUsageError(`${misplaced[0]} ${parsed.reverse ? "does not apply to --reverse" : "needs --reverse"}`)
+  if (parsed.reverse) parsed.reverseSteps = (requested.length > 0 ? requested : [...REVERSE_STEPS]) as ReverseStep[]
+  else parsed.steps = (requested.length > 0 ? requested : [...MIGRATION_STEPS]) as MigrationStep[]
   parsed.meridianUrl = meridianUrl
   parsed.baseURL = baseURL ?? `${meridianUrl}/v1`
   if (!/^https?:\/\//.test(parsed.baseURL)) throw new MigrateUsageError(`the provider baseURL must be an http(s) URL, not "${parsed.baseURL}"`)
@@ -146,6 +196,30 @@ export async function runMigrateCli(argv: readonly string[]): Promise<number> {
     return 0
   }
   const env = environmentFromProcess(process.env, homedir())
+  const store = createOwnedStoreAdapter({
+    storePath: args.storePath ?? chatGptStorePath(),
+    meridianUrl: args.meridianUrl,
+    apiKey: process.env.MERIDIAN_API_KEY || undefined,
+    ...(args.testModel ? { testModels: [args.testModel] } : {}),
+  })
+  if (args.reverse) {
+    return (await runReverseMigration({
+      env,
+      steps: args.reverseSteps,
+      dryRun: args.dryRun,
+      force: args.force,
+      seats: args.seats,
+      pluginStorePath: args.pluginStorePath,
+      pluginPath: args.pluginPath,
+      providerId: args.providerId,
+      baseURL: args.baseURL,
+      apiKey: args.apiKey,
+      projectDirs: args.projectDirs,
+      opencodeDatabasePath: args.useOpencodeDatabase ? defaultOpencodeDatabasePath(env) : null,
+      store,
+      log: line => console.log(line),
+    })).exitCode
+  }
   const keychain = args.keychain || env.codexKeychain ? await loadNativeKeychainBackend() : null
   if ((args.keychain || env.codexKeychain) && !keychain) {
     console.log("The OS keychain could not be opened (@napi-rs/keyring is not installed); keychain entries were not checked.\n")
@@ -161,13 +235,9 @@ export async function runMigrateCli(argv: readonly string[]): Promise<number> {
     projectDirs: args.projectDirs,
     opencodeDatabasePath: args.useOpencodeDatabase ? defaultOpencodeDatabasePath(env) : null,
     includeBackupOnly: args.includeBackupOnly,
+    skipPossibleDuplicates: args.skipPossibleDuplicates,
     testPrompt: args.testPrompt,
-    store: createOwnedStoreAdapter({
-      storePath: args.storePath ?? chatGptStorePath(),
-      meridianUrl: args.meridianUrl,
-      apiKey: process.env.MERIDIAN_API_KEY || undefined,
-      ...(args.testModel ? { testModels: [args.testModel] } : {}),
-    }),
+    store,
     keychain,
     log: line => console.log(line),
   }
