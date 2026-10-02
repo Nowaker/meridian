@@ -5,13 +5,14 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { parse as parseJsonc } from "jsonc-parser"
-import { MigrateUsageError, parseMigrateArgs } from "../proxy/chatgpt/migrate/cli"
+import { MigrateUsageError, parseMigrateArgs, resolveInstancePaths } from "../proxy/chatgpt/migrate/cli"
 import { findDuplicate, planImportNaming, possibleDuplicateName } from "../proxy/chatgpt/migrate/duplicates"
 import { mergeIntoPluginStore, PluginStoreFormatError } from "../proxy/chatgpt/migrate/handback"
+import { findMeridianInstance } from "../proxy/chatgpt/migrate/instance"
 import { ACCOUNTS_FILE_NAME, type MigrationEnvironment } from "../proxy/chatgpt/migrate/layout"
 import { runMigration, type ChatGptStoreAdapter, type ImportAccount, type MigrationOptions } from "../proxy/chatgpt/migrate/migrate"
 import { addPluginEntry, pointProviderAtMeridian, providerBefore, removePluginEntries, restoreProvider } from "../proxy/chatgpt/migrate/opencodeConfig"
@@ -433,13 +434,89 @@ describe("round trip: forward, then --reverse", () => {
     expect(refused.join("\n")).toContain("not oc-codex-multi-auth")
   })
 
-  it("falls back to the published package when no preserved config names one", async () => {
+  it("falls back to the published package when no preserved config names one, TUI status bar included", async () => {
     mkdirSync(join(home, ".config", "opencode"), { recursive: true })
     writeFileSync(join(home, ".config", "opencode", "opencode.json"), `{ "plugin": [] }`)
     const lines: string[] = []
     expect((await runReverseMigration(reverseOptions({ steps: ["plugin"] }, lines))).exitCode).toBe(0)
     expect(parseJsonc(readFileSync(join(home, ".config", "opencode", "opencode.json"), "utf8")).plugin).toEqual([DEFAULT_PLUGIN_SPEC])
     expect(existsSync(join(home, ".config", "opencode", "opencode.jsonc"))).toBe(false)
+    expect(parseJsonc(readFileSync(join(home, ".config", "opencode", "tui.json"), "utf8")).plugin).toEqual([DEFAULT_PLUGIN_SPEC])
+  })
+
+  it("removes the TUI status bar going forward and puts it back where it was", async () => {
+    seedPlugin()
+    const tuiPath = join(home, ".config", "opencode", "tui.json")
+    const tuiText = `{\n  "$schema": "https://opencode.ai/tui.json",\n  "plugin": ["oc-codex-multi-auth@6", "other-tui-plugin"]\n}\n`
+    writeFileSync(tuiPath, tuiText)
+    await forward()
+    expect(parseJsonc(readFileSync(tuiPath, "utf8")).plugin).toEqual(["other-tui-plugin"])
+
+    const lines: string[] = []
+    expect((await runReverseMigration(reverseOptions({ store: adapter() }, lines))).exitCode).toBe(0)
+    expect(parseJsonc(readFileSync(tuiPath, "utf8"))).toEqual(parseJsonc(tuiText))
+    expect(lines.join("\n")).toContain("opencode's global TUI config loads the plugin's status bar")
+  })
+})
+
+describe("the Meridian instance behind --meridian-url", () => {
+  function fakeProcess(pid: number, argv: string[], cwd: string, environ: Record<string, string>) {
+    const dir = join(procRoot, String(pid))
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, "cmdline"), `${argv.join("\0")}\0`)
+    writeFileSync(join(dir, "environ"), `${Object.entries(environ).map(([key, value]) => `${key}=${value}`).join("\0")}\0`)
+    symlinkSync(cwd, join(dir, "cwd"))
+  }
+
+  function checkout(): string {
+    const dir = join(root, "meridian-checkout")
+    mkdirSync(join(dir, "bin"), { recursive: true })
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "@rynfar/meridian" }))
+    writeFileSync(join(dir, "bin", "cli.ts"), "")
+    return dir
+  }
+
+  it("finds the server on the URL's port and derives its store and config directory", () => {
+    const dir = checkout()
+    const isolated = join(root, "isolated-home")
+    fakeProcess(10, ["/usr/bin/bun", "run", "./bin/cli.ts"], dir, { HOME: isolated, MERIDIAN_PORT: "3459", MERIDIAN_CHATGPT_STORE_PATH: "/srv/gpt/chatgpt-accounts.json", MERIDIAN_API_KEY: "not-read" })
+    fakeProcess(11, ["/usr/bin/bun", "run", "./bin/cli.ts", "chatgpt-migrate", "--dry-run"], dir, { HOME: home, MERIDIAN_PORT: "3459" })
+    fakeProcess(12, ["/usr/bin/bun", "run", "./bin/cli.ts"], dir, { HOME: home })
+
+    expect(findMeridianInstance("http://127.0.0.1:3459", { procRoot, selfPid: 1 }))
+      .toEqual({ pid: 10, port: "3459", configDir: join(isolated, ".config", "meridian"), storePath: "/srv/gpt/chatgpt-accounts.json" })
+    expect(findMeridianInstance("http://127.0.0.1:3456", { procRoot, selfPid: 1 })).toMatchObject({ pid: 12, storePath: join(home, ".config", "meridian", "chatgpt-accounts.json") })
+    expect(findMeridianInstance("http://127.0.0.1:3460", { procRoot, selfPid: 1 })).toBeNull()
+  })
+
+  it("ignores a process that is not Meridian", () => {
+    const other = join(root, "other")
+    mkdirSync(join(other, "bin"), { recursive: true })
+    writeFileSync(join(other, "package.json"), JSON.stringify({ name: "something-else" }))
+    writeFileSync(join(other, "bin", "cli.ts"), "")
+    fakeProcess(20, ["/usr/bin/bun", "run", "./bin/cli.ts"], other, { HOME: home })
+    expect(findMeridianInstance("http://127.0.0.1:3456", { procRoot, selfPid: 1 })).toBeNull()
+  })
+
+  it("takes flags, then explicit shell variables, then the instance, then the defaults", () => {
+    const instance = { pid: 10, port: "3459", configDir: "/inst/config", storePath: "/inst/store.json" }
+    const unset = { configDir: null, storePath: null, defaultConfigDir: "/home/.config/meridian" }
+    const url = "http://127.0.0.1:3459"
+    const none = { storePath: null, configDir: null, meridianUrl: url }
+    expect(resolveInstancePaths(none, instance, unset)).toMatchObject({ storePath: "/inst/store.json", configDir: "/inst/config" })
+    expect(resolveInstancePaths(none, null, unset)).toMatchObject({ storePath: "/home/.config/meridian/chatgpt-accounts.json", configDir: null })
+
+    const flagged = resolveInstancePaths({ ...none, storePath: "/flag/store.json" }, instance, unset)
+    expect(flagged).toMatchObject({ storePath: "/flag/store.json", configDir: "/inst/config" })
+    expect(flagged.notes.join("\n")).toContain("that instance will not see what is written there")
+
+    const shell = resolveInstancePaths(none, instance, { ...unset, configDir: "/sandbox" })
+    expect(shell).toMatchObject({ storePath: "/sandbox/chatgpt-accounts.json", configDir: "/sandbox" })
+    expect(resolveInstancePaths({ ...none, configDir: "/inst/config" }, instance, unset)).toMatchObject({ storePath: "/inst/store.json" })
+
+    const stopped = resolveInstancePaths({ ...none, configDir: "/flag/config" }, null, unset)
+    expect(stopped).toMatchObject({ storePath: "/flag/config/chatgpt-accounts.json", configDir: "/flag/config" })
+    expect(stopped.notes.join("\n")).toContain("pass --store and --config-dir")
   })
 })
 

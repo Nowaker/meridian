@@ -79,7 +79,8 @@ or conflicting input, creates private backups and uses per-file atomic replaceme
 (`sources.ts`), /proc scanning (`processes.ts`), opencode config resolution and
 jsonc editing (`opencodeConfig.ts`), stripping under oc-codex-multi-auth's own
 locks (`strip.ts`, `files.ts`), duplicate detection and naming on import
-(`duplicates.ts`), the `--reverse` hand-back to the plugin (`reverse.ts`, with
+(`duplicates.ts`), finding the running instance's store and config directory
+(`instance.ts`), the `--reverse` hand-back to the plugin (`reverse.ts`, with
 the pure store merge in `handback.ts`) and the owned-store adapter
 (`ownedStore.ts`), which writes only through `chatgpt/credentials.ts` under the
 writer lease. The server never imports it.

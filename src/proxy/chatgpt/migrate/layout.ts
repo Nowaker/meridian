@@ -25,6 +25,8 @@ export interface MigrationEnvironment {
   opencodeConfigDir?: string
   /** `OPENCODE_CONFIG_CONTENT`: inline config. Read for its plugin list only. */
   opencodeConfigContent?: string
+  /** `OPENCODE_TUI_CONFIG`: one extra TUI config file. */
+  opencodeTuiConfig?: string
   disableProjectConfig?: boolean
   /** `CODEX_KEYCHAIN=1`: the plugin keeps its stores in the OS keychain. */
   codexKeychain?: boolean
@@ -48,6 +50,9 @@ export const MERIDIAN_BACKUP_SUFFIX = ".meridian-backup"
 /** Opencode loads these three from its global directory, in this order. */
 export const GLOBAL_CONFIG_FILE_NAMES = ["config.json", "opencode.json", "opencode.jsonc"] as const
 
+/** The TUI's own config (`config/tui.ts`), which lists the plugin's quota status bar. */
+export const TUI_CONFIG_FILE_NAMES = ["tui.json", "tui.jsonc"] as const
+
 export function environmentFromProcess(
   env: NodeJS.ProcessEnv,
   home: string,
@@ -59,6 +64,7 @@ export function environmentFromProcess(
     opencodeConfig: env.OPENCODE_CONFIG || undefined,
     opencodeConfigDir: env.OPENCODE_CONFIG_DIR || undefined,
     opencodeConfigContent: env.OPENCODE_CONFIG_CONTENT || undefined,
+    opencodeTuiConfig: env.OPENCODE_TUI_CONFIG || undefined,
     disableProjectConfig: isTruthyFlag(env.OPENCODE_DISABLE_PROJECT_CONFIG),
     codexKeychain: env.CODEX_KEYCHAIN === "1",
   }

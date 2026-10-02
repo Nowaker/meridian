@@ -4,11 +4,12 @@
  */
 
 import { homedir } from "node:os"
-import { resolve } from "node:path"
+import { join, resolve } from "node:path"
 import { loadNativeKeychainBackend } from "./keychain"
 import { environmentFromProcess } from "./layout"
+import { findMeridianInstance, type MeridianInstance } from "./instance"
 import { createOwnedStoreAdapter } from "./ownedStore"
-import { chatGptStorePath } from "../paths"
+import { defaultConfigDir } from "../../../configDir"
 import { REVERSE_STEPS, runReverseMigration, type ReverseStep } from "./reverse"
 import {
   MIGRATION_STEPS,
@@ -43,8 +44,15 @@ Options:
   --api-key-env <VAR>     Write apiKey as {env:VAR} instead of a placeholder
   --project <dir>         Also edit this project's opencode configs (repeatable)
   --no-opencode-db        Do not read opencode's database for project directories
-  --store <path>          Meridian's ChatGPT store (default: $MERIDIAN_CHATGPT_STORE_PATH,
-                          else chatgpt-accounts.json in Meridian's config directory)
+  --store <path>          Meridian's ChatGPT store (default: $MERIDIAN_CHATGPT_STORE_PATH
+                          when set, else the store of the Meridian running at
+                          --meridian-url, else chatgpt-accounts.json in the
+                          config directory)
+  --config-dir <dir>      Meridian's config directory, for profile names and
+                          Claude profile ids (default: $MERIDIAN_CONFIG_DIR when
+                          set, else that of the Meridian running at
+                          --meridian-url, else ~/.config/meridian). The command
+                          prints both, and the flags to pass once it is stopped.
   --include-backup-only   Import accounts found only in plugin backups
   --skip-possible-duplicates
                           Leave out seats that look like an account Meridian
@@ -82,7 +90,10 @@ Reverse options:
   --plugin-store <path>   The plugin store to write (default: the global store,
                           ~/.opencode/oc-codex-multi-auth-accounts.json)
   --provider, --meridian-url, --base-url, --api-key-env, --project,
-  --no-opencode-db, --store, --dry-run, --force  as above
+  --no-opencode-db, --store, --config-dir, --dry-run, --force  as above
+
+Both directions also edit oc-codex-multi-auth's entries in opencode's TUI
+config (tui.json), which loads its quota status bar.
 
 No token value is ever printed.`
 
@@ -103,6 +114,7 @@ export interface ParsedMigrateArgs {
   baseURL: string
   meridianUrl: string
   storePath: string | null
+  configDir: string | null
   testModel: string | null
   apiKey: string
   projectDirs: string[]
@@ -122,7 +134,7 @@ export function parseMigrateArgs(argv: readonly string[], env: NodeJS.ProcessEnv
   const reverseOnly: string[] = []
   const forwardOnly: string[] = []
   const parsed: ParsedMigrateArgs = {
-    help: false, reverse: false, steps: [], reverseSteps: [], seats: [], pluginPath: null, pluginStorePath: null, skipPossibleDuplicates: false, dryRun: false, force: false, providerId: "openai", baseURL: "", meridianUrl: "", storePath: null, testModel: null, apiKey: "meridian",
+    help: false, reverse: false, steps: [], reverseSteps: [], seats: [], pluginPath: null, pluginStorePath: null, skipPossibleDuplicates: false, dryRun: false, force: false, providerId: "openai", baseURL: "", meridianUrl: "", storePath: null, configDir: null, testModel: null, apiKey: "meridian",
     projectDirs: [], useOpencodeDatabase: true, includeBackupOnly: false, keychain: false, testPrompt: false,
   }
   const value = (index: number, flag: string): string => {
@@ -153,6 +165,7 @@ export function parseMigrateArgs(argv: readonly string[], env: NodeJS.ProcessEnv
       case "--meridian-url": meridianUrl = value(i, arg).replace(/\/+$/, ""); i++; break
       case "--base-url": baseURL = value(i, arg); i++; break
       case "--store": parsed.storePath = resolve(value(i, arg)); i++; break
+      case "--config-dir": parsed.configDir = resolve(value(i, arg)); i++; break
       case "--test-model": parsed.testModel = value(i, arg); i++; break
       case "--api-key-env":
         apiKeyEnv = value(i, arg)
@@ -182,6 +195,51 @@ export function parseMigrateArgs(argv: readonly string[], env: NodeJS.ProcessEnv
   return parsed
 }
 
+export interface InstancePaths {
+  storePath: string
+  /** Null leaves `MERIDIAN_CONFIG_DIR` as the shell has it. */
+  configDir: string | null
+  notes: string[]
+}
+
+/** What this shell says about Meridian's paths; the two variables are null when unset. */
+export interface ShellPaths {
+  configDir: string | null
+  storePath: string | null
+  defaultConfigDir: string
+}
+
+/**
+ * Flags first, then a path this shell sets explicitly, then the running
+ * instance at --meridian-url, then the defaults. An explicit variable outranks
+ * the instance because setting one is a statement about which files are meant.
+ */
+export function resolveInstancePaths(
+  args: Pick<ParsedMigrateArgs, "storePath" | "configDir" | "meridianUrl">,
+  instance: MeridianInstance | null,
+  shell: ShellPaths,
+): InstancePaths {
+  const chosenConfigDir = args.configDir ?? shell.configDir
+  const configDir = chosenConfigDir ?? instance?.configDir ?? null
+  // Meridian keeps its store in its config directory unless told otherwise, so another config directory brings its own store.
+  const instanceStore = instance && (chosenConfigDir === null || chosenConfigDir === instance.configDir) ? instance.storePath : null
+  const storePath = args.storePath ?? shell.storePath ?? instanceStore ?? join(configDir ?? shell.defaultConfigDir, "chatgpt-accounts.json")
+  const notes: string[] = []
+  if (instance) {
+    notes.push(`Meridian at ${args.meridianUrl} is pid ${instance.pid}: store ${instance.storePath}, config directory ${instance.configDir}.`)
+    if (storePath !== instance.storePath || (configDir ?? shell.defaultConfigDir) !== instance.configDir) {
+      notes.push(`  ! using store ${storePath} and config directory ${configDir ?? shell.defaultConfigDir} (from flags or this shell's MERIDIAN_*); that instance will not see what is written there.`)
+    }
+    notes.push(`  Once it is stopped (handback needs that), pass: --store ${instance.storePath} --config-dir ${instance.configDir}`)
+  } else {
+    notes.push(`No Meridian server is running at ${args.meridianUrl}; using store ${storePath}${configDir ? ` and config directory ${configDir}` : " and this shell's config directory"}.`)
+    if (!args.storePath || !args.configDir) {
+      notes.push("  If the instance runs with its own HOME, MERIDIAN_CONFIG_DIR or MERIDIAN_CHATGPT_STORE_PATH, pass --store and --config-dir.")
+    }
+  }
+  return { storePath, configDir, notes }
+}
+
 export async function runMigrateCli(argv: readonly string[]): Promise<number> {
   let args: ParsedMigrateArgs
   try {
@@ -196,8 +254,17 @@ export async function runMigrateCli(argv: readonly string[]): Promise<number> {
     return 0
   }
   const env = environmentFromProcess(process.env, homedir())
+  const paths = resolveInstancePaths(args, findMeridianInstance(args.meridianUrl), {
+    configDir: process.env.MERIDIAN_CONFIG_DIR || null,
+    storePath: process.env.MERIDIAN_CHATGPT_STORE_PATH || null,
+    defaultConfigDir: defaultConfigDir(),
+  })
+  // Settings and Claude profiles are read through MERIDIAN_CONFIG_DIR, resolved per call.
+  if (paths.configDir) process.env.MERIDIAN_CONFIG_DIR = paths.configDir
+  for (const note of paths.notes) console.log(note)
+  console.log("")
   const store = createOwnedStoreAdapter({
-    storePath: args.storePath ?? chatGptStorePath(),
+    storePath: paths.storePath,
     meridianUrl: args.meridianUrl,
     apiKey: process.env.MERIDIAN_API_KEY || undefined,
     ...(args.testModel ? { testModels: [args.testModel] } : {}),

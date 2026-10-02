@@ -29,6 +29,7 @@ import { fileURLToPath } from "node:url"
 import { applyEdits, findNodeAtLocation, modify, parse as parseJsonc, parseTree, type ParseError } from "jsonc-parser"
 import {
   GLOBAL_CONFIG_FILE_NAMES,
+  TUI_CONFIG_FILE_NAMES,
   PLUGIN_PACKAGE_NAME,
   defaultManagedConfigDir,
   opencodeGlobalConfigDir,
@@ -314,6 +315,46 @@ export function resolvePlugins(env: MigrationEnvironment, context: OpencodeConte
 
   const autoloaded = directoriesFor(env, context).flatMap(autoloadedFiles)
   return { layers, entries, autoloaded, unparseable }
+}
+
+/**
+ * The TUI config files opencode reads for this context, in merge order
+ * (`config/tui.ts`): global, `OPENCODE_TUI_CONFIG`, project files root-first
+ * (the walk does not stop at the worktree), then each `.opencode` directory
+ * and `OPENCODE_CONFIG_DIR`. Unlike the main config, TUI plugin lists
+ * accumulate across every file, global ones included.
+ */
+export function tuiConfigLayers(env: MigrationEnvironment, context: OpencodeContext | null): ConfigLayer[] {
+  const layers: ConfigLayer[] = TUI_CONFIG_FILE_NAMES.map(name => ({ path: join(opencodeGlobalConfigDir(env), name), scope: "global" as const }))
+  if (env.opencodeTuiConfig) layers.push({ path: env.opencodeTuiConfig, scope: "custom" })
+  if (context && !env.disableProjectConfig) {
+    for (const path of up(["tui.jsonc", "tui.json"], context.directory, "/").reverse()) layers.push({ path, scope: "project" })
+  }
+  for (const dir of directoriesFor(env, context)) {
+    if (!dir.endsWith(".opencode") && dir !== env.opencodeConfigDir) continue
+    for (const name of TUI_CONFIG_FILE_NAMES) layers.push({ path: join(dir, name), scope: "dotdir" })
+  }
+  const seen = new Set<string>()
+  return layers.filter(layer => !seen.has(layer.path) && seen.add(layer.path))
+}
+
+/** Every oc-codex-multi-auth entry in the TUI config files; all of them load. */
+export function resolveTuiPlugins(env: MigrationEnvironment, context: OpencodeContext | null): { entries: PluginEntry[]; unparseable: string[] } {
+  const entries: PluginEntry[] = []
+  const unparseable: string[] = []
+  for (const layer of tuiConfigLayers(env, context)) {
+    const text = readLayerText(layer, env)
+    if (text === null) continue
+    try {
+      for (const { index, spec } of pluginEntriesIn(text, layer.path)) {
+        entries.push({ layer, index, spec, match: matchPluginSpec(spec, layer.path), effective: true })
+      }
+    } catch (error) {
+      if (!(error instanceof UnparseableOpencodeConfigError)) throw error
+      unparseable.push(layer.path)
+    }
+  }
+  return { entries, unparseable }
 }
 
 export function loadsPlugin(resolution: PluginResolution): boolean {

@@ -32,9 +32,12 @@ import {
   providerBaseUrlOverrides,
   providerBefore,
   resolvePlugins,
+  resolveTuiPlugins,
   restoreProvider,
+  tuiConfigLayers,
   UnparseableOpencodeConfigError,
   type ConfigLayer,
+  type OpencodeContext,
   type ProviderBefore,
 } from "./opencodeConfig"
 import { holdsRefreshAuthority, scanOpencodeProcesses, type OpencodeProcess } from "./processes"
@@ -240,10 +243,14 @@ async function runHandback(options: ReverseOptions, gate: ProcessGate): Promise<
 // plugin
 // ---------------------------------------------------------------------------
 
-function fileLayers(options: ReverseOptions, processes: readonly OpencodeProcess[]): ConfigLayer[] {
+function fileLayers(
+  options: ReverseOptions,
+  processes: readonly OpencodeProcess[],
+  layersFor: (env: MigrationEnvironment, context: OpencodeContext | null) => ConfigLayer[],
+): ConfigLayer[] {
   const seen = new Map<string, ConfigLayer>()
   for (const context of [null, ...contexts(options, processes)]) {
-    for (const layer of configLayers(options.env, context)) {
+    for (const layer of layersFor(options.env, context)) {
       if (layer.scope === "content" || layer.scope === "managed") continue
       if (!seen.has(layer.path)) seen.set(layer.path, layer)
     }
@@ -309,9 +316,11 @@ function effectiveGlobalPluginFile(env: MigrationEnvironment): string {
 
 function runPluginRestore(options: ReverseOptions, processes: readonly OpencodeProcess[]): boolean {
   const { log } = options
-  const layers = fileLayers(options, processes)
+  const layers = fileLayers(options, processes, configLayers)
+  const tuiLayers = fileLayers(options, processes, tuiConfigLayers)
   const remembered = rememberedEntries(layers)
-  let spec: string
+  const rememberedTui = rememberedEntries(tuiLayers)
+  let pathSpec: string | null = null
   if (options.pluginPath) {
     const fromPath = pluginPathSpec(options.pluginPath)
     if (fromPath.problem) {
@@ -319,25 +328,35 @@ function runPluginRestore(options: ReverseOptions, processes: readonly OpencodeP
       return false
     }
     if (fromPath.warning) log(`  ! ${fromPath.warning}`)
-    spec = fromPath.spec
-    log(`  Plugin: ${spec} (--plugin-path)`)
-  } else {
-    spec = remembered[0]?.spec ?? DEFAULT_PLUGIN_SPEC
-    log(`  Plugin: ${spec} (${remembered[0] ? `as ${remembered[0].path} listed it before the migration` : "no preserved config names one"})`)
+    pathSpec = fromPath.spec
+    log(`  Plugin: ${pathSpec} (--plugin-path)`)
   }
+  const first = remembered[0] ?? rememberedTui[0]
+  const spec = pathSpec ?? first?.spec ?? DEFAULT_PLUGIN_SPEC
+  if (!pathSpec) log(`  Plugin: ${spec} (${first ? `as ${first.path} listed it before the migration` : "no preserved config names one"})`)
 
+  interface Target { index: number | undefined; spec: string; layer: ConfigLayer; active: boolean }
+  const targets = new Map<string, Target>()
+  const layerOf = (path: string, among: readonly ConfigLayer[]): ConfigLayer => among.find(layer => layer.path === path) ?? { path, scope: "global" }
+  for (const entry of remembered) targets.set(entry.path, { index: entry.index, spec: pathSpec ?? entry.spec, layer: layerOf(entry.path, layers), active: false })
   const effective = effectiveGlobalPluginFile(options.env)
-  const targets = new Map<string, number | undefined>(remembered.map(entry => [entry.path, entry.index]))
-  if (!targets.has(effective)) targets.set(effective, undefined)
-  const layerOf = (path: string): ConfigLayer => layers.find(layer => layer.path === path) ?? { path, scope: "global" }
+  if (targets.has(effective)) targets.get(effective)!.active = true
+  else targets.set(effective, { index: undefined, spec, layer: layerOf(effective, layers), active: true })
+  for (const entry of rememberedTui) targets.set(entry.path, { index: entry.index, spec: pathSpec ?? entry.spec, layer: layerOf(entry.path, tuiLayers), active: false })
+  // The plugin's installer enables its TUI status bar in the global tui.json; a migration that never saw one still gets it back there.
+  if (rememberedTui.length === 0 && resolveTuiPlugins(options.env, null).entries.length === 0) {
+    const tuiJson = tuiConfigLayers(options.env, null)[0]!
+    targets.set(tuiJson.path, { index: undefined, spec, layer: tuiJson, active: false })
+  }
 
   let ok = true
   let changed = false
-  for (const [path, index] of [...targets].sort(([a], [b]) => a.localeCompare(b))) {
-    const where = `${describeLayer(layerOf(path))}${path === effective ? " [active]" : ""}`
+  for (const [path, target] of [...targets].sort(([a], [b]) => a.localeCompare(b))) {
+    const where = `${describeLayer(target.layer)}${target.active ? " [active]" : ""}`
     const raw = readIfExists(path)
+    const spec = target.spec
     try {
-      const edit = addPluginEntry(raw ?? "{}\n", path, spec, { index, replace: options.pluginPath !== null })
+      const edit = addPluginEntry(raw ?? "{}\n", path, spec, { index: target.index, replace: pathSpec !== null })
       if (edit.outcome === "present") {
         log(`  ${where}: already lists the plugin`)
         continue
@@ -461,6 +480,9 @@ function runVerify(options: ReverseOptions): boolean {
   const loaded = resolvePlugins(options.env, null).entries.some(entry => entry.match && entry.effective)
   log(loaded ? "  opencode's global config loads the plugin" : "  ! opencode's global config does not load the plugin (run the plugin step)")
   ok &&= loaded
+  const tuiLoaded = resolveTuiPlugins(options.env, null).entries.length > 0
+  log(tuiLoaded ? "  opencode's global TUI config loads the plugin's status bar" : "  ! opencode's global TUI config does not load the plugin's status bar (run the plugin step)")
+  ok &&= tuiLoaded
   const path = highestPrecedenceGlobalFile(options.env)
   const current = readIfExists(path)
   if (current !== null) {

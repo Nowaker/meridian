@@ -77,6 +77,7 @@ const ENVIRONMENT_ALLOW_LIST = new Set([
   "OPENCODE_CONFIG",
   "OPENCODE_CONFIG_DIR",
   "OPENCODE_CONFIG_CONTENT",
+  "OPENCODE_TUI_CONFIG",
   "OPENCODE_DISABLE_PROJECT_CONFIG",
   "CODEX_KEYCHAIN",
 ])
@@ -85,7 +86,7 @@ const OPENCODE_BINARY = /^opencode\d*(\..*)?$/
 const INTERPRETERS = new Set(["bun", "node", "nodejs"])
 const ROLES: ReadonlySet<string> = new Set(["serve", "web", "run", "acp"])
 
-function readText(path: string): string | null {
+export function readText(path: string): string | null {
   try {
     return readFileSync(path, "utf8")
   } catch {
@@ -93,7 +94,7 @@ function readText(path: string): string | null {
   }
 }
 
-function readLink(path: string): string | null {
+export function readLink(path: string): string | null {
   try {
     return readlinkSync(path)
   } catch {
@@ -157,6 +158,7 @@ function environmentOf(raw: string | null, fallback: MigrationEnvironment): { kn
       opencodeConfig: values.get("OPENCODE_CONFIG") || undefined,
       opencodeConfigDir: values.get("OPENCODE_CONFIG_DIR") || undefined,
       opencodeConfigContent: values.get("OPENCODE_CONFIG_CONTENT") || undefined,
+      opencodeTuiConfig: values.get("OPENCODE_TUI_CONFIG") || undefined,
       disableProjectConfig: isTruthyFlag(values.get("OPENCODE_DISABLE_PROJECT_CONFIG")),
       codexKeychain: values.get("CODEX_KEYCHAIN") === "1",
       managedConfigDir: fallback.managedConfigDir,

@@ -31,6 +31,7 @@ import {
   providerBaseUrlOverrides,
   removePluginEntries,
   resolvePlugins,
+  resolveTuiPlugins,
   UnparseableOpencodeConfigError,
   type OpencodeContext,
   type PluginEntry,
@@ -387,9 +388,10 @@ function runPlugin(options: MigrationOptions, processes: readonly OpencodeProces
   const inline: string[] = []
   for (const context of [null, ...contexts(options, processes)]) {
     const resolution = resolvePlugins(options.env, context)
-    for (const path of resolution.unparseable) unparseable.add(path)
+    const tui = resolveTuiPlugins(options.env, context)
+    for (const path of [...resolution.unparseable, ...tui.unparseable]) unparseable.add(path)
     for (const file of resolution.autoloaded) autoloaded.add(file.path)
-    for (const entry of resolution.entries) {
+    for (const entry of [...resolution.entries, ...tui.entries]) {
       if (!entry.match) continue
       if (entry.layer.scope === "content") {
         inline.push(entry.spec)
@@ -511,7 +513,7 @@ async function runValidate(options: MigrationOptions): Promise<boolean> {
   const held = readHeld(options)
   if (held === null) return false
   if (held.length === 0) {
-    log("  Meridian's store holds no seats.")
+    log(`  Meridian's store at ${store.storePath} holds no seats. If the running Meridian uses another store, pass --store.`)
     return false
   }
   if (options.dryRun) {
