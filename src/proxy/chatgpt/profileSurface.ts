@@ -35,7 +35,7 @@ import {
   type ObservedRateLimit,
 } from "./profiles"
 import type { CreditBurn } from "./creditRates"
-import type { ChatGptCreditsPolicy } from "./features"
+import type { ChatGptCreditsPolicy, ChatGptFreeSeatOrder } from "./features"
 import type { ChatGptCredentialSource } from "./source"
 import type { ChatGptRateLimit, ChatGptUsageWindow } from "./windows"
 
@@ -84,6 +84,8 @@ export interface ChatGptProfileSurfaceDeps {
   /** The saved profile order (`profileOrder`), Claude ids included; ChatGPT failover follows it after the active seat. */
   order?: () => readonly string[] | undefined
   spent: (profileId: string) => SpentRecord | undefined
+  /** Where a free-plan seat ranks among the others for unpinned work (chatgpt/features.ts). */
+  freeSeatOrder?: () => ChatGptFreeSeatOrder
 }
 
 export type ChatGptActivation =
@@ -131,15 +133,36 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
     const excluded = excludedSeats(list)
     const pointer = findChatGptProfile(list, deps.activeSeat())
     if (pointer && !excluded.has(pointer.seat)) return pointer
-    // Without a pointer, the pick is the seat a turn would go to first: one
-    // with plan quota, or one whose policy spends its credits at once.
+    return firstServing(list.filter(profile => !excluded.has(profile.seat)))
+  }
+
+  // The seat a turn would go to first among `candidates`: a paid seat with
+  // plan quota (or whose policy spends its credits at once) before a free one.
+  const firstServing = (candidates: readonly ChatGptProfile[]): ChatGptProfile | undefined => {
     const servesFirst = (profile: ChatGptProfile) => !deps.creditState?.(profile.seat).planSpent
       || deps.creditsPolicy?.(profile.seat).policy === "immediately"
-    const candidates = list.filter(profile => !excluded.has(profile.seat))
-    return candidates.find(profile => profile.ownerActive && servesFirst(profile))
-      ?? candidates.find(profile => profile.eligible && servesFirst(profile))
-      ?? candidates.find(profile => profile.ownerActive)
-      ?? candidates.find(profile => profile.eligible)
+    const paid = candidates.filter(profile => profile.planTier !== "free")
+    for (const pool of [paid, candidates]) {
+      const pick = pool.find(profile => profile.ownerActive && servesFirst(profile))
+        ?? pool.find(profile => profile.eligible && servesFirst(profile))
+      if (pick) return pick
+    }
+    return candidates.find(profile => profile.ownerActive) ?? candidates.find(profile => profile.eligible)
+  }
+
+  /** Paid seats that could take an unpinned turn ahead of `profile`, when it is a free one. */
+  const paidAhead = (list: readonly ChatGptProfile[], profile: ChatGptProfile): ChatGptProfile[] => {
+    if (profile.planTier !== "free") return []
+    const excluded = excludedSeats(list)
+    return list.filter(other => other.planTier === "paid" && other.eligible && !excluded.has(other.seat)
+      && !deps.creditState?.(other.seat).planSpent)
+  }
+
+  const inOrder = (list: readonly ChatGptProfile[]): ChatGptProfile[] => {
+    const order = savedSeatOrder(list)
+    if (!order) return [...list]
+    const rank = new Map(order.map((seat, index) => [seat, index]))
+    return [...list].sort((a, b) => (rank.get(a.seat) ?? Number.MAX_SAFE_INTEGER) - (rank.get(b.seat) ?? Number.MAX_SAFE_INTEGER))
   }
 
   return {
@@ -174,7 +197,26 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
         }
         return { kind: "pinned" as const, seat: pinned.seat }
       }
-      return { kind: "pool" as const, preferred: active(list)?.seat, excluded, order: savedSeatOrder(list) }
+      return {
+        kind: "pool" as const,
+        preferred: active(list)?.seat,
+        excluded,
+        order: savedSeatOrder(list),
+        free: new Set(list.filter(profile => profile.planTier === "free").map(profile => profile.seat)),
+        freeSeatOrder: deps.freeSeatOrder?.() ?? "before-credits",
+      }
+    },
+
+    /**
+     * The seat the active pointer moves to when `seat` is removed: the first
+     * one that would serve unpinned work, in routing order, without it.
+     */
+    successorFor(seat: string): ChatGptProfile | undefined {
+      const list = profiles().filter(profile => profile.seat !== seat)
+      const excluded = excludedSeats(list)
+      const candidates = inOrder(list).filter(profile => !excluded.has(profile.seat) && profile.eligible)
+      const serving = candidates.filter(profile => !deps.creditState?.(profile.seat).planSpent)
+      return serving.find(profile => profile.planTier !== "free") ?? serving[0] ?? candidates[0]
     },
 
     /** Profile id for a seat, for telemetry and events. */
@@ -195,20 +237,22 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
       to,
     }),
 
-    /** Why a remove of this seat is refused, and what removes it at its owner. */
-    removalRefusal(profile: ChatGptProfile): string {
+    /** Why a remove of this seat is refused and what removes it at its owner; null when Meridian removes it itself. */
+    removalRefusal(profile: ChatGptProfile): string | null {
       return chatGptRemovalRefusal(profile, chatGptOwner(deps.source.mode, profile.storeIndex))
     },
 
     listEntries() {
       const list = profiles()
       const activeId = active(list)?.id
+      const freeSeatOrder = deps.freeSeatOrder?.() ?? "before-credits"
       const usage = deps.usage()
       const usageById = new Map((usage?.entries ?? []).map(entry => [entry.id, entry]))
       return list.map(profile => {
         const reading = usageById.get(profile.seat)
         const tokenState = chatGptTokenState(profile.unavailable, reading?.error)
         const owner = chatGptOwner(deps.source.mode, profile.storeIndex)
+        const ahead = profile.id === activeId ? paidAhead(list, profile) : []
         return {
           id: profile.id,
           type: CHATGPT_PROFILE_TYPE,
@@ -229,6 +273,12 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           planLabel: profile.planLabel,
           accountType: profile.accountType,
           planName: profile.planName,
+          planTier: profile.planTier,
+          freeSeatOrder: profile.planTier === "free" ? freeSeatOrder : null,
+          // The pointer names a free seat, yet a paid one takes unpinned work first.
+          freeSeatDeferred: ahead.length > 0
+            ? { servedFirstBy: ahead.map(other => other.id), freeSeatOrder }
+            : null,
           loggedIn: tokenState === "ok",
           tokenState,
           unavailable: profile.unavailable,
@@ -266,6 +316,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           isActive: profile.id === activeId,
           type: CHATGPT_PROFILE_TYPE,
           provider: CHATGPT_PROFILE_TYPE,
+          planTier: profile.planTier,
           windows: reading.windows,
           windowsReported: reading.windowsReported,
           windowSource: reading.source,

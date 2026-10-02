@@ -33,7 +33,7 @@ import { isModelRefusal, sniffChatGptFailure, type ChatGptFailureKind } from "..
 import { aggregateResponsesStream, tapResponsesStream, type ChatGptUsage, type TapSummary } from "../chatgpt/tap"
 import { chatGptCooldownUntil, chatGptCreditsFromHeaders, chatGptRateLimitFromHeaders, creditsCanServe, type ChatGptRateLimit } from "../chatgpt/windows"
 import type { CodexCredits, CodexUsageWindow } from "../codex/types"
-import type { ChatGptCreditsPolicy } from "../chatgpt/features"
+import type { ChatGptCreditsPolicy, ChatGptFreeSeatOrder } from "../chatgpt/features"
 import type { ChatGptCredentialSource, SeatUnavailableReason } from "../chatgpt/source"
 
 export type UpstreamFetch = (url: string, init: RequestInit) => Promise<Response>
@@ -122,9 +122,17 @@ export interface ChatGptHooks {
  * `spendCredits: false` keeps the turn off seats that could serve only on
  * purchased Codex credits (a warm has no business spending them); absent
  * means they may serve once no seat has plan quota left.
+ *
+ * `free` names the seats on ChatGPT's free plan. They serve a pool turn only
+ * after every paid seat with plan quota, `preferred` or not, and then either
+ * before any seat serves on credits or after all of them (`freeSeatOrder`,
+ * chatgpt/features.ts).
  */
 export type ChatGptRoute =
-  | { kind: "pool"; preferred?: string; excluded: ReadonlySet<string>; order?: readonly string[]; spendCredits?: boolean }
+  | {
+    kind: "pool"; preferred?: string; excluded: ReadonlySet<string>; order?: readonly string[]; spendCredits?: boolean
+    free?: ReadonlySet<string>; freeSeatOrder?: ChatGptFreeSeatOrder
+  }
   | { kind: "pinned"; seat: string; spendCredits?: boolean }
   | { kind: "refuse"; response: Response; error: string }
 
@@ -176,6 +184,8 @@ export interface ChatGptBackend<Ctx> extends UpstreamBackend<Ctx> {
   /** Latest `x-codex-*` window headers per seat, from real responses. */
   observedLimits(): ReadonlyMap<string, ObservedSeatLimits>
   seatCreditState(seat: string): ChatGptSeatCreditState
+  /** Drop everything learned about a removed seat: observed windows, credits, refusals, bench. */
+  forgetSeat(seat: string): void
 }
 
 /** How long a spent seat sits out when the refusal named no reset. */
@@ -298,6 +308,16 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
     provider: "chatgpt",
     observedLimits: () => observed,
 
+    forgetSeat(seat) {
+      observed.delete(seat)
+      observedCredits.delete(seat)
+      lastServedOnCredits.delete(seat)
+      exhaustion.forget(seat)
+      for (const map of [reserveRefusedUntil, modelRefusedUntil]) {
+        for (const key of [...map.keys()]) if (key.startsWith(`${seat}\u0000`)) map.delete(key)
+      }
+    },
+
     seatCreditState(seat) {
       const planSpent = (source.reserveSeats?.() ?? []).includes(seat)
         || exhaustion.snapshot().some(mark => mark.id === seat && mark.reason === "quota_spent")
@@ -400,17 +420,34 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
       }
       const onCreditsNow = new Set(await payable(immediate))
 
+      // Free-plan seats with quota left, held out of the normal order: they
+      // follow every paid seat with plan quota, then come before the seats
+      // serving on credits or, under `after-credits`, after the reserve tier.
+      const freeSeats = route.kind === "pool" ? route.free ?? new Set<string>() : new Set<string>()
+      const lateFree: string[] = []
       const seats = ((): string[] => {
         const eligible = routable.filter(seat => planTier.includes(seat) || onCreditsNow.has(seat))
         const live = route.kind === "pool" && route.order ? inSavedOrder(eligible, route.order) : eligible
-        // The active seat leads: a supervisor that moved the pointer wants the
-        // next turn there, at the price of a cold cache. Otherwise a
+        const freePlan = live.filter(seat => freeSeats.has(seat) && planTier.includes(seat))
+        const rest = live.filter(seat => !freePlan.includes(seat))
+        let tiers: string[][]
+        if (freePlan.length === 0) tiers = [live]
+        else if (route.kind === "pool" && route.freeSeatOrder === "after-credits") {
+          tiers = [rest]
+          lateFree.push(...freePlan)
+        } else {
+          tiers = [rest.filter(seat => planTier.includes(seat)), freePlan, rest.filter(seat => !planTier.includes(seat))]
+        }
+        // The active seat leads its tier: a supervisor that moved the pointer
+        // wants the next turn there, at the price of a cold cache. Otherwise a
         // conversation stays on the seat holding its prompt-cache prefix while
-        // that seat can serve.
+        // that seat can serve. Neither lifts a free seat over a paid one.
+        const lead = tiers.find(tier => tier.length > 0) ?? []
         const active = route.kind === "pool" ? route.preferred : undefined
         const cached = cacheKey ? affinity.get(cacheKey)?.profileId : undefined
-        const first = [active, cached].find(seat => seat !== undefined && live.includes(seat))
-        return first === undefined ? live : [first, ...live.filter(seat => seat !== first)]
+        const first = [active, cached].find(seat => seat !== undefined && lead.includes(seat))
+        const ordered = tiers.flat()
+        return first === undefined ? ordered : [first, ...ordered.filter(seat => seat !== first)]
       })()
 
       const refusals: ChatGptSeatRefusal[] = []
@@ -448,6 +485,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
         if (next === queue.length && !reserveQueued) {
           reserveQueued = true
           for (const seat of await creditReserve(dispatched)) enqueue(seat, true)
+          for (const seat of lateFree) enqueue(seat, false)
         }
         if (next === queue.length && dispatched.size === 0 && sittingOut.length > 0) queue.push(sittingOut.shift()!)
         if (next === queue.length) break

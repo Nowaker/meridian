@@ -22,6 +22,7 @@ import { resolveClaudeExecutableSync } from "./models"
 import { fetchOAuthPlanFields, type OAuthPlanFields } from "./oauthPlan"
 import type { ProfileConfig } from "./profiles"
 import { applyProfileRemove } from "./profileRemove"
+import { fetchChatGptSeats, findSeat, loginChatGptSeat, printChatGptSeats, removeChatGptSeat, renameChatGptSeat } from "./chatgpt/seatCli"
 export { dirsToRemoveOnProfileRemove } from "./profileRemove"
 import {
   applyProfileRename,
@@ -678,9 +679,11 @@ export async function profileAddOauthToken(id: string, tokenArg: string | undefi
   printEnvHint(profiles)
 }
 
-export function profileList(): void {
+export async function profileList(): Promise<void> {
   const profiles = loadProfileConfig()
+  const seats = await fetchChatGptSeats() ?? []
   if (profiles.length === 0) {
+    if (seats.length > 0) { printChatGptSeats(seats); return }
     console.log("No profiles configured.")
     console.log("  Add one: meridian profile add <name>")
     return
@@ -703,10 +706,25 @@ export function profileList(): void {
     }
   }
   console.log()
+  printChatGptSeats(seats)
   printEnvHint(profiles)
 }
 
-export function profileRemove(id: string): void {
+/**
+ * Whether this name is one of the running instance's ChatGPT seats and no
+ * Claude profile's. A Claude profile's name always wins, as on the server.
+ */
+async function chatGptSeatNamed(id: string): Promise<boolean> {
+  if (loadProfileConfig().some(p => p.id === id || p.aliases?.includes(id))) return false
+  const seats = await fetchChatGptSeats()
+  return seats !== null && findSeat(seats, id) !== undefined
+}
+
+export async function profileRemove(id: string): Promise<void> {
+  if (await chatGptSeatNamed(id)) {
+    if (!await removeChatGptSeat(id)) process.exit(1)
+    return
+  }
   if (envBool("CREDENTIALS_READONLY")) {
     console.error("\x1b[31m✗ MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials.\x1b[0m")
     console.error("  Remove the profile from the instance that owns them.")
@@ -732,7 +750,11 @@ export function profileRemove(id: string): void {
 }
 
 
-export function profileRename(from: string, to: string): void {
+export async function profileRename(from: string, to: string): Promise<void> {
+  if (await chatGptSeatNamed(from)) {
+    if (!await renameChatGptSeat(from, to)) process.exit(1)
+    return
+  }
   if (envBool("CREDENTIALS_READONLY")) {
     console.error("\x1b[31m✗ MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials.\x1b[0m")
     console.error("  Rename the profile from the instance that owns them.")
@@ -760,12 +782,15 @@ export async function profileSwitch(id: string): Promise<void> {
   try {
     const res = await fetch(`http://${host}:${port}/profiles/active`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...(process.env.MERIDIAN_API_KEY ? { "x-api-key": process.env.MERIDIAN_API_KEY } : {}) },
       body: JSON.stringify({ profile: id }),
       signal: AbortSignal.timeout(5000),
     })
-    const body = await res.json() as { success?: boolean; error?: string }
-    if (body.success) {
+    const body = await res.json() as { success?: boolean; error?: string; provider?: string; activeProfile?: string }
+    if (body.success && body.provider === "chatgpt") {
+      // The instance keeps its own ChatGPT pointer; the local Claude one must never name a seat.
+      console.log(`\x1b[32m✓ Active ChatGPT seat: ${body.activeProfile ?? id}\x1b[0m`)
+    } else if (body.success) {
       // Also persist locally so it survives proxy restarts
       setSetting("activeProfile", id)
       console.log(`\x1b[32m✓ Switched to profile: ${id}\x1b[0m`)
@@ -803,6 +828,10 @@ export function planProfileLogin(id: string, profiles: ProfileConfig[]): Profile
 }
 
 export async function profileLogin(id: string, options: AuthLoginOptions = {}): Promise<void> {
+  if (await chatGptSeatNamed(id)) {
+    if (!await loginChatGptSeat(id)) process.exit(1)
+    return
+  }
   const plan = planProfileLogin(id, loadProfileConfig())
 
   if (plan.action === "reject-invalid-id") {
@@ -942,6 +971,11 @@ Commands:
   meridian profile switch <name>                    Switch the active profile (requires running proxy)
   meridian profile login <name> [--headless]        Re-authenticate a profile, adding it first if it does not
                                                     exist yet (claude-max only)
+
+ChatGPT seats (Meridian with MERIDIAN_CHATGPT_CREDENTIALS=owned) are listed by
+\`list\`, and \`switch\`, \`rename\`, \`remove\` and \`login\` act on them by name.
+They go through the running instance, which holds the seats' store: \`login\`
+signs a seat in again by device code. Add a new seat from its web UI (/profiles).
 
 Examples:
   meridian profile add personal                     # Add personal account (browser login)

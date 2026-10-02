@@ -10,6 +10,7 @@ import {
   chatGptProfiles,
   chatGptQuotaError,
   chatGptRemovalRefusal,
+  chatGptRemovalSettings,
   chatGptResetsView,
   chatGptTokenState,
   findChatGptProfile,
@@ -66,8 +67,11 @@ describe("chatGptPlanFields", () => {
     expect(chatGptPlanFields("pro")).toMatchObject({ subscriptionType: "pro", planLabel: "ChatGPT Pro", planName: "Pro", accountType: "Personal", allowance: "20x", allowanceWeight: 20 })
     expect(chatGptPlanFields("self_serve_business_prolite")).toMatchObject({ allowance: "5x", allowanceWeight: 5, accountType: "Business" })
     expect(chatGptPlanFields("plus")).toMatchObject({ allowanceWeight: 1 })
-    expect(chatGptPlanFields("free")).toMatchObject({ allowance: null, allowanceWeight: null })
-    expect(chatGptPlanFields(null)).toEqual({ subscriptionType: null, planLabel: null, planName: null, accountType: null, allowance: null, allowanceWeight: null })
+    expect(chatGptPlanFields("free")).toMatchObject({ allowance: null, allowanceWeight: null, planTier: "free" })
+    expect(chatGptPlanFields("pro").planTier).toBe("paid")
+    expect(chatGptPlanFields("go").planTier).toBe("paid")
+    expect(chatGptPlanFields("chatgptfreeplan").planTier).toBe("free")
+    expect(chatGptPlanFields(null)).toEqual({ subscriptionType: null, planLabel: null, planName: null, accountType: null, allowance: null, allowanceWeight: null, planTier: null })
   })
 })
 
@@ -285,6 +289,76 @@ describe("a seat's token and owner", () => {
     expect(refusal).toContain("pick oferty@x.test · id:c487c4 and choose \"Delete this account\"")
     expect(refusal).toContain("check with `codex-list` that account 3 is oferty@x.test · id:c487c4 and run `codex-remove index=3 confirm=true`")
     expect(chatGptOwner("owned", 0)).toMatchObject({ name: "meridian", login: null, refresh: null, remove: null, importCommand: "meridian chatgpt-migrate --step import", webSignIn: true })
+    expect(chatGptRemovalRefusal({ id: "work", label: "w@x.test · id:aaaaaa" }, chatGptOwner("owned", 0))).toBeNull()
+  })
+})
+
+describe("removing an owned seat", () => {
+  const removed = { id: "work", seat: "user-a__ws-aaaaaa", aliases: ["a-aaaaaa"] }
+
+  it("drops the seat from its name, former names, order and both exclusion lists, whichever id they use", () => {
+    expect(chatGptRemovalSettings(removed, {
+      chatGptProfileNames: { "user-a__ws-aaaaaa": "work", "user-b__ws-bbbbbb": "home" },
+      chatGptProfileAliases: { "user-a__ws-aaaaaa": ["a-aaaaaa"], "user-b__ws-bbbbbb": ["b-bbbbbb"] },
+      profileOrder: ["claude-x", "work", "home"],
+      routingExcludedProfiles: ["a-aaaaaa", "claude-y"],
+      routingManagedExcludedProfiles: ["user-a__ws-aaaaaa"],
+    })).toEqual({
+      chatGptProfileNames: { "user-b__ws-bbbbbb": "home" },
+      chatGptProfileAliases: { "user-b__ws-bbbbbb": ["b-bbbbbb"] },
+      profileOrder: ["claude-x", "home"],
+      routingExcludedProfiles: ["claude-y"],
+      routingManagedExcludedProfiles: [],
+    })
+  })
+
+  it("writes nothing for settings that never named the seat", () => {
+    expect(chatGptRemovalSettings(removed, { chatGptProfileNames: { "user-b__ws-bbbbbb": "home" }, profileOrder: ["home"] })).toEqual({})
+    expect(chatGptRemovalSettings(removed, {})).toEqual({})
+  })
+})
+
+describe("free-plan seats on the profile surface", () => {
+  const seats = [
+    seat("user-f__ws-ffffff", "f@x.test", { planType: "free", active: true }),
+    seat("user-p__ws-pppppp", "p@x.test", { planType: "pro" }),
+    seat("user-q__ws-qqqqqq", "q@x.test", { planType: "plus" }),
+  ]
+  const source = { mode: "owned", seats: () => seats } as unknown as ChatGptCredentialSource
+  const surface = (options: { activeSeat?: string; spent?: string[]; order?: string[]; freeSeatOrder?: "before-credits" | "after-credits" } = {}) => createChatGptProfileSurface({
+    source, observed: () => new Map(), usage: () => null, reserved: () => new Set(), names: () => undefined,
+    activeSeat: () => options.activeSeat, excluded: () => [], spent: () => undefined, order: () => options.order,
+    creditState: (s) => ({ planSpent: (options.spent ?? []).includes(s), servingOnCredits: false }),
+    freeSeatOrder: options.freeSeatOrder ? () => options.freeSeatOrder! : undefined,
+  })
+
+  it("states the plan tier on every list and quota entry", () => {
+    const s = surface()
+    expect(s.listEntries().map(e => [e.id, e.planTier])).toEqual([["f-ffffff", "free"], ["p-pppppp", "paid"], ["q-qqqqqq", "paid"]])
+    expect(s.quotaEntries().map(e => e.planTier)).toEqual(["free", "paid", "paid"])
+  })
+
+  it("picks a paid seat over the owner's free pick when no pointer is set", () => {
+    expect(surface().activeProfileId()).toBe("p-pppppp")
+    expect(surface({ spent: ["user-p__ws-pppppp", "user-q__ws-qqqqqq"] }).activeProfileId()).toBe("f-ffffff")
+  })
+
+  it("routes with the free seats and the setting, and keeps a pointer that names the free seat while saying why it serves later", () => {
+    const s = surface({ activeSeat: "user-f__ws-ffffff", freeSeatOrder: "after-credits" })
+    expect(s.activeProfileId()).toBe("f-ffffff")
+    const route = s.route(undefined, "work")
+    expect(route).toMatchObject({ kind: "pool", preferred: "user-f__ws-ffffff", freeSeatOrder: "after-credits" })
+    expect(route.kind === "pool" && [...route.free]).toEqual(["user-f__ws-ffffff"])
+    expect(s.listEntries()[0]!.freeSeatDeferred).toEqual({ servedFirstBy: ["p-pppppp", "q-qqqqqq"], freeSeatOrder: "after-credits" })
+    expect(s.listEntries()[1]!.freeSeatDeferred).toBeNull()
+    expect(surface({ activeSeat: "user-f__ws-ffffff", spent: ["user-p__ws-pppppp", "user-q__ws-qqqqqq"] }).listEntries()[0]!.freeSeatDeferred).toBeNull()
+    expect(surface().route(undefined, "work")).toMatchObject({ freeSeatOrder: "before-credits" })
+  })
+
+  it("hands the pointer of a removed seat to the next serving seat in routing order, paid before free", () => {
+    expect(surface({ order: ["q-qqqqqq", "p-pppppp"] }).successorFor("user-p__ws-pppppp")?.id).toBe("q-qqqqqq")
+    expect(surface({ order: ["f-ffffff", "q-qqqqqq", "p-pppppp"] }).successorFor("user-f__ws-ffffff")?.id).toBe("q-qqqqqq")
+    expect(surface({ spent: ["user-q__ws-qqqqqq"] }).successorFor("user-p__ws-pppppp")?.id).toBe("f-ffffff")
   })
 })
 

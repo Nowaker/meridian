@@ -115,6 +115,21 @@ function profileFacts(p) {
       title: p.rateLimitTier || ''
     });
   }
+  if (chatgpt && p.planTier === 'free') {
+    var deferred = p.freeSeatDeferred;
+    facts.push({
+      label: 'Routing',
+      value: deferred
+        ? 'Active, but free: ' + deferred.servedFirstBy.join(', ') + ' serve' + (deferred.servedFirstBy.length === 1 ? 's' : '') + ' unpinned work first'
+        : 'Free plan: serves unpinned work after every paid seat',
+      shortValue: deferred ? 'paid seats first' : 'free seat last',
+      tone: '',
+      title: 'A free-plan seat refuses most Codex models, so it takes unpinned work only once no paid seat has plan usage left, '
+        + (p.freeSeatOrder === 'after-credits'
+          ? 'and only after every seat that can serve on Codex credits (Settings \\u2192 Free-Plan Seats).'
+          : 'and before any seat spends Codex credits (Settings \\u2192 Free-Plan Seats).')
+    });
+  }
   if (chatgpt && p.owner) {
     facts.push({
       label: 'Owner',

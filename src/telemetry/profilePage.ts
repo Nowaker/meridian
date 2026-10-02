@@ -1050,9 +1050,9 @@ function render(data, quotaData) {
       html += '<div class="rename-error">' + esc(renameError) + '</div>';
     }
 
-    if (removingProfile === p.id && isChatGptProfile(p)) {
-      // A seat's owner, not Meridian, deletes it: the panel says where,
-      // instead of offering a Remove that could only be refused.
+    if (removingProfile === p.id && isChatGptProfile(p) && p.removal) {
+      // A followed seat's owner, not Meridian, deletes it: the panel says
+      // where, instead of offering a Remove that could only be refused.
       html += '<div class="remove-confirm">';
       html += '<div class="remove-confirm-text">' + codeSpans(p.removal || '') + '</div>';
       html += '<div class="remove-confirm-actions">';

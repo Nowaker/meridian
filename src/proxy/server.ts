@@ -6,14 +6,14 @@ import { createChatGptBackend, type ChatGptSeatCreditState, type ChatGptSeatRefu
 import { resolveChatGptSource } from './chatgpt/config'
 import { ChatGptTurnLedger, chatGptTokenFields, createChatGptAdmission, createChatGptParityBackend, createUnpricedModelWarning, decorateChatGptTurn, type ChatGptTurnNotes } from './chatgpt/parity'
 import { BURN_SPARSE_WINDOW_MS, creditBurn } from './chatgpt/creditRates'
-import { chatGptFeatureCapabilities, effectiveCreditsPolicy, getChatGptFeatures, resetChatGptFeatures, updateChatGptFeatures, validateChatGptFeatureUpdate } from './chatgpt/features'
+import { CHATGPT_CREDITS_INHERIT, chatGptFeatureCapabilities, effectiveCreditsPolicy, getChatGptFeatures, resetChatGptFeatures, updateChatGptFeatures, validateChatGptFeatureUpdate } from './chatgpt/features'
 import { resolveModelPricing } from '../telemetry/pricing'
 import { getPricingOverrides } from '../telemetry/pricingStore'
 import { computeSummary } from '../telemetry/percentiles'
 import { CATALOG_CLIENT_VERSION, chatGptModelList, createChatGptModelCatalog, type CatalogModel } from './chatgpt/catalog'
 import { createCodexClientVersion } from './chatgpt/clientVersion'
 import { CHATGPT_WARM_MODELS, chatGptRefusalDiagnosis, chatGptWarmBody, createChatGptProfileSurface } from './chatgpt/profileSurface'
-import { chatGptNameProblem } from './chatgpt/profiles'
+import { chatGptNameProblem, chatGptRemovalSettings, type ChatGptProfile } from './chatgpt/profiles'
 import { getCodexUsage } from './codex/service'
 import type { CodexUsageResponse } from './codex/types'
 import { createUpstreamRegistry, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
@@ -8049,6 +8049,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     excluded: configuredRoutingExcludedProfileIds,
     order: priorityProfileOrderSetting,
     spent: (profileId) => spentProfiles.get(profileId),
+    freeSeatOrder: () => getChatGptFeatures().freeSeatOrder,
   }) : undefined
   const orderableProfileIds = (): string[] => [
     ...listProfiles(finalConfig.profiles, finalConfig.defaultProfile).map(p => p.id),
@@ -8228,12 +8229,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     const unavailable: Record<string, number> = {}
     for (const seat of seats) if (seat.reason) unavailable[seat.reason] = (unavailable[seat.reason] ?? 0) + 1
     const benched = chatGptExhaustion.snapshot()
+    const planTiers = { paid: 0, free: 0, unknown: 0 }
+    const profiles = chatGptProfiles?.profiles() ?? []
+    for (const profile of profiles) planTiers[profile.planTier ?? "unknown"]++
+    const activeId = chatGptProfiles?.activeProfileId()
     return {
       mode: source.mode,
       serving: source.isServing(),
       accounts: seats.length,
       eligible: seats.filter(seat => seat.eligible).length,
       unavailable,
+      planTiers,
+      activePlanTier: profiles.find(profile => profile.id === activeId)?.planTier ?? null,
       benched: benched.length,
       ...(benched.length > 0 ? { nextSeatFreeAt: new Date(Math.min(...benched.map(mark => mark.until))).toISOString() } : {}),
     }
@@ -9528,6 +9535,55 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return c.json({ success: true, from: result.from, to: result.to, aliases: result.aliases })
   })
 
+  // A seat in Meridian's own store is deleted with its credentials, which
+  // also ends its renewal: the refresher only ever renews a stored seat. Every
+  // setting keyed on it goes too, and the active pointer moves to the seat
+  // that would serve next. Telemetry is history and keeps it.
+  const removeChatGptSeat = (c: Context, seat: ChatGptProfile) => {
+    const refusal = chatGptProfiles!.removalRefusal(seat)
+    if (refusal || !chatGptSource?.removeAccount) {
+      return c.json({ error: refusal ?? "This Meridian cannot remove ChatGPT seats.", code: "owned_elsewhere", provider: "chatgpt" }, 409)
+    }
+    if (envBool("CREDENTIALS_READONLY")) {
+      return c.json({ error: "MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials." }, 403)
+    }
+    const pointerMoves = chatGptProfiles!.activeProfileId() === seat.id || getSetting("chatGptActiveSeat") === seat.seat
+    const successor = chatGptProfiles!.successorFor(seat.seat)
+    try {
+      if (!chatGptSource.removeAccount(seat.seat)) return c.json({ error: `No ChatGPT seat is called "${seat.id}".`, code: "unknown_profile" }, 404)
+    } catch (error) {
+      return c.json({ error: (error as Error).message, code: "store_write_failed", provider: "chatgpt" }, 503)
+    }
+    saveSettings(chatGptRemovalSettings(seat, {
+      chatGptProfileNames: getSetting("chatGptProfileNames"),
+      chatGptProfileAliases: getSetting("chatGptProfileAliases"),
+      profileOrder: getSetting("profileOrder"),
+      routingExcludedProfiles: getSetting("routingExcludedProfiles"),
+      routingManagedExcludedProfiles: getSetting("routingManagedExcludedProfiles"),
+    }))
+    if (getChatGptFeatures().seatCreditsPolicy[seat.seat]) updateChatGptFeatures({ seatCreditsPolicy: { [seat.seat]: CHATGPT_CREDITS_INHERIT } })
+    if (pointerMoves) setSetting("chatGptActiveSeat", successor?.seat)
+    chatGptBackend?.forgetSeat(seat.seat)
+    for (const id of [seat.id, ...seat.aliases]) spentProfiles.forget(id)
+    chatGptUsageAt = 0
+    void chatGptCatalog?.refresh()
+    claudeLog("profile.removed", {
+      profile: seat.id,
+      provider: "chatgpt",
+      remaining: chatGptProfiles!.profiles().length,
+      userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+      origin: c.req.header("origin") ?? c.req.header("referer")?.slice(0, 120) ?? null,
+    })
+    plog(`[PROXY] ChatGPT seat removed: ${seat.id}${pointerMoves ? ` (active moves to ${successor?.id ?? "none"})` : ""}`)
+    return c.json({
+      success: true,
+      profile: seat.id,
+      provider: "chatgpt",
+      activeProfile: pointerMoves ? successor?.id ?? null : undefined,
+      remaining: chatGptProfiles!.profiles().map(p => p.id),
+    })
+  }
+
   app.post("/profiles/remove", async (c) => {
     let body: { profile?: string }
     try {
@@ -9539,9 +9595,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       return c.json({ error: "Missing 'profile' in request body" }, 400)
     }
     const chatGptSeat = chatGptProfiles?.resolve(body.profile)
-    if (chatGptSeat) {
-      return c.json({ error: chatGptProfiles!.removalRefusal(chatGptSeat), code: "owned_elsewhere", provider: "chatgpt" }, 409)
-    }
+    if (chatGptSeat) return removeChatGptSeat(c, chatGptSeat)
     if (envBool("CREDENTIALS_READONLY")) {
       return c.json({ error: "MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials." }, 403)
     }

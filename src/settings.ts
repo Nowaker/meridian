@@ -88,6 +88,8 @@ export type ChatGptFeatureSettings = {
   creditsPolicy?: string
   /** Seat id (accountUserId) -> policy overriding `creditsPolicy` for that seat. */
   seatCreditsPolicy?: Record<string, string>
+  /** "before-credits" | "after-credits"; see ChatGptFreeSeatOrder. */
+  freeSeatOrder?: string
 }
 
 /**

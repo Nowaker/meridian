@@ -252,6 +252,11 @@ const CHATGPT_FEATURES = [
   { key: 'maxBudgetUsd', label: 'Max Budget (USD)', desc: 'Per-request cost cap from OpenAI pricing (0 = disabled). Refused before sending when the input alone is over it, stopped mid-stream when the estimate passes it. Hidden reasoning tokens are only counted when the response ends', type: 'number' },
   { key: 'fallbackModel', label: 'Fallback Model', desc: 'Retry once on this ChatGPT model when the requested one fails before any output was sent: a server error, every account rate limited, or the model refused. Never on a sign-in problem', type: 'select' },
   { key: 'creditsPolicy', label: 'Codex Credits', desc: 'When a seat whose plan usage is used up may keep serving on its purchased Codex credits. Credits may be real money: ChatGPT spends them by itself once a seat\u2019s plan runs out, and an account with automatic reload is charged again every time its balance runs low. Meridian cannot see whether reload is on. Seats with plan usage left are never affected', type: 'policy' },
+  { key: 'freeSeatOrder', label: 'Free-Plan Seats', desc: 'Where a seat on ChatGPT\u2019s free plan ranks for work no profile is pinned to. It always comes after every paid seat with plan usage left, because a free seat refuses most Codex models, and it does so even when it is the active seat. A turn pinned to it still goes there', type: 'freeseat' },
+];
+const FREE_SEAT_ORDER_OPTIONS = [
+  { value: 'before-credits', label: 'Before any seat spends credits (free usage costs nothing)' },
+  { value: 'after-credits', label: 'Only once no seat can serve on credits either' },
 ];
 const CREDITS_POLICY_OPTIONS = [
   { value: 'never', label: 'Never use credits' },
@@ -353,6 +358,8 @@ function renderChatGpt() {
       row.appendChild(input);
     } else if (feat.type === 'policy') {
       row.appendChild(policySelect(CREDITS_POLICY_OPTIONS, features[feat.key], function (value) { saveChatGpt(feat.key, value); }));
+    } else if (feat.type === 'freeseat') {
+      row.appendChild(policySelect(FREE_SEAT_ORDER_OPTIONS, features[feat.key], function (value) { saveChatGpt(feat.key, value); }));
     } else {
       const select = document.createElement('select');
       select.className = 'feature-select';

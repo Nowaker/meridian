@@ -22,7 +22,7 @@
  * Pure: no I/O, no clock of its own, no credential field in or out.
  */
 import { createHash } from "node:crypto"
-import { describeCodexPlan } from "../codex/plan"
+import { describeCodexPlan, normalizeCodexPlanSlug } from "../codex/plan"
 import type { CodexResetCredits, CodexUsageEntry, CodexUsageWindow } from "../codex/types"
 import { codexWindowLabel } from "../codex/windows"
 import type { ChatGptCredentialMode, ChatGptSeatView, SeatUnavailableReason } from "./source"
@@ -71,7 +71,15 @@ export interface ChatGptPlanFields {
   /** Displayed multiplier, e.g. `"20x"`; null where the slug does not determine it. */
   allowance: string | null
   allowanceWeight: number | null
+  /**
+   * `free` for a seat on ChatGPT's free plan, which most Codex models refuse;
+   * `paid` for any other known plan; null until the plan has been read.
+   * Routing serves unpinned work from a free seat only after every paid one.
+   */
+  planTier: ChatGptPlanTier | null
 }
+
+export type ChatGptPlanTier = "free" | "paid"
 
 export interface ChatGptProfile extends ChatGptPlanFields {
   id: string
@@ -183,7 +191,7 @@ export function chatGptProfileIds(
 export function chatGptPlanFields(planType: string | null | undefined): ChatGptPlanFields {
   const described = describeCodexPlan(planType)
   if (described.slug === null) {
-    return { subscriptionType: null, planLabel: null, planName: null, accountType: null, allowance: null, allowanceWeight: null }
+    return { subscriptionType: null, planLabel: null, planName: null, accountType: null, allowance: null, allowanceWeight: null, planTier: null }
   }
   const weight = described.multiplier ? Number.parseFloat(described.multiplier) : Number.NaN
   const label = described.label === "—" ? null : described.label
@@ -199,6 +207,7 @@ export function chatGptPlanFields(planType: string | null | undefined): ChatGptP
     accountType,
     allowance: described.multiplier,
     allowanceWeight: Number.isFinite(weight) ? weight : null,
+    planTier: normalizeCodexPlanSlug(described.slug) === "free" ? "free" : "paid",
   }
 }
 
@@ -402,19 +411,53 @@ export function chatGptOwner(mode: ChatGptCredentialMode, storeIndex: number | n
 
 /**
  * Why Meridian answers a remove of this seat with a refusal, and what removes
- * it instead. The interactive menu leads because it names each account by its
+ * it instead; null for a seat in Meridian's own store, which it removes
+ * itself. The interactive menu leads because it names each account by its
  * email; `codex-remove` takes a store position, which moves when an account
  * is added or deleted, so it is offered with the check that comes first.
  */
-export function chatGptRemovalRefusal(profile: Pick<ChatGptProfile, "id" | "label">, owner: ChatGptOwner): string {
-  if (owner.mode === "owned") {
-    return `"${profile.id}" is a ChatGPT seat in Meridian's own store. Removing an owned seat from the web UI is not supported; exclude it from routing to stop it serving work.`
-  }
+export function chatGptRemovalRefusal(profile: Pick<ChatGptProfile, "id" | "label">, owner: ChatGptOwner): string | null {
+  if (owner.mode === "owned") return null
   const menu = `run \`${owner.login}\`, choose ${owner.loginMethod}, pick ${profile.label} and choose "Delete this account"`
   const tool = owner.remove
     ? `, or in an opencode session check with \`codex-list\` that account ${owner.account} is ${profile.label} and run \`${owner.remove}\``
     : ""
   return `"${profile.id}" is a ChatGPT seat that ${CHATGPT_OWNER_TOOL} owns. Meridian only reads that store, so it cannot remove the seat. To remove it, ${menu}${tool}. Meridian drops the card on its next read of the store.`
+}
+
+export interface ChatGptRemovalSettings {
+  chatGptProfileNames?: Record<string, string>
+  chatGptProfileAliases?: Record<string, string[]>
+  profileOrder?: string[]
+  routingExcludedProfiles?: string[]
+  routingManagedExcludedProfiles?: string[]
+}
+
+/**
+ * Every setting keyed on a removed seat, rewritten without it: its name and
+ * former names, its place in the order and its routing exclusions. Only keys
+ * that change are returned. The caller moves the active pointer and drops the
+ * credits override (a ChatGPT feature). Telemetry is history and keeps the seat.
+ */
+export function chatGptRemovalSettings(
+  profile: Pick<ChatGptProfile, "id" | "seat" | "aliases">,
+  settings: Readonly<ChatGptRemovalSettings>,
+): ChatGptRemovalSettings {
+  const names = new Set([profile.id, profile.seat, ...profile.aliases])
+  const update: ChatGptRemovalSettings = {}
+  if (settings.chatGptProfileNames && profile.seat in settings.chatGptProfileNames) {
+    const { [profile.seat]: _name, ...rest } = settings.chatGptProfileNames
+    update.chatGptProfileNames = rest
+  }
+  if (settings.chatGptProfileAliases && profile.seat in settings.chatGptProfileAliases) {
+    const { [profile.seat]: _aliases, ...rest } = settings.chatGptProfileAliases
+    update.chatGptProfileAliases = rest
+  }
+  for (const key of ["profileOrder", "routingExcludedProfiles", "routingManagedExcludedProfiles"] as const) {
+    const list = settings[key]
+    if (list?.some(id => names.has(id))) update[key] = list.filter(id => !names.has(id))
+  }
+  return update
 }
 
 /**

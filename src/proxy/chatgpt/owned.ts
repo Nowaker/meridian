@@ -13,6 +13,7 @@
  * Without the lease `credentials` answers `no_authority` for every seat.
  */
 import type { CodexPoolResult } from "../codex/pool"
+import { decodeCodexToken } from "../codex/token"
 import { createChatGptCredentialStore, type ChatGptCredentialStore } from "./credentials"
 import { acquireWriterLease, type WriterLease } from "./lease"
 import { chatGptLockPath } from "./paths"
@@ -75,7 +76,7 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
         return {
           id: account.accountUserId,
           email: account.email,
-          planType: null,
+          planType: decodeCodexToken(account.accessToken)?.planType ?? null,
           eligible: !pending,
           ...(pending ? { reason: "requires_reauth" as const } : {}),
           expiresAt: account.expiresAt,
@@ -122,7 +123,7 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
             expiresAt: account.expiresAt,
             organizationId: null,
             accountLabel: null,
-            planType: null,
+            planType: decodeCodexToken(account.accessToken)?.planType ?? null,
             enabled: true,
           })),
         },
@@ -174,6 +175,13 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
         tokenRotatedAt: now(),
         exchangeStartedAt: null,
       }))
+    },
+
+    removeAccount(seat) {
+      if (!store || !holdsLease()) {
+        throw new Error("This Meridian does not hold the writer lease for its ChatGPT store, so it cannot remove a seat.")
+      }
+      return store.removeAccounts([seat]).length > 0
     },
 
     async refreshSeat(seat) {

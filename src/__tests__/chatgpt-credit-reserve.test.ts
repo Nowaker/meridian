@@ -15,7 +15,7 @@ import { join } from "node:path"
 import { createChatGptBackend, type ChatGptRoute, type ChatGptTurnEvent } from "../proxy/backends/chatgpt"
 import { createExternalCredentialSource } from "../proxy/chatgpt/external"
 import { chatGptCreditsFromHeaders, creditsCanServe } from "../proxy/chatgpt/windows"
-import type { ChatGptCreditsPolicy } from "../proxy/chatgpt/features"
+import type { ChatGptCreditsPolicy, ChatGptFreeSeatOrder } from "../proxy/chatgpt/features"
 import type { CodexCredits, CodexUsageWindow } from "../proxy/codex/types"
 import { ProfileExhaustion } from "../proxy/routing"
 
@@ -356,6 +356,71 @@ describe("Codex credits policy", () => {
     await drain(await backend.handle({ context: {}, endpoint: "responses", route: "/v1/responses" }))
     expect(backend.seatCreditState(seatId(0))).toEqual({ planSpent: true, servingOnCredits: true })
     expect(backend.seatCreditState(seatId(1))).toEqual({ planSpent: false, servingOnCredits: false })
+  })
+})
+
+describe("free-plan seats", () => {
+  // Seat 0 is the free seat throughout, and the active pointer names it.
+  const freePool = (freeSeatOrder: ChatGptFreeSeatOrder): ChatGptRoute => ({
+    kind: "pool", excluded: new Set(), preferred: seatId(0), free: new Set([seatId(0)]), freeSeatOrder,
+  })
+
+  it("serves a paid seat with plan quota first, though the pointer names the free seat", async () => {
+    writePool([account(0, { planType: "free" }), account(1)])
+    const h = harness({ route: freePool("before-credits") })
+    const response = await h.turn()
+    await drain(response)
+    expect(response.status).toBe(200)
+    expect(h.calls).toEqual(["at-1"])
+  })
+
+  it("before-credits: the free seat serves before any seat spends credits", async () => {
+    writePool([account(0, { planType: "free" }), stamped(1)])
+    const h = harness({ route: freePool("before-credits"), policy: "immediately", credits: { [seatId(1)]: PAYABLE } })
+    await drain(await h.turn())
+    expect(h.calls).toEqual(["at-0"])
+    expect(h.events[0]?.servedOnCredits).toBeUndefined()
+  })
+
+  it("before-credits: falls to credits when the free seat refuses the turn", async () => {
+    writePool([account(0, { planType: "free" }), stamped(1)])
+    const h = harness({ route: freePool("before-credits"), credits: { [seatId(1)]: PAYABLE }, respond: (token) => token === "at-0" ? usageLimit() : served() })
+    await drain(await h.turn())
+    expect(h.calls).toEqual(["at-0", "at-1"])
+    expect(h.events[0]).toMatchObject({ seat: seatId(1), servedOnCredits: true })
+  })
+
+  it("after-credits: a seat on credits serves before the free seat, under either credits policy", async () => {
+    for (const policy of ["immediately", "reserve"] as const) {
+      writePool([account(0, { planType: "free" }), stamped(1)])
+      const h = harness({ route: freePool("after-credits"), policy, credits: { [seatId(1)]: PAYABLE } })
+      await drain(await h.turn())
+      expect(h.calls).toEqual(["at-1"])
+      expect(h.events[0]).toMatchObject({ seat: seatId(1), servedOnCredits: true })
+    }
+  })
+
+  it("after-credits: the free seat serves once no seat can pay on credits", async () => {
+    writePool([account(0, { planType: "free" }), stamped(1)])
+    const h = harness({ route: freePool("after-credits"), credits: { [seatId(1)]: EMPTY } })
+    const response = await h.turn()
+    await drain(response)
+    expect(response.status).toBe(200)
+    expect(h.calls).toEqual(["at-0"])
+  })
+
+  it("after-credits: the free seat is still asked after a credits seat refuses", async () => {
+    writePool([account(0, { planType: "free" }), stamped(1)])
+    const h = harness({ route: freePool("after-credits"), credits: { [seatId(1)]: PAYABLE }, respond: (token) => token === "at-1" ? usageLimit() : served() })
+    await drain(await h.turn())
+    expect(h.calls).toEqual(["at-1", "at-0"])
+  })
+
+  it("serves a turn pinned to the free seat there", async () => {
+    writePool([account(0, { planType: "free" }), account(1)])
+    const h = harness({ route: { kind: "pinned", seat: seatId(0) } })
+    await drain(await h.turn())
+    expect(h.calls).toEqual(["at-0"])
   })
 })
 

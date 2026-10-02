@@ -27,6 +27,26 @@ export interface ChatGptFeatures {
   creditsPolicy: ChatGptCreditsPolicy
   /** Per-seat overrides of `creditsPolicy`, keyed by seat id (accountUserId). */
   seatCreditsPolicy: Record<string, ChatGptCreditsPolicy>
+  /** Where a free-plan seat ranks for unpinned work: before any seat spends credits, or after. */
+  freeSeatOrder: ChatGptFreeSeatOrder
+}
+
+/**
+ * When a seat on ChatGPT's free plan may take unpinned work. Either way it
+ * comes after every paid seat with plan quota left, because a free seat
+ * refuses most Codex models and its quota is small.
+ *
+ * - `before-credits`: next, before any seat is sent work on its Codex credits.
+ *   Free quota costs nothing; credits are bought.
+ * - `after-credits`: only once no seat can serve on credits either.
+ *
+ * A turn pinned to a free seat goes there regardless, as any pin does.
+ */
+export type ChatGptFreeSeatOrder = "before-credits" | "after-credits"
+export const CHATGPT_FREE_SEAT_ORDERS: readonly ChatGptFreeSeatOrder[] = ["before-credits", "after-credits"]
+
+export function isChatGptFreeSeatOrder(value: unknown): value is ChatGptFreeSeatOrder {
+  return typeof value === "string" && (CHATGPT_FREE_SEAT_ORDERS as readonly string[]).includes(value)
 }
 
 /**
@@ -66,6 +86,7 @@ export const CHATGPT_FEATURE_DEFAULTS: Readonly<ChatGptFeatures> = {
   // A fresh install must not spend money nobody agreed to spend.
   creditsPolicy: "never",
   seatCreditsPolicy: {},
+  freeSeatOrder: "before-credits",
 }
 
 /**
@@ -89,6 +110,7 @@ export function getChatGptFeatures(): ChatGptFeatures {
       : CHATGPT_FEATURE_DEFAULTS.fallbackModel,
     creditsPolicy: isChatGptCreditsPolicy(saved.creditsPolicy) ? saved.creditsPolicy : CHATGPT_FEATURE_DEFAULTS.creditsPolicy,
     seatCreditsPolicy: savedSeatPolicies(saved.seatCreditsPolicy),
+    freeSeatOrder: isChatGptFreeSeatOrder(saved.freeSeatOrder) ? saved.freeSeatOrder : CHATGPT_FEATURE_DEFAULTS.freeSeatOrder,
   }
 }
 
@@ -152,6 +174,9 @@ export function validateChatGptFeatureUpdate(
         seats[seat] = policy
       }
       result.seatCreditsPolicy = seats
+    } else if (key === "freeSeatOrder") {
+      if (!isChatGptFreeSeatOrder(value)) throw new Error(`freeSeatOrder must be one of: ${CHATGPT_FREE_SEAT_ORDERS.join(", ")}`)
+      result.freeSeatOrder = value
     } else {
       throw new Error(`Unknown ChatGPT setting: ${key}`)
     }
@@ -182,6 +207,13 @@ export function chatGptFeatureCapabilities(features: ChatGptFeatures): Array<{ n
       name: "Codex Credits",
       status: features.creditsPolicy + (Object.keys(features.seatCreditsPolicy).length > 0 ? ` (+${Object.keys(features.seatCreditsPolicy).length} seat overrides)` : ""),
       detail: CREDITS_POLICY_DETAIL[features.creditsPolicy],
+    },
+    {
+      name: "Free Seats",
+      status: features.freeSeatOrder,
+      detail: features.freeSeatOrder === "before-credits"
+        ? "A free-plan seat takes unpinned work after every paid seat with plan quota, and before any seat spends Codex credits."
+        : "A free-plan seat takes unpinned work only once no seat can serve on its plan or on Codex credits.",
     },
   ]
 }

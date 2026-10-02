@@ -566,6 +566,10 @@ function profileSection(q,s,pl,h){
       ?'<a class="spend-pill needs-login" href="'+esc(profileHref(p.id))+'" title="'+esc(chat?access.summary:'Open this profile to log in again')+'">'+esc(access.pill)+'</a>'
       :'<span class="spend-pill needs-login">'+esc(access.pill)+'</span>');
     else if(spend.state==='spent')badge+=' <span class="spend-pill">spent</span>';
+    // A free-plan seat serves unpinned work after the paid ones even while it
+    // is the active seat, which the active badge alone would hide.
+    var freeFact=chat&&p.entry&&p.entry.planTier==='free'?profileFacts(p.entry).filter(function(f){return f.label==='Routing'})[0]:null;
+    if(freeFact)badge+=' <span class="spend-pill" title="'+esc(freeFact.value+'. '+freeFact.title)+'">'+esc(p.entry.freeSeatDeferred?'free \u00b7 paid seats first':'free plan')+'</span>';
     var spendClass=spend.reason==='unusable'?' needs-login':spend.fade>0?' spend-'+spend.state:'';
     var spendStyle=spend.fade>0?' style="--spend-fade:'+spend.fade.toFixed(2)+'"':'';
     var spendTip=access?' title="'+esc(access.summary)+'"'

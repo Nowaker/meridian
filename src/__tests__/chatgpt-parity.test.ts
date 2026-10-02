@@ -306,13 +306,13 @@ describe("Fallback Model", () => {
 describe("ChatGPT feature settings", () => {
   it("defaults to thinking passthrough on, no budget, no fallback, and never spending credits", () => {
     resetChatGptFeatures()
-    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: true, maxBudgetUsd: 0, fallbackModel: "", creditsPolicy: "never", seatCreditsPolicy: {} })
+    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: true, maxBudgetUsd: 0, fallbackModel: "", creditsPolicy: "never", seatCreditsPolicy: {}, freeSeatOrder: "before-credits" })
   })
 
   it("round-trips through settings.json", () => {
     updateChatGptFeatures({ thinkingPassthrough: false, maxBudgetUsd: 0.5 })
     updateChatGptFeatures({ fallbackModel: "gpt-5.4", creditsPolicy: "reserve" })
-    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: false, maxBudgetUsd: 0.5, fallbackModel: "gpt-5.4", creditsPolicy: "reserve", seatCreditsPolicy: {} })
+    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: false, maxBudgetUsd: 0.5, fallbackModel: "gpt-5.4", creditsPolicy: "reserve", seatCreditsPolicy: {}, freeSeatOrder: "before-credits" })
     resetChatGptFeatures()
   })
 

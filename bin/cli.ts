@@ -88,9 +88,9 @@ if (args[0] === "profile") {
       await profileAdd(profileId, { headless })
     }
   }
-  else if (subcommand === "list" || subcommand === "ls") profileList()
-  else if (subcommand === "remove" && profileId) profileRemove(profileId)
-  else if (subcommand === "rename" && profileId && args[3]) profileRename(profileId, args[3])
+  else if (subcommand === "list" || subcommand === "ls") await profileList()
+  else if (subcommand === "remove" && profileId) await profileRemove(profileId)
+  else if (subcommand === "rename" && profileId && args[3]) await profileRename(profileId, args[3])
   else if (subcommand === "switch" && profileId) await profileSwitch(profileId)
   else if (subcommand === "login" && profileId) await profileLogin(profileId, { headless })
   else profileHelp()

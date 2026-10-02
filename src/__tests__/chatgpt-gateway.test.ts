@@ -38,7 +38,7 @@ delete process.env.MERIDIAN_API_KEY
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 const { telemetryStore } = await import("../telemetry")
 const { __setFetchOAuthUsageOverride, resetOAuthUsageCache } = await import("../proxy/oauthUsage")
-const { saveSettings } = await import("../settings")
+const { getSetting, saveSettings } = await import("../settings")
 const { resetCodexUsageCache } = await import("../proxy/codex/service")
 const { __setChatGptLoginListenOverride } = await import("../proxy/chatgpt/login")
 
@@ -1048,6 +1048,73 @@ describe("owned mode signs its own seats in", () => {
       const seat = (await listed()).find(p => p.seat === "user-9__workspace-9")!
       expect(seat).toMatchObject({ id: "work-pro", unavailable: null })
       expect(seat.aliases).toContain("fresh-pace-9")
+    } finally {
+      proxy.chatGpt!.release()
+    }
+  })
+
+  it("removes an owned seat: credentials, name, order, exclusions and credits override go; the active pointer moves on", async () => {
+    mkdirSync(storeDir, { recursive: true, mode: 0o700 })
+    const stored = (n: number, extra: Record<string, unknown> = {}) => ({
+      accountUserId: `user-${n}__workspace-${n}`, accountId: `workspace-${n}`, email: `s${n}@example.test`,
+      refreshToken: `rt-${n}`, accessToken: signedIn, expiresAt: NOW + 3_600_000, tokenRotatedAt: NOW, exchangeStartedAt: null, ...extra,
+    })
+    // Seat 1's refresh died mid-exchange: removing a seat that needs a login must work too.
+    const freeToken = `${part({ alg: "none" })}.${part({
+      exp: Math.floor(NOW / 1000) + 3600,
+      "https://api.openai.com/auth": { chatgpt_account_id: "workspace-2", chatgpt_account_user_id: "user-2__workspace-2", chatgpt_plan_type: "free" },
+    })}.sig`
+    writeFileSync(storePath, JSON.stringify({ version: 1, accounts: [stored(0), stored(1, { exchangeStartedAt: 1 }), stored(2, { accessToken: freeToken })] }), { mode: 0o600 })
+    saveSettings({
+      chatGptProfileNames: { "user-0__workspace-0": "zero", "user-1__workspace-1": "dead-one" },
+      chatGptProfileAliases: { "user-1__workspace-1": ["s1-kspace-1"] },
+      profileOrder: ["dead-one", "two-x", "zero"],
+      routingExcludedProfiles: ["s1-kspace-1"],
+      chatGptActiveSeat: "user-1__workspace-1",
+      chatgpt: { seatCreditsPolicy: { "user-1__workspace-1": "immediately", "user-0__workspace-0": "reserve" } },
+    })
+    const proxy = await server("owned")
+    await proxy.chatGpt!.acquire()
+    try {
+      const listed = async () => (await (await proxy.app.fetch(new Request("http://localhost/profiles/list"))).json() as {
+        activeProfiles?: { chatgpt: string | null }; profiles: Array<{ id: string; seat?: string; planTier?: string | null }>
+      })
+      const seat2 = (await listed()).profiles.find(p => p.seat === "user-2__workspace-2")!.id
+      saveSettings({ profileOrder: ["dead-one", seat2, "zero"] })
+
+      const res = await post(proxy.app, "/profiles/remove", { profile: "s1-kspace-1" })
+      expect(res.status).toBe(200)
+      expect(await res.json()).toMatchObject({ success: true, profile: "dead-one", provider: "chatgpt", activeProfile: "zero" })
+
+      const doc = JSON.parse(readFileSync(storePath, "utf8")) as { accounts: Array<{ accountUserId: string }> }
+      expect(doc.accounts.map(a => a.accountUserId)).toEqual(["user-0__workspace-0", "user-2__workspace-2"])
+      expect(getSetting("chatGptProfileNames")).toEqual({ "user-0__workspace-0": "zero" })
+      expect(getSetting("chatGptProfileAliases")).toEqual({})
+      expect(getSetting("profileOrder")).toEqual([seat2, "zero"])
+      expect(getSetting("routingExcludedProfiles")).toEqual([])
+      expect(getSetting("chatGptActiveSeat")).toBe("user-0__workspace-0")
+      expect(getSetting("chatgpt")?.seatCreditsPolicy).toEqual({ "user-0__workspace-0": "reserve" })
+      const after = await listed()
+      expect(after.profiles.map(p => p.id)).toEqual(["zero", seat2])
+      expect(after.activeProfiles?.chatgpt).toBe("zero")
+      expect((await post(proxy.app, "/profiles/remove", { profile: "dead-one" })).status).toBe(400)
+
+      expect(after.profiles.find(p => p.id === seat2)).toMatchObject({ planTier: "free" })
+      // The paid successor goes too, so the pointer falls to the free seat, the only one left.
+      expect((await post(proxy.app, "/profiles/remove", { profile: "zero" })).status).toBe(200)
+      expect(getSetting("chatGptActiveSeat")).toBe("user-2__workspace-2")
+      expect(getSetting("chatgpt")?.seatCreditsPolicy).toEqual({})
+      expect(tokenCalls).toBe(0)
+
+      const settings = async () => (await (await proxy.app.fetch(new Request("http://localhost/settings/api/chatgpt"))).json() as { features: { freeSeatOrder: string } }).features
+      expect((await settings()).freeSeatOrder).toBe("before-credits")
+      const patch = (body: unknown) => proxy.app.fetch(new Request("http://localhost/settings/api/chatgpt", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }))
+      expect((await patch({ freeSeatOrder: "sometimes" })).status).toBe(400)
+      expect((await patch({ freeSeatOrder: "after-credits" })).status).toBe(200)
+      expect((await settings()).freeSeatOrder).toBe("after-credits")
+      const entry = (await listed()).profiles[0] as Record<string, unknown>
+      expect(entry).toHaveProperty("planTier")
+      expect(entry).toHaveProperty("freeSeatDeferred")
     } finally {
       proxy.chatGpt!.release()
     }

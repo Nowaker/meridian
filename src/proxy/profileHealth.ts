@@ -100,6 +100,10 @@ export class SpentStore {
   clear(): void {
     this.records.clear()
   }
+
+  forget(profileId: string): void {
+    this.records.delete(profileId)
+  }
 }
 
 /**

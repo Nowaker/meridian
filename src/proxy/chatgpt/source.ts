@@ -95,6 +95,12 @@ export interface ChatGptCredentialSource {
    * under the writer lease. Throws when this process does not hold it.
    */
   connectAccount?(account: ChatGptConnectedAccount): void
+  /**
+   * owned only: delete a seat and its credentials under the writer lease, so
+   * nothing renews or serves it again. False when the store had no such seat;
+   * throws when this process does not hold the lease.
+   */
+  removeAccount?(seat: string): boolean
   /** owned only: renew one seat's access token now, through the same single-exchange path a request uses. */
   refreshSeat?(seat: string): Promise<RefreshOutcome>
 }
