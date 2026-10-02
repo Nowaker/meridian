@@ -13,14 +13,18 @@ import { hostname, tmpdir } from "node:os"
 import { join } from "node:path"
 import { CrossProcessTurnCoordinator } from "../proxy/session/crossProcessTurnCoordinator"
 import { captureProcessIncarnation } from "../proxy/session/processIncarnation"
+import { releaseStoreDatabase } from "./storeDatabaseHelpers"
 import { prepareFork, readSessionGcSnapshot } from "../proxy/sessionLifecycle"
 import { setSessionStoreDir } from "../proxy/sessionStore"
 
 const roots: string[] = []
 
-afterEach(() => {
+afterEach(async () => {
   setSessionStoreDir(null)
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
+  for (const root of roots.splice(0)) {
+    await releaseStoreDatabase(root)
+    rmSync(root, { recursive: true, force: true })
+  }
 })
 
 describe("Windows-safe durable session storage", () => {

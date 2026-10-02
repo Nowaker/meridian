@@ -23,6 +23,7 @@ import {
   attachSharedTranscriptLocator,
   lookupSharedSession,
   readSessionStoreDocument,
+  readSessionStoreSnapshot,
   sessionStoreWritesSettled,
   setSessionStoreDir,
   storeSharedSession,
@@ -192,6 +193,44 @@ describe("copy-on-write store mutations", () => {
     expect(readCommittedSession(dir, "a")).toEqual(document.a as Record<string, unknown>)
     expect(readCommittedSession(dir, "b")).toEqual(document.b as Record<string, unknown>)
     expect(readCommittedSession(dir, "a")?.messageCount).toBe(3)
+  })
+
+  it("owns nested caller data before caching the committed entry", async () => {
+    const hashes = ["m1"]
+    const blockHashes = [["b1"]]
+    const uuids = ["sdk-1"]
+    await storeSharedSession("a", "claude-a", 1, "h", hashes, uuids, undefined, blockHashes)
+    hashes[0] = "changed"
+    blockHashes[0]![0] = "changed"
+    uuids[0] = "changed"
+    const cached = lookupSharedSession("a")!
+    expect(cached.messageHashes).toEqual(["m1"])
+    expect(cached.messageBlockHashes).toEqual([["b1"]])
+    expect(cached.sdkMessageUuids).toEqual(["sdk-1"])
+    const committed = readCommittedSession(dir, "a")!
+    expect(committed.messageHashes).toEqual(cached.messageHashes)
+    expect(committed.messageBlockHashes).toEqual(cached.messageBlockHashes)
+  })
+
+  it("prevents nested lookup edits from diverging from the database", async () => {
+    await storeSharedSession("a", "claude-a", 1, "h", ["m1"], undefined, undefined, [["b1"]])
+    const cached = lookupSharedSession("a")!
+    expect(() => { cached.messageHashes![0] = "changed" }).toThrow()
+    expect(() => { cached.messageBlockHashes![0]![0] = "changed" }).toThrow()
+    expect(cached.messageHashes).toEqual(["m1"])
+    const snapshot = readSessionStoreSnapshot()
+    expect(() => { delete snapshot.a }).toThrow()
+    expect(lookupSharedSession("a")).toBe(cached)
+  })
+
+  it("protects nested history another process committed before exposing it", async () => {
+    await storeSharedSession("seed", "claude-seed", 1, "h", ["m1"])
+    commitRawSession(dir, "a", fixtureEntry(2, Date.now()))
+    const cached = lookupSharedSession("a")!
+    const original = cached.messageBlockHashes![0]![0]
+    expect(() => { cached.messageBlockHashes![0]![0] = "changed" }).toThrow()
+    await storeSharedSession("b", "claude-b", 1, "h", ["b"])
+    expect((readCommittedSession(dir, "a")!.messageBlockHashes as string[][])[0]![0]).toBe(original)
   })
 
   it("hands out frozen entries and leaves earlier reads untouched by later mutations", async () => {

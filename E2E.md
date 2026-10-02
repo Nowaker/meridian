@@ -624,6 +624,27 @@ This verifies actual SDK refusal handling and live recovery, not two separate
 paid accounts. Run the full priority-routing suite and all four E41 modes to
 retain the barrier against failover after real content, tools or structured output.
 
+### Late idle deadlines after a proxy freeze (#1222)
+
+Run `scripts/e2e-late-idle-sockets.mjs` with Bun and Node (Node 22 requires
+`--experimental-strip-types`). Its separate writer continues while the guarded
+consumer freezes; active, silent, ping-only and on-time controls are asserted.
+Set `E2E_IDLE_GUARD_MODULE` to an unchanged baseline guard and pass
+`--expect-baseline` to reproduce rejection of queued progress.
+
+After build, run `scripts/e2e-late-idle-client.mjs` with
+`E2E_PROFILE_CLAUDE_DIR` naming an owned native credential directory,
+`E2E_PLUGIN_PATH` naming independently installed scrub, and
+`E2E_OPENCODE_BIN` selecting actual OpenCode. It uses Opus 5.5 by default and
+freezes only the proxy during a sustained actual SDK answer after tool-result
+resume. The native Claude subprocess remains running. The fixed flow must
+observe a production late-deadline resumed verdict, zero stalls, tool receipt,
+continuation, served-model confirmation and consistent credential affinity.
+Use `E2E_PROXY_MODULE` for a built unchanged baseline with `--expect-baseline`;
+it must record an actual late false stall. Run on the implicated Linux runtime
+and include all four E41 modes. Retain sanitized assertions rather than raw
+client transcripts or OAuth values. See the [evidence record](docs/maintenance/evidence/1222-late-idle-deadline.md).
+
 ### Consecutive idle stalls (#868)
 
 ```bash
@@ -7098,3 +7119,26 @@ forwarding refusal, and resumes one client's conversation. The snapshot contains
 The proxy uses a read-only isolated OAuth-token profile. The endpoint describes
 `scope: client-http`; zero cannot establish background-job, pending-continuation
 or post-probe restart safety. See the durable [evidence](docs/maintenance/evidence/1190-request-activity.md).
+
+### Profile-copy pruning (#1187)
+
+Run the maintained `scripts/e2e-profile-copy-prune-client.mjs` against an owned
+access-only grant and independently installed OpenCode scrub as documented in
+[the evidence record](docs/maintenance/evidence/1187-profile-copy-pruning.md).
+Run once with `E2E_PRUNE_ENABLED=1` and once with `0`: verify actual SDK deletion
+versus retained native resume, immutable fork source, unchanged newest history,
+unrelated aged session retention and a client-tool receipt surviving the final
+return. Both aliases deliberately share a grant, so this is lifecycle proof.
+Run all four E41 modes for affected session/history/cache continuity as well.
+Production pruning is opt-in through `MERIDIAN_SESSION_PROFILE_COPY_PRUNE=1`.
+
+### Asynchronous SDK launch gate (#1221)
+
+After build, run `scripts/e2e-sdk-gate-client.mjs` with
+`E2E_PROFILE_CLAUDE_DIR`, `E2E_PLUGIN_PATH` and optional `E2E_CLAUDE_BIN` as
+documented in [the evidence record](docs/maintenance/evidence/1221-async-sdk-gate.md).
+Actual gate file-handle fsyncs are held while the real OpenCode/SDK/model path
+runs. Require liveness answers during those holds, a random tool receipt and
+same-session recall, actual served-model confirmation and zero client exits.
+The direct gate regression additionally requires bounded join and eventual
+sensitive-file cleanup if disk publication remains stuck after child exit.

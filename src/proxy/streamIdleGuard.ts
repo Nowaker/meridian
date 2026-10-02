@@ -55,19 +55,25 @@ const realClock: IdleGuardClock = {
   clearTimeout: (handle) => clearTimeout(handle),
 }
 
+function isSdkStreamPing(value: unknown): boolean {
+  return typeof value === "object" && value !== null
+    && "type" in value && value.type === "stream_event"
+    && "event" in value && typeof value.event === "object" && value.event !== null
+    && "type" in value.event && value.event.type === "ping"
+}
+
 /**
  * How far past its deadline the idle timer may fire before the guard treats
  * the lateness as a blocked event loop rather than ordinary timer jitter.
  *
- * A timer can only fire late if this process stopped running callbacks: a
- * synchronous fsync or a long CPU burst on the main thread. While the loop is
+ * A late timer suggests delayed callbacks, for example from a synchronous
+ * fsync or a long CPU burst on the main thread. While the loop is
  * blocked the upstream keeps sending, and its bytes wait in the socket or
  * pipe. When the loop resumes, expired timers run before the I/O poll that
  * would deliver those bytes, so without this check a live stream is rejected
- * as silent. On a responsive but loaded host timers fire within a few hundred
- * milliseconds of their deadline, so 2 s never catches an on-time firing,
- * while a freeze long enough to matter is well past it. The only cost of
- * crossing it is one turn of the event loop.
+ * as silent. The two-second threshold excludes ordinary short timer jitter;
+ * it is not proof of a particular cause. Crossing it adds only a bounded I/O
+ * opportunity, without extending the idle window or accepting transport pings.
  */
 export const IDLE_DEADLINE_LATE_MS = 2_000
 
@@ -77,24 +83,17 @@ export interface LateIdleDeadline {
   lateMs: number
   /** Time since the last upstream message, measured when the timer ran. */
   sinceLastMs: number
-  /** True if upstream data turned up after yielding to I/O, so the stream continues. */
+  /** True if model progress or completion turned up after yielding to I/O. */
   resumed: boolean
 }
 
 const IDLE = Symbol("idle")
 
-// Two chained immediates guarantee one I/O poll in between on both runtimes.
-// Node polls before the first one runs, but Bun runs an immediate queued from
-// a timer callback before it polls, so a single one is not enough there.
+// Give socket/pipe processing an opportunity on supported Node/Bun runtimes.
+// A single immediate can resume before I/O under Bun; the independent-process
+// socket probe exercises the two-immediate ordering on both runtimes.
 function yieldToIo(): Promise<void> {
   return new Promise((resolve) => setImmediate(() => setImmediate(resolve)))
-}
-
-function isSdkStreamPing(value: unknown): boolean {
-  return typeof value === "object" && value !== null
-    && "type" in value && value.type === "stream_event"
-    && "event" in value && typeof value.event === "object" && value.event !== null
-    && "type" in value.event && value.event.type === "ping"
 }
 
 export async function* guardUpstreamIdle<T>(
@@ -140,7 +139,7 @@ export async function* guardUpstreamIdle<T>(
           await yieldToIo()
           res = await Promise.race([nextP, Promise.resolve(IDLE)])
           try {
-            onLateDeadline?.({ lateMs, sinceLastMs, resumed: res !== IDLE })
+            onLateDeadline?.({ lateMs, sinceLastMs, resumed: res !== IDLE && (res.done || !isSdkStreamPing(res.value)) })
           } catch {
             // Observer errors must not change the guard's verdict.
           }

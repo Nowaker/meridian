@@ -703,6 +703,25 @@ function parseSessionRow(key: string, entry: string): StoredSession {
   return Object.freeze(value)
 }
 
+function freezeStoreValue(value: unknown): void {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return
+  // History has hundreds of thousands of small block-hash arrays. Iterate
+  // arrays directly instead of allocating another array for every row.
+  if (Array.isArray(value)) {
+    for (const child of value) freezeStoreValue(child)
+  } else {
+    for (const child of Object.values(value)) freezeStoreValue(child)
+  }
+  Object.freeze(value)
+}
+
+function freezeSessionForRead(session: StoredSession): StoredSession {
+  // Parsed arrays are privately owned until a lookup exposes the entry. Freeze
+  // them at that boundary, avoiding a full-store walk for a single cold lookup.
+  for (const child of Object.values(session)) freezeStoreValue(child)
+  return Object.freeze(session)
+}
+
 function loadSlots(database: StoreDatabase): Record<string, number> {
   const slots: Record<string, number> = {}
   for (const row of database.all<{ slot: string; counter: number }>("SELECT slot, counter FROM generation_slots")) {
@@ -808,7 +827,9 @@ function currentDocument(): SessionStoreDocument {
 /** Read a strict, coherent snapshot for maintenance tasks such as session GC.
  *  Unlike lookup helpers, a corrupt store and I/O errors are propagated. */
 export function readSessionStoreSnapshot(): Record<string, StoredSession> {
-  return currentDocument().sessions
+  const sessions = currentDocument().sessions
+  for (const session of Object.values(sessions)) freezeSessionForRead(session)
+  return Object.freeze(sessions)
 }
 
 /** Capture exact durable generations for one adapter session across profile keys. */
@@ -938,9 +959,6 @@ function storeChangeOps(
 
 /** The cached document after `draft` committed over `base`. */
 function committedDocument(base: SessionStoreDocument, draft: SessionStoreDocument): SessionStoreDocument {
-  for (const [key, entry] of Object.entries(draft.sessions)) {
-    if (base.sessions[key] !== entry) Object.freeze(entry)
-  }
   // The counters only advance. Updating the cached object in place is safe
   // because mutations run one at a time and readers use it synchronously.
   const slots = base.meta.slots
@@ -971,6 +989,16 @@ async function mutateStore(mutator: (document: SessionStoreDocument) => boolean)
         const base = freshStoreCache(database)
         const draft = draftStoreDocument(base.document)
         if (!mutator(draft)) return { ops: [], result: undefined }
+        // A new entry may still reference caller-owned arrays or usage objects.
+        // Own and freeze those values before serializing; otherwise later
+        // caller/lookup edits make the cache disagree with the database.
+        for (const [key, entry] of Object.entries(draft.sessions)) {
+          if (base.document.sessions[key] !== entry && !Object.isFrozen(entry)) {
+            const owned = structuredClone(entry)
+            freezeStoreValue(owned)
+            draft.sessions[key] = owned
+          }
+        }
         const seq = base.seq + 1
         return { ops: storeChangeOps(base.document, draft, seq, commitToken), result: { base, draft, seq } }
       },
@@ -1163,6 +1191,7 @@ export function lookupSharedSessionResult(key: string): SharedSessionLookupResul
     const session = document.sessions[key]
     const generation = keyGeneration(key, session, document.meta)
     if (!session) return { status: "missing", generation }
+    freezeSessionForRead(session)
     // Versions 1.61.0–1.62.3 stored a user/tool_result UUID even though the SDK's
     // resumeSessionAt accepts assistant UUIDs only. Replaying once is safer than
     // resuming that invalid tail and re-triggering full-history cache churn.
@@ -1224,7 +1253,7 @@ export function lookupSharedSessionByClaudeIdResult(claudeSessionId: string): Sh
       }
     }
     return newest && newestKey
-      ? { status: "found", session: newest, generation: getStoredSessionGeneration(newest, newestKey) }
+      ? { status: "found", session: freezeSessionForRead(newest), generation: getStoredSessionGeneration(newest, newestKey) }
       : { status: "missing" }
   } catch (error) {
     const normalized = error instanceof Error ? error : new Error(String(error))
@@ -1661,6 +1690,7 @@ export async function storeSharedSessionAndPriorityAssignment(
       passthroughToolCallAssistantUuid: options.passthroughToolCallAssistantUuid ?? undefined,
       passthroughToolCallIds: options.passthroughToolCallIds ?? undefined,
       contextUsage: options.contextUsage,
+      // Copy, never alias — same reason as in storeSharedSession.
       ...(resolvedCurrentTranscript ? { currentTranscript: { ...resolvedCurrentTranscript } } : {}),
       ...(previousTranscript ? { previousTranscript: { ...previousTranscript } } : {}),
       ...(previousClaudeSessionId ? { previousClaudeSessionId } : {}),
@@ -1954,7 +1984,8 @@ export async function attachSharedTranscriptLocator(
     if (!existing || existing.claudeSessionId !== expectedClaudeSessionId) return false
     if (expectedGeneration !== undefined && getStoredSessionGeneration(existing, key) !== expectedGeneration) return false
     if (!sameTranscriptLocator(existing.currentTranscript, locator)) {
-      // Copy, never alias — same reason as in storeSharedSession.
+      // Copy, never alias — same reason as in storeSharedSession. The entry is
+      // replaced rather than edited: cached entries are shared and frozen.
       const attached: StoredSession = {
         ...existing,
         currentTranscript: { ...locator },
@@ -2005,6 +2036,14 @@ export async function evictSharedSession(
   })
   return evicted
 }
+
+/**
+ * How long a superseded copy stays resumable. A conversation that moves to
+ * another account and comes back - typically once the first account's 5-hour
+ * usage window has reset - resumes that account's own SDK session while its
+ * copy exists, and is replayed as flattened, window-trimmed history after.
+ */
+export const DEFAULT_PROFILE_COPY_GRACE_MS = 24 * 60 * 60_000
 
 export interface ProfileCopyPruneOptions {
   /** Configured non-default profile IDs; only their `${id}:` prefixes are recognized. */
@@ -2071,12 +2110,23 @@ function selectSupersededProfileCopies(
   return victims
 }
 
+/** Candidate conversations only; callers must fence turns before deleting their mappings. */
+export function listSupersededProfileConversations(options: ProfileCopyPruneOptions): string[] {
+  const profileIds = new Set(options.profileIds)
+  const candidates = selectSupersededProfileCopies(currentDocument(),
+    { ...options, profileIds }, Date.now())
+  return [...new Set(candidates.map(key => {
+    const separator = key.indexOf(":")
+    return separator > 0 && key.slice(0, separator) !== "default" && profileIds.has(key.slice(0, separator))
+      ? key.slice(separator + 1) : key
+  }))]
+}
+
 /**
  * Remove mappings superseded by a newer copy of the same conversation under
- * another profile, oldest first. A copy only replays locally what the newer
- * copy already resumes, and the account's prompt cache it was warm against
- * expires within the hour, yet it keeps its per-message hashes and its
- * transcript pinned. Removal unpins those transcripts; lifecycle
+ * another profile, oldest first. Past the grace window a copy is rarely
+ * returned to, yet it keeps its per-message hashes in every store write and
+ * its transcript pinned. Removal unpins those transcripts; lifecycle
  * reconciliation retires them through the normal bounded backlog.
  * Returns the number of mappings removed.
  */

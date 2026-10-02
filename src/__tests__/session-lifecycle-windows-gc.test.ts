@@ -16,6 +16,7 @@ import {
   type TranscriptLocator,
 } from "../proxy/sessionLifecycle"
 import { captureProcessIncarnation } from "../proxy/session/processIncarnation"
+import { releaseStoreDatabase } from "./storeDatabaseHelpers"
 
 // Regression coverage for the Windows session-GC stall: runGc used to no-op on
 // win32 whenever no custom deleter was injected (the production configuration),
@@ -44,7 +45,10 @@ interface StoredSidecar {
 const tempRoots: string[] = []
 
 afterEach(async () => {
-  await Promise.all(tempRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })))
+  await Promise.all(tempRoots.splice(0).map(async (path) => {
+    await releaseStoreDatabase(join(path, "store"))
+    await rm(path, { recursive: true, force: true })
+  }))
 })
 
 // A stand-in for @anthropic-ai/claude-agent-sdk. deleteSession records the

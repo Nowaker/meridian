@@ -442,6 +442,16 @@ export function peekStoreDatabase(dir: string): StoreDatabase | undefined {
   return openDatabases.get(dir)
 }
 
+/** Close the database open for a directory once its queued writes have landed.
+ *  Windows refuses to remove a directory that holds an open file. */
+export async function closeStoreDatabase(dir: string): Promise<void> {
+  const database = openDatabases.get(dir)
+  if (!database) return
+  openDatabases.delete(dir)
+  await database.settled()
+  database.close()
+}
+
 export function fileDigest(data: Buffer): string {
   return createHash("sha256").update(data).digest("hex")
 }

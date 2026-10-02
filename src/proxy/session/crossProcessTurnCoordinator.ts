@@ -483,18 +483,29 @@ export class CrossProcessTurnCoordinator {
     return existsSync(join(this.root, lockName(key)))
   }
 
-  async acquire(key: string, signal?: AbortSignal): Promise<CrossProcessTurnLease> {
-    if (signal?.aborted) throw abortError(signal.reason)
-
+  /** Try once without waiting or recovering a busy/dead lock. Used by maintenance. */
+  async tryAcquireIdle(key: string): Promise<CrossProcessTurnLease | undefined> {
     const arrivedAt = Date.now()
-    const deadline = arrivedAt + this.acquireTimeoutMs
-    const lockPath = join(this.root, lockName(key))
+    await this.initializeRoot()
+    return this.tryAcquire(join(this.root, lockName(key)), arrivedAt)
+  }
+
+  private async initializeRoot(): Promise<void> {
     await mkdir(this.root, { recursive: true, mode: 0o700 })
     const rootInfo = await lstat(this.root)
     if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
       throw new Error(`Cross-process turn root is not a private directory: ${this.root}`)
     }
     await chmod(this.root, 0o700)
+  }
+
+  async acquire(key: string, signal?: AbortSignal): Promise<CrossProcessTurnLease> {
+    if (signal?.aborted) throw abortError(signal.reason)
+
+    const arrivedAt = Date.now()
+    const deadline = arrivedAt + this.acquireTimeoutMs
+    const lockPath = join(this.root, lockName(key))
+    await this.initializeRoot()
 
     while (true) {
       if (signal?.aborted) throw abortError(signal.reason)

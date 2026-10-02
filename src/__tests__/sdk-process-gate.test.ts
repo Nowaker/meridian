@@ -151,6 +151,43 @@ describe("SDK process gate", () => {
     expect(readdirSync(root).filter((name) => name.includes(".gate"))).toEqual([])
   })
 
+  it("bounds join while publication is stuck and removes its late sensitive gate", async () => {
+    const root = mkdtempSync(join(tmpdir(), "meridian-sdk-gate-"))
+    roots.push(root)
+    const marker = join(root, "must-not-run")
+    const gate = await createSdkProcessGate(root, async () => undefined)
+    const disk = holdDisk()
+    const restore = await replaceFileHandleSync(root, async (sync) => {
+      await disk.held
+      return sync()
+    })
+    let joining: Promise<boolean> | undefined
+    try {
+      const controller = new AbortController()
+      const child = gate.spawnClaudeCodeProcess({
+        command: process.execPath,
+        args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran")`],
+        env: { ...process.env }, signal: controller.signal,
+      })
+      const exited = new Promise<void>(resolve => child.once("exit", () => resolve()))
+      controller.abort()
+      await exited
+      joining = gate.closeAndJoin(30)
+      expect(await Promise.race([joining, Bun.sleep(300).then(() => "unbounded")])).toBe(false)
+      disk.release()
+      const deadline = Date.now() + 2000
+      while (readdirSync(root).some(name => name.includes(".gate")) && Date.now() < deadline) await Bun.sleep(10)
+      expect(readdirSync(root).filter(name => name.includes(".gate"))).toEqual([])
+      expect(existsSync(marker)).toBe(false)
+      expect(await gate.closeAndJoin()).toBe(true)
+    } finally {
+      disk.release()
+      restore()
+      await joining
+      await gate.closeAndJoin()
+    }
+  })
+
   it("stops the wrapper instead of opening the command when the gate cannot be published", async () => {
     const root = mkdtempSync(join(tmpdir(), "meridian-sdk-gate-"))
     roots.push(root)

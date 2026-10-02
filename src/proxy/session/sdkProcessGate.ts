@@ -24,7 +24,7 @@ export interface SdkProcessGate {
   /** False means a crashed proxy's lease must remain fail-closed forever. */
   readonly recoverableAfterCrash: boolean
   readonly spawnClaudeCodeProcess: (options: SpawnOptions) => SpawnedProcess
-  /** True only after the exact wrapper/CLI process has exited safely. */
+  /** True only after the exact wrapper/CLI has exited and gate publication settled. */
   closeAndJoin(timeoutMs?: number): Promise<boolean>
 }
 
@@ -278,31 +278,36 @@ export async function createSdkProcessGate(
       recoverableAfterCrash,
       spawnClaudeCodeProcess,
       async closeAndJoin(timeoutMs = 7_000): Promise<boolean> {
+        const deadline = performance.now() + Math.max(0, timeoutMs)
+        const remaining = (): number => Math.max(0, deadline - performance.now())
         let joined = child.exitCode !== null
-        // Give a terminal SDK process a short chance to report its natural exit
-        // before cancellation turns Windows recovery into a permanent fence.
-        if (!joined) joined = await waitForExit(exited, Math.min(250, timeoutMs))
+        // Use one budget for termination and publication. An exited child
+        // cannot make an unresponsive disk safe to await indefinitely.
+        if (!joined) joined = await waitForExit(exited, Math.min(250, remaining()))
         if (!joined) {
           killOwned("SIGTERM")
-          joined = await waitForExit(exited, timeoutMs)
+          joined = await waitForExit(exited, remaining())
         }
         if (!joined && process.platform !== "win32") {
           killOwned("SIGKILL")
-          joined = await waitForExit(exited, Math.min(2_000, timeoutMs))
+          joined = await waitForExit(exited, Math.min(2_000, remaining()))
         }
-        // The gate holds the CLI's whole environment. A publication still in
-        // flight would rename it into place after the removal below.
-        if (joined) {
-          await publication
+        const publicationSettled = joined && await waitForExit(publication, remaining())
+        const cleanup = (): void => {
           rmSync(gatePath, { force: true })
           rmSync(cancelPath, { force: true })
+        }
+        if (publicationSettled) {
+          cleanup()
         } else {
-          void Promise.all([exited, publication]).then(() => {
-            rmSync(gatePath, { force: true })
-            rmSync(cancelPath, { force: true })
+          // A late publication carries the CLI environment; remove it only
+          // after both publication and process exit, and retain the caller's
+          // fail-closed lease until a later join succeeds.
+          void Promise.all([exited, publication]).then(cleanup).catch((error: unknown) => {
+            console.error("[sdkProcessGate] deferred gate cleanup failed:", error)
           })
         }
-        return joined
+        return publicationSettled
       },
     }
   } catch (error) {

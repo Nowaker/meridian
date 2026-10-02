@@ -6,7 +6,7 @@
 import { spyOn } from "bun:test"
 import Database from "libsql"
 import { join } from "node:path"
-import { StoreDatabase, type WriteOutcome, type WriteTransaction } from "../proxy/session/storeDatabase"
+import { closeStoreDatabase, StoreDatabase, type WriteOutcome, type WriteTransaction } from "../proxy/session/storeDatabase"
 
 function withStoreDatabase<T>(dir: string, use: (database: Database.Database) => T): T {
   const database = new Database(join(dir, "sessions.db"))
@@ -24,6 +24,17 @@ export function readCommittedSession(dir: string, key: string): Record<string, u
     const row = database.prepare("SELECT entry FROM sessions WHERE key = ?").get(key) as { entry: string } | undefined
     return row ? JSON.parse(row.entry) as Record<string, unknown> : undefined
   })
+}
+
+/**
+ * Close a store directory's database and release its files, so the directory
+ * can be removed on Windows. libsql closes a connection only once its prepared
+ * statements are finalized, which happens when they are collected.
+ */
+export async function releaseStoreDatabase(dir: string): Promise<void> {
+  await closeStoreDatabase(dir)
+  Bun.gc(true)
+  await new Promise((resolve) => setImmediate(resolve))
 }
 
 /** The sequence number of the store's latest commit. */

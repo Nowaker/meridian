@@ -1,6 +1,35 @@
 # Upstream review handoff
 
-## Active authorized backlog (2026-10-01)
+## Additional Nowaker work (2026-10-02)
+
+Owner authorized continuing more Nowaker work. #1222 source `1bffa43fe` is
+cherry-picked on fresh main `f443faee0` as `66d6d2cc`, with separate ping-report
+and independent-process probe corrections. [Evidence](evidence/1222-late-idle-deadline.md).
+Actual macOS/Linux OpenCode/Opus baseline false stalls and corrected
+receipts/resume pass, as do independent Node/Bun socket controls, all four E41
+modes and final local tests/typecheck/build. Integration is [#1241](https://github.com/rynfar/meridian/pull/1241); its live
+state and final-head check links are the authority for CI/merge disposition.
+Required final-head CI remains a merge gate. #792 existing-account re-authentication now completed and its native
+grant changed with the same profile mapping. The preview blanked at its
+localhost callback; replaying that original callback privately to the same
+server via 127.0.0.1 completed exchange. This is assisted callback evidence,
+not automatic loopback proof. Draft #1217 remains unfinished. Other public
+contract/deferred gates remain in the takeover record.
+
+## Takeover checkpoint (2026-10-02)
+
+[Current dispositions and proof](BACKLOG_TAKEOVER_2026-10-02.md) supersede the
+October 1 status leads below. #1187 incorporated with corrections as #1235,
+merge `c0af34eaa`, verified exact tree/CI/Nowaker credit and source closure.
+#1221 correction and actual macOS/Linux proof merged as #1236, `e1f8bc473`;
+exact tested tree/CI/Nowaker credit and source closure verified. #1217 rebased head `eb0c2b9e` has all executed
+CI passing, but remains draft pending real existing-account re-authentication.
+#1234 exact plugin pins and a reproduced `/inflight` queue-fixture correction
+are in #1237; final-head checks remain required before merge. General CI flake
+issues remain open. #1176 is deferred until a supported OpenAI-serving backend exists. #1175 already
+merged as #1227 (`3cb65df0c`). No release or external community messages.
+
+## Prior active authorized backlog (2026-10-01)
 
 **Nowaker priority checkpoint (2026-10-01).** #1171 incorporated with corrections
 as [#1225](https://github.com/rynfar/meridian/pull/1225), merge

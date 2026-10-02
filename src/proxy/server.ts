@@ -200,6 +200,7 @@ import {
   readSessionStoreGenerationSnapshot,
   sessionStoreWritesSettled,
   type StoredSessionGeneration,
+  DEFAULT_PROFILE_COPY_GRACE_MS,
 } from "./sessionStore"
 import {
   abandonFork,
@@ -562,7 +563,7 @@ function plog(message: string): void {
 
 function logLateIdleDeadline(mode: string): (late: LateIdleDeadline) => void {
   return ({ lateMs, sinceLastMs, resumed }) => {
-    plog(`[PROXY] upstream idle deadline fired ${lateMs}ms late (sinceLastMs=${sinceLastMs}, limit=${UPSTREAM_IDLE_MS}ms): ${resumed ? "upstream data was waiting, stream continues" : "still silent, stalling"}`)
+    plog(`[PROXY] upstream idle deadline fired ${lateMs}ms late (sinceLastMs=${sinceLastMs}, limit=${UPSTREAM_IDLE_MS}ms): ${resumed ? "upstream progress or completion was waiting" : "no model progress observed after yielding"}`)
     claudeLog("upstream.idle_deadline_late", { mode, lateMs, sinceLastMs, resumed })
   }
 }
@@ -820,7 +821,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   }
   sessionGcOptions.pinProvider = collectSessionGcPins
 
-  const profileCopyGraceMs = Math.max(0, envInt("SESSION_PROFILE_COPY_GRACE_MS", 60 * 60_000))
+  const profileCopyPruningEnabled = envBool("SESSION_PROFILE_COPY_PRUNE")
+  const profileCopyGraceMs = Math.max(0, envInt("SESSION_PROFILE_COPY_GRACE_MS", DEFAULT_PROFILE_COPY_GRACE_MS))
   const pruneSupersededProfileCopies = async (): Promise<void> => {
     try {
       const pruned = await releaseSupersededProfileCopies({
@@ -829,13 +831,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // In this process, a request waits for the store writes already under
         // way, then snapshots every profile's mapping generation and registers
         // its turn in one synchronous step, so no local request can see a copy
-        // vanish under it. Another process sharing the store is covered for the
-        // length of its held turn lock.
+        // vanish under it. Another process sharing the store is fenced by
+        // maintenance leases acquired by the lifecycle.
         isConversationActive: (conversationId) => {
           const turnKey = `session:${conversationId}`
-          return processSessionTurns.isActive(turnKey) || crossProcessSessionTurns.isHeld(turnKey)
+          return processSessionTurns.isActive(turnKey)
         },
-      }, sessionGcOptions)
+      }, sessionGcOptions, crossProcessSessionTurns)
       if (pruned > 0) claudeLog("session.profile_copies_pruned", { pruned })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -846,7 +848,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   const sweepSessionGc = (): Promise<void> => {
     if (sessionGcRunning) return sessionGcRunning
     sessionGcRunning = (async () => {
-      await pruneSupersededProfileCopies()
+      if (profileCopyPruningEnabled) await pruneSupersededProfileCopies()
       const result = await runSessionGc(collectSessionGcPins(), sessionGcOptions)
       if (result.deleted || result.notFound || result.failed) {
         claudeLog("session.gc", { ...result })
