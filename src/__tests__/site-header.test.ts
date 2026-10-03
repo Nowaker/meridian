@@ -334,6 +334,7 @@ describe("design-system conformance (DESIGN.md)", () => {
     "src/telemetry/dashboard.ts",
     "src/telemetry/settingsPage.ts",
     "src/telemetry/profilePage.ts",
+    "src/telemetry/profileProviders.ts",
     "src/proxy/plugins/pluginPage.ts",
   ]
 

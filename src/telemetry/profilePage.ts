@@ -7,6 +7,7 @@ import { profileBarCss, profileBarHtml, profileBarJs, themeCss } from "./profile
 import { profileFactsJs } from "./profileFacts"
 import { profileFindJs } from "./profileFind"
 import { reorderClientJs, reorderCss, reorderLiveRegionHtml } from "./profileOrder"
+import { PROVIDERS_NONE_SHOWN_HTML, profileProvidersCss, profileProvidersJs } from "./profileProviders"
 import { WINDOW_LABELS } from "./profileUsage"
 import { selectionHoldJs } from "./selectionHold"
 
@@ -60,10 +61,15 @@ export const profilePageHtml = `<!DOCTYPE html>
 
   .profile-card {
     background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-    padding: 20px; margin-bottom: 12px; transition: border-color 0.2s;
+    padding: 20px; margin-bottom: 12px; transition: border-color 0.2s; position: relative;
   }
   .profile-card[hidden] { display: none; }
-  .profile-card.active { border-color: var(--accent); }
+  /* --brand and its relatives come from the card's .provider-<id> class
+     (profileProviders.ts): each provider's active account, and the button
+     that switches to one, are in that provider's brand. */
+  .profile-card.active { border-color: var(--brand, var(--accent)); box-shadow: 0 0 0 1px var(--brand, var(--accent)); }
+  #content .provider-group-head { margin-bottom: 10px; }
+  #content .provider-group-head:not([hidden]) ~ .provider-group-head { margin-top: 24px; }
   /* Wide layout: the stack becomes a grid of larger cards, two to four to a
      row on a desktop monitor. The order note, the empty state and the loading
      line take a whole row rather than a card's slot. */
@@ -72,6 +78,7 @@ export const profilePageHtml = `<!DOCTYPE html>
   }
   html[data-layout="wide"] #content > :not(.profile-card) { grid-column: 1 / -1; }
   html[data-layout="wide"] #content > .profile-card { margin-bottom: 0; }
+  html[data-layout="wide"] #content > .provider-group-head { margin-bottom: 0; }
   /* Arriving from a /profiles#<name> link: one short pulse says which card. */
   .profile-card.anchor-flash { animation: profile-anchor-flash 0.5s ease-out; }
   @keyframes profile-anchor-flash {
@@ -89,6 +96,7 @@ export const profilePageHtml = `<!DOCTYPE html>
      the layout. */
   .profile-card-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 12px; }
   ${reorderCss}
+  ${profileProvidersCss}
   .profile-name { font-size: 16px; font-weight: 600; min-width: 0; overflow-wrap: anywhere; color: inherit; text-decoration: none; }
   a.profile-name:hover { color: var(--accent); }
   .profile-card-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
@@ -125,7 +133,7 @@ export const profilePageHtml = `<!DOCTYPE html>
     font-size: 10px; padding: 2px 8px; border-radius: 4px; text-transform: uppercase;
     letter-spacing: 0.5px; font-weight: 500; min-width: 0; overflow-wrap: anywhere;
   }
-  .badge-active { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .badge-active { background: rgba(var(--brand-rgb, 88,166,255),0.15); color: var(--brand-bright, var(--accent)); }
   .badge-type { background: var(--bg); color: var(--muted); border: 1px solid var(--border); }
   .badge-spent { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.35); }
   .spent-note { margin: 10px 0; padding: 10px 14px; border-radius: 8px; font-size: 12px; line-height: 1.5;
@@ -152,6 +160,8 @@ export const profilePageHtml = `<!DOCTYPE html>
   .switch-btn:hover { background: rgba(88,166,255,0.1); }
   .switch-btn:disabled { opacity: 0.4; cursor: default; }
   .switch-btn.current { border-color: var(--border); color: var(--muted); cursor: default; }
+  .switch-btn.switch-to { color: var(--brand-bright, var(--accent)); border-color: var(--brand, var(--accent)); }
+  .switch-btn.switch-to:hover { background: rgba(var(--brand-rgb, 88,166,255),0.12); border-color: var(--brand-bright, var(--accent)); }
 
   .empty-state {
     text-align: center; padding: 48px; color: var(--muted);
@@ -333,6 +343,7 @@ export const profilePageHtml = `<!DOCTYPE html>
      on every poll: a box inside it would lose its text every ten seconds. -->
 <div class="section" id="profiles-section">
   <h2 class="section-title">Configured Profiles</h2>
+  <div id="profiles-provider-chips"></div>
   <div class="profile-search" id="profiles-filter-bar" hidden>
     <input type="search" id="profiles-filter" ${PROFILE_INPUT_ATTRS}
       aria-label="Filter profiles" aria-controls="content"
@@ -344,6 +355,7 @@ export const profilePageHtml = `<!DOCTYPE html>
     No profile matches <strong id="profiles-no-match-query"></strong>.
     <button type="button" class="link-btn" onclick="setProfileQuery('')">Clear the search</button>
   </div>
+  <div class="provider-none" id="profiles-provider-none" hidden>${PROVIDERS_NONE_SHOWN_HTML}</div>
 </div>
 ${reorderLiveRegionHtml}
 
@@ -472,6 +484,22 @@ function formatExtraUsage(eu) {
 
 ${reorderClientJs}
 ${selectionHoldJs}
+${profileProvidersJs}
+
+var providersPresent = [];
+// The chips sit outside #content, so a poll does not replace them; they are
+// redrawn only when the providers or their counts change.
+var providerChipsKey = null;
+
+function renderProviderChips(groups) {
+  var key = groups.map(function (g) { return g.provider + ':' + g.items.length; }).join(',');
+  var slot = document.getElementById('profiles-provider-chips');
+  if (key !== providerChipsKey) {
+    providerChipsKey = key;
+    slot.innerHTML = meridianProviders.chipsHtml(groups);
+  }
+  meridianProviders.syncChips(slot);
+}
 
 // Cache the last seen quota response so the /profiles/list refresh can
 // keep showing usage even if a single /v1/usage/quota/all call fails.
@@ -1016,6 +1044,13 @@ function render(data, quotaData) {
     quotaById[quotaProfiles[qi].id] = quotaProfiles[qi];
   }
 
+  // One list, a group per provider; grouping keeps the saved order within each.
+  const groups = meridianProviders.group(profiles, meridianProviders.providerOf);
+  const slots = meridianProviders.slots(groups);
+  const grouped = groups.length > 1;
+  providersPresent = groups.map(function (g) { return g.provider; });
+  renderProviderChips(groups);
+
   if (profiles.length === 0) {
     document.getElementById('content').innerHTML = '<div class="empty-state">'
       + '<h2>No profiles configured</h2>'
@@ -1032,14 +1067,16 @@ function render(data, quotaData) {
   const reorderable = profiles.length > 1 && !meridianReorder.envPinned();
 
   let html = '';
-  if (profiles.length > 1) html += meridianReorder.noteHtml(reorderable, profiles.some(isChatGptProfile));
+  if (profiles.length > 1) html += meridianReorder.noteHtml(reorderable, profiles.some(isChatGptProfile), grouped);
 
-  for (let idx = 0; idx < profiles.length; idx++) {
-    const p = profiles[idx];
+  for (let idx = 0; idx < slots.length; idx++) {
+    const slot = slots[idx];
+    const p = slot.item;
+    if (grouped && slot.place === 0) html += meridianProviders.headingHtml(slot.group, false);
     // Per profile rather than against data.activeProfile: an instance serving
     // both providers has an active Claude account AND an active ChatGPT seat.
     const isActive = !!p.isActive;
-    html += '<div class="profile-card' + (isActive ? ' active' : '') + '" id="' + esc(profileAnchorElementId(p.id)) + '" data-id="' + esc(p.id) + '" data-index="' + idx + '">';
+    html += '<div class="profile-card provider-' + esc(slot.provider) + (isActive ? ' active' : '') + '" id="' + esc(profileAnchorElementId(p.id)) + '" data-id="' + esc(p.id) + '" data-index="' + idx + '" data-group="' + esc(slot.provider) + '">';
     html += '<div class="profile-card-header">';
     if (editingProfile === p.id) {
       html += "<input class=\\"rename-input\\" id=\\"rename-input\\" type=\\"text\\" value=\\"" + esc(p.id) + "\\" " + PROFILE_INPUT_ATTRS
@@ -1051,10 +1088,12 @@ function render(data, quotaData) {
       html += "<button class=\\"icon-btn\\" title=\\"Cancel\\" onclick=\\"cancelRename()\\">" + ICON_X + "</button>";
       html += "</span>";
     } else {
-      if (reorderable) html += meridianReorder.handleHtml(p.id, idx, profiles.length);
+      if (reorderable && slot.size > 1) html += meridianReorder.handleHtml(p.id, idx, slot.place, slot.size);
       html += "<a class=\\"profile-name\\" href=\\"#" + esc(encodeURIComponent(p.id)) + "\\" title=\\"Link to this profile\\">" + esc(p.id) + "</a>";
       if (isActive) html += "<span class=\\"profile-badge badge-active\\">active</span>";
-      html += "<span class=\\"profile-badge badge-type\\">" + esc(p.type || "claude-max") + "</span>";
+      html += meridianProviders.badgeHtml(slot.provider, "profile-badge");
+      // A seat's type is its provider's name, which the badge before it says.
+      if ((p.type || "claude-max") !== slot.provider) html += "<span class=\\"profile-badge badge-type\\">" + esc(p.type || "claude-max") + "</span>";
       html += renderSpentBadge((quotaById[p.id] || {}).spent);
       if ((quotaById[p.id] || {}).servingOnCredits) html += '<span class="profile-badge badge-credits" title="This seat\u2019s plan usage is spent; its turns are paid with Codex credits">on credits</span>';
       html += "<span class=\\"profile-card-actions\\">";
@@ -1098,7 +1137,7 @@ function render(data, quotaData) {
     html += renderUsageSection(quotaById[p.id], p);
 
     if (!isActive) {
-      html += '<button class="switch-btn" onclick="switchProfile(&quot;'+esc(p.id)+'&quot;)">Switch to ' + esc(p.id) + '</button>';
+      html += '<button class="switch-btn switch-to" onclick="switchProfile(&quot;'+esc(p.id)+'&quot;)">Switch to ' + esc(p.id) + '</button>';
     } else {
       html += '<button class="switch-btn current" disabled>Currently active</button>';
     }
@@ -1145,26 +1184,38 @@ function writeProfilesUrl(hashId) {
   if (url.toString() !== location.href) history.replaceState(history.state, '', url.toString());
 }
 
+// A card shows when its provider's chip is on AND it matches the search; a
+// provider's heading shows while any of its cards does. The count and the
+// no-match message count only the providers on screen.
 function applyProfileFilter() {
   var profiles = profilesForFind();
   var byId = {};
   for (var i = 0; i < profiles.length; i++) byId[profiles[i].id] = profiles[i];
   var cards = document.querySelectorAll('#content .profile-card[data-id]');
   var shown = 0;
+  var inView = 0;
+  var groupShown = Object.create(null);
   for (var c = 0; c < cards.length; c++) {
-    var match = profileMatchesQuery(byId[cards[c].getAttribute('data-id')], profileQuery);
+    var group = cards[c].getAttribute('data-group');
+    var providerOn = meridianProviders.visible(group, providersPresent);
+    var match = providerOn && profileMatchesQuery(byId[cards[c].getAttribute('data-id')], profileQuery);
     cards[c].hidden = !match;
-    if (match) shown++;
+    if (providerOn) inView++;
+    if (match) { shown++; groupShown[group] = true; }
   }
+  var heads = document.querySelectorAll('#content .provider-group-head');
+  for (var h = 0; h < heads.length; h++) heads[h].hidden = !groupShown[heads[h].getAttribute('data-group')];
+  meridianProviders.syncChips(document.getElementById('profiles-provider-chips'));
+  document.getElementById('profiles-provider-none').hidden = meridianProviders.anyShown(providersPresent);
   var filtering = profileQueryTerms(profileQuery).length > 0;
   document.getElementById('profiles-section').classList.toggle('filtering', filtering);
   document.getElementById('profiles-filter-bar').hidden = cards.length === 0 && !filtering;
   var paused = filtering && document.querySelector('#content .drag-handle') ? ' \u00b7 clear to reorder' : '';
   document.getElementById('profiles-filter-count').textContent = filtering
-    ? shown + ' of ' + cards.length + paused
+    ? shown + ' of ' + inView + paused
     : '';
   document.getElementById('profiles-no-match-query').textContent = profileQuery.trim();
-  document.getElementById('profiles-no-match').hidden = !(filtering && cards.length > 0 && shown === 0);
+  document.getElementById('profiles-no-match').hidden = !(filtering && inView > 0 && shown === 0);
 }
 
 function setProfileQuery(query) {
@@ -1205,7 +1256,13 @@ function jumpToProfileAnchor() {
   if (!id) return;
   var card = document.getElementById(profileAnchorElementId(id));
   if (!card) return;
-  // Following a link to one profile outranks a filter that hides it.
+  // Following a link to one profile outranks a filter that hides it, the
+  // provider chip included.
+  var group = card.getAttribute('data-group');
+  if (group && !meridianProviders.visible(group, providersPresent)) {
+    meridianProviders.setHidden(group, false);
+    applyProfileFilter();
+  }
   if (card.hidden) setProfileQuery('');
   // A former name, or different casing, becomes the name the card shows.
   if (profileIdFromHash(location.hash) !== id) writeProfilesUrl(id);
@@ -1228,6 +1285,17 @@ function jumpToProfileAnchor() {
   window.addEventListener('hashchange', function () {
     anchorPending = true;
     if (lastProfiles) afterRender();
+  });
+  // The chips and "Show all" act on cards that are already drawn, so a toggle
+  // never re-renders and never interrupts a rename, a login or a drag.
+  document.getElementById('profiles-section').addEventListener('click', function (e) {
+    var id = meridianProviders.onClick(e.target);
+    if (!id) return;
+    applyProfileFilter();
+    if (id === '*') {
+      var first = document.querySelector('#profiles-provider-chips .provider-chip');
+      if (first) first.focus();
+    }
   });
 })();
 

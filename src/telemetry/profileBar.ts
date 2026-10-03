@@ -51,6 +51,18 @@ export const themeCss = `
     --queue:     #d29922;
     --ttfb:      #58a6ff;
     --upstream:  #3fb950;
+    /* Provider brands, for account cards only (profileProviders.ts): a
+       card's stripe and badge, its provider's chip and heading, and the
+       border of each provider's active account. -bright is the brand mixed
+       30% toward white, for hover and badge text; -rgb feeds tinted fills.
+       ChatGPT is its green-grey, not its violet #ab68ff: that one shares
+       --accent2's hue, and its bright tint is --accent2 itself. */
+    --claude:         #c15f3c;
+    --claude-bright:  #d48f76;
+    --claude-rgb:     193,95,60;
+    --chatgpt:        #74aa9c;
+    --chatgpt-bright: #9ec3ba;
+    --chatgpt-rgb:    116,170,156;
   }
   /* Banner backsplash — the brand look: a gentle diagonal wash with soft
      blue (top-left) and violet (bottom-right) glows. Pages must not set

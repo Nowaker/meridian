@@ -12,6 +12,7 @@ import { profileBarCss, profileBarHtml, profileBarJs, themeCss } from "./profile
 import { profileFactsJs } from "./profileFacts"
 import { profileFindJs } from "./profileFind"
 import { reorderClientJs, reorderCss, reorderLiveRegionHtml } from "./profileOrder"
+import { profileProvidersCss, profileProvidersJs } from "./profileProviders"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "./profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT } from "./profileSpent"
 import { selectionHoldJs } from "./selectionHold"
@@ -58,10 +59,15 @@ export const landingHtml = `<!DOCTYPE html>
      of stretching across the window. */
   html[data-layout="wide"] .profile-grid { grid-template-columns: repeat(auto-fill, minmax(min(380px, 100%), 1fr)); }
   .profile-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
-    padding: 18px 20px; position: relative; transition: border-color 0.15s; }
+    padding: 18px 20px; position: relative; transition: border-color 0.15s, background 0.15s; }
+  .profile-card[hidden] { display: none; }
+  /* Each provider has its own active account, so the active ring and the
+     hover that offers a switch are in that provider's brand (--brand comes
+     from the card's .provider-<id> class, profileProviders.ts). */
   .profile-card.switchable { cursor: pointer; }
-  .profile-card.switchable:hover { border-color: var(--accent); }
-  .profile-card.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .profile-card.switchable:hover { border-color: var(--brand-bright, var(--accent)); background: rgba(var(--brand-rgb, 88,166,255), 0.05); }
+  .profile-card.active { border-color: var(--brand, var(--accent)); box-shadow: 0 0 0 1px var(--brand, var(--accent)); }
+  .profile-grid .provider-group-head:not([hidden]) ~ .provider-group-head { margin-top: 8px; }
 
   /* Spent accounts recede. --spend-fade is set per card (0..1) from the
      shared classifier; hovering restores the card so a dimmed one can still
@@ -70,19 +76,25 @@ export const landingHtml = `<!DOCTYPE html>
 
      The fade is on the card's CONTENTS and never on the card, because
      filter and opacity apply to an element's OWN border and box-shadow.
-     Fading .profile-card therefore greyed out the accent ring on
+     Fading .profile-card therefore greyed out the active ring on
      .profile-card.active - the one mark on the page saying which account is
      serving requests - so the active profile became unfindable the moment it
      passed 95%, which is precisely when somebody comes looking for it. A
      descendant cannot undo an ancestor's filter or opacity, so scoping the
-     fade to the children is the only thing that leaves the ring alone; the
-     "Active" pill sits inside those contents and fades with them. */
+     fade to the children is the only thing that leaves the ring alone. The
+     active card spares its name row as well, so its Active pill and its
+     spent badge stay readable and only its figures recede. */
   .profile-card.spend-fading > *, .profile-card.spend-spent > * {
     filter: grayscale(var(--spend-fade, 0));
     opacity: calc(1 - 0.55 * var(--spend-fade, 0));
     transition: filter 0.2s, opacity 0.2s; }
   .profile-card.spend-fading:hover > *, .profile-card.spend-spent:hover > * { filter: none; opacity: 1; }
-  .profile-card.needs-login { border-color: var(--red); }
+  .profile-card.active.spend-fading > .profile-head, .profile-card.active.spend-spent > .profile-head { filter: none; opacity: 1; }
+  /* Dashed, because beside the Claude brand this red differs in hue alone,
+     which a protanope cannot see (ΔE2000 3.5): solid is the active border. */
+  .profile-card.needs-login { border-color: var(--red); border-style: dashed; }
+  /* The pill says it needs a login; the border keeps saying it is active. */
+  .profile-card.active.needs-login { border-color: var(--brand, var(--accent)); border-style: solid; }
   .profile-card.needs-login .prof-dot { background: var(--red); }
   .spend-pill { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
     color: var(--muted); background: var(--surface2); border: 1px solid var(--border);
@@ -92,6 +104,7 @@ export const landingHtml = `<!DOCTYPE html>
   a.spend-pill { text-decoration: none; }
   a.spend-pill:hover { border-color: var(--red); }
   ${reorderCss}
+  ${profileProvidersCss}
   /* The name row carries every badge the card can earn - Active, the plan
      chip, pool position, exhausted/refused, needs login, spent - and on a
      narrow card they do not fit beside the cost. The row wraps its badges
@@ -105,9 +118,12 @@ export const landingHtml = `<!DOCTYPE html>
   .profile-name { font-size: 13px; font-weight: 600; letter-spacing: 0.5px; display: flex; align-items: center; gap: 8px;
     flex: 1 1 12em; flex-wrap: wrap; row-gap: 4px; min-width: 0; overflow-wrap: anywhere; }
   .profile-name .prof-dot { width: 8px; height: 8px; flex-shrink: 0; border-radius: 50%; background: var(--border); }
-  .profile-card.active .prof-dot { background: var(--accent); box-shadow: 0 0 6px rgba(88,166,255,0.5); }
+  .profile-card.active .prof-dot { background: var(--brand, var(--accent)); box-shadow: 0 0 6px rgba(var(--brand-rgb, 88,166,255),0.5); }
   .active-pill { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
-    color: var(--accent); background: rgba(88,166,255,0.12); border: 1px solid rgba(88,166,255,0.35);
+    color: var(--brand-bright, var(--accent)); background: rgba(var(--brand-rgb, 88,166,255),0.12);
+    border: 1px solid rgba(var(--brand-rgb, 88,166,255),0.35);
+    border-radius: 10px; padding: 1px 8px; }
+  .provider-pill { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
     border-radius: 10px; padding: 1px 8px; }
   .switch-hint { font-size: 9px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px;
     color: var(--muted); opacity: 0; transition: opacity 0.15s; }
@@ -345,6 +361,20 @@ function setViewSort(mode){
 
 ${reorderClientJs}
 ${selectionHoldJs}
+${profileProvidersJs}
+
+var providersPresent=[];
+
+// A chip hides or shows its provider's cards where they stand. Hidden cards
+// stay in the page, so a drag still saves their place in the order.
+function applyProviderFilter(){
+  var root=document.getElementById('content');
+  var grouped=root.querySelectorAll('[data-group]');
+  for(var i=0;i<grouped.length;i++)grouped[i].hidden=!meridianProviders.visible(grouped[i].getAttribute('data-group'),providersPresent);
+  meridianProviders.syncChips(root);
+  var none=root.querySelector('.provider-none');
+  if(none)none.hidden=meridianProviders.anyShown(providersPresent);
+}
 
 // Whether this instance serves Claude at all. An instance that serves ChatGPT
 // and has neither a Claude login nor a Claude profile does not, and its page
@@ -473,12 +503,21 @@ function profileSection(q,s,pl,h){
     return computeProfileSpend({windows:quota.windows,error:quota.error,loggedIn:p.loggedIn,provider:p.entry&&p.entry.provider}).fraction;
   }
   profs=sortProfilesForView(profs,viewSort,spentOf);
+  // One grid, a group per provider. Grouping keeps the order each card
+  // arrived in, so the view sort above applies within every group.
+  var groups=meridianProviders.group(profs,function(p){return meridianProviders.providerOf(p.entry||p)});
+  var slots=meridianProviders.slots(groups);
+  var grouped=groups.length>1;
+  providersPresent=groups.map(function(g){return g.provider});
   var reorderable=multi&&!meridianReorder.envPinned()&&viewSort==='configured';
   var cards='';
   var shown=[];
   var pos=0;
-  for(var i=0;i<profs.length;i++){
-    var p=profs[i];var cost=profileCost(byProfile,p);
+  for(var i=0;i<slots.length;i++){
+    var slot=slots[i];
+    var providerHidden=!meridianProviders.visible(slot.provider,providersPresent);
+    if(grouped&&slot.place===0)cards+=meridianProviders.headingHtml(slot.group,providerHidden);
+    var p=slot.item;var cost=profileCost(byProfile,p);
     var chat=isChatGptProfile(p.entry);
     var quota=quotaByProfile[p.id]||{};
     var wins=(quota.windows||[]).filter(function(w){return w.utilization!=null});
@@ -579,11 +618,13 @@ function profileSection(q,s,pl,h){
     var spendStyle=spend.fade>0?' style="--spend-fade:'+spend.fade.toFixed(2)+'"':'';
     var spendTip=access?' title="'+esc(access.summary)+'"'
       :spend.fraction!=null&&spend.fade>0?' title="'+Math.round(spend.fraction*100)+'% of this '+(chat?'seat\u2019s allowance':'account\u2019s 5h / 7d allowance')+' is used"':'';
-    var draggable=reorderable&&p.configured;
-    cards+='<div class="profile-card'+(p.isActive?' active':'')+(switchable?' switchable':'')+spendClass+'"'+spendStyle+spendTip
+    // A provider's only card has nowhere to move, so it gets no handle.
+    var draggable=reorderable&&p.configured&&slot.size>1;
+    cards+='<div class="profile-card provider-'+esc(slot.provider)+(p.isActive?' active':'')+(switchable?' switchable':'')+spendClass+'"'+spendStyle+spendTip
+      +' data-group="'+esc(slot.provider)+'"'+(providerHidden?' hidden':'')
       +(p.configured?' data-id="'+esc(p.id)+'" data-index="'+pos+'"':'')
       +(switchable?' data-profile="'+esc(p.id)+'" role="button" tabindex="0"':'')+'>'
-      +'<div class="profile-head"><span class="profile-name">'+(draggable?meridianReorder.handleHtml(p.id,pos,profs.length):'')+'<span class="prof-dot"></span>'+(p.entry?infoIcon(p.entry,p.type):'')+''+esc(p.label||p.id)+' '+badge+'</span>'
+      +'<div class="profile-head"><span class="profile-name">'+(draggable?meridianReorder.handleHtml(p.id,pos,slot.place,slot.size):'')+'<span class="prof-dot"></span>'+(p.entry?infoIcon(p.entry,p.type):'')+''+esc(p.label||p.id)+' '+meridianProviders.badgeHtml(slot.provider,'provider-pill')+badge+'</span>'
       +'<span class="profile-cost">'+usd(cost?cost.estimatedUsd:0)+'</span></div>'
       +'<div class="profile-sub">'+(cost?cost.requests+' request'+(cost.requests===1?'':'s')+' · est. API value · 24h':'no traffic · 24h')+'</div>'
       +spentBanner+rows+'</div>';
@@ -591,7 +632,9 @@ function profileSection(q,s,pl,h){
   }
   if(!cards)return {html:'',shown:shown};
   return {shown:shown,html:'<div class="section"><div class="section-head"><div class="section-title">'+(profs.length===1?'Account':'Accounts')+'</div>'+sortTabs(profs.length)+'</div>'
-    +(multi?meridianReorder.noteHtml(reorderable,configured.some(isChatGptProfile)):'')
+    +meridianProviders.chipsHtml(groups)
+    +(multi?meridianReorder.noteHtml(reorderable,configured.some(isChatGptProfile),grouped):'')
+    +(grouped?meridianProviders.noneShownHtml(meridianProviders.anyShown(providersPresent)):'')
     +'<div class="profile-grid">'+cards+'</div></div>'};
 }
 
@@ -622,6 +665,8 @@ function tokens(v){if(v==null)return '—';if(v>=1e6)return (v/1e6).toFixed(1)+'
 function render(h,s,q,pl){
   lastData=[h,s,q,pl];
   var refocusId=meridianReorder.focusAnchor();
+  var focused=document.activeElement;
+  var refocusChip=focused&&focused.getAttribute?focused.getAttribute('data-provider-chip'):null;
   let o='';
   o+=introSection(h,pl);
 
@@ -648,6 +693,7 @@ function render(h,s,q,pl){
   o+='<div class="footer">Meridian · <a href="https://github.com/rynfar/meridian">GitHub</a> · Built on the <a href="https://github.com/anthropics/claude-agent-sdk-typescript">Claude Agent SDK</a></div>';
   document.getElementById('content').innerHTML=o;
   meridianReorder.restoreFocus(refocusId);
+  if(refocusChip){var chip=document.querySelector('.provider-chip[data-provider-chip="'+refocusChip+'"]');if(chip)chip.focus()}
 }
 
 function switchProfile(id){
@@ -660,6 +706,14 @@ function switchProfile(id){
 // this every grab of the handle would also change the active account.
 function onHandle(e){return !!(e.target.closest&&e.target.closest('.drag-handle'))}
 document.getElementById('content').addEventListener('click',function(e){
+  // Before the selection check: pressing a button leaves a selection standing,
+  // and a chip that does nothing while some text is selected looks broken.
+  var chip=meridianProviders.onClick(e.target);
+  if(chip){
+    applyProviderFilter();
+    if(chip==='*'){var first=document.querySelector('.provider-chip');if(first)first.focus()}
+    return;
+  }
   // Releasing a drag-select dispatches a click too, and that one is the end of
   // a copy rather than a request to switch account. A plain click has already
   // collapsed whatever was selected by the time it fires, so this refuses only
