@@ -76,6 +76,29 @@ retry tests reproduced four idle/busy/extra-usage timing failures. This is not
 a green full-suite claim. Deployment and browser verification on meridian-dev
 remain gated on its owner's source-versus-bundled runtime decision.
 
+## Transcript retention
+
+```sh
+bun scripts/e2e-transcript-retention.mjs
+MERIDIAN_TRANSCRIPT_RETENTION_DAYS=0 bun scripts/e2e-transcript-retention.mjs --expect-kept
+```
+
+Needs no credentials, network or running proxy. The harness drives the
+installed Claude Code CLI through the Agent SDK with the options
+`buildQueryOptions` produces, against a disposable config directory holding one
+transcript last touched 40 days ago and one fresh one. The child never receives
+a message, so nothing reaches the model; it idles while Claude Code's
+background housekeeping runs. The first run asserts the sweep deletes the old
+transcript, keeps the fresh one and loads no settings file, then that resuming
+the deleted session is refused in a way `classifyResumeRefusal` reads as
+`unresumable`, the cue for Meridian's fresh-session replay. With retention off
+the child receives exactly the settings Meridian sent before this setting
+existed, and `--expect-kept` asserts nothing is deleted.
+
+**Verified 2026-10-03:** Linux, Claude Code 2.1.284, Agent SDK 0.2.141: with
+the default 30 days the old transcript was deleted, the fresh one kept, and the
+resume classified `unresumable`; with `0` both transcripts were kept.
+
 ## Antigravity subscription CLI backend
 
 ```sh
