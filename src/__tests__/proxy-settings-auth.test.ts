@@ -120,7 +120,19 @@ describe("auth audit: every registered prefix is protected when MERIDIAN_API_KEY
   //                   profileLogin.ts), and redeeming the code additionally
   //                   needs the PKCE verifier, which never leaves this process.
   //                   A caller without both gets a rejection, not a login.
-  const PUBLIC_PREFIXES = new Set(["/", "/health", "/livez", "/readyz", "/callback"])
+  //
+  // The review for `/callback/:id/*`:
+  //
+  //   what it is      the same OAuth redirect, relayed from the browser's
+  //                   machine to a loopback listener that only exists on this
+  //                   one (oauthCallbacks.ts). The relay was told the id by an
+  //                   `oauth.callback.listening` hook.
+  //   why not gated   it is still a browser redirect, with no API key.
+  //   what guards it  the 128-bit id exists only while a sign-in waits and is
+  //                   a 404 otherwise; behind it the provider's `state` must
+  //                   match a waiting sign-in and the code needs the PKCE
+  //                   verifier held in this process.
+  const PUBLIC_PREFIXES = new Set(["/", "/health", "/livez", "/readyz", "/callback", "/callback/x/*"])
 
   it("rejects unauthenticated requests to every non-public route prefix", async () => {
     const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })

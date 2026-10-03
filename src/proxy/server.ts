@@ -27,7 +27,7 @@ import { stream } from "hono/streaming"
 import { serve, createAdaptorServer } from "@hono/node-server"
 import { socketActivationFd, parseIdleExitSeconds, isModelRequestPath } from "./socketActivation"
 import type { Server } from "node:http"
-import { homedir } from "node:os"
+import { homedir, hostname } from "node:os"
 import { join } from "node:path"
 import { query } from "@anthropic-ai/claude-agent-sdk"
 import { rateLimitStore } from "./rateLimitStore"
@@ -126,6 +126,8 @@ import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, F
 import { startFollowUsagePolling, stopFollowUsagePolling } from "./followUsage"
 import { startProfileLogin, completeProfileLogin, completeProfileLoginFromCallback, getProfileLoginStatus } from "./profileLogin"
 import { createChatGptLogin } from "./chatgpt/login"
+import { createHookDispatcher, HOOK_EVENTS, HOOK_LIMITS, hookTargetLabel, parseHookSettings, resolveHookTargets } from "./hooks"
+import { createOAuthCallbackRegistry, normalizePublicUrl, requestPublicOrigin } from "./oauthCallbacks"
 import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
 import { startProfileAdd, completeProfileAdd } from "./profileAdd"
 import { filterEligibleProfileIds, mergeRoutingExcludedProfiles, parseRoutingExcludedProfiles } from "./routingExclusions"
@@ -657,6 +659,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   const chatGptSource = resolveChatGptSource()
   proxyLogSilent = finalConfig.silent
   const serverVersion = finalConfig.version ?? "unknown"
+
+  // Event hooks (hooks.ts) and the public doors to loopback OAuth listeners
+  // (oauthCallbacks.ts). Targets are re-read per event, so a /settings edit
+  // applies to the next one.
+  const hookEnvironment = () => ({ url: env("HOOK_URL"), command: env("HOOK_COMMAND") })
+  const hooks = createHookDispatcher({
+    targets: () => resolveHookTargets(getSetting("hooks"), hookEnvironment()),
+    instance: () => ({ host: hostname(), pid: process.pid, port: finalConfig.port ?? null, version: serverVersion }),
+    log: plog,
+  })
+  const oauthCallbacks = createOAuthCallbackRegistry({ emit: (event, payload, options) => hooks.emit(event, payload, options) })
+  const configuredPublicUrl = () => normalizePublicUrl(env("PUBLIC_URL")) ?? normalizePublicUrl(getSetting("publicUrl"))
 
   const currentBuild = () =>
     buildRuntime.info(serverVersion, getLatestVersion())
@@ -8562,6 +8576,57 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return c.json({ success: true, restartRequired: true, supervision: detectSupervision() })
   })
 
+  // Event hooks (hooks.ts). `saved` is what the form edits; `environment`
+  // names the env targets by label only, since a command line or webhook URL
+  // may carry a credential. `recent` is the last deliveries, newest first.
+  app.get("/settings/api/hooks", (c) => {
+    const environment = hookEnvironment()
+    const envPublicUrl = env("PUBLIC_URL")
+    return c.json({
+      saved: getSetting("hooks") ?? {},
+      environment: {
+        webhook: environment.url?.trim() ? hookTargetLabel({ kind: "webhook", value: environment.url.trim() }) : null,
+        command: environment.command?.trim() ? hookTargetLabel({ kind: "command", value: environment.command.trim() }) : null,
+      },
+      publicUrl: {
+        saved: getSetting("publicUrl") ?? null,
+        env: envPublicUrl ? normalizePublicUrl(envPublicUrl) ?? "(invalid)" : null,
+        effective: configuredPublicUrl(),
+      },
+      events: HOOK_EVENTS,
+      limits: HOOK_LIMITS,
+      recent: hooks.recent(),
+    })
+  })
+  app.put("/settings/api/hooks", async (c) => {
+    let body: Record<string, unknown>
+    try { body = await c.req.json() as Record<string, unknown> } catch { return c.json({ error: "Invalid JSON" }, 400) }
+    const updates: Partial<MeridianSettings> = {}
+    if (body.hooks !== undefined) {
+      const parsed = parseHookSettings(body.hooks)
+      if (!parsed.ok) return c.json({ error: parsed.error }, 400)
+      updates.hooks = parsed.value
+    }
+    if (body.publicUrl !== undefined) {
+      if (body.publicUrl === null || body.publicUrl === "") {
+        updates.publicUrl = undefined
+      } else {
+        const normalized = normalizePublicUrl(body.publicUrl)
+        if (!normalized) return c.json({ error: "publicUrl must be an http(s) URL without credentials, query or fragment" }, 400)
+        updates.publicUrl = normalized
+      }
+    }
+    if (Object.keys(updates).length > 0) saveSettings(updates)
+    plog(`[PROXY] Event hooks updated: ${resolveHookTargets(getSetting("hooks"), hookEnvironment()).map(hookTargetLabel).join(", ") || "none"}`)
+    return c.json({ success: true })
+  })
+  // Sends a `hooks.test` event to every target that takes it and answers
+  // with each outcome, so the form can show whether a target works.
+  app.post("/settings/api/hooks/test", async (c) => {
+    const deliveries = await hooks.emit("hooks.test", { test: true })
+    return c.json({ deliveries })
+  })
+
   // ChatGPT gateway features (chatgpt/features.ts), re-read per request.
   // `models` is the Fallback Model choice list: what the gateway offers.
   // `seats` lists every seat with its own credits-policy override (null =
@@ -9340,6 +9405,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       ? { ok: true, okMessage: `ChatGPT seat${result.email ? ` ${result.email}` : ""} is connected to Meridian. You can close this tab.`, ...(result.returnTo ? { backHref: result.returnTo } : {}) }
       : { ok: false, message: result.message, ...(result.returnTo ? { backHref: result.returnTo } : {}) }),
     log: plog,
+    callbacks: oauthCallbacks,
   }) : undefined
 
   const chatGptSignInUnavailable = (c: Context) => c.json({
@@ -9388,7 +9454,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         returnTo = null
       }
     }
-    const started = await chatGptLogin.start({ returnTo, name: named.name, expect: named.expect })
+    // Where a relay on the browser's machine can reach this instance: the
+    // configured address, else the one this request came in on.
+    const publicBaseUrl = configuredPublicUrl() ?? requestPublicOrigin({ url: c.req.url, header: name => c.req.header(name) })
+    const started = await chatGptLogin.start({ returnTo, name: named.name, expect: named.expect, publicBaseUrl })
     plog(`[PROXY] ChatGPT sign-in started (browser redirect, loopback=${started.loopback}${named.expect ? `, again for ${chatGptProfiles?.profileIdFor(named.expect.seat)}` : ""})`)
     return c.json(started)
   })
@@ -9462,6 +9531,26 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       return c.json({ status: "refreshed", profile: profile.id, expiresAt: outcome.expiresAt })
     }
     return c.json({ status: outcome.status, profile: profile.id, reason: outcome.reason }, outcome.status === "requires-reauth" ? 401 : 503)
+  })
+
+  // PUBLIC - no requireAuth, for the same reason as /callback above: what
+  // arrives here is a browser redirect, relayed from the browser's machine by
+  // whatever an `oauth.callback.listening` hook started there. It carries no
+  // API key. The id is minted per open loopback listener (128 random bits) and
+  // removed when that listener closes; behind it the provider's `state` must
+  // still match a waiting sign-in and the code needs the PKCE verifier held
+  // only in this process. Unknown, closed or expired ids are a 404 that
+  // touches nothing. Its review is in proxy-settings-auth.test.ts.
+  app.get("/callback/:id/*", async (c) => {
+    const id = c.req.param("id")
+    const prefix = `/callback/${id}`
+    const url = new URL(c.req.url)
+    const rest = url.pathname.startsWith(prefix) ? url.pathname.slice(prefix.length) || "/" : "/"
+    const page = await oauthCallbacks.dispatch(id, { method: "GET", path: rest, query: url.searchParams })
+    if (!page) return c.text("Not found", 404, { "cache-control": "no-store" })
+    // Neither the id, the code nor the state is logged.
+    plog(`[PROXY] Relayed OAuth callback answered ${page.status}`)
+    return c.html(page.html, page.status as 200, { "cache-control": "no-store" })
   })
 
   app.post("/profiles/rename", async (c) => {
@@ -10504,7 +10593,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     config: finalConfig,
     initPlugins: initPluginsAsync,
     closeBackend: antigravity?.closeBackend,
-    beginDrain: () => { draining = true; antigravity?.beginDrain?.() },
+    beginDrain: () => {
+      draining = true
+      antigravity?.beginDrain?.()
+      // Closes the sign-in listener and tells relays to stop forwarding to it.
+      chatGptLogin?.close()
+      oauthCallbacks.closeAll("shutdown")
+    },
     forceAbortInFlight: () => {
       antigravity?.forceAbortInFlight?.()
       durableWritesRevoked = true

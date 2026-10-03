@@ -77,6 +77,21 @@ export interface MeridianSettings {
 
   /** ChatGPT gateway features. Re-read per request; resolved in proxy/chatgpt/features.ts. */
   chatgpt?: ChatGptFeatureSettings
+
+  /** Event hook targets; validated and delivered in proxy/hooks.ts. Re-read per event. */
+  hooks?: MeridianHookSettings
+  /**
+   * The address people reach this instance at, e.g. https://meridian.example.
+   * Public OAuth callback URLs are built on it. MERIDIAN_PUBLIC_URL wins; when
+   * neither is set, the address the sign-in was started from is used.
+   */
+  publicUrl?: string
+}
+
+/** Webhooks get the event as a JSON POST body, commands as JSON on stdin. Absent `events` = all. */
+export type MeridianHookSettings = {
+  webhooks?: Array<{ url: string; events?: string[] }>
+  commands?: Array<{ command: string; events?: string[] }>
 }
 
 /** What the operator saved; absent keys take the defaults in proxy/chatgpt/features.ts. */

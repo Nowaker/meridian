@@ -972,6 +972,71 @@ describe("owned mode signs its own seats in", () => {
     }
   })
 
+  it("announces the redirect listener to a command hook and finishes the sign-in through /callback/<id>", async () => {
+    const events = join(dir, "hook-events.jsonl")
+    process.env.MERIDIAN_HOOK_COMMAND = `cat >> '${events}'; echo >> '${events}'; echo 'laptop: forwarding 127.0.0.1:1455'`
+    process.env.MERIDIAN_PUBLIC_URL = "https://meridian.example/"
+    const proxy = await server("owned")
+    await proxy.chatGpt!.acquire()
+    try {
+      const startedRes = await post(proxy.app, "/profiles/chatgpt/connect/start", {})
+      const started = await startedRes.json() as { connectId: string; authorizeUrl: string; announcements: unknown[] }
+      expect(started.announcements).toEqual([{ target: "command cat", ok: true, detail: "laptop: forwarding 127.0.0.1:1455" }])
+      const listening = JSON.parse(readFileSync(events, "utf8").trim()) as { event: string; callback: { id: string; url: string; redirect: { port: number } } }
+      expect(listening).toMatchObject({ event: "oauth.callback.listening", callback: { redirect: { port: 1455 } } })
+      expect(listening.callback.url).toBe(`https://meridian.example/callback/${listening.callback.id}`)
+      const state = new URL(started.authorizeUrl).searchParams.get("state")!
+      expect(readFileSync(events, "utf8")).not.toContain(state)
+
+      const unknown = await proxy.app.fetch(new Request(`http://localhost/callback/not-an-id/auth/callback?code=one-time&state=${state}`))
+      expect(unknown.status).toBe(404)
+      expect(codeExchanges).toBe(0)
+
+      const relayed = await proxy.app.fetch(new Request(`http://localhost/callback/${listening.callback.id}/auth/callback?code=one-time&state=${state}`))
+      expect(relayed.status).toBe(200)
+      expect(relayed.headers.get("cache-control")).toBe("no-store")
+      expect(await relayed.text()).toContain("is connected to Meridian")
+      expect(codeExchanges).toBe(1)
+      const status = await (await proxy.app.fetch(new Request(`http://localhost/profiles/chatgpt/connect/status?connectId=${started.connectId}`))).json()
+      expect(status).toMatchObject({ status: "completed", accountUserId: "user-9__workspace-9" })
+
+      const deadline = Date.now() + 5_000
+      while (readFileSync(events, "utf8").trim().split("\n").length < 2 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50))
+      const closed = JSON.parse(readFileSync(events, "utf8").trim().split("\n")[1]!) as { event: string; callback: { id: string; reason: string } }
+      expect(closed).toMatchObject({ event: "oauth.callback.closed", callback: { id: listening.callback.id, reason: "completed" } })
+
+      const replay = await proxy.app.fetch(new Request(`http://localhost/callback/${listening.callback.id}/auth/callback?code=again&state=${state}`))
+      expect(replay.status).toBe(404)
+      expect(codeExchanges).toBe(1)
+    } finally {
+      proxy.chatGpt!.release()
+      delete process.env.MERIDIAN_HOOK_COMMAND
+      delete process.env.MERIDIAN_PUBLIC_URL
+    }
+  })
+
+  it("keeps hook settings behind validation and reports the environment's targets by label only", async () => {
+    process.env.MERIDIAN_HOOK_COMMAND = "TOKEN=secret-value /opt/bin/vibeterm-oauth-relay --flag"
+    const proxy = await server("owned")
+    try {
+      const put = (body: unknown) => proxy.app.fetch(new Request("http://localhost/settings/api/hooks", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }))
+      expect((await put({ hooks: { webhooks: [{ url: "ftp://x" }] } })).status).toBe(400)
+      expect((await put({ publicUrl: "https://u:p@host.example" })).status).toBe(400)
+      expect((await put({ hooks: { webhooks: [{ url: "https://hooks.example/a" }] }, publicUrl: "https://meridian.example/" })).status).toBe(200)
+      const text = await (await proxy.app.fetch(new Request("http://localhost/settings/api/hooks"))).text()
+      expect(text).not.toContain("secret-value")
+      expect(JSON.parse(text)).toMatchObject({
+        saved: { webhooks: [{ url: "https://hooks.example/a" }] },
+        environment: { webhook: null, command: "command vibeterm-oauth-relay" },
+        publicUrl: { saved: "https://meridian.example", env: null, effective: "https://meridian.example" },
+      })
+      expect((await put({ hooks: {}, publicUrl: null })).status).toBe(200)
+      expect(getSetting("publicUrl")).toBeUndefined()
+    } finally {
+      delete process.env.MERIDIAN_HOOK_COMMAND
+    }
+  })
+
   it("signs a seat in by device code under the name typed for it, keeping the derived id as an alias", async () => {
     const proxy = await server("owned")
     await proxy.chatGpt!.acquire()
