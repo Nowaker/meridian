@@ -286,6 +286,14 @@ describe("settings page layout", () => {
   })
 })
 
+describe("home page spacing on a phone", () => {
+  test("the page edge is a third and a card's padding half of the desktop values", () => {
+    expect(landingHtml).toContain(".container { max-width: 960px; margin: 0 auto; padding: 28px 24px; }")
+    expect(landingHtml).toMatch(/\.profile-card \{[^}]*padding: 18px 20px;/)
+    expect(landingHtml).toMatch(/@media \(max-width: 720px\) \{\s*\.container \{ padding-left: 8px; padding-right: 8px; \}\s*\.profile-card \{ padding: 9px 10px; \}\s*\}/)
+  })
+})
+
 describe("per-page titles do not repeat the brand", () => {
   test("dashboard h1 is the page name, not the brand", () => {
     expect(dashboardHtml).not.toContain("<h1>Meridian</h1>")
