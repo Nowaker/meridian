@@ -27,7 +27,7 @@ Commands:
   (default)        Start the proxy server
   status           Show what a running instance is doing (the / page, in the terminal)
   setup            Configure client integrations (run once after install)
-  profile          Manage Claude account profiles (add, list, switch, remove)
+  profile          Manage Claude account profiles and ChatGPT seats (add, list, switch, remove)
   refresh-token    Refresh the Claude Code OAuth token
   chatgpt-migrate  Move ChatGPT accounts from oc-codex-multi-auth into Meridian, or back with --reverse (--help)
 
@@ -78,6 +78,7 @@ if (args[0] === "profile") {
   const subcommand = args[1]
   const profileId = args[2]
   const headless = args.includes("--headless")
+  const chatgpt = args.includes("--chatgpt")
 
   if (subcommand === "add" && profileId) {
     const oauthFlagIdx = args.indexOf("--oauth-token", 3)
@@ -85,14 +86,14 @@ if (args[0] === "profile") {
       const tokenArg = args[oauthFlagIdx + 1]
       await profileAddOauthToken(profileId, tokenArg?.startsWith("--") ? undefined : tokenArg)
     } else {
-      await profileAdd(profileId, { headless })
+      await profileAdd(profileId, { headless, chatgpt })
     }
   }
   else if (subcommand === "list" || subcommand === "ls") await profileList()
   else if (subcommand === "remove" && profileId) await profileRemove(profileId)
   else if (subcommand === "rename" && profileId && args[3]) await profileRename(profileId, args[3])
   else if (subcommand === "switch" && profileId) await profileSwitch(profileId)
-  else if (subcommand === "login" && profileId) await profileLogin(profileId, { headless })
+  else if (subcommand === "login" && profileId) await profileLogin(profileId, { headless, chatgpt })
   else profileHelp()
   process.exit(0)
 }

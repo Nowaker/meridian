@@ -6,14 +6,15 @@ import { createChatGptBackend, type ChatGptSeatCreditState, type ChatGptSeatRefu
 import { resolveChatGptSource } from './chatgpt/config'
 import { ChatGptTurnLedger, chatGptTokenFields, createChatGptAdmission, createChatGptParityBackend, createUnpricedModelWarning, decorateChatGptTurn, type ChatGptTurnNotes } from './chatgpt/parity'
 import { BURN_SPARSE_WINDOW_MS, creditBurn } from './chatgpt/creditRates'
-import { CHATGPT_CREDITS_INHERIT, chatGptFeatureCapabilities, effectiveCreditsPolicy, getChatGptFeatures, resetChatGptFeatures, updateChatGptFeatures, validateChatGptFeatureUpdate } from './chatgpt/features'
+import { chatGptFeatureCapabilities, effectiveCreditsPolicy, getChatGptFeatures, resetChatGptFeatures, updateChatGptFeatures, validateChatGptFeatureUpdate } from './chatgpt/features'
 import { resolveModelPricing } from '../telemetry/pricing'
 import { getPricingOverrides } from '../telemetry/pricingStore'
 import { computeSummary } from '../telemetry/percentiles'
 import { CATALOG_CLIENT_VERSION, chatGptModelList, createChatGptModelCatalog, type CatalogModel } from './chatgpt/catalog'
 import { createCodexClientVersion } from './chatgpt/clientVersion'
 import { CHATGPT_WARM_MODELS, chatGptRefusalDiagnosis, chatGptWarmBody, createChatGptProfileSurface } from './chatgpt/profileSurface'
-import { chatGptNameProblem, chatGptRemovalSettings, type ChatGptProfile } from './chatgpt/profiles'
+import { chatGptNameProblem, type ChatGptProfile } from './chatgpt/profiles'
+import { applyChatGptRemoval, applyChatGptRename } from './chatgpt/seatOps'
 import { getCodexUsage } from './codex/service'
 import type { CodexUsageResponse } from './codex/types'
 import { createUpstreamRegistry, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
@@ -9323,9 +9324,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       plog(`[PROXY] ChatGPT seat keeps the name ${current.id}: ${plan.error}`)
       return
     }
-    saveSettings({ chatGptProfileNames: plan.names, chatGptProfileAliases: plan.aliasesBySeat })
-    const order = getSetting("profileOrder")
-    if (order?.includes(plan.from)) setSetting("profileOrder", order.map(id => (id === plan.from ? plan.to : id)))
+    applyChatGptRename(plan)
     plog(`[PROXY] ChatGPT seat named ${plan.to} (still answers to: ${plan.aliases.join(", ")})`)
   }
   const chatGptLogin = connectChatGptAccount ? createChatGptLogin({
@@ -9480,9 +9479,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     if (chatGptProfiles?.resolve(body.from)) {
       const plan = chatGptProfiles.planRename(body.from, body.to)
       if (!plan.ok) return c.json({ error: plan.error }, 400)
-      saveSettings({ chatGptProfileNames: plan.names, chatGptProfileAliases: plan.aliasesBySeat })
-      const order = getSetting("profileOrder")
-      if (order?.includes(plan.from)) setSetting("profileOrder", order.map(id => (id === plan.from ? plan.to : id)))
+      applyChatGptRename(plan)
       claudeLog("profile.renamed", {
         from: plan.from,
         to: plan.to,
@@ -9554,15 +9551,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     } catch (error) {
       return c.json({ error: (error as Error).message, code: "store_write_failed", provider: "chatgpt" }, 503)
     }
-    saveSettings(chatGptRemovalSettings(seat, {
-      chatGptProfileNames: getSetting("chatGptProfileNames"),
-      chatGptProfileAliases: getSetting("chatGptProfileAliases"),
-      profileOrder: getSetting("profileOrder"),
-      routingExcludedProfiles: getSetting("routingExcludedProfiles"),
-      routingManagedExcludedProfiles: getSetting("routingManagedExcludedProfiles"),
-    }))
-    if (getChatGptFeatures().seatCreditsPolicy[seat.seat]) updateChatGptFeatures({ seatCreditsPolicy: { [seat.seat]: CHATGPT_CREDITS_INHERIT } })
-    if (pointerMoves) setSetting("chatGptActiveSeat", successor?.seat)
+    applyChatGptRemoval(seat, { moves: pointerMoves, to: successor?.seat })
     chatGptBackend?.forgetSeat(seat.seat)
     for (const id of [seat.id, ...seat.aliases]) spentProfiles.forget(id)
     chatGptUsageAt = 0
