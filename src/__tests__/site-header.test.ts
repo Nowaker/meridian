@@ -433,6 +433,31 @@ describe("home page spacing on a phone", () => {
   })
 })
 
+describe("header build info collapses to the room it has", () => {
+  test("the calm drift chip goes first, warnings never", () => {
+    expect(profileBarCss).toContain('.meridian-header[data-prov-calm="hidden"] .mh-drift.calm { display: none; }')
+    expect(profileBarCss).not.toMatch(/data-prov-calm[^{]*\.mh-drift\.(warning|neutral)/)
+    expect(profileBarCss).not.toMatch(/data-prov-[a-z]+="[a-z]+"\][^{]*\.mh-update/)
+  })
+
+  test("each compact form shows only its own pieces", () => {
+    const shown = (form: string) => profileBarCss.match(new RegExp(`\\[data-prov-form="${form}"\\] (\\.[a-z-]+)[,\\s]`, "g")) ?? []
+    expect(shown("commit").join(" ")).toContain(".mh-prov-short-commit")
+    expect(shown("run").join(" ")).toContain(".mh-prov-short-run")
+    expect(shown("version").join(" ")).not.toMatch(/short-(commit|run)/)
+  })
+
+  test("the fit follows the header's width and content, largest form first", () => {
+    expect(profileBarJs).toContain("[['shown', 'full'], ['hidden', 'full']].concat(provForms.map(")
+    expect(profileBarJs).toContain("new ResizeObserver(")
+    expect(profileBarJs).toContain("new MutationObserver(queueFit)")
+    expect(profileBarJs).toContain("attributeFilter: ['class', 'hidden']")
+    // The short forms are appended beside the full parts, so the full pill's
+    // tooltip and links are untouched and switching never rebuilds a link.
+    expect(profileBarJs).toContain("provForms = appendShortForms(view.parts);")
+  })
+})
+
 describe("per-page titles do not repeat the brand", () => {
   test("dashboard h1 is the page name, not the brand", () => {
     expect(dashboardHtml).not.toContain("<h1>Meridian</h1>")
@@ -458,6 +483,7 @@ describe("header active-profile chip", () => {
       removeAttribute: () => undefined,
       setAttribute: () => undefined,
       replaceChildren: () => undefined,
+      querySelector: () => stubElement(),
     }
   }
   function escapingDiv() {
@@ -479,7 +505,9 @@ describe("header active-profile chip", () => {
     runInNewContext(profileBarJs, {
       document: { getElementById: byId, querySelectorAll: () => [], createElement: escapingDiv },
       location: { pathname: "/" },
-      window: {},
+      window: { addEventListener: () => undefined },
+      MutationObserver: class { observe() {} },
+      requestAnimationFrame: () => 0,
       fetch: (url: string) => Promise.resolve({
         ok: true,
         json: () => Promise.resolve(url === "/profiles/list" ? list : { status: "healthy" }),
