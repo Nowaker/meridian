@@ -275,6 +275,15 @@ describe("settings page layout", () => {
     expect(settingsPageHtml).toMatch(/\.pricing-scroll \{[^}]*overflow-x: auto/)
     expect(settingsPageHtml).toMatch(/<div class="pricing-scroll">\s*<table class="pricing-table">/)
   })
+
+  test("a model id stays on one line and a rate input is sized to a rate", () => {
+    const model = settingsPageHtml.match(/\.pricing-model \{[^}]*\}/)?.[0] ?? ""
+    expect(model).toContain("white-space: nowrap")
+    expect(model).not.toContain("word-break")
+    // 7 characters of content (123.45, 0.0375) plus the input's padding and
+    // border, which border-box sizing would otherwise take out of the text.
+    expect(settingsPageHtml).toMatch(/\.pricing-table \.pricing-input \{[^}]*width: calc\(7ch \+ 18px\)/)
+  })
 })
 
 describe("per-page titles do not repeat the brand", () => {
