@@ -101,6 +101,13 @@ import { extractAdvisorModel, extractSystemText, getLastUserMessage, stripAdviso
 import { requireAuth, authEnabled } from "./auth"
 import { detectAdapter } from "./adapters/detect"
 import { buildQueryOptions, resolveQueryConfigDir, singleTurnCapLiftRaisesBudget, type QueryContext } from "./query"
+import {
+  DEFAULT_TRANSCRIPT_RETENTION_DAYS,
+  isTranscriptRetentionDays,
+  meridianTranscriptRetention,
+  resolveTranscriptRetention,
+  TRANSCRIPT_RETENTION_LIMITS,
+} from "./transcriptRetention"
 import { normalizeEffort } from "./effort"
 import { parseOutputFormat, structuredOutputText } from "./structuredOutput"
 import { runTransformHook, buildPipeline, createRequestContext } from "./transform"
@@ -2511,6 +2518,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           sdkFeatures.sharedMemory,
           workingDirectory,
         )
+        const transcriptRetentionDays = resolveTranscriptRetention(transcriptConfigDir).days
         const transcriptLocator = (sessionId: string): TranscriptLocator => ({
           sessionId,
           configDir: transcriptConfigDir,
@@ -4104,7 +4112,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     effort, thinking, taskBudget, outputFormat, betas, settingSources,
                     codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                     memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                    webFetchPreflight: sdkFeatures.webFetchPreflight,
+                    webFetchPreflight: sdkFeatures.webFetchPreflight, transcriptRetentionDays,
                     claudeAiConnectors: sdkFeatures.claudeAiConnectors,
                     maxBudgetUsd: sdkFeatures.maxBudgetUsd, maxOutputTokens: clientMaxOutputTokens, fallbackModel: sdkFeatures.fallbackModel,
                     sdkDebug: sdkFeatures.sdkDebug,
@@ -4210,7 +4218,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       effort, thinking, taskBudget, outputFormat, betas, settingSources,
                       codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                     memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                    webFetchPreflight: sdkFeatures.webFetchPreflight,
+                    webFetchPreflight: sdkFeatures.webFetchPreflight, transcriptRetentionDays,
                     claudeAiConnectors: sdkFeatures.claudeAiConnectors,
                       maxBudgetUsd: sdkFeatures.maxBudgetUsd, maxOutputTokens: clientMaxOutputTokens, fallbackModel: sdkFeatures.fallbackModel,
                       sdkDebug: sdkFeatures.sdkDebug,
@@ -4271,7 +4279,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       effort, thinking, taskBudget, outputFormat, betas, settingSources,
                       codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                       memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                    webFetchPreflight: sdkFeatures.webFetchPreflight,
+                    webFetchPreflight: sdkFeatures.webFetchPreflight, transcriptRetentionDays,
                     claudeAiConnectors: sdkFeatures.claudeAiConnectors,
                       maxBudgetUsd: sdkFeatures.maxBudgetUsd, maxOutputTokens: clientMaxOutputTokens, fallbackModel: sdkFeatures.fallbackModel,
                       sdkDebug: sdkFeatures.sdkDebug,
@@ -5296,7 +5304,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       effort, thinking, taskBudget, outputFormat, betas, settingSources,
                       codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                     memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                    webFetchPreflight: sdkFeatures.webFetchPreflight,
+                    webFetchPreflight: sdkFeatures.webFetchPreflight, transcriptRetentionDays,
                     claudeAiConnectors: sdkFeatures.claudeAiConnectors,
                       maxBudgetUsd: sdkFeatures.maxBudgetUsd, maxOutputTokens: clientMaxOutputTokens, fallbackModel: sdkFeatures.fallbackModel,
                       sdkDebug: sdkFeatures.sdkDebug,
@@ -5382,7 +5390,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         effort, thinking, taskBudget, outputFormat, betas, settingSources,
                         codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                     memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                    webFetchPreflight: sdkFeatures.webFetchPreflight,
+                    webFetchPreflight: sdkFeatures.webFetchPreflight, transcriptRetentionDays,
                     claudeAiConnectors: sdkFeatures.claudeAiConnectors,
                         maxBudgetUsd: sdkFeatures.maxBudgetUsd, maxOutputTokens: clientMaxOutputTokens, fallbackModel: sdkFeatures.fallbackModel,
                         sdkDebug: sdkFeatures.sdkDebug,
@@ -5439,7 +5447,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         effort, thinking, taskBudget, outputFormat, betas, settingSources,
                         codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                         memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                        webFetchPreflight: sdkFeatures.webFetchPreflight,
+                        webFetchPreflight: sdkFeatures.webFetchPreflight, transcriptRetentionDays,
                         claudeAiConnectors: sdkFeatures.claudeAiConnectors,
                         maxBudgetUsd: sdkFeatures.maxBudgetUsd, maxOutputTokens: clientMaxOutputTokens, fallbackModel: sdkFeatures.fallbackModel,
                         sdkDebug: sdkFeatures.sdkDebug,
@@ -6378,7 +6386,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                     memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming,
                     sharedMemory: sdkFeatures.sharedMemory,
-                    webFetchPreflight: sdkFeatures.webFetchPreflight,
+                    webFetchPreflight: sdkFeatures.webFetchPreflight, transcriptRetentionDays,
                     claudeAiConnectors: sdkFeatures.claudeAiConnectors,
                     maxBudgetUsd: sdkFeatures.maxBudgetUsd,
                     fallbackModel: sdkFeatures.fallbackModel,
@@ -8478,6 +8486,44 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       setSetting("showHostname", body.showHostname ?? undefined)
     }
     return c.json(headerSettingsState())
+  })
+
+  /**
+   * How long Claude Code keeps the transcripts requests leave on disk. Read on
+   * every request, so unlike telemetry there is no pending-restart state:
+   * `effective` is what the next SDK child gets, unless its config root's own
+   * settings.json names a period (see transcriptRetention.ts).
+   */
+  function transcriptRetentionState() {
+    const saved = getSetting("transcriptRetentionDays")
+    const effective = meridianTranscriptRetention()
+    return {
+      saved: isTranscriptRetentionDays(saved) ? saved : null,
+      effective,
+      envOverride: effective.source === "env",
+      default: DEFAULT_TRANSCRIPT_RETENTION_DAYS,
+      limits: TRANSCRIPT_RETENTION_LIMITS,
+    }
+  }
+
+  app.get("/settings/api/transcripts", (c) => c.json(transcriptRetentionState()))
+  app.put("/settings/api/transcripts", async (c) => {
+    let input: unknown
+    try { input = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
+    if (typeof input !== "object" || input === null || Array.isArray(input)) {
+      return c.json({ error: "Settings must be a JSON object" }, 400)
+    }
+    const value = (input as Record<string, unknown>).transcriptRetentionDays
+    if (value !== undefined) {
+      if (value !== null && !isTranscriptRetentionDays(value)) {
+        const { min, max } = TRANSCRIPT_RETENTION_LIMITS
+        return c.json({ error: `transcriptRetentionDays must be an integer between ${min} and ${max}, or null to unset` }, 400)
+      }
+      setSetting("transcriptRetentionDays", value ?? undefined)
+    }
+    const state = transcriptRetentionState()
+    plog(`[PROXY] Transcript retention updated: ${state.effective.days === 0 ? "off" : `${state.effective.days}d`} (${state.effective.source})`)
+    return c.json(state)
   })
 
   app.get("/settings/api/pricing", (c) => {
