@@ -236,6 +236,7 @@ export const profileBarJs = `
   var buildChip = document.getElementById('mhBuild');
   var statusDot = document.getElementById('mhDot');
   var statusText = document.getElementById('mhStatusText');
+  var statusEl = document.getElementById('mhStatus');
 
   // Highlight active nav link
   var path = location.pathname;
@@ -351,6 +352,7 @@ export const profileBarJs = `
       var st = h.status === 'healthy' ? 'healthy' : h.status === 'degraded' ? 'degraded' : 'unhealthy';
       statusDot.className = 'mh-dot ' + st;
       statusText.textContent = st === 'healthy' ? 'Operational' : st === 'degraded' ? 'Degraded' : 'Offline';
+      statusEl.title = h.error ? statusText.textContent + ': ' + h.error : statusText.textContent;
       renderBuild(h.build);
       if (h.backend === 'antigravity') {
         ['nav-telemetry','nav-profiles','nav-settings','nav-plugins'].forEach(function(id) { document.getElementById(id).hidden = true; });
@@ -359,6 +361,7 @@ export const profileBarJs = `
     }).catch(function() {
       statusDot.className = 'mh-dot unhealthy';
       statusText.textContent = 'Offline';
+      statusEl.title = 'Offline';
     });
 
     fetch('/profiles/list').then(function(r) { return r.json(); }).then(function(data) {

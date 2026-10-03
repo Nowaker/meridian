@@ -54,6 +54,8 @@ export interface ReadinessInput {
   readonly profileCount: number
   /** Whether a Claude executable resolves for this instance. */
   readonly claudeExecutableResolved: boolean
+  /** ChatGPT seats, when this instance serves ChatGPT; absent when it does not. */
+  readonly chatGptAccounts?: number
 }
 
 /**
@@ -79,22 +81,29 @@ export interface ReadinessInput {
  *                      own `node_modules`, or its platform package - all
  *                      per-instance, and without one no request can be served
  *                      (#478).
+ *
+ * An instance serving ChatGPT counts its seats as profiles. With no Claude
+ * profile it serves ChatGPT alone, and needs no Claude executable.
  */
 export function readinessReport(input: ReadinessInput): ProbeReport {
+  const servesClaude = input.chatGptAccounts === undefined || input.profileCount > 0
+  const accounts = input.profileCount + (input.chatGptAccounts ?? 0)
   const checks: ProbeCheck[] = [
     {
       name: "profiles",
-      ok: input.profileCount > 0,
-      ...(input.profileCount > 0 ? {} : { detail: "no profiles configured" }),
+      ok: accounts > 0,
+      ...(accounts > 0 ? {} : { detail: "no profiles configured" }),
     },
-    {
+  ]
+  if (servesClaude) {
+    checks.push({
       name: "claude-executable",
       ok: input.claudeExecutableResolved,
       ...(input.claudeExecutableResolved
         ? {}
         : { detail: "no Claude executable resolved (set MERIDIAN_CLAUDE_PATH or install @anthropic-ai/claude-code)" }),
-    },
-  ]
+    })
+  }
   return { ok: checks.every(c => c.ok), checks }
 }
 

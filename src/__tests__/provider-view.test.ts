@@ -29,6 +29,12 @@ describe('provider presentation and contract', () => {
     expect(claudeProvider({status:'healthy'}, {}, {}).activity).toBeUndefined()
     expect(claudeProvider({}, {totalRequests:2,tokenUsage:{totalInputTokens:33,totalOutputTokens:4}}, {}).activity?.inputTokens).toBe(33)
   })
+  it('reads Claude\'s own verdict on an instance that also serves ChatGPT, and none when it serves ChatGPT alone', () => {
+    const both = { status: 'degraded', backends: { claude: { status: 'unhealthy' }, chatgpt: { status: 'healthy' } } }
+    expect(claudeProvider(both, {}, {}).status).toBe('unhealthy')
+    const chatGptOnly = { status: 'healthy', backends: { chatgpt: { status: 'healthy' } } }
+    expect(claudeProvider(chatGptOnly, {}, {})).toMatchObject({ enabled: false, status: 'disabled' })
+  })
   it('rejects orphan, duplicated and role-invalid tool history before replay', () => {
     const call = {type:'tool_use',id:'one',name:'read',input:{}}
     const result = {type:'tool_result',tool_use_id:'one',content:'done'}

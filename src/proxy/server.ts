@@ -2,6 +2,7 @@ import { providerPageHtml } from '../telemetry/providerPage'
 import { providerOverview, isProviderFilter } from '../telemetry/providerView'
 import { ClaudeProviderFacts, disabledProvider, providerSnapshot } from './backends/providerStatus'
 import { chatGptProvider, CHATGPT_ADAPTER } from './backends/chatgptStatus'
+import { chatGptVerdict, combineBackendVerdicts, type BackendStatus } from './chatgpt/health'
 import { createChatGptBackend, type ChatGptSeatCreditState, type ChatGptSeatRefusal, type ChatGptTurnEvent, type ObservedSeatLimits } from './backends/chatgpt'
 import { resolveChatGptSource } from './chatgpt/config'
 import { ChatGptTurnLedger, chatGptTokenFields, createChatGptAdmission, createChatGptParityBackend, createUnpricedModelWarning, decorateChatGptTurn, type ChatGptTurnNotes } from './chatgpt/parity'
@@ -121,7 +122,7 @@ import { runTransformHook, buildPipeline, createRequestContext } from "./transfo
 import { getAdapterTransforms } from "./transforms/registry"
 import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
-import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, restoreActiveProfile, invalidateDiskProfileCache, shareableCredentialDir, resetActiveProfile, type ProfileConfig, type ResolvedProfile } from "./profiles" 
+import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, hasProfiles, restoreActiveProfile, invalidateDiskProfileCache, shareableCredentialDir, resetActiveProfile, type ProfileConfig, type ResolvedProfile } from "./profiles" 
 import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
 import { startFollowUsagePolling, stopFollowUsagePolling } from "./followUsage"
 import { startProfileLogin, completeProfileLogin, completeProfileLoginFromCallback, getProfileLoginStatus } from "./profileLogin"
@@ -8244,6 +8245,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     const unavailable: Record<string, number> = {}
     for (const seat of seats) if (seat.reason) unavailable[seat.reason] = (unavailable[seat.reason] ?? 0) + 1
     const benched = chatGptExhaustion.snapshot()
+    const benchedIds = new Set(benched.map(mark => mark.id))
     const planTiers = { paid: 0, free: 0, unknown: 0 }
     const profiles = chatGptProfiles?.profiles() ?? []
     for (const profile of profiles) planTiers[profile.planTier ?? "unknown"]++
@@ -8253,6 +8255,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       serving: source.isServing(),
       accounts: seats.length,
       eligible: seats.filter(seat => seat.eligible).length,
+      ready: seats.filter(seat => seat.eligible && !benchedIds.has(seat.id)).length,
       unavailable,
       planTiers,
       activePlanTier: profiles.find(profile => profile.id === activeId)?.planTier ?? null,
@@ -8716,6 +8719,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // where the alternative is reporting a freshly started instance unready.
       claudeExecutableResolved:
         (getResolvedClaudeExecutableInfo() ?? resolveClaudeExecutableSync()) !== null,
+      ...(chatGptSource ? { chatGptAccounts: chatGptSource.seats().length } : {}),
     })
     return c.text(
       renderProbe("readyz", report, c.req.query("verbose") !== undefined),
@@ -8729,11 +8733,36 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return buildRuntime.local ? c.json(buildRuntime.status()) : c.notFound()
   })
 
-  // Reported on every verdict: a ChatGPT-only instance never has Claude auth
-  // and always answers "degraded", yet may be serving GPT models fine.
-  const chatGptHealth = () => chatGptSource
-    ? { chatgpt: chatGptSeatHealth(chatGptSource) }
-    : {}
+  // An instance is judged by the backends it serves (./chatgpt/health.ts).
+  // Without ChatGPT that is Claude alone, and every reply goes out exactly as
+  // the Claude probe built it. With ChatGPT, `claude` is null when this
+  // instance does not serve Claude at all: no Claude profile and no ambient
+  // login - a ChatGPT-only instance, which has neither by design and must not
+  // read "degraded" while it serves every GPT turn.
+  const replyHealth = (c: Context, claude: Record<string, unknown> | null, claudeCode: 200 | 503) => {
+    if (!chatGptSource) return c.json(claude ?? {}, claudeCode)
+    const chatgpt = chatGptSeatHealth(chatGptSource)
+    const backends = {
+      ...(claude ? { claude: { status: claude.status as BackendStatus, ...(typeof claude.error === "string" ? { error: claude.error } : {}) } } : {}),
+      chatgpt: chatGptVerdict(chatgpt),
+    }
+    const overall = combineBackendVerdicts(backends)
+    const { status: _claudeStatus, error: _claudeError, ...claudeFields } = claude ?? {
+      version: serverVersion,
+      backend: finalConfig.backend ?? "claude",
+      build: currentBuild(),
+      mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
+    }
+    return c.json({
+      status: overall.status,
+      ...claudeFields,
+      ...(overall.error ? { error: overall.error } : {}),
+      backends,
+      chatgpt,
+    }, overall.status === "unhealthy" ? 503 : 200)
+  }
+  const servesClaude = (auth: { loggedIn?: boolean } | null | undefined) =>
+    !chatGptSource || hasProfiles(finalConfig.profiles) || auth?.loggedIn === true
   app.get("/health", async (c) => {
     // Checked first and unconditionally: a fleet manager routing on this
     // endpoint (e.g. a gateway's account-pool scheduler) needs to learn
@@ -8770,19 +8799,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           healthProfile.id !== "default" ? healthProfile.id : undefined,
           profileEnvOverrides
         )
+      if (!servesClaude(auth)) return replyHealth(c, null, 200)
       if (!auth) {
-        return c.json({
+        return replyHealth(c, {
           status: "degraded",
           version: serverVersion,
           backend: finalConfig.backend ?? "claude",
           build: currentBuild(),
           error: "Could not verify auth status",
           mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
-          ...chatGptHealth(),
-        })
+        }, 200)
       }
       if (!auth.loggedIn) {
-        return c.json({
+        return replyHealth(c, {
           status: "unhealthy",
           version: serverVersion,
           backend: finalConfig.backend ?? "claude",
@@ -8825,7 +8854,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         ...(auth.subscriptionType ? { subscriptionType: auth.subscriptionType } : {}),
       })
 
-      return c.json({
+      return replyHealth(c, {
         status: "healthy",
         version: serverVersion,
         backend: finalConfig.backend ?? "claude",
@@ -8847,18 +8876,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
         ...(claudeExecutableInfo ? { claudeExecutable: claudeExecutableInfo } : {}),
         plugin: { opencode: checkPluginConfigured() ? "configured" : "not-configured" },
-        ...chatGptHealth(),
-      })
+      }, 200)
     } catch {
-      return c.json({
+      if (!servesClaude(null)) return replyHealth(c, null, 200)
+      return replyHealth(c, {
         status: "degraded",
         version: serverVersion,
         backend: finalConfig.backend ?? "claude",
         build: currentBuild(),
         error: "Could not verify auth status",
         mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
-        ...chatGptHealth(),
-      })
+      }, 200)
     }
   })
 

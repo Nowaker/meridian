@@ -49,6 +49,22 @@ describe("readinessReport", () => {
     expect(report.checks.find(c => c.name === "claude-executable")?.detail).toContain("MERIDIAN_CLAUDE_PATH")
   })
 
+  test("an instance serving only ChatGPT is ready on its seats, without a Claude executable", () => {
+    const report = readinessReport({ profileCount: 0, claudeExecutableResolved: false, chatGptAccounts: 2 })
+    expect(report.ok).toBe(true)
+    expect(report.checks.map(c => c.name)).toEqual(["profiles"])
+  })
+
+  test("an instance serving ChatGPT with no seat and no profile is not ready", () => {
+    expect(readinessReport({ profileCount: 0, claudeExecutableResolved: true, chatGptAccounts: 0 }).ok).toBe(false)
+  })
+
+  test("an instance serving both still needs its Claude executable", () => {
+    const report = readinessReport({ profileCount: 1, claudeExecutableResolved: false, chatGptAccounts: 2 })
+    expect(report.ok).toBe(false)
+    expect(report.checks.find(c => !c.ok)?.name).toBe("claude-executable")
+  })
+
   test("reports both failures rather than stopping at the first", () => {
     const report = readinessReport({ profileCount: 0, claudeExecutableResolved: false })
     expect(report.checks.filter(c => !c.ok).map(c => c.name)).toEqual(["profiles", "claude-executable"])
