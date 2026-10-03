@@ -106,6 +106,7 @@ import {
   resolveTranscriptRetention,
   TRANSCRIPT_RETENTION_LIMITS,
 } from "./transcriptRetention"
+import { createTranscriptSweep, DEFAULT_TRANSCRIPT_SWEEP_INTERVAL_MS, listSweepRoots, runIdleSweepChild } from "./transcriptSweep"
 import { normalizeEffort } from "./effort"
 import { parseOutputFormat, structuredOutputText } from "./structuredOutput"
 import { runTransformHook, buildPipeline, createRequestContext } from "./transform"
@@ -873,6 +874,44 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     : getProcessSdkSemaphore()
   const responseCompletions = new WeakMap<Response, Promise<void>>()
 
+  // Config roots a request's Claude Code process is running in, so the idle
+  // transcript sweep never starts a second process beside one.
+  const busySdkRoots = new Map<string, number>()
+  const markSdkRootBusy = (options: Parameters<typeof query>[0]["options"]): (() => void) => {
+    const root = resolveQueryConfigDir(options?.env ?? {}, false, options?.cwd)
+    busySdkRoots.set(root, (busySdkRoots.get(root) ?? 0) + 1)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      const remaining = (busySdkRoots.get(root) ?? 1) - 1
+      if (remaining > 0) busySdkRoots.set(root, remaining)
+      else busySdkRoots.delete(root)
+    }
+  }
+  const transcriptSweep = createTranscriptSweep({
+    listRoots: () => {
+      const profiles = getEffectiveProfiles(finalConfig.profiles)
+      const resolved = profiles.length === 0
+        ? [resolveProfile(finalConfig.profiles, finalConfig.defaultProfile)]
+        : profiles.map((profile) => resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, profile.id))
+      return listSweepRoots(resolved, process.env)
+    },
+    isRootBusy: (configDir) => busySdkRoots.has(configDir),
+    isDraining: () => draining,
+    credentialsReadOnly: isCredentialsReadOnly,
+    tryAcquireSlot: () => sdkSemaphore.tryAcquire(),
+    readCredentials: (root) => createPlatformCredentialStore(
+      root.explicitConfigDir ? { claudeConfigDir: root.configDir } : undefined,
+    ).read(),
+    runChild: async (root, retentionDays, signal) => {
+      if (!claudeExecutable) claudeExecutable = await resolveClaudeExecutableAsync()
+      return runIdleSweepChild({ root, retentionDays, claudeExecutable, signal })
+    },
+    log: plog,
+    intervalMs: Math.max(0, envInt("TRANSCRIPT_SWEEP_INTERVAL_MS", DEFAULT_TRANSCRIPT_SWEEP_INTERVAL_MS)),
+  })
+
   // Graceful shutdown (#drain): once true, handleWithQueue fast-fails new
   // requests instead of queueing them, and /health reports it so a fleet
   // manager (e.g. a gateway's account-pool scheduler) can stop routing here
@@ -986,6 +1025,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     requestMeta.sdkQueueWaitMs += lease.waitedMs
     const startedAt = Date.now()
     requestMeta.currentSdkStartedAt = startedAt
+    const releaseSdkRoot = markSdkRootBusy(params.options)
     let sdkQuery: ReturnType<typeof query> | undefined
     let activeTranscriptLease: Awaited<ReturnType<typeof acquireActiveTranscriptLease>> | undefined
     let processGate: Awaited<ReturnType<typeof createSdkProcessGate>> | undefined
@@ -1032,6 +1072,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         }
       } finally {
         requestMeta.sdkActiveDurationMs += Date.now() - startedAt
+        releaseSdkRoot()
         lease.release()
       }
     }
@@ -9563,6 +9604,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     },
     getInFlightCount: () => inFlightRequests + (antigravity?.getInFlightCount?.() ?? 0),
     sweepSessionGc,
+    transcriptSweep,
   }
 }
 
@@ -9668,6 +9710,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
     getInFlightCount,
     sweepSessionGc,
     closeBackend,
+    transcriptSweep,
   } = createProxyServer(config)
   if (initPlugins) await initPlugins()
 
@@ -9680,6 +9723,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
     : undefined
   sessionGcInterval?.unref?.()
   if (sweepSessionGc) void sweepSessionGc()
+  transcriptSweep?.start()
 
   // Cached, once a day, never on the request path, and only when the
   // checkForUpdates setting is on. The banner below reports build-source drift
@@ -9829,6 +9873,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
         if (profileTokenRefreshInterval) clearInterval(profileTokenRefreshInterval)
         if (authKeepaliveInterval) clearInterval(authKeepaliveInterval)
         if (sessionGcInterval) clearInterval(sessionGcInterval)
+        const transcriptSweepStopped = transcriptSweep?.stop()
         // Refuse new work before potentially waiting for a deletion child.
         beginDrain?.()
         stopFollowPolling()
@@ -9852,6 +9897,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
         } finally {
           connectionTracker.dispose()
           await closeBackend?.()
+          await transcriptSweepStopped
         }
         // Give aborted SDK iterators one short bounded window to observe the
         // revocation and release their fencing leases. Durable callbacks also

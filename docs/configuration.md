@@ -59,6 +59,7 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_TELEMETRY_DB` | `CLAUDE_PROXY_TELEMETRY_DB` | `~/.config/meridian/telemetry.db` | SQLite database path (when persistence is enabled) |
 | `MERIDIAN_TELEMETRY_RETENTION_DAYS` | `CLAUDE_PROXY_TELEMETRY_RETENTION_DAYS` | `7` | Days to retain telemetry data before cleanup |
 | `MERIDIAN_TRANSCRIPT_RETENTION_DAYS` | `CLAUDE_PROXY_TRANSCRIPT_RETENTION_DAYS` | `30` | Days Claude Code keeps the transcripts requests leave on disk before deleting them; `0` keeps them all. `transcriptRetentionDays` in `settings.json` (or the `/settings` page) is the alternative, and the environment wins. See [Transcript retention](#transcript-retention). |
+| `MERIDIAN_TRANSCRIPT_SWEEP_INTERVAL_MS` | `CLAUDE_PROXY_TRANSCRIPT_SWEEP_INTERVAL_MS` | `10800000` (3 hours) | How often Meridian sweeps the transcripts of idle profiles; `0` leaves the sweep to requests alone. See [Transcript retention](#transcript-retention). |
 | `MERIDIAN_DEFAULT_PROFILE` | — | *(first profile)* | Default profile ID when no header is sent |
 | `MERIDIAN_ADAPTER_INSTANCES` | — | unset | JSON [adapter instance](agents.md#adapter-instances) definitions, overriding `~/.config/meridian/adapter-instances.json` |
 | `MERIDIAN_BETA_POLICY` | — | `allow-safe` | Client `anthropic-beta` header handling: `allow-safe`, `strip-all`, or `allow-all` |
@@ -616,9 +617,30 @@ period over itself, as a flag setting, which loads no file.
   of these inside Claude Code.
 - **When it runs:** Claude Code sweeps in the background a few seconds after a
   process starts, at most once a day per config directory (`.last-cleanup`
-  there records the last run). A profile that receives no requests is not
-  swept until it does. After upgrading, the first sweep can take up to a day:
+  there records the last run). A request's process often ends before the
+  sweep gets going. After upgrading, the first sweep can take up to a day:
   older versions let Claude Code record a skipped sweep as a run.
+- **Idle profiles:** two minutes after startup and then every three hours,
+  Meridian looks at every profile's config directory, one at a time. Where
+  Claude Code has not swept for a day and no request is running, it starts
+  one Claude Code process just for the sweep and stops it once
+  `.last-cleanup` advances, or after ten minutes. That process gets no
+  prompt, makes no model call, writes no transcript, and cannot reach the
+  network: every connection it opens goes to a local proxy that refuses it.
+  It starts only when an SDK slot is free and no request is waiting for one,
+  and holds that slot until the sweep finishes: about half a minute in
+  testing, ten minutes at most.
+  Change the interval with `MERIDIAN_TRANSCRIPT_SWEEP_INTERVAL_MS`; `0` turns
+  idle sweeps off and leaves the cleanup to requests.
+- **Logins are never touched:** a Claude Code process whose stored login is
+  about to expire refreshes it. The idle sweep skips a directory whose login
+  expires within 30 minutes, leaving it until Meridian's own refresher has
+  rolled it over. The refusing proxy would stop a refresh from reaching
+  Anthropic anyway. The stored login is compared before and after each sweep
+  process; if it ever changed, Meridian logs `transcript sweep STOPPED` and
+  runs no further idle sweeps until it restarts. An instance under
+  `MERIDIAN_CREDENTIALS_READONLY` never runs idle sweeps; whichever instance
+  owns the logins does.
 - **Resuming an expired conversation:** a conversation idle for longer than the
   period has no transcript left to resume. Meridian retries the resume a few
   times, then replays the history into a fresh session, so the request still

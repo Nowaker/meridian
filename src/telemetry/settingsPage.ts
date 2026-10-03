@@ -208,8 +208,9 @@ ${profileBarHtml}
     Every request leaves a Claude Code transcript on disk, under <code>projects/</code> in the config directory of
     the profile that served it. Claude Code deletes transcripts nobody has touched for this many days, the same
     cleanup it runs for your own Claude Code sessions, so that directory stops growing forever. The cleanup runs
-    inside Meridian's Claude Code processes, at most once a day per profile, so a profile that receives no requests
-    is not cleaned until it does. A conversation idle for longer than this has no transcript left to resume from;
+    inside Meridian's Claude Code processes, at most once a day per profile. For a profile that is idle and has not
+    been cleaned for a day, Meridian starts one Claude Code process just for the cleanup every few hours; it gets no
+    prompt and cannot reach the network. A conversation idle for longer than this has no transcript left to resume from;
     Meridian then replays its history into a fresh session. 0 keeps every transcript. A profile whose own
     <code>settings.json</code> sets <code>cleanupPeriodDays</code> keeps its own value.
     Changes apply to the next request - no restart needed.

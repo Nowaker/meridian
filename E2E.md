@@ -95,9 +95,29 @@ the deleted session is refused in a way `classifyResumeRefusal` reads as
 the child receives exactly the settings Meridian sent before this setting
 existed, and `--expect-kept` asserts nothing is deleted.
 
+On Linux, where Claude Code keeps its OAuth login in `.credentials.json`, the
+first run then drives the idle sweep (`transcriptSweep.ts`) through the real
+CLI against four synthetic config roots, each with a synthetic login, a
+40-day-old transcript and a `.last-cleanup` two days old. A dead login and a
+valid one must be cleaned; an expired one, which Claude Code would try to
+refresh, must be skipped. The expired root is then swept with the token check
+overridden, to show the refusing proxy alone holds. Every login file must keep
+its inode, mtime and content hash.
+
 **Verified 2026-10-03:** Linux, Claude Code 2.1.284, Agent SDK 0.2.141: with
 the default 30 days the old transcript was deleted, the fresh one kept, and the
-resume classified `unresumable`; with `0` both transcripts were kept.
+resume classified `unresumable`; with `0` both transcripts were kept. Idle
+sweep: dead and valid logins were cleaned (0 and 6 connections refused), the
+expired one was skipped, and with the token check overridden it was cleaned
+with 6 connections refused; no login file changed.
+
+Before the gate existed, the same idle process was probed behind a logging
+proxy. With an expired or nearly expired login it tried to refresh at
+platform.claude.com 12 times. With a valid login it made 13 attempts to fetch
+the profile, remote settings and policy limits from api.anthropic.com. A dead
+login made no connection at all. Under `strace -f` with the refusing proxy, all
+25 `connect()` calls of the process tree went to the proxy and none bypassed
+it.
 
 ## Antigravity subscription CLI backend
 
