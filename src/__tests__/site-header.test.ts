@@ -327,6 +327,15 @@ describe("settings page layout", () => {
     expect(settingsPageHtml).toMatch(/<div class="pricing-scroll">\s*<table class="pricing-table">/)
   })
 
+  test("a model id stays on one line and a rate input is sized to a rate", () => {
+    const model = settingsPageHtml.match(/\.pricing-model \{[^}]*\}/)?.[0] ?? ""
+    expect(model).toContain("white-space: nowrap")
+    expect(model).not.toContain("word-break")
+    // 7 characters of content (123.45, 0.0375) plus the input's padding and
+    // border, which border-box sizing would otherwise take out of the text.
+    expect(settingsPageHtml).toMatch(/\.pricing-table \.pricing-input \{[^}]*width: calc\(7ch \+ 18px\)/)
+  })
+
   test("offers the page layout setting", () => {
     expect(settingsPageHtml).toContain('id="layout-body"')
     expect(settingsPageHtml).toContain("fetch('/settings/api/layout'")
