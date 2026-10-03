@@ -154,7 +154,7 @@ second instance pointed at an empty directory starts genuinely empty:
 
 | File | Holds |
 |---|---|
-| `settings.json` | Active profile, routing mode, priority order |
+| `settings.json` | Active profile, routing mode, priority order, page `layout` |
 | `profiles.json` | Configured profiles ([Multi-Profile Support](profiles.md)) |
 | `profiles/<id>/` | Per-profile `CLAUDE_CONFIG_DIR` (credentials, SDK state) |
 | `adapter-instances.json` | [Adapter instances](agents.md#adapter-instances) |
@@ -294,9 +294,10 @@ adapter lets the subprocess run the built-in WebFetch at all.
 | `POST /profiles/active` | Switch the active profile |
 | `GET /v1/usage/quota` | Usage windows for the active profile (JSON) |
 | `GET /v1/usage/quota/all` | Usage windows for every profile (JSON) |
-| `GET /settings` | SDK feature toggles + model pricing UI |
+| `GET /settings` | SDK feature toggles, model pricing and page layout UI |
 | `GET/PUT /settings/api/hooks`, `POST /settings/api/hooks/test` | [Event hooks](#event-hooks) and the public URL (JSON); `test` sends a `hooks.test` event |
 | `GET /callback/<id>/<path>` | A loopback OAuth redirect, relayed from another machine (see [Event hooks](#event-hooks)). No API key; unknown ids are 404 |
+| `GET/PUT /settings/api/layout` | Read or set the web pages' `layout`: `contained` (default, a centered column) or `wide` (spans the window, more cards per row). JSON `{"layout": "wide"}`, `null` to unset; applies on the next page load |
 | `GET /plugins` | Plugin management page (`/plugins/list`, `POST /plugins/reload` for JSON/actions) |
 
 Illustrative health response excerpt (versions and status vary by installation):
