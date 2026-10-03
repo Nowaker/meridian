@@ -19,6 +19,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import { configPath } from "./configDir"
 import type { PriorityFailbackPolicy } from "./proxy/routing"
+import type { PageLayout } from "./telemetry/pageLayout"
 
 /**
  * Resolve the settings file path.
@@ -99,6 +100,10 @@ export interface MeridianSettings {
   upstreamUnreachableAfterMs?: number
   upstreamUnreachableHoldMs?: number
   upstreamUnreachableMinFailures?: number
+  /** How much of the window the web pages use: "contained" (default) keeps
+   *  them in a centered column, "wide" spans the window. Read on every page
+   *  load, so a change shows on the next reload. */
+  layout?: PageLayout
 }
 
 /**
