@@ -159,7 +159,9 @@ function profileFacts(p) {
   if (p.allowance) {
     facts.push({
       label: 'Allowance',
-      value: p.allowance + (chatgpt ? ' of a ChatGPT Plus plan\\u2019s Codex usage' : ' of a Pro plan\\u2019s Claude Code usage'),
+      value: chatgpt && p.planTier === 'free'
+        ? p.allowance + ': a free seat has almost no Codex usage'
+        : p.allowance + (chatgpt ? ' of a ChatGPT Plus plan\\u2019s Codex usage' : ' of a Pro plan\\u2019s Claude Code usage'),
       shortValue: p.allowance,
       tone: '',
       title: p.rateLimitTier || ''

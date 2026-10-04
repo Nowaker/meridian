@@ -202,10 +202,16 @@ export function chatGptPlanFields(planType: string | null | undefined): ChatGptP
     : /business/.test(normalized) ? "Business"
     : /team/.test(normalized) ? "Team"
     : "Personal"
+  const planName = label?.replace(/^ChatGPT\s+/, "") ?? null
   return {
     subscriptionType: described.slug,
-    planLabel: label,
-    planName: label?.replace(/^ChatGPT\s+/, "") ?? null,
+    // Worded the way a Claude profile's is - `Personal Max`, `Team Premium` -
+    // so one column can name both pools' plans: `Personal Pro`, `Business
+    // Premium`, `Team`. The card already says which provider a seat is on.
+    planLabel: planName === null || accountType === null || planName.startsWith(accountType)
+      ? planName
+      : `${accountType} ${planName}`,
+    planName,
     accountType,
     allowance: described.multiplier,
     allowanceWeight: Number.isFinite(weight) ? weight : null,

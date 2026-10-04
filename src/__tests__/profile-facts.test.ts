@@ -153,6 +153,7 @@ describe("a ChatGPT seat's card", () => {
   test("words the allowance against ChatGPT Plus, and the owner of the login", () => {
     expect(valueOf(seat(), "Allowance")).toBe("20x of a ChatGPT Plus plan’s Codex usage")
     expect(valueOf({ allowance: "20x" }, "Allowance")).toBe("20x of a Pro plan’s Claude Code usage")
+    expect(valueOf(seat({ allowance: "~0x", planTier: "free" }), "Allowance")).toBe("~0x: a free seat has almost no Codex usage")
     expect(valueOf(seat(), "Owner")).toBe("oc-codex-multi-auth · account 3")
     expect(valueOf(seat({ unavailable: "quota_exhausted" }), "Owner state")).toBe("quota exhausted")
     expect(labels({ subscriptionType: "max" })).not.toContain("Owner")

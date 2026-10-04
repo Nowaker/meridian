@@ -72,7 +72,9 @@ function describeNormalized(plan: string): PlanFacts | null {
     return { label: "ChatGPT Pro Lite", multiplier: "5x", price: "$100/mo" }
   }
   if (plan === "go") return { label: "ChatGPT Go", multiplier: null, price: null }
-  if (plan === "free") return { label: "ChatGPT Free", multiplier: null, price: null }
+  // Not a guess like an unknown tier's null: a free seat's Codex allowance is
+  // a sliver next to Plus, and every model but the smallest refuses it.
+  if (plan === "free") return { label: "ChatGPT Free", multiplier: "~0x", price: null }
   return null
 }
 

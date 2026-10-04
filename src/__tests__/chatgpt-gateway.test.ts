@@ -563,7 +563,7 @@ describe("ChatGPT seats on the profile surface", () => {
       ["seat1-pace-1", "chatgpt", "chatgpt", 5, true, false],
       ["seat2-pace-2", "chatgpt", "chatgpt", null, false, false],
     ])
-    expect(list.profiles[0]).toMatchObject({ subscriptionType: "pro", planLabel: "ChatGPT Pro", seat: "user-0__workspace-0", label: "seat0@example.test · id:pace-0" })
+    expect(list.profiles[0]).toMatchObject({ subscriptionType: "pro", planLabel: "Personal Pro", seat: "user-0__workspace-0", label: "seat0@example.test · id:pace-0" })
     expect(list.activeProfile).toBe("seat0-pace-0")
     expect(list.activeProfiles).toEqual({ claude: null, chatgpt: "seat0-pace-0" })
 

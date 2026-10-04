@@ -64,10 +64,12 @@ describe("chatGptProfileIds", () => {
 
 describe("chatGptPlanFields", () => {
   it("weights plans by what the slug determines, and nothing more", () => {
-    expect(chatGptPlanFields("pro")).toMatchObject({ subscriptionType: "pro", planLabel: "ChatGPT Pro", planName: "Pro", accountType: "Personal", allowance: "20x", allowanceWeight: 20 })
-    expect(chatGptPlanFields("self_serve_business_prolite")).toMatchObject({ allowance: "5x", allowanceWeight: 5, accountType: "Business" })
-    expect(chatGptPlanFields("plus")).toMatchObject({ allowanceWeight: 1 })
-    expect(chatGptPlanFields("free")).toMatchObject({ allowance: null, allowanceWeight: null, planTier: "free" })
+    expect(chatGptPlanFields("pro")).toMatchObject({ subscriptionType: "pro", planLabel: "Personal Pro", planName: "Pro", accountType: "Personal", allowance: "20x", allowanceWeight: 20 })
+    expect(chatGptPlanFields("self_serve_business_prolite")).toMatchObject({ planLabel: "Business Premium", allowance: "5x", allowanceWeight: 5, accountType: "Business" })
+    expect(chatGptPlanFields("team")).toMatchObject({ planLabel: "Team", allowance: "1x" })
+    expect(chatGptPlanFields("plus")).toMatchObject({ planLabel: "Personal Plus", allowanceWeight: 1 })
+    // ~0x is a reading, not a weight: ranking keeps treating it as unsized.
+    expect(chatGptPlanFields("free")).toMatchObject({ planLabel: "Personal Free", allowance: "~0x", allowanceWeight: null, planTier: "free" })
     expect(chatGptPlanFields("pro").planTier).toBe("paid")
     expect(chatGptPlanFields("go").planTier).toBe("paid")
     expect(chatGptPlanFields("chatgptfreeplan").planTier).toBe("free")

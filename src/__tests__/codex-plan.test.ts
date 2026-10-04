@@ -60,7 +60,7 @@ describe("describeCodexPlan", () => {
     expect(describeCodexPlan("free")).toEqual({
       slug: "free",
       label: "ChatGPT Free",
-      multiplier: null,
+      multiplier: "~0x",
       price: null,
     })
   })
