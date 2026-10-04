@@ -9618,9 +9618,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // Additive: which reading the three fields above came from. A failed
         // check returns getClaudeAuthStatusAsync's lastKnownGood rather than
         // nothing, so they routinely hold a remembered value in the exact shape
-        // of a fresh one. "never" — failed with nothing to fall back on — is a
-        // different fact from "cached" and must not render as the same blank.
-        authProvenance: cacheInfo.isFailure ? (auth ? "cached" : "never") : "live",
+        // of a fresh one. "never" — no answer at all, whether the check failed
+        // with nothing to fall back on or a first check is still running past
+        // the caller's wait — is a different fact from "cached" and must not
+        // render as the same blank, nor as a live "not logged in".
+        authProvenance: !auth ? "never" : cacheInfo.isFailure ? "cached" : "live",
         // Additive: the login's lifetime. `refreshTokenExpiresAt` and the two
         // renewal fields mean what they mean in /health; past the deadline the
         // account keeps working until `accessTokenExpiresAt`. The rest is the
