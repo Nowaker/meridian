@@ -8695,10 +8695,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     const provider = chatGptBackend ? providerForModel(model) : "claude"
     try {
       if (provider !== "chatgpt") return await upstream.backendFor(provider).handle({ context: c, endpoint, route })
-      if (draining) return drainingResponse(endpoint === "responses" ? "openai" : "anthropic")
+      const shape: ErrorShape = endpoint === "responses" ? "openai" : "anthropic"
+      if (draining) return drainingResponse(shape)
+      // A restart drain holds a ChatGPT turn at the door exactly like a Claude
+      // one; without this a drained /inflight reads 0 while ChatGPT streams
+      // run. An internal hop (a seat warm) was admitted by its public route,
+      // as in handleWithQueue, but is still counted below.
+      if (c.req.header("x-meridian-internal-hop") !== internalHopToken) {
+        const refused = await awaitAdmission(c, shape)
+        if (refused) return refused
+      }
       // Admitted work is counted and abortable exactly like a Claude request,
-      // so drain and forced shutdown cover it; the count is released when the
-      // client finishes or cancels the body, not when the headers go out.
+      // so drain, forced shutdown and GET /inflight cover it; the count is
+      // released when the client finishes or cancels the body, not when the
+      // headers go out.
       const controller = new AbortController()
       const abort = () => controller.abort(c.req.raw.signal.reason)
       c.req.raw.signal.addEventListener("abort", abort, { once: true })
@@ -8706,6 +8716,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       upstreamSignals.set(c, controller.signal)
       activeRequestAborts.add(controller)
       inFlightRequests++
+      const inflightEntry = inflight.begin("chatgpt")
       // Registered in the session tree like a Claude turn, so
       // /v1/sessions/:key/cancel stops a ChatGPT turn of that session too.
       const session = await chatGptSessionKey(c)
@@ -8720,10 +8731,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         upstreamSignals.delete(c)
         activeRequestAborts.delete(controller)
         treeEntry?.release()
+        inflightEntry.end()
         inFlightRequests--
       }
       try {
         const response = await upstream.backendFor(provider).handle({ context: c, endpoint, route })
+        inflightEntry.setStream((response.headers.get("content-type") ?? "").includes("text/event-stream"))
         return completeUpstreamResponse(response, controller.signal, complete)
       } catch (error) {
         complete()
@@ -9214,7 +9227,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     if (refused) return refused
     c.header("Cache-Control", "no-store")
     return c.json({
-      ...inflight.snapshot(antigravity ? ["claude", "antigravity"] : ["claude"]),
+      ...inflight.snapshot([
+        "claude",
+        ...(antigravity ? ["antigravity" as const] : []),
+        ...(chatGptBackend ? ["chatgpt" as const] : []),
+      ]),
       draining: admissionHold.active,
       drain: admissionHold.snapshot(),
     })

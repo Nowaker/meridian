@@ -627,13 +627,15 @@ HTTP requests before requesting a graceful shutdown:
   "oldestStartedAt": "2026-09-28T11:01:40.012Z",
   "upstreams": {
     "claude": { "streams": 1, "requests": 0, "queued": 2 },
-    "antigravity": { "streams": 0, "requests": 0, "queued": 0 }
+    "antigravity": { "streams": 0, "requests": 0, "queued": 0 },
+    "chatgpt": { "streams": 0, "requests": 0, "queued": 0 }
   }
 }
 ```
 
 - `scope` is `"client-http"`. `total` counts admitted Claude Messages requests
-  (including internal OpenAI translations) and combined Antigravity POSTs; zero
+  (including internal OpenAI translations), combined Antigravity POSTs and
+  ChatGPT gateway turns; zero
   means that none of those requests is currently admitted. It does not mean
   that restarting will interrupt no work. Each request counts once: in `queued`
   while it waits for its session's turn or a free SDK slot, otherwise in
@@ -646,6 +648,9 @@ HTTP requests before requesting a graceful shutdown:
   after their `POST` returned and processes waiting for a client tool result
   are not counted. The standalone
   `MERIDIAN_BACKEND=antigravity` server does not serve `/inflight`.
+- `chatgpt` appears only when the ChatGPT gateway is configured and counts
+  every turn it serves on `/v1/responses` and `/v1/messages`, seat warms
+  included.
 - Meridian's own background work (token refresh, usage polling, session
   cleanup) is never counted.
 - Only a loopback peer (`127.0.0.0/8`, `::1`) gets an answer, and not through a
@@ -675,7 +680,8 @@ can restart.
   `Retry-After`, as any new request does.
 - Held requests are not in `total`; `drain.held` counts them.
 - It holds the requests `/inflight` counts: Claude Messages (including the
-  OpenAI translations) and combined Antigravity POSTs. Background Responses
+  OpenAI translations), combined Antigravity POSTs and ChatGPT gateway turns
+  (a seat warm is admitted by its own route and not held). Background Responses
   jobs and pending client tool continuations keep running and are not held, so
   a supervisor still waits for them through their own lifecycle APIs.
 - Body (optional JSON): `holdMs` (default 60000, 1000-240000) and `timeoutMs`
