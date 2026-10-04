@@ -42,7 +42,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { decodeCodexToken } from "../codex/token"
 import type { HookDelivery } from "../hooks"
 import type { OAuthCallbackCloseReason, OAuthCallbackHandle, OAuthCallbackRegistry, OAuthCallbackRequest } from "../oauthCallbacks"
-import { CHATGPT_OAUTH_CLIENT_ID, CHATGPT_TOKEN_URL, type TokenExchangeFetch } from "./refresh"
+import { noteAuthLogin } from "../authLifecycle"
+import { CHATGPT_OAUTH_CLIENT_ID, CHATGPT_TOKEN_URL, chatGptAuthLifecycleKey, type TokenExchangeFetch } from "./refresh"
 import type { ChatGptConnectedAccount } from "./source"
 
 const ISSUER = "https://auth.openai.com"
@@ -366,6 +367,7 @@ export function createChatGptLogin(options: ChatGptLoginOptions): ChatGptLogin {
       console.error("[chatgpt] could not save a signed-in seat:", (error as Error).message)
       return fail(500, "store_write_failed", `Meridian could not save the sign-in: ${(error as Error).message}`)
     }
+    noteAuthLogin(chatGptAuthLifecycleKey(accountUserId), { at: now() })
     settle(login, { status: "completed", accountUserId, email })
     log(`[chatgpt] account ${accountUserId} signed in${email ? ` as ${email}` : ""} (${login.kind === "device" ? "device code" : "browser redirect"})`)
     return { ok: true, accountUserId, email }

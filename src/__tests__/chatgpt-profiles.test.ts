@@ -407,7 +407,39 @@ describe("list entries", () => {
   })
 
   it("never carries a credential", () => {
-    expect(JSON.stringify(surface.listEntries())).not.toMatch(/accessToken|refreshToken|Bearer/)
+    // Keyed exactly: `accessTokenExpiresAt` is a time, and the guard is for token values.
+    expect(JSON.stringify(surface.listEntries())).not.toMatch(/"(accessToken|refreshToken)"|Bearer/)
+  })
+
+  it("reports a seat's login the way a Claude profile reports its own", () => {
+    expect(a).toMatchObject({ accessTokenExpiresAt: null, refreshTokenExpiresAt: null, daysUntilRenewal: null, renewalRequiredSoon: false, firstUnauthedAt: null })
+  })
+})
+
+describe("a seat's login lifecycle", () => {
+  const SEAT_ID = `user-l__ws-llllll`
+  let tokenState: { unavailable: string | null } = { unavailable: null }
+  const surface = createChatGptProfileSurface({
+    source: { mode: "follow-external", seats: () => [seat(SEAT_ID, "l@x.test", { expiresAt: NOW + 3_600_000, eligible: tokenState.unavailable === null, reason: (tokenState.unavailable ?? undefined) as ChatGptSeatView["reason"] })] } as unknown as ChatGptCredentialSource,
+    observed: () => new Map(), usage: () => null, reserved: () => new Set(), names: () => undefined,
+    activeSeat: () => undefined, excluded: () => [], spent: () => undefined,
+  })
+
+  it("is logged out once the seat has no usable sign-in, and back in once it signs in again", () => {
+    tokenState = { unavailable: "requires_reauth" }
+    const out = surface.listEntries()[0]!
+    expect(out.unauthedReason).toBe("credentials_cleared")
+    expect(typeof out.firstUnauthedAt).toBe("number")
+    // Recorded once, not re-stamped on every poll.
+    expect(surface.listEntries()[0]!.firstUnauthedAt).toBe(out.firstUnauthedAt)
+    tokenState = { unavailable: null }
+    const back = surface.listEntries()[0]!
+    expect(back).toMatchObject({ firstUnauthedAt: null, unauthedReason: null, authObtainedVia: "observed", accessTokenExpiresAt: NOW + 3_600_000 })
+  })
+
+  it("does not call an expired access token a lost sign-in", () => {
+    tokenState = { unavailable: "expired" }
+    expect(surface.listEntries()[0]!.firstUnauthedAt).toBeNull()
   })
 })
 

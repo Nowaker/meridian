@@ -8,6 +8,8 @@ import { createHash } from "node:crypto"
 import { __setChatGptLoginRedirectPortOverride, createChatGptLogin, parseCallbackInput, type LoopbackHandler } from "../proxy/chatgpt/login"
 import { createOAuthCallbackRegistry } from "../proxy/oauthCallbacks"
 import type { ChatGptConnectedAccount } from "../proxy/chatgpt/source"
+import { chatGptAuthLifecycleKey } from "../proxy/chatgpt/refresh"
+import { authLifecycleFor } from "../proxy/authLifecycle"
 
 const NOW = 1_800_000_000_000
 
@@ -80,6 +82,14 @@ describe("ChatGPT sign-in", () => {
     // Nothing is waiting any more, so the redirect listener is closed.
     await Promise.resolve()
     expect(closed()).toBe(1)
+  })
+
+  it("records when the seat signed in", async () => {
+    const { login, callback } = harness()
+    const started = await login.start()
+    const state = new URL(started.authorizeUrl).searchParams.get("state")!
+    await callback()(new URLSearchParams({ code: "code-1", state }))
+    expect(authLifecycleFor(chatGptAuthLifecycleKey("user-1__ws-1"))).toMatchObject({ authObtainedAt: NOW, authObtainedVia: "login" })
   })
 
   it("finishes from a pasted callback address, and the code is spent only once", async () => {

@@ -25,7 +25,8 @@ import {
   type ChatGptAccount,
   type ChatGptCredentialStore,
 } from "../proxy/chatgpt/credentials"
-import { createChatGptRefresher, type RefreshOutcome } from "../proxy/chatgpt/refresh"
+import { chatGptAuthLifecycleKey, createChatGptRefresher, type RefreshOutcome } from "../proxy/chatgpt/refresh"
+import { authLifecycleFor } from "../proxy/authLifecycle"
 
 const LEASE_MODULE = join(import.meta.dir, "../proxy/chatgpt/lease.ts")
 const STORE_MODULE = join(import.meta.dir, "../proxy/chatgpt/credentials.ts")
@@ -393,5 +394,33 @@ describe("ChatGPT refresh - nothing it says contains a credential", () => {
       expect(written.join("\n")).not.toContain(secret)
       expect(JSON.stringify(outcome)).not.toContain(secret)
     }
+  })
+})
+
+describe("ChatGPT refresh - the seat's login lifecycle", () => {
+  async function seededAs(accountUserId: string): Promise<ChatGptCredentialStore> {
+    const store = await seededStore()
+    store.commitAccount(accountUserId, () => seat({ accountUserId }))
+    return store
+  }
+
+  it("stamps a successful refresh", async () => {
+    const store = await seededAs("seat-lifecycle-ok")
+    const mock = endpoint(() => tokenResponse({ access_token: "fresh", refresh_token: "rotated", expires_in: 3600 }))
+    await createChatGptRefresher({ store, fetchImpl: mock.fetchImpl, now: () => 1_700_000_000_000 }).refreshAccount("seat-lifecycle-ok")
+    expect(authLifecycleFor(chatGptAuthLifecycleKey("seat-lifecycle-ok"))?.lastRefreshAt).toBe(1_700_000_000_000)
+  })
+
+  it("records a refused refresh as the moment the seat was logged out, once", async () => {
+    const store = await seededAs("seat-lifecycle-refused")
+    const mock = endpoint(() => tokenResponse({ error: "invalid_grant" }, 400))
+    const refresher = createChatGptRefresher({ store, fetchImpl: mock.fetchImpl, now: () => 1_700_000_000_000 })
+    await refresher.refreshAccount("seat-lifecycle-refused")
+    const record = authLifecycleFor(chatGptAuthLifecycleKey("seat-lifecycle-refused"))!
+    expect(record).toMatchObject({ firstUnauthedAt: 1_700_000_000_000, unauthedReason: "refresh_rejected" })
+    expect(record.events.at(-1)).toMatchObject({ kind: "logged_out", detail: "rejected" })
+    // Every later attempt reports the same lost login, not a new one.
+    await refresher.refreshAccount("seat-lifecycle-refused")
+    expect(authLifecycleFor(chatGptAuthLifecycleKey("seat-lifecycle-refused"))!.events).toHaveLength(record.events.length)
   })
 })

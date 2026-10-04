@@ -16,6 +16,7 @@
  * of the exclusions (settings, injected), the usage reading (injected), and
  * any credential - nothing here sees a token.
  */
+import { noteCredentialObserved } from "../authLifecycle"
 import type { CodexUsageResponse } from "../codex/types"
 import type { LimitDiagnosis } from "../limitDetection"
 import type { SpentRecord } from "../profileHealth"
@@ -32,8 +33,10 @@ import {
   profileWindowType,
   seatWindows,
   type ChatGptProfile,
+  type ChatGptTokenState,
   type ObservedRateLimit,
 } from "./profiles"
+import { chatGptAuthLifecycleKey } from "./refresh"
 import type { CreditBurn } from "./creditRates"
 import type { ChatGptCreditsPolicy, ChatGptFreeSeatOrder } from "./features"
 import type { ChatGptCredentialSource } from "./source"
@@ -86,6 +89,17 @@ export interface ChatGptProfileSurfaceDeps {
   spent: (profileId: string) => SpentRecord | undefined
   /** Where a free-plan seat ranks among the others for unpinned work (chatgpt/features.ts). */
   freeSeatOrder?: () => ChatGptFreeSeatOrder
+}
+
+/**
+ * A seat's token state as authLifecycle.ts reads a credential. Only a seat
+ * with no usable sign-in at all counts as logged out: an expired or refused
+ * access token is the owner's next refresh to make, not yet a lost login.
+ */
+function seatLoginPresence(tokenState: ChatGptTokenState): "present" | "absent" | "unknown" {
+  if (tokenState === "ok") return "present"
+  if (tokenState === "no_token" || tokenState === "requires_reauth") return "absent"
+  return "unknown"
 }
 
 export type ChatGptActivation =
@@ -251,6 +265,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
       return list.map(profile => {
         const reading = usageById.get(profile.seat)
         const tokenState = chatGptTokenState(profile.unavailable, reading?.error)
+        const lifecycle = noteCredentialObserved(chatGptAuthLifecycleKey(profile.seat), { presence: seatLoginPresence(tokenState) })
         const owner = chatGptOwner(deps.source.mode, profile.storeIndex)
         const ahead = profile.id === activeId ? paidAhead(list, profile) : []
         return {
@@ -290,6 +305,17 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           lastCheckedAt: reading?.failure?.lastFailureAt ?? reading?.fetchedAt ?? null,
           lastSuccessAt: reading?.fetchedAt ?? null,
           authProvenance: "live" as const,
+          // The fields a Claude profile reports about its login. A seat's
+          // provider states no login deadline, so those three stay empty.
+          refreshTokenExpiresAt: null,
+          daysUntilRenewal: null,
+          renewalRequiredSoon: false,
+          accessTokenExpiresAt: profile.accessTokenExpiresAt,
+          authObtainedAt: lifecycle?.authObtainedAt ?? null,
+          authObtainedVia: lifecycle?.authObtainedVia ?? null,
+          lastRefreshAt: lifecycle?.lastRefreshAt ?? null,
+          firstUnauthedAt: lifecycle?.firstUnauthedAt ?? null,
+          unauthedReason: lifecycle?.unauthedReason ?? null,
           credentialDir: null,
         }
       })

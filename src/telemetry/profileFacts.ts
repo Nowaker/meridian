@@ -98,8 +98,12 @@ function spanText(ms) {
 function loginFacts(p, now) {
   var facts = [];
   if (p.firstUnauthedAt) {
-    var why = p.unauthedReason === 'refresh_rejected' ? ' \\u2014 Anthropic refused to renew the login'
-      : p.unauthedReason === 'credentials_cleared' ? ' \\u2014 the stored login was wiped' : '';
+    var seat = isChatGptProfile(p);
+    var why = p.unauthedReason === 'refresh_rejected'
+      ? (seat ? ' \\u2014 the sign-in could not be renewed' : ' \\u2014 Anthropic refused to renew the login')
+      : p.unauthedReason === 'credentials_cleared'
+        ? (seat ? ' \\u2014 the seat has no usable sign-in' : ' \\u2014 the stored login was wiped')
+        : '';
     facts.push({ label: 'Logged out', value: spanText(now - p.firstUnauthedAt) + ' ago', tone: 'err',
       title: 'Since ' + new Date(p.firstUnauthedAt).toLocaleString() + why });
   } else if (p.refreshTokenExpiresAt) {

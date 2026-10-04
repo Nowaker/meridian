@@ -95,6 +95,8 @@ export interface ChatGptProfile extends ChatGptPlanFields {
   aliases: string[]
   /** 0-based position in the credential owner's store, when it has one. */
   storeIndex: number | null
+  /** When the seat's current access token runs out, epoch ms. */
+  accessTokenExpiresAt: number | null
 }
 
 /** One window in Claude's `/v1/usage/quota` vocabulary. */
@@ -250,6 +252,7 @@ export function chatGptProfiles(
       ownerActive: seat.active === true,
       aliases,
       storeIndex: seat.storeIndex ?? null,
+      accessTokenExpiresAt: seat.expiresAt,
       ...chatGptPlanFields(options.planTypes?.get(seat.id) ?? seat.planType),
     }
   })

@@ -26,8 +26,14 @@
  * deliberate: a 429 must not brand an account, and an unexplained silence must.
  */
 
+import { noteRefreshRejected, noteRefreshSucceeded } from "../authLifecycle"
 import { WriterLeaseRequiredError, type ChatGptCredentialStore } from "./credentials"
 import { WriterLeaseLostError } from "./lease"
+
+/** A seat's record in authLifecycle.ts, kept apart from Claude's, which are keyed by credential path. */
+export function chatGptAuthLifecycleKey(accountUserId: string): string {
+  return `chatgpt:${accountUserId}`
+}
 
 export const CHATGPT_TOKEN_URL = "https://auth.openai.com/oauth/token"
 /** The Codex CLI's OAuth client. Logins and refreshes must use the same one. */
@@ -123,6 +129,7 @@ export function createChatGptRefresher(options: ChatGptRefresherOptions): ChatGp
     // goes on serving until the access token expires and then falls over. The
     // reason is this module's own vocabulary, never the provider's wording.
     console.error(`[chatgpt] account ${accountUserId} needs an interactive login (${reason})`)
+    noteRefreshRejected(chatGptAuthLifecycleKey(accountUserId), { at: now(), detail: reason })
     return { status: "requires-reauth", accountUserId, reason }
   }
 
@@ -200,6 +207,7 @@ export function createChatGptRefresher(options: ChatGptRefresherOptions): ChatGp
     // One line per renewal, so the operator can see a refresh happen. The
     // seat id is an identity, not a credential.
     console.log(`[chatgpt] account ${accountUserId} refreshed${parsed.refreshToken ? " (refresh token rotated)" : ""}; access token valid until ${new Date(expiresAt).toISOString()}`)
+    noteRefreshSucceeded(chatGptAuthLifecycleKey(accountUserId), { at: now() })
     return { status: "refreshed", accountUserId, accessToken, expiresAt }
   }
 
