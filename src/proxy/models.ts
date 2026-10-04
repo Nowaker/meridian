@@ -103,6 +103,23 @@ const AUTH_STATUS_FAILURE_TTL_MS = 5_000
 const AUTH_STATUS_FAILURE_MAX_TTL_MS = 5 * 60_000
 
 /**
+ * How long one `claude auth status` may run before it is killed, and
+ * deliberately far longer than any caller waits for it.
+ *
+ * The CLI is a ~220 MB binary. On a host under memory pressure its pages are
+ * evicted between checks, and a run started from a launchd agent was measured
+ * paging itself back in for 15-40 s before it answered. Killing it at the
+ * caller's patience did not shorten anything: the run never finished, so
+ * nothing was cached, and the next attempt started just as cold - a fresh
+ * process stayed "Could not verify auth status" for hours with every profile
+ * logged in. A run that is allowed to finish answers, and warms the next.
+ */
+const AUTH_STATUS_SPAWN_TIMEOUT_MS = 90_000
+/** How long a caller with no cached answer waits for the check in flight. */
+const AUTH_STATUS_WAIT_MS = 5_000
+let authStatusWaitMs = AUTH_STATUS_WAIT_MS
+
+/**
  * How long a failed auth check is trusted before the next attempt: 5 s after
  * the first failure, doubling with each consecutive one up to 5 min. A
  * success resets the count. A flat 5 s retry spawned `claude auth status`
@@ -563,14 +580,81 @@ export async function getClaudeAuthStatusAsync(profileId?: string, envOverrides?
   }
 
   // Stale-while-revalidate. `/health` reads this on every probe, and the
-  // refresh spawns the claude binary with a 5 s timeout; a load balancer
-  // probing with a shorter timeout marked a healthy proxy down each time the
-  // cache expired on a loaded host. With a previous answer in hand, serve it
-  // and refresh in the background - a changed answer reaches the next caller.
-  // Only a caller with nothing to fall back on waits. One refresh at a time:
-  // concurrent callers share the in-flight one.
+  // refresh spawns the claude binary, which a loaded host stretches past any
+  // probe timeout; a load balancer probing with a shorter timeout marked a
+  // healthy proxy down each time the cache expired. With a previous answer in
+  // hand, serve it and refresh in the background - a changed answer reaches
+  // the next caller. Only a caller with nothing to fall back on waits, and only
+  // for AUTH_STATUS_WAIT_MS: the check outlives that wait and answers whoever
+  // asks after it lands. One refresh at a time: concurrent callers share the
+  // in-flight one.
   const inflight = c_promise ?? startAuthStatusRefresh(cache, profileId, envOverrides, credMtime)
-  return previous ?? inflight
+  return previous ?? waitForFirstAnswer(inflight)
+}
+
+/** The check in flight, or null - "could not verify" - once the caller's wait runs out. */
+function waitForFirstAnswer(inflight: Promise<ClaudeAuthStatus | null>): Promise<ClaudeAuthStatus | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const waitOver = new Promise<null>(resolve => {
+    timer = setTimeout(() => resolve(null), authStatusWaitMs)
+    timer.unref?.()
+  })
+  return Promise.race([inflight, waitOver]).finally(() => clearTimeout(timer))
+}
+
+const warnedAuthStatusFailures = new Map<string, string>()
+
+const authContextLabel = (profileId: string | undefined) => profileId ? `profile "${profileId}"` : "the default account"
+const formatSeconds = (ms: number) => `${(ms / 1000).toFixed(1)}s`
+
+function reportedLoggedIn(stdout: unknown): boolean | undefined {
+  try {
+    const loggedIn: unknown = JSON.parse(String(stdout))?.loggedIn
+    return typeof loggedIn === "boolean" ? loggedIn : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Why a `claude auth status` run gave no answer, in terms an operator can act
+ * on. Never quotes the CLI's output, which carries the account's email.
+ */
+function describeAuthStatusFailure(err: unknown): string {
+  const e = err as { killed?: boolean; signal?: string | null; code?: unknown; stdout?: unknown } | null
+  if (e?.killed) return `no answer within ${AUTH_STATUS_SPAWN_TIMEOUT_MS / 1000}s, so the check was killed`
+  if (typeof e?.code === "number") {
+    const loggedIn = reportedLoggedIn(e.stdout)
+    return `\`claude auth status\` exited with code ${e.code}${loggedIn === undefined ? "" : ` reporting loggedIn: ${loggedIn}`}`
+  }
+  if (e?.signal) return `\`claude auth status\` was terminated by ${e.signal}`
+  if (typeof e?.code === "string") return `could not run \`claude auth status\` (${e.code})`
+  if (err instanceof SyntaxError) return "`claude auth status` answered with output that is not JSON"
+  return (err instanceof Error ? err.message : String(err)).split("\n")[0]!.slice(0, 200)
+}
+
+function warnAuthStatusFailure(profileId: string | undefined, reason: string, failures: number, everAnswered: boolean, retryInMs: number): void {
+  const key = profileId ?? ""
+  // A check that keeps failing the same way is retried for as long as the
+  // proxy runs: warn on the 1st, 2nd, 4th, 8th... repeat, or when it changes.
+  const quietRepeat = warnedAuthStatusFailures.get(key) === reason && (failures & (failures - 1)) !== 0
+  warnedAuthStatusFailures.set(key, reason)
+  if (quietRepeat) return
+  // Not gated on `silent`: an account the proxy cannot verify is not routine
+  // chatter, and the throttle above keeps a persistent failure to a few lines.
+  console.warn(
+    `[PROXY] Could not verify Claude auth status for ${authContextLabel(profileId)}: ${reason} ` +
+    `(${failures} in a row; ${everAnswered ? "serving the last known status" : "no status known yet"}; next check in ${Math.round(retryInMs / 1000)}s)`,
+  )
+}
+
+function noteAuthStatusAnswered(profileId: string | undefined, priorFailures: number, everAnswered: boolean, elapsedMs: number): void {
+  warnedAuthStatusFailures.delete(profileId ?? "")
+  if (priorFailures > 0) {
+    console.warn(`[PROXY] Verified Claude auth status for ${authContextLabel(profileId)} after ${priorFailures} failed check${priorFailures === 1 ? "" : "s"} (this one took ${formatSeconds(elapsedMs)})`)
+  } else if (!everAnswered && elapsedMs > authStatusWaitMs) {
+    console.warn(`[PROXY] Claude auth status for ${authContextLabel(profileId)} took ${formatSeconds(elapsedMs)} to answer; it read as unverified until then`)
+  }
 }
 
 function startAuthStatusRefresh(
@@ -579,6 +663,7 @@ function startAuthStatusRefresh(
   envOverrides: Record<string, string> | undefined,
   credMtime: number,
 ): Promise<ClaudeAuthStatus | null> {
+  const startedAt = Date.now()
   const refresh = (async (): Promise<ClaudeAuthStatus | null> => {
     try {
       // Route through the resolver instead of relying on `claude` being
@@ -592,7 +677,7 @@ function startAuthStatusRefresh(
       // spaces in the resolved path.
       const claudePath = await resolveClaudeExecutableAsync()
       const { stdout } = await execFile(claudePath, ["auth", "status"], {
-        timeout: 5000,
+        timeout: AUTH_STATUS_SPAWN_TIMEOUT_MS,
         windowsHide: true,
         ...(envOverrides ? { env: { ...process.env, ...envOverrides } } : {}),
       })
@@ -607,6 +692,12 @@ function startAuthStatusRefresh(
         fields: authFieldPaths(parsed),
         payload: describeAuthFields(parsed),
       })
+      noteAuthStatusAnswered(
+        profileId,
+        cache ? cache.failures : cachedAuthStatusFailures,
+        Boolean(cache ? cache.lastKnownGood : lastKnownGoodAuthStatus),
+        Date.now() - startedAt,
+      )
       if (cache) {
         cache.status = parsed; cache.lastKnownGood = parsed
         cache.at = Date.now(); cache.isFailure = false; cache.failures = 0; cache.lastSuccessAt = Date.now()
@@ -619,14 +710,17 @@ function startAuthStatusRefresh(
       return parsed
     } catch (err) {
       const failures = (cache ? cache.failures : cachedAuthStatusFailures) + 1
+      const everAnswered = Boolean(cache ? cache.lastKnownGood : lastKnownGoodAuthStatus)
+      const retryInMs = authStatusFailureTtlMs(failures)
       claudeLog("auth.status_failed", {
         source: "cli_async",
         profile: profileId ?? "default",
         error: String(err),
-        servingLastKnownGood: Boolean(cache ? cache.lastKnownGood : lastKnownGoodAuthStatus),
+        servingLastKnownGood: everAnswered,
         consecutiveFailures: failures,
-        retryInMs: authStatusFailureTtlMs(failures),
+        retryInMs,
       })
+      warnAuthStatusFailure(profileId, describeAuthStatusFailure(err), failures, everAnswered, retryInMs)
       if (cache) {
         cache.isFailure = true; cache.failures = failures; cache.at = Date.now(); cache.status = null
         cache.credMtimeMs = credMtime
@@ -996,6 +1090,12 @@ export function resetCachedClaudeAuthStatus(): void {
   cachedAuthStatusPromise = null
   cachedAuthStatusCredMtimeMs = 0
   profileAuthCaches.clear()
+  warnedAuthStatusFailures.clear()
+}
+
+/** Shorten how long a caller with no cached answer waits; no argument restores the default - for testing only. */
+export function setAuthStatusWaitMsForTesting(ms: number = AUTH_STATUS_WAIT_MS): void {
+  authStatusWaitMs = ms
 }
 
 /** Expire the auth status cache without clearing lastKnownGoodAuthStatus.

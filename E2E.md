@@ -109,6 +109,26 @@ See [durable evidence](docs/maintenance/evidence/1197-auth-refresh.md).
 This demonstrates a controlled auth-subprocess delay, not a reproduction of
 the contributor's entire overloaded Linux deployment or Windows behavior.
 
+## Auth-status cold start
+
+```sh
+bun scripts/e2e-auth-status-cold-start.mjs
+```
+
+Requires actual Claude login on macOS/Linux. A freshly started proxy whose
+first `claude auth status` is slower than any caller waits: the gate forwards
+to the installed Claude CLI, delaying only `auth status` by eight seconds. The
+first `/health` must answer `degraded` before the delay ends, the delayed check
+must run to completion, and the next `/health` must answer healthy from it, with
+one auth subprocess in total. Isolation is the same as the refresh gate above.
+On an unchanged pre-fix checkout, `--expect-killed` must show the check killed
+before it answered and the proxy still degraded.
+
+Verified Linux x64 with Claude Code 2.1.284: baseline first probe degraded at
+5159 ms, check killed, second probe still degraded; fixed first probe degraded
+at 5127 ms, check answered at 8.7 s, second probe healthy in 85 ms, one real
+auth subprocess.
+
 ## Local build provenance
 
 ```sh
