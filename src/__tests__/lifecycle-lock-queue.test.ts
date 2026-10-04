@@ -1,5 +1,6 @@
-import { expect, it } from "bun:test"
+import { expect, it, spyOn } from "bun:test"
 import { LifecycleLockQueue } from "../proxy/session/lifecycleLockQueue"
+import { diagnosticLog } from "../telemetry"
 import {
   SessionLifecycleQueueCapacityError,
   SessionLifecycleQueueStalledError,
@@ -10,6 +11,7 @@ function controlledClock() {
   let now = 0
   const timers = new Map<() => void, number>()
   return {
+    now: () => now,
     schedule: (callback: () => void, delay: number) => {
       timers.set(callback, now + delay)
       return () => { timers.delete(callback) }
@@ -96,6 +98,66 @@ it("rejects waiters behind a stalled active holder without permitting overlap", 
   await active
   await queue.run("store", undefined, async () => { executed = true })
   expect(executed).toBe(true)
+})
+
+it("does not blame the holder for a stall deadline delayed by a blocked event loop", async () => {
+  // Given: a holder whose own continuations were blocked along with the
+  // deadline - synchronous work anywhere in the process froze the loop.
+  const clock = controlledClock()
+  const logged: string[] = []
+  const queue = new LifecycleLockQueue({ stallMs: 100, lagToleranceMs: 10, schedule: clock.schedule, now: clock.now, log: message => logged.push(message) })
+  const holder = Promise.withResolvers<void>()
+  const active = queue.run("store", undefined, () => holder.promise)
+  let executed = false
+  const waiting = queue.run("store", undefined, async () => { executed = true })
+  // When: the deadline only gets to run long after it was due.
+  clock.advance(400)
+  // Then: the extension is logged with how late the deadline ran, the waiter
+  // is still queued, and it is served once the holder finishes.
+  expect(logged).toHaveLength(1)
+  expect(logged[0]).toStartWith("session.lifecycle_stall_deadline_late late_ms=300 queued=1;")
+  holder.resolve()
+  await active
+  await waiting
+  expect(executed).toBe(true)
+})
+
+it("reports a late stall deadline on stderr and in the diagnostic log by default", async () => {
+  diagnosticLog.clear()
+  const stderr = spyOn(console, "error").mockImplementation(() => {})
+  try {
+    const clock = controlledClock()
+    const queue = new LifecycleLockQueue({ stallMs: 100, lagToleranceMs: 10, schedule: clock.schedule, now: clock.now })
+    const holder = Promise.withResolvers<void>()
+    const active = queue.run("store", undefined, () => holder.promise)
+    clock.advance(250)
+    holder.resolve()
+    await active
+    expect(stderr.mock.calls.map(call => String(call[0]))).toContainEqual(
+      expect.stringMatching(/^\[PROXY\] session\.lifecycle_stall_deadline_late late_ms=150 queued=0;/),
+    )
+    expect(diagnosticLog.getRecent({ category: "session" }).map(entry => entry.message)).toContainEqual(
+      expect.stringMatching(/^session\.lifecycle_stall_deadline_late late_ms=150 queued=0;/),
+    )
+  } finally {
+    stderr.mockRestore()
+  }
+})
+
+it("still declares a stall when the rearmed deadline passes on time", async () => {
+  const clock = controlledClock()
+  const logged: string[] = []
+  const queue = new LifecycleLockQueue({ stallMs: 100, lagToleranceMs: 10, schedule: clock.schedule, now: clock.now, log: message => logged.push(message) })
+  const holder = Promise.withResolvers<void>()
+  const active = queue.run("store", undefined, () => holder.promise)
+  const waiting = queue.run("store", undefined, async () => {}).then(() => undefined, error => error)
+  clock.advance(400)
+  clock.advance(100)
+  expect(await waiting).toBeInstanceOf(SessionLifecycleQueueStalledError)
+  // Only the late run was an extension; the on-time one is a real stall.
+  expect(logged).toHaveLength(1)
+  holder.resolve()
+  await active
 })
 
 it("does not settle or release an active transaction when its caller aborts", async () => {

@@ -2,6 +2,28 @@
 import { sanitizeAssistantText } from "./sanitize"
 import { describeToolCall, MULTIMODAL_TYPES, REPLAY_CONTEXT_OPEN, REPLAY_CONTEXT_CLOSE, type ToolCallInfo } from "./messages"
 
+interface ReplayMessage {
+  role: string
+  content: unknown
+}
+
+/** Trailing client metadata belongs to the immediately preceding live user
+ * turn. Keep it in that turn when framing replay, without making it an SDK
+ * system instruction or changing the original messages used for lineage. */
+export function coalesceTrailingSystemReminders(messages: readonly ReplayMessage[]): ReplayMessage[] {
+  let boundary = messages.length - 1
+  while (boundary >= 0 && messages[boundary]?.role === "system") boundary--
+  if (boundary < 0 || boundary === messages.length - 1 || messages[boundary]?.role !== "user") return [...messages]
+  const current = messages[boundary]!
+  const currentAndReminders = messages.slice(boundary)
+  if (!currentAndReminders.every(message => typeof message.content === "string" || Array.isArray(message.content))) return [...messages]
+  const content = currentAndReminders.every(message => typeof message.content === "string")
+    ? currentAndReminders.map(message => message.content).join("\n\n")
+    : currentAndReminders.flatMap(message => Array.isArray(message.content)
+      ? message.content : [{ type: "text", text: message.content }])
+  return [...messages.slice(0, boundary), { ...current, content }]
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
 }
@@ -111,6 +133,16 @@ export function replayToolResultHeader(block: Record<string, unknown>, info?: To
   return `${attribution}Recorded tool result: ${JSON.stringify({ tool_use_id: block.tool_use_id, is_error: block.is_error ?? false })}`
 }
 
+/** Client `system` tool-change blocks (`tool_addition`/`tool_removal`) are only
+ * valid inside a mid-conversation system message. Replay recasts history as user
+ * turns, where the API rejects them, so they are rendered as history text. */
+function toolChangeText(block: Record<string, unknown>): string | undefined {
+  if (block.type !== "tool_addition" && block.type !== "tool_removal") return undefined
+  const tool = record(block.tool) ? block.tool : undefined
+  const name = typeof block.name === "string" ? block.name : typeof tool?.name === "string" ? tool.name : "unknown"
+  return `[Client ${block.type === "tool_addition" ? "added" : "removed"} tool: ${name}]`
+}
+
 /** Only a real SDK tool checkpoint may receive native tool_result blocks.
  * Fresh replay renders results as history, retaining their payloads and media
  * rather than presenting orphan results for calls absent from the SDK session. */
@@ -122,6 +154,8 @@ export function normalizeStructuredUserContent(
   if (!Array.isArray(content)) return content
   return content.flatMap(block => {
     if (!record(block)) return []
+    const toolChange = toolChangeText(block)
+    if (toolChange) return [{ type: "text", text: toolChange }]
     if (block.type !== "tool_result") return [block]
     if (preserveToolResultWrapper) {
       return [{ ...block, content: normalizeStructuredUserContent(block.content, true, toolIndex) }]

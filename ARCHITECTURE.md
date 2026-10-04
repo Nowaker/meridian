@@ -195,11 +195,16 @@ src/
 │   ├── requestAbort.ts        ← HTTP request abort → SDK query abort bridge
 │   ├── sessionTree.ts         ← Live parent→child request registry; subtree cancellation (PURE bookkeeping)
 │   ├── shutdown.ts            ← Bounded HTTP drain and connection tracking
+│   ├── inflight.ts            ← Per-upstream in-flight request counts for GET /inflight (PURE bookkeeping)
+│   ├── admissionHold.ts       ← POST /drain: hold new requests (never refuse) so in-flight can reach 0
+│   ├── upstreamReachability.ts ← Passive "can Anthropic be reached from here" state for /readyz and /health
 │   ├── adapter.ts             ← AgentAdapter interface (extensibility point for multi-agent support)
 │   ├── adapters/
 │   │   ├── opencode.ts        ← OpenCode adapter (session headers, CWD extraction, tool config)
 │   │   └── forgecode.ts       ← ForgeCode adapter (fingerprint sessions, XML CWD, passthrough)
 │   ├── query.ts               ← SDK query options builder (shared between stream/non-stream paths)
+│   ├── transcriptRetention.ts ← Claude Code transcript retention period per SDK config root
+│   ├── transcriptSweep.ts     ← Idle sweep: an offline, promptless Claude Code process per idle config root
 │   ├── errors.ts              ← Error classification (SDK errors → HTTP responses)
 │   ├── retryAfter.ts          ← Retry-After computation for 429/503/529 (PURE)
 │   ├── models.ts              ← Model mapping, Claude executable resolution
@@ -207,11 +212,13 @@ src/
 │   ├── localBuildInfo.ts      ← Local build comparisons and public forge links (PURE)
 │   ├── buildRuntime.ts        ← Immutable runtime identity and independent disk status
 │   ├── buildSnapshot.ts       ← Git/source snapshot boundary
+│   ├── buildFingerprint.ts    ← Streaming file hashing and bounded metadata reads
+│   ├── buildProvenanceError.ts ← Shared provenance boundary errors
 │   ├── buildArtifacts.ts      ← Serialized build certification and artifact validation
 │   ├── buildLock.ts           ← Local builder owner claims and dead-owner recovery
 │   ├── buildObserver.ts       ← Single-flight bounded disk observation cache
 │   ├── buildObservationWorker.ts ← Off-thread source/artifact observation
-│   ├── updateCheck.ts         ← Cached npm registry lookup for the newest published version
+│   ├── updateCheck.ts         ← Opt-in cached npm registry lookup for the newest published version
 │   ├── tools.ts               ← Tool blocking lists, MCP server name, allowed tools
 │   ├── messages.ts            ← Content normalization, message parsing
 │   ├── replay.ts              ← Pure rendering of assistant calls and tool results for SDK replay
@@ -224,10 +231,15 @@ src/
 │   │   ├── turnCoordinator.ts ← Process-wide serialization for reliable session IDs
 │   │   ├── crossProcessTurnCoordinator.ts ← Durable coordination across proxy processes
 │   │   ├── processIncarnation.ts ← Process/host identity for lock ownership
+│   │   ├── storeDatabase.ts   ← SQLite database behind the session store and lifecycle journal (WAL, off-loop commits)
 │   │   └── durableFileSystem.ts ← Durable file operations
-│   ├── sessionStore.ts        ← Shared file store (cross-proxy session resume)
+│   ├── sessionStore.ts        ← Shared session store (cross-proxy session resume)
 │   ├── profiles.ts            ← Multi-profile support: resolve, list, switch auth contexts (leaf)
 │   ├── profileCli.ts          ← CLI commands for profile management (leaf, I/O)
+│   ├── profileConfigStore.ts  ← cross-process profile writer lock and atomic snapshots (leaf, I/O)
+│   ├── profileLogin.ts        ← Browser re-authentication state, redirect/paste completion and status
+│   ├── profileAdd.ts          ← Browser profile creation and isolated credential persistence
+│   ├── profileOAuthBody.ts    ← Runtime schemas for browser OAuth request bodies (pure)
 │   ├── statusProbe.ts         ← Asks a busy port whether it is Meridian, and collects what / shows
 │   ├── agentDefs.ts           ← Subagent definition extraction from tool descriptions
 │   ├── agentMatch.ts          ← Fuzzy agent name matching
@@ -236,6 +248,10 @@ src/
 ├── fileChanges.ts             ← PostToolUse hook: tracks write/edit ops, formats summary
 ├── mcpTools.ts                ← MCP tool definitions (read, write, edit, bash, glob, grep)
 ├── logger.ts                  ← Logging with AsyncLocalStorage context
+├── errorReporting/            ← Opt-in crash reporting to a GlitchTip/Sentry DSN (off without one)
+│   ├── event.ts               ← Thrown value → scrubbed Sentry event/envelope (PURE)
+│   ├── deliver.ts             ← Spool → collector; self-contained so a dying process can run it detached
+│   └── index.ts               ← Process hooks, spool writes, delivery scheduling
 ├── utils/
 │   └── lruMap.ts              ← Generic LRU map with eviction callbacks
 ├── telemetry/
@@ -251,6 +267,7 @@ src/
 │   ├── openaiOfficialPricing.ts ← Hand-kept official OpenAI rates guarding the update
 │   ├── profileBar.ts          ← Shared profile switcher bar (injected into HTML pages)
 │   ├── profilePage.ts         ← Profile management page HTML
+│   ├── pageLayout.ts          ← Contained/wide layout setting, stamped on each page as it is served
 │   ├── cliDashboard.ts        ← The landing page rendered for a terminal (pure)
 │   └── types.ts               ← Telemetry types
 
@@ -493,7 +510,7 @@ E2E tests (`E2E.md`) should be run before releases or after major refactors.
 
 ## Transcript publication lifetime
 
-`sessionLifecycle.ts` persists a publication lease atomically with each new request target before SDK launch. The lease survives physical SDK writer shutdown and commit until the synchronous durable mapping CAS succeeds, or the request abandons its target. Failed publication restores the lease. Collectors in other processes cannot depend on a proxy instance's private request pins, so they consult these durable leases as well as durable mappings.
+`sessionLifecycle.ts` persists a publication lease atomically with each new request target before SDK launch. The lease survives physical SDK writer shutdown and commit until the durable mapping CAS succeeds, or the request abandons its target. Failed publication restores the lease. Collectors in other processes cannot depend on a proxy instance's private request pins, so they consult these durable leases as well as durable mappings.
 
 Publication leases use the existing unarmed active-lease representation with `purpose: "publication"`. Older collectors also retain them while the owner process is alive; exact process-incarnation death permits recovery. They do not count as exclusive SDK writers, and abandoning publication never removes an actual writer lease. Published transcripts are retained by their durable mappings and become collectible after eviction.
 
@@ -503,12 +520,26 @@ An SDK writer lease is released once its writer has been joined. If the lifecycl
 FIFO with at most 256 waiting callers. Local waiting does not consume the
 two-second external-lock acquisition budget; only the head creates a durable
 candidate. A holder stalled for 60 seconds rejects queued/new callers without
-unlocking or abandoning its transaction. Capacity and stalled-holder errors are
+unlocking or abandoning its transaction. A stall deadline that runs more than a
+second late was delayed by a blocked event loop, which delayed the holder too, so
+it rearms instead of rejecting. Capacity and stalled-holder errors are
 distinct, defined in the dependency-leaf `session/lifecycleErrors.ts`.
+A turn whose model already answered does not fail on any of these lock errors
+at terminal publication: they are raised before the transaction runs, so the
+turn invalidates its unchanged pre-turn mapping and the next turn replays. A
+durable priority attempt still requires its atomic publication.
 Request admission signals remove queued work and cancel external acquisition,
 but a running durable callback always finishes before returning ownership.
 Cleanup never receives the canceled admission signal. Publication callbacks
 remain synchronous; same-context recursive acquisition is rejected explicitly.
+
+## Session store write cost
+
+`sessionStore.ts` mutations are synchronous and run on the event loop, so their cost is lag for every request. The parsed document is cached by file identity (device, inode, size, mtime, ctime); every writer publishes by rename while holding the store lock, so a locked mutation that finds the cache current builds on it without re-parsing. Mutators receive a copy-on-write draft and replace entries rather than editing them; cached entries are frozen. Each entry's serialized UTF-8 bytes are memoized, so a write encodes only the entries it changed. The file format, lock, fsync and rename are unchanged.
+
+A conversation that has run under several profiles has one mapping per profile (`<profile>:<session>`), each holding full per-message hashes and pinning its own transcript. Before each GC sweep, mappings superseded by a newer copy under another profile and unused for `MERIDIAN_SESSION_PROFILE_COPY_GRACE_MS` are removed. Priority route and rollback mappings and conversations with a turn registered in this process are exempt. Removal only unpins transcripts; reconciliation retires them through the normal lifecycle backlog, and `releaseSupersededProfileCopies` limits the transcripts it unpins so that at least half of the pending budget stays free for admission. A conversation returning to a pruned profile replays instead of resuming.
+
+A conversation that has run under several profiles has one mapping per profile (`<profile>:<session>`), each holding full per-message hashes and pinning its own transcript. With explicit `MERIDIAN_SESSION_PROFILE_COPY_PRUNE=1`, before each GC sweep mappings superseded by a newer copy under another profile and unused for `MERIDIAN_SESSION_PROFILE_COPY_GRACE_MS` (default 24 hours, `DEFAULT_PROFILE_COPY_GRACE_MS`) are removed. Priority route and rollback mappings and conversations with a turn registered in this process are exempt. Removal only unpins transcripts; reconciliation retires them through the normal lifecycle backlog, and `releaseSupersededProfileCopies` limits the transcripts it unpins so that at least half of the pending budget stays free and admission never has to return the prune's retirements to live. A conversation returning to a pruned profile replays instead of resuming. Pruning is off by default to preserve native resume history, including SDK thinking that flattened replay cannot restore. Maintenance acquires nonwaiting conversation leases and reserves retirement capacity while holding the lifecycle lock; held or stale turn locks defer pruning.
 
 ## Lineage hash encoding
 

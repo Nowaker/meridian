@@ -14,6 +14,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { assistantMessage, messageStart, textBlockStart, textDelta, toolUseBlockStart, inputJsonDelta, blockStop, messageDelta, messageStop, parseSSE, resolveMockSdkSessionId } from "./helpers"
+import { commitRawSession } from "./storeDatabaseHelpers"
 
 interface LifecycleResourceSnapshot {
   locator: { sessionId: string }
@@ -121,7 +122,8 @@ installMcpToolsMock(() => ({
 
 const { createProxyServer } = await import("../proxy/server")
 const { clearSessionCache } = await import("../proxy/session/cache")
-const { evictSharedSession, lookupSharedSession, setSessionStoreDir } = await import("../proxy/sessionStore")
+const { evictSharedSession, lookupSharedSession, readSessionStoreSnapshot, setSessionStoreDir } = await import("../proxy/sessionStore")
+const { readSessionGcSnapshot } = await import("../proxy/sessionLifecycle")
 const { diagnosticLog, telemetryStore } = await import("../telemetry")
 
 function userDenyMessage(toolUseId: string) {
@@ -162,7 +164,7 @@ const usedSessionKeys = new Set<string>()
 async function waitForLifecycleState(sessionId: string, state: string): Promise<void> {
   const deadline = Date.now() + 1_000
   while (Date.now() < deadline) {
-    const sidecar = JSON.parse(readFileSync(join(TEST_SESSION_DIR, "session-gc.json"), "utf8"))
+    const sidecar = readSessionGcSnapshot(TEST_SESSION_DIR)
     const resource = Object.values(sidecar.resources as Record<string, LifecycleResourceSnapshot>)
       .find((candidate) => candidate.locator.sessionId === sessionId)
     if (resource?.state === state) return
@@ -241,10 +243,10 @@ describe("Integration: passthrough early stop", () => {
     mockOmitReturnedSessionId = false
   })
 
-  afterEach(() => {
-    for (const key of usedSessionKeys) evictSharedSession(key)
+  afterEach(async () => {
+    for (const key of usedSessionKeys) await evictSharedSession(key)
     usedSessionKeys.clear()
-    clearSessionCache()
+    await clearSessionCache()
     if (savedPassthrough !== undefined) process.env.MERIDIAN_PASSTHROUGH = savedPassthrough
     else delete process.env.MERIDIAN_PASSTHROUGH
     if (savedEarlyStop !== undefined) process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP = savedEarlyStop
@@ -258,17 +260,18 @@ describe("Integration: passthrough early stop", () => {
     const sessionKey = `${sessionHeader}-${TEST_RUN_ID}`
     usedSessionKeys.add(sessionKey)
     const now = Date.now()
-    writeFileSync(join(TEST_SESSION_DIR, "sessions.json"), JSON.stringify({
-      [sessionKey]: {
-        claudeSessionId: "legacy-sdk-session",
-        revision: 1,
-        createdAt: now,
-        lastUsedAt: now,
-        messageCount: 1,
-        lineageHash: "legacy-lineage",
-        passthroughResumeUuid: "legacy-user-denial-uuid",
-      },
-    }))
+    // Opens the store, so the row below lands in a database that exists.
+    expect(lookupSharedSession(sessionKey)).toBeUndefined()
+    commitRawSession(TEST_SESSION_DIR, sessionKey, {
+      claudeSessionId: "legacy-sdk-session",
+      revision: 1,
+      createdAt: now,
+      lastUsedAt: now,
+      messageCount: 1,
+      lineageHash: "legacy-lineage",
+      passthroughResumeUuid: "legacy-user-denial-uuid",
+    })
+    expect(readSessionStoreSnapshot()[sessionKey]).toMatchObject({ passthroughResumeUuid: "legacy-user-denial-uuid" })
     mockMessages = [assistantMessage([{ type: "text", text: "fresh replay" }])]
 
     const response = await post(app, {
@@ -570,7 +573,7 @@ describe("Integration: passthrough early stop", () => {
     expect(storedSecond?.previousClaudeSessionId).toBe(initialManagedSessionId())
     expect(storedSecond?.currentTranscript?.sessionId).toBe(secondQuery.options.sessionId)
     expect(storedSecond?.previousTranscript?.sessionId).toBe(initialManagedSessionId())
-    const secondSidecar = JSON.parse(readFileSync(join(TEST_SESSION_DIR, "session-gc.json"), "utf8"))
+    const secondSidecar = readSessionGcSnapshot(TEST_SESSION_DIR)
     const targetResource = Object.values(secondSidecar.resources as Record<string, any>)
       .find((resource) => resource.locator.sessionId === secondQuery.options.sessionId)
     expect(targetResource?.state).toBe("live")
@@ -655,7 +658,7 @@ describe("Integration: passthrough early stop", () => {
     const targetId = capturedQueryParamsAll[0]?.options?.sessionId
     expect(targetId).toMatch(/^[0-9a-f-]{36}$/)
     expect(lookupSharedSession(`es-fresh-id-mismatch-${TEST_RUN_ID}`)).toBeUndefined()
-    const sidecar = JSON.parse(readFileSync(join(TEST_SESSION_DIR, "session-gc.json"), "utf8"))
+    const sidecar = readSessionGcSnapshot(TEST_SESSION_DIR)
     const resources = Object.values(sidecar.resources as Record<string, LifecycleResourceSnapshot>)
     expect(resources.find((resource) => resource.locator.sessionId === targetId)?.state).toBe("retired")
     expect(resources.find((resource) => resource.locator.sessionId === wrongSessionId)?.state).toBe("retired")
@@ -680,7 +683,7 @@ describe("Integration: passthrough early stop", () => {
 
     const targetId = capturedQueryParamsAll[0]?.options?.sessionId
     await waitForLifecycleState(targetId, "retired")
-    const sidecar = JSON.parse(readFileSync(join(TEST_SESSION_DIR, "session-gc.json"), "utf8"))
+    const sidecar = readSessionGcSnapshot(TEST_SESSION_DIR)
     const resources = Object.values(sidecar.resources as Record<string, LifecycleResourceSnapshot>)
     expect(resources.find((resource) => resource.locator.sessionId === targetId)?.state).toBe("retired")
     expect(resources.find((resource) => resource.locator.sessionId === wrongSessionId)?.state).toBe("retired")
@@ -755,7 +758,7 @@ describe("Integration: passthrough early stop", () => {
     const stored = lookupSharedSession(`es-managed-id-mismatch-${TEST_RUN_ID}`)
     expect(stored?.claudeSessionId).toBe(initialManagedSessionId())
     expect(stored?.previousClaudeSessionId).toBeUndefined()
-    const sidecar = JSON.parse(readFileSync(join(TEST_SESSION_DIR, "session-gc.json"), "utf8"))
+    const sidecar = readSessionGcSnapshot(TEST_SESSION_DIR)
     const resources = Object.values(sidecar.resources as Record<string, LifecycleResourceSnapshot>)
     const target = resources.find((resource) => resource.locator.sessionId === targetId)
     const unexpected = resources.find((resource) => resource.locator.sessionId === wrongSessionId)
@@ -815,7 +818,7 @@ describe("Integration: passthrough early stop", () => {
     expect(lookupSharedSession(`es-stream-managed-id-missing-${TEST_RUN_ID}`)?.claudeSessionId).toBe(initialManagedSessionId())
     const targetId = capturedQueryParamsAll[1].options.sessionId
     await waitForLifecycleState(targetId, "retired")
-    const sidecar = JSON.parse(readFileSync(join(TEST_SESSION_DIR, "session-gc.json"), "utf8"))
+    const sidecar = readSessionGcSnapshot(TEST_SESSION_DIR)
     const target = Object.values(sidecar.resources as Record<string, any>)
       .find((resource) => resource.locator.sessionId === targetId)
     expect(target == null || target.state === "retired" || target.state === "tombstoned").toBe(true)
@@ -2571,6 +2574,96 @@ describe("Integration: passthrough early stop", () => {
     expect(capturedQueryParamsAll[4]?.options.resume).toBeUndefined()
     expect(capturedQueryParamsAll[4]?.options.allowedTools ?? []).not.toContain("mcp__oc__read")
     expect(capturedQueryParamsAll[4]?.options.allowedTools ?? []).not.toContain("mcp__oc__glob")
+  })
+
+  // Deferred tools lift the one-turn cap (maxTurns 4). The same bare-name
+  // rejection then keeps the SDK going after the checkpoint: the model retries
+  // under the registered name (dropped as hidden digest) or the bare name again
+  // (rejected again), and the turn ends at max_turns (4). The client already
+  // holds the complete streamed call, so it must still get a tool_use handoff.
+  it("stream: a CLI-rejected call recovers at the deferred-tools turn budget", async () => {
+    delete process.env.MERIDIAN_PASSTHROUGH_UNCAPTURED_TOOL_RECOVERY
+    const sessionHeader = "es-deferred-rejected"
+    const tools = [
+      { name: "bash", input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } },
+      { name: "lsp_diagnostics", defer_loading: true, input_schema: { type: "object", properties: { file: { type: "string" } } } },
+    ]
+    mockMessages = [
+      messageStart("msg_deferred_rejected"),
+      toolUseBlockStart(0, "bash", "toolu_bare_bash"),
+      inputJsonDelta(0, '{"command":"ls"}'),
+      blockStop(0),
+      messageDelta("tool_use"),
+      messageStop(),
+      { ...assistantMessage([
+        { type: "tool_use", id: "toolu_bare_bash", name: "bash", input: { command: "ls" } },
+      ]), test_skip_pre_tool_hook: true },
+      unavailableToolMessage("toolu_bare_bash", "bash"),
+      assistantMessage([{ type: "tool_use", id: "toolu_retry_prefixed", name: "mcp__oc__bash", input: { command: "ls" } }]),
+      userDenyMessage("toolu_retry_prefixed"),
+      { ...assistantMessage([
+        { type: "tool_use", id: "toolu_retry_bare", name: "bash", input: { command: "ls -la" } },
+      ]), test_skip_pre_tool_hook: true },
+      unavailableToolMessage("toolu_retry_bare", "bash"),
+      { type: "result", subtype: "error_max_turns", is_error: true, session_id: "test-session" },
+    ]
+    mockTerminalError = new Error("Claude Code returned an error result: Reached maximum number of turns (4)")
+
+    const res = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: true,
+      tools,
+      messages: [{ role: "user", content: "list the files" }],
+    }, sessionHeader)
+    expect(res.status).toBe(200)
+    const events = parseSSE(await res.text())
+    expect(capturedQueryParamsAll[0]?.options.maxTurns).toBe(4)
+    expect(events.filter(e => e.event === "error")).toHaveLength(0)
+    const toolBlocks = events.flatMap(({ event, data }) => {
+      const block = data.content_block as { type?: string; id?: string; name?: string } | undefined
+      return event === "content_block_start" && block?.type === "tool_use" ? [`${block.id}:${block.name}`] : []
+    })
+    expect(toolBlocks).toEqual(["toolu_bare_bash:bash"])
+    const terminalReasons = events.flatMap(({ event, data }) => {
+      const delta = data.delta as { stop_reason?: string } | undefined
+      return event === "message_delta" && typeof delta?.stop_reason === "string" ? [delta.stop_reason] : []
+    })
+    expect(terminalReasons).toEqual(["tool_use"])
+    expect(events.filter(e => e.event === "message_stop")).toHaveLength(1)
+    expect(lookupSharedSession(`${sessionHeader}-${TEST_RUN_ID}`)).toBeUndefined()
+  })
+
+  it("stream: an uncaptured call without CLI rejection still errors at the deferred budget", async () => {
+    process.env.MERIDIAN_PASSTHROUGH_UNCAPTURED_TOOL_RECOVERY = "1"
+    const tools = [
+      { name: "bash", input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } },
+      { name: "lsp_diagnostics", defer_loading: true, input_schema: { type: "object", properties: { file: { type: "string" } } } },
+    ]
+    mockMessages = [
+      messageStart("msg_deferred_unproven"),
+      toolUseBlockStart(0, "bash", "toolu_unproven"),
+      inputJsonDelta(0, '{"command":"ls"}'),
+      blockStop(0),
+      messageDelta("tool_use"),
+      messageStop(),
+      { ...assistantMessage([
+        { type: "tool_use", id: "toolu_unproven", name: "bash", input: { command: "ls" } },
+      ]), test_skip_pre_tool_hook: true },
+      { type: "result", subtype: "error_max_turns", is_error: true, session_id: "test-session" },
+    ]
+    mockTerminalError = new Error("Claude Code returned an error result: Reached maximum number of turns (4)")
+
+    const res = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: true,
+      tools,
+      messages: [{ role: "user", content: "list the files" }],
+    }, "es-deferred-unproven")
+    const events = parseSSE(await res.text())
+    expect(capturedQueryParamsAll[0]?.options.maxTurns).toBe(4)
+    expect(events.filter(e => e.event === "error")).toHaveLength(1)
   })
 
   it("stream: explicit empty tools do not spend the recovered grant", async () => {

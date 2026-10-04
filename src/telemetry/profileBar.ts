@@ -11,6 +11,8 @@
  */
 
 import { buildDriftView, buildIdentityView } from "./buildBadge"
+import { hostLabelView } from "./hostLabel"
+import { statusPillView } from "./statusPill"
 
 /**
  * Canonical Meridian theme.
@@ -135,24 +137,22 @@ export const profileBarCss = `
   }
   .meridian-header .mh-profile:hover { border-color: var(--accent, #58a6ff); }
   .meridian-header .mh-profile.visible { display: inline-flex; }
+  .meridian-header .mh-profile-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .meridian-header .mh-profile .mh-profile-type {
-    color: var(--muted, #8b949e); font-size: 10px;
+    color: var(--muted, #8b949e); font-size: 10px; flex-shrink: 0; white-space: nowrap;
   }
   /* npm update chip — a link to the releases page, so it is blue
      (interactive). Local/dev provenance is the separate .mh-prov pill. */
   .meridian-header .mh-build {
     display: none; align-items: center; gap: 6px;
     font-size: 11px; font-weight: 500; white-space: nowrap;
-    padding: 3px 10px; border-radius: 20px; text-decoration: none;
-    transition: background 0.15s;
+    padding: 3px 10px; border-radius: 20px;
+    color: var(--muted, #8b949e);
+    background: var(--surface, #161b22);
+    border: 1px solid var(--border, #30363d);
+    cursor: default;
   }
   .meridian-header .mh-build.visible { display: inline-flex; }
-  .meridian-header .mh-build.update {
-    color: var(--accent, #58a6ff);
-    background: rgba(88,166,255,0.12);
-    border: 1px solid rgba(88,166,255,0.35);
-  }
-  .meridian-header .mh-build.update:hover { background: rgba(88,166,255,0.18); }
   /* Local/dev build identity: a violet meta pill whose branch and commit
      pieces become blue links only when the backend supplied a safe URL.
      Drift sits beside it as its own chip, because it is refreshed from a
@@ -212,6 +212,17 @@ export const profileBarCss = `
     background: rgba(210,153,34,0.12);
     border-color: rgba(210,153,34,0.35);
   }
+  .meridian-header .mh-update {
+    display: none; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 500; white-space: nowrap;
+    padding: 3px 10px; border-radius: 20px; text-decoration: none;
+    color: var(--accent, #58a6ff);
+    background: rgba(88,166,255,0.12);
+    border: 1px solid rgba(88,166,255,0.35);
+    transition: background 0.15s;
+  }
+  .meridian-header .mh-update.visible { display: inline-flex; }
+  .meridian-header .mh-update:hover { background: rgba(88,166,255,0.18); }
   .meridian-header .mh-profile.following { border-color: var(--accent2, #bc8cff); }
   .meridian-header .mh-profile .mh-profile-follow {
     color: var(--accent2, #bc8cff); font-size: 10px;
@@ -227,6 +238,26 @@ export const profileBarCss = `
   .meridian-header .mh-dot.healthy { background: var(--green, #3fb950); box-shadow: 0 0 6px rgba(63,185,80,0.5); }
   .meridian-header .mh-dot.degraded { background: var(--yellow, #d29922); }
   .meridian-header .mh-dot.unhealthy { background: var(--red, #f85149); }
+  .meridian-header .mh-status.outage,
+  .meridian-header .mh-status.recovering {
+    font-weight: 500; line-height: 16px; padding: 3px 10px; border-radius: 12px; cursor: help;
+  }
+  .meridian-header .mh-status.outage {
+    color: var(--red, #f85149);
+    background: rgba(248,81,73,0.12);
+    border: 1px solid rgba(248,81,73,0.35);
+  }
+  .meridian-header .mh-status.recovering {
+    color: var(--yellow, #d29922);
+    background: rgba(210,153,34,0.12);
+    border: 1px solid rgba(210,153,34,0.35);
+  }
+  .meridian-header .mh-host {
+    display: inline-block; min-width: 0; max-width: 24ch;
+    overflow: hidden; text-overflow: ellipsis; vertical-align: bottom;
+  }
+  .meridian-header .mh-host[hidden] { display: none; }
+  .meridian-header .mh-host::before { content: "·"; margin-right: 6px; }
   @media (max-width: 720px) {
     .meridian-header { gap: 10px; padding: 10px 16px; }
     .meridian-header .mh-right { flex-wrap: wrap; justify-content: flex-end; row-gap: 6px; min-width: 0; }
@@ -236,6 +267,12 @@ export const profileBarCss = `
     .meridian-header .mh-nav a { flex-shrink: 0; }
     .meridian-header .mh-right { flex: 1 1 0; }
     .meridian-header .mh-status .mh-status-text { display: none; }
+    .meridian-header .mh-status.outage .mh-status-text,
+    .meridian-header .mh-status.recovering .mh-status-text { display: inline; }
+    .meridian-header .mh-host { max-width: 14ch; }
+    .meridian-header .mh-host::before { content: none; }
+    .meridian-header .mh-status.outage .mh-host::before,
+    .meridian-header .mh-status.recovering .mh-host::before { content: "·"; }
   }
   /* Wide layout (Settings, Layout): every page drops its centered column and
      spans the window, keeping an edge margin that grows with the screen. The
@@ -263,11 +300,12 @@ export const profileBarHtml = `
     <a href="/plugins" id="nav-plugins">Plugins</a>
   </nav>
   <div class="mh-right">
-    <a class="mh-build" id="mhBuild" target="_blank" rel="noopener"></a>
     <span class="mh-prov" id="mhProv" role="group"></span>
     <span class="mh-drift" id="mhDrift" role="status" hidden></span>
     <a class="mh-profile" id="mhProfile" href="/" title="Active profile — switch from the home page"></a>
-    <span class="mh-status" id="mhStatus"><span class="mh-dot" id="mhDot"></span><span class="mh-status-text" id="mhStatusText"></span></span>
+    <span class="mh-status" id="mhStatus"><span class="mh-dot" id="mhDot"></span><span class="mh-status-text" id="mhStatusText"></span><span class="mh-host" id="mhHost" hidden></span></span>
+    <span class="mh-build" id="mhBuild"></span>
+    <a class="mh-update" id="mhUpdate" href="https://github.com/rynfar/meridian/releases" target="_blank" rel="noopener"></a>
   </div>
 </header>
 `
@@ -276,9 +314,11 @@ export const profileBarJs = `
 (function() {
   var profileChip = document.getElementById('mhProfile');
   var buildChip = document.getElementById('mhBuild');
+  var updateChip = document.getElementById('mhUpdate');
+  var statusPill = document.getElementById('mhStatus');
   var statusDot = document.getElementById('mhDot');
   var statusText = document.getElementById('mhStatusText');
-  var statusEl = document.getElementById('mhStatus');
+  var hostChip = document.getElementById('mhHost');
 
   // Highlight active nav link
   var path = location.pathname;
@@ -294,6 +334,28 @@ export const profileBarJs = `
   // Inlined from src/telemetry/buildBadge.ts, unit-tested in build-badge.test.ts.
   var buildIdentityView = ${buildIdentityView.toString()};
   var buildDriftView = ${buildDriftView.toString()};
+  // Inlined from src/telemetry/statusPill.ts, unit-tested in status-pill.test.ts.
+  var statusPillView = ${statusPillView.toString()};
+
+  function renderStatus(view) {
+    statusPill.className = 'mh-status' + (view.alert ? ' ' + view.alert : '');
+    statusDot.className = 'mh-dot ' + view.tone;
+    statusText.textContent = view.text;
+    if (view.title) statusPill.title = view.title;
+    else statusPill.removeAttribute('title');
+  }
+
+  // Inlined from src/telemetry/hostLabel.ts, unit-tested in host-label.test.ts.
+  var hostLabelView = ${hostLabelView.toString()};
+
+  function renderHost(name) {
+    var view = hostLabelView(name);
+    hostChip.hidden = !view;
+    hostChip.textContent = view ? view.text : '';
+    if (view) hostChip.title = view.title;
+    else hostChip.removeAttribute('title');
+  }
+
   var provChip = document.getElementById('mhProv');
   var driftChip = document.getElementById('mhDrift');
   var provKey = '';
@@ -357,6 +419,7 @@ export const profileBarJs = `
   }
 
   function fitBuildChip() {
+    profileChip.style.maxWidth = '';
     var steps = [['shown', 'full'], ['hidden', 'full']].concat(provForms.map(function(form) { return ['hidden', form]; }));
     function apply(step) { headerEl.setAttribute('data-prov-calm', step[0]); headerEl.setAttribute('data-prov-form', step[1]); }
     for (var pass = 0; pass < 2; pass++) {
@@ -364,6 +427,17 @@ export const profileBarJs = `
         apply(steps[i]);
         if (rightFits(pass === 0)) return;
       }
+    }
+    // Native scrollbars and long account names can exhaust the row even with
+    // version-only provenance. Preserve health/update/warning chips and give
+    // the account name the remaining space; its full identity stays in title.
+    var visible = Array.from(rightEl.children).filter(function(el) { return el.getBoundingClientRect().width > 0; });
+    var used = visible.filter(function(el) { return el !== profileChip; }).reduce(function(sum, el) { return sum + el.getBoundingClientRect().width; }, 0);
+    var gap = parseFloat(getComputedStyle(rightEl).columnGap) || 0;
+    var budget = Math.floor(rightEl.clientWidth - used - gap * Math.max(0, visible.length - 1));
+    if (profileChip.getBoundingClientRect().width > budget && budget >= 96) {
+      profileChip.style.maxWidth = budget + 'px';
+      if (!rightFits(false)) profileChip.style.maxWidth = '';
     }
   }
 
@@ -395,14 +469,18 @@ export const profileBarJs = `
   // yanks a link out from under the pointer or keyboard focus.
   function renderBuild(build) {
     var view = buildIdentityView(build);
-    if (view.mode === 'update') {
-      buildChip.textContent = view.text;
-      buildChip.href = view.href;
-      buildChip.title = view.title;
-      buildChip.className = 'mh-build update visible';
+    var known = build && build.version && build.version !== 'unknown';
+    buildChip.textContent = known ? 'v' + build.version : '';
+    buildChip.title = known ? 'Running Meridian ' + build.version : '';
+    // Local provenance already includes release/package version and run identity.
+    buildChip.className = known && build.source === 'npm' ? 'mh-build visible' : 'mh-build';
+    if (build && build.updateAvailable && build.latest) {
+      updateChip.textContent = 'update available';
+      updateChip.title = build.latest + ' is published, running ' + build.version + ' — ' +
+        (build.source === 'npm' ? 'update with:\\nnpm install -g @rynfar/meridian@latest' : 'pull and rebuild this checkout');
+      updateChip.className = 'mh-update visible';
     } else {
-      buildChip.removeAttribute('href');
-      buildChip.className = 'mh-build';
+      updateChip.className = 'mh-update';
     }
     var key = JSON.stringify(view);
     if (key !== provKey) {
@@ -484,19 +562,17 @@ export const profileBarJs = `
 
   function loadHeader() {
     fetch('/health').then(function(r) { return r.json(); }).then(function(h) {
-      var st = h.status === 'healthy' ? 'healthy' : h.status === 'degraded' ? 'degraded' : 'unhealthy';
-      statusDot.className = 'mh-dot ' + st;
-      statusText.textContent = st === 'healthy' ? 'Operational' : st === 'degraded' ? 'Degraded' : 'Offline';
-      statusEl.title = h.error ? statusText.textContent + ': ' + h.error : statusText.textContent;
+      var view = statusPillView(h);
+      renderStatus(view);
+      if (!view.title && h.error) statusPill.title = view.text + ': ' + h.error;
+      renderHost(h.hostname);
       renderBuild(h.build);
       if (h.backend === 'antigravity') {
         ['nav-telemetry','nav-profiles','nav-settings','nav-plugins'].forEach(function(id) { document.getElementById(id).hidden = true; });
         profileChip.removeAttribute('href');
       }
     }).catch(function() {
-      statusDot.className = 'mh-dot unhealthy';
-      statusText.textContent = 'Offline';
-      statusEl.title = 'Offline';
+      renderStatus(statusPillView(null));
     });
 
     fetch('/profiles/list').then(function(r) { return r.json(); }).then(function(data) {
@@ -513,7 +589,7 @@ export const profileBarJs = `
       var followLabel = follow ? (follow.activeProfile ? 'following' : 'follow: local') : '';
       if (follow && follow.stale) followLabel += ' (stale)';
       profileChip.innerHTML = actives.map(function(p) {
-        return esc(p.id) + ' <span class="mh-profile-type">' + esc(p.type || '') + '</span>'
+        return '<span class="mh-profile-name">' + esc(p.id) + '</span> <span class="mh-profile-type">' + esc(p.type || '') + '</span>'
           + (follow && p.provider !== 'chatgpt' ? ' <span class="mh-profile-follow">' + esc(followLabel) + '</span>' : '');
       }).join(' \\u00b7 ');
       profileChip.classList.toggle('following', !!follow);
@@ -525,6 +601,7 @@ export const profileBarJs = `
         : actives.length > 1
           ? 'Active profiles, one per provider — switch from the home page'
           : 'Active profile — switch from the home page';
+      profileChip.title += ' — ' + actives.map(function(p) { return p.id; }).join(', ');
       profileChip.classList.add('visible');
     }).catch(function() {});
   }

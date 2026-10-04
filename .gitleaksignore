@@ -27,3 +27,8 @@ src/__tests__/priority-session-store.test.ts:generic-api-key:867
 # process.env.OPENAI_API_KEY to a literal beginning "fixture-". File is
 # byte-identical to upstream/main.
 src/__tests__/antigravity-gaps.test.ts:dreamhost-service-credentials:297
+
+# Upstream's #1249 live driver hands Claude Code a letters-only placeholder
+# ANTHROPIC_API_KEY to talk to a local Meridian, which ignores it. File is
+# byte-identical to upstream/main; verified at the f299fe06 merge.
+scripts/e2e-thinking-display-interactive-driver.py:dreamhost-service-credentials:22

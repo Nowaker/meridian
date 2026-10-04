@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
 import { spawn, spawnSync } from "node:child_process"
-import { realpathSync } from "node:fs"
+import { existsSync, readFileSync, realpathSync } from "node:fs"
 import {
   chmod,
   link,
@@ -33,7 +33,23 @@ export {
   SessionLifecycleQueueStalledError,
   SessionLifecycleReentrancyError,
 } from "./session/lifecycleErrors"
-import { getMaxStoredSessionsLimit, getSessionStoreDir } from "./sessionStore"
+import {
+  getMaxStoredSessionsLimit,
+  getSessionStoreDir,
+  pruneSupersededProfileCopies,
+  listSupersededProfileConversations,
+  type ProfileCopyPruneOptions,
+} from "./sessionStore"
+import { CrossProcessTurnCoordinator, type CrossProcessTurnLease } from "./session/crossProcessTurnCoordinator"
+import {
+  fileDigest,
+  getStoreLockWaitMs,
+  openStoreDatabase,
+  retireImportedFile,
+  STORE_DATABASE_NAME,
+  type StoreDatabase,
+  type WriteOp,
+} from "./session/storeDatabase"
 import {
   directoryRenameWasBlocked,
   syncDirectoryDurably,
@@ -217,7 +233,7 @@ export async function acquireActiveTranscriptLease(
   if (!owner) throw new SessionLifecycleError("cannot capture active transcript owner incarnation")
   const token = randomUUID()
   await withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const unarmedLeaseTtlMs = nonNegativeOption(options.unarmedLeaseTtlMs, DEFAULT_UNARMED_LEASE_TTL_MS, "unarmedLeaseTtlMs")
     for (const [key, locator] of normalized) {
       const resource = sidecar.resources[key]
@@ -234,7 +250,7 @@ export async function acquireActiveTranscriptLease(
       resource.activeLeases ??= {}
       resource.activeLeases[token] = { token, owner, createdAt: nowMs(options) }
     }
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
   })
   return { token, resourceKeys: normalized.map(([key]) => key) }
 }
@@ -249,7 +265,7 @@ export async function attachActiveTranscriptExecutor(
   const parsedExecutor = parseProcessIncarnation(executor)
   if (!parsedExecutor) throw new TypeError("invalid active transcript executor incarnation")
   await withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     for (const key of lease.resourceKeys) {
       const record = sidecar.resources[key]?.activeLeases?.[lease.token]
       if (!record) throw new SessionLifecycleError(`active transcript lease ${lease.token} was lost`)
@@ -257,7 +273,7 @@ export async function attachActiveTranscriptExecutor(
       record.executor = parsedExecutor
       record.executorRecoverable = executorRecoverable
     }
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
   })
 }
 
@@ -267,7 +283,7 @@ export async function releaseActiveTranscriptLease(
   options: SessionLifecycleOptions = {},
 ): Promise<void> {
   await withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     let changed = false
     for (const key of lease.resourceKeys) {
       const resource = sidecar.resources[key]
@@ -276,7 +292,7 @@ export async function releaseActiveTranscriptLease(
       if (Object.keys(resource.activeLeases).length === 0) delete resource.activeLeases
       changed = true
     }
-    if (changed) await writeSidecar(paths.sidecar, sidecar)
+    if (changed) await writeSidecar(paths, sidecar)
   })
 }
 
@@ -346,7 +362,7 @@ async function prepareForkIntent(
   const normalized = canonicalizeTranscriptLocator(locator)
   const key = getTranscriptResourceKey(normalized)
   return withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const existing = sidecar.resources[key]
     if (existing) {
       if (publicationOwner) throw new SessionLifecycleError(`publication target ${key} already exists`)
@@ -358,8 +374,9 @@ async function prepareForkIntent(
       Object.assign(locator, exactLocator(existing))
       return exactLocator(existing)
     }
-    assertResourceCapacity(sidecar, options, "prepared")
     const now = nowMs(options)
+    deferRetirementForAdmission(sidecar, options, now)
+    assertResourceCapacity(sidecar, options, "prepared")
     const resource: TranscriptResource = {
       key,
       generation: allocateLifecycleGeneration(sidecar, key),
@@ -377,7 +394,7 @@ async function prepareForkIntent(
     }
     sidecar.resources[key] = resource
     pruneTombstones(sidecar, options)
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
     Object.assign(locator, exactLocator(resource))
     return exactLocator(resource)
   })
@@ -391,7 +408,7 @@ export async function ensureTranscriptJournaled(
   const normalized = canonicalizeTranscriptLocator(locator)
   const key = getTranscriptResourceKey(normalized)
   return withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const existing = sidecar.resources[key]
     if (existing) {
       assertSameLocator(existing.locator, normalized)
@@ -418,7 +435,7 @@ export async function ensureTranscriptJournaled(
     }
     sidecar.resources[key] = resource
     pruneTombstones(sidecar, options)
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
     Object.assign(locator, exactLocator(resource))
     return exactLocator(resource)
   })
@@ -432,7 +449,7 @@ export async function registerLiveTranscript(
   const normalized = canonicalizeTranscriptLocator(locator)
   const key = getTranscriptResourceKey(normalized)
   return withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     let resource = sidecar.resources[key]
     if (!resource) {
       if (normalized.lifecycleGeneration !== undefined) {
@@ -451,7 +468,7 @@ export async function registerLiveTranscript(
       }
       sidecar.resources[key] = resource
       pruneTombstones(sidecar, options)
-      await writeSidecar(paths.sidecar, sidecar)
+      await writeSidecar(paths, sidecar)
       Object.assign(locator, exactLocator(resource))
       return exactLocator(resource)
     }
@@ -468,7 +485,7 @@ export async function registerLiveTranscript(
     resource.updatedAt = nowMs(options)
     delete resource.nextAttemptAt
     delete resource.lastError
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
     Object.assign(locator, exactLocator(resource))
     return exactLocator(resource)
   })
@@ -482,7 +499,7 @@ export async function commitFork(
   const normalized = canonicalizeTranscriptLocator(locator)
   const key = getTranscriptResourceKey(normalized)
   await withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const resource = sidecar.resources[key]
     if (!resource) {
       throw new SessionLifecycleError(`fork ${key} was not prepared`)
@@ -497,20 +514,21 @@ export async function commitFork(
     resource.updatedAt = nowMs(options)
     delete resource.nextAttemptAt
     delete resource.lastError
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
   })
 }
 
 /**
  * Fence durable mapping publication against GC's final claim transaction.
- * The callback must be synchronous and must perform the session-store CAS.
+ * The callback must perform the session-store CAS; the lifecycle lock is held
+ * until it settles.
  * A normal publisher must refer to an already journaled resource. This makes
  * tombstone pruning safe: a delayed old publisher cannot recreate a locator
  * that GC already deleted.
  */
 export async function publishPinnedTranscript<T extends boolean | string>(
   locator: TranscriptLocator,
-  publish: () => T,
+  publish: () => T | Promise<T>,
   options: SessionLifecycleOptions = {},
 ): Promise<T> {
   return updatePinnedTranscript(locator, publish, options, false)
@@ -523,7 +541,7 @@ export async function publishPinnedTranscript<T extends boolean | string>(
  */
 export async function attachPinnedTranscript<T extends boolean | string>(
   locator: TranscriptLocator,
-  publish: () => T,
+  publish: () => T | Promise<T>,
   options: SessionLifecycleOptions = {},
 ): Promise<T> {
   return updatePinnedTranscript(locator, publish, options, true)
@@ -531,7 +549,7 @@ export async function attachPinnedTranscript<T extends boolean | string>(
 
 async function updatePinnedTranscript<T extends boolean | string>(
   locator: TranscriptLocator,
-  publish: () => T,
+  publish: () => T | Promise<T>,
   options: SessionLifecycleOptions,
   allowMissing: boolean,
 ): Promise<T> {
@@ -539,7 +557,7 @@ async function updatePinnedTranscript<T extends boolean | string>(
   const key = getTranscriptResourceKey(normalized)
   const originalGeneration = locator.lifecycleGeneration
   return withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const beforeMutation = structuredClone(sidecar)
     let resource = sidecar.resources[key]
     let changed = false
@@ -576,24 +594,24 @@ async function updatePinnedTranscript<T extends boolean | string>(
       }
     }
     // Release publication ownership in the same locked transaction as the
-    // synchronous mapping CAS. A failed CAS restores the complete lease record.
+    // mapping CAS. A failed CAS restores the complete lease record.
     if (releasePublicationLease(resource)) changed = true
     if (changed) {
       pruneTombstones(sidecar, options)
-      await writeSidecar(paths.sidecar, sidecar)
+      await writeSidecar(paths, sidecar)
     }
-    // Keep the lifecycle lock held across the synchronous session-store CAS.
+    // Keep the lifecycle lock held across the session-store CAS.
     locator.lifecycleGeneration = resource.generation
     try {
-      const result = publish()
+      const result = await publish()
       if (result === false) {
-        if (changed) await writeSidecar(paths.sidecar, beforeMutation)
+        if (changed) await writeSidecar(paths, beforeMutation)
         if (originalGeneration === undefined) delete locator.lifecycleGeneration
         else locator.lifecycleGeneration = originalGeneration
       }
       return result
     } catch (error) {
-      if (changed) await writeSidecar(paths.sidecar, beforeMutation)
+      if (changed) await writeSidecar(paths, beforeMutation)
       if (originalGeneration === undefined) delete locator.lifecycleGeneration
       else locator.lifecycleGeneration = originalGeneration
       throw error
@@ -609,7 +627,7 @@ export async function abandonFork(
   const normalized = canonicalizeTranscriptLocator(locator)
   const key = getTranscriptResourceKey(normalized)
   await withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const resource = sidecar.resources[key]
     if (!resource) {
       throw new SessionLifecycleError(`fork ${key} was not prepared`)
@@ -622,9 +640,9 @@ export async function abandonFork(
       resource.state = "retired"
       resource.updatedAt = nowMs(options)
       resource.nextAttemptAt = resource.updatedAt + retiredGraceMs(options)
-      await writeSidecar(paths.sidecar, sidecar)
+      await writeSidecar(paths, sidecar)
     } else if (releasedPublication) {
-      await writeSidecar(paths.sidecar, sidecar)
+      await writeSidecar(paths, sidecar)
     }
   })
 }
@@ -640,9 +658,16 @@ export async function reconcile(
   // Validate caller pins before waiting for the lock. The authoritative pin
   // provider is refreshed again while the lifecycle lock is held.
   indexPins(pins)
-  return withSidecarLock(options, async (paths) => {
+  return withSidecarLock(options, paths => reconcileUnderLock(pins, options, paths))
+}
+
+async function reconcileUnderLock(
+  pins: readonly TranscriptLocator[],
+  options: SessionLifecycleOptions,
+  paths: SidecarPaths,
+): Promise<ReconcileResult> {
     const effectivePins = indexPins(options.pinProvider?.() ?? pins)
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const pinKeys = new Set(Object.values(sidecar.resources)
       .filter((resource) => resourceIsPinned(resource, effectivePins))
       .map((resource) => resource.key))
@@ -741,8 +766,59 @@ export async function reconcile(
       }
     }
 
-    if (changed) await writeSidecar(paths.sidecar, sidecar)
+    if (changed) await writeSidecar(paths, sidecar)
     return result
+}
+
+/**
+ * Remove superseded cross-profile mappings no faster than the transcript
+ * backlog can absorb them. Fresh-request admission draws on the same pending
+ * budget and, when it is full, returns the newest retired transcripts to live
+ * (deferRetirementForAdmission) - which would undo this prune's retirements
+ * one request at a time. The transcripts unpinned here are therefore capped to
+ * keep at least half of the budget free: a large first prune drains over
+ * successive sweeps, as retired transcripts are deleted, instead of filling
+ * the backlog at once.
+ * Reconciliation reserves retirement capacity before releasing the same lock.
+ * An authoritative pin provider is required. Returns mappings removed.
+ */
+export async function releaseSupersededProfileCopies(
+  copies: Omit<ProfileCopyPruneOptions, "maxUnpinnedTranscripts">,
+  options: SessionLifecycleOptions = {},
+  turnCoordinator = new CrossProcessTurnCoordinator(join(options.storeDir ?? getSessionStoreDir(), "turn-locks")),
+): Promise<number> {
+  const maxPending = option(options.maxPending, DEFAULT_MAX_PENDING, "maxPending")
+  if (!options.pinProvider) throw new SessionLifecycleError("profile-copy pruning requires an authoritative pin provider")
+  return withSidecarLock(options, async paths => {
+    // Recover unrecorded retirements from an earlier failed publication before
+    // granting more capacity; a pin-provider/write failure must precede pruning.
+    await reconcileUnderLock([], options, paths)
+    const sidecar = await readSidecar(paths)
+    const budget = Math.floor(maxPending / 2) - pendingResourceCount(sidecar)
+    if (budget <= 0) return 0
+    const selection = { ...copies, maxUnpinnedTranscripts: budget }
+    const conversations = listSupersededProfileConversations(selection).slice(0, 64)
+    const leases: CrossProcessTurnLease[] = []
+    const fenced = new Set<string>()
+    try {
+      // Never wait while holding the sidecar lock: a request holding a turn
+      // may itself need lifecycle metadata. Busy conversations wait for a later sweep.
+      for (const conversation of conversations) {
+        const lease = await turnCoordinator.tryAcquireIdle(`session:${conversation}`)
+        if (!lease) continue
+        leases.push(lease)
+        fenced.add(conversation)
+      }
+      const removed = await pruneSupersededProfileCopies({ ...selection,
+        isConversationActive: id => !fenced.has(id) || copies.isConversationActive(id),
+      })
+      if (removed) await reconcileUnderLock([], options, paths)
+      return removed
+    } finally {
+      const releases = await Promise.allSettled(leases.map(lease => lease.release()))
+      const failed = releases.find(result => result.status === "rejected")
+      if (failed?.status === "rejected") throw failed.reason
+    }
   })
 }
 
@@ -825,7 +901,7 @@ async function claimDeletion(
   options: SessionLifecycleOptions,
 ): Promise<TranscriptResource | undefined> {
   return withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const refreshedPins = options.pinProvider?.()
     const finalPins = refreshedPins ? indexPins(refreshedPins) : pins
     const now = nowMs(options)
@@ -842,7 +918,7 @@ async function claimDeletion(
         && (resource.nextAttemptAt ?? 0) <= now)
       .sort((left, right) => left.updatedAt - right.updatedAt || left.key.localeCompare(right.key))[0]
     if (!candidate) {
-      if (leasesChanged) await writeSidecar(paths.sidecar, sidecar)
+      if (leasesChanged) await writeSidecar(paths, sidecar)
       return undefined
     }
     const deletionOwner = captureProcessIncarnation()
@@ -853,7 +929,7 @@ async function claimDeletion(
     candidate.deletionOwner = deletionOwner
     delete candidate.deletionExecutor
     delete candidate.deletionProcessGroupId
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
     return structuredClone(candidate)
   })
 }
@@ -866,7 +942,7 @@ async function attachDeletionExecutor(
   options: SessionLifecycleOptions,
 ): Promise<void> {
   await withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const resource = sidecar.resources[key]
     if (!resource || resource.state !== "deleting" || resource.deletionToken !== deletionToken) {
       throw new SessionLifecycleError(`deletion lease for ${key} was lost before executor handshake`)
@@ -874,7 +950,7 @@ async function attachDeletionExecutor(
     resource.deletionExecutor = executor
     resource.deletionProcessGroupId = processGroupId
     resource.updatedAt = nowMs(options)
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
   })
 }
 
@@ -885,7 +961,7 @@ async function finishDeletion(
   options: SessionLifecycleOptions,
 ): Promise<void> {
   await withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     const resource = sidecar.resources[key]
     if (!resource || resource.state !== "deleting" || resource.deletionToken !== deletionToken) {
       throw new SessionLifecycleError(`deletion lease for ${key} was lost`)
@@ -910,7 +986,7 @@ async function finishDeletion(
       resource.nextAttemptAt = now + delay
     }
     pruneTombstones(sidecar, options)
-    await writeSidecar(paths.sidecar, sidecar)
+    await writeSidecar(paths, sidecar)
   })
 }
 
@@ -919,7 +995,7 @@ async function countDeferred(
   options: SessionLifecycleOptions,
 ): Promise<number> {
   return withSidecarLock(options, async (paths) => {
-    const sidecar = await readSidecar(paths.sidecar)
+    const sidecar = await readSidecar(paths)
     return Object.values(sidecar.resources).filter((resource) =>
       (resource.state === "retired" || resource.state === "deleting")
       && !resourceIsPinned(resource, pins)).length
@@ -1576,22 +1652,224 @@ async function recoverStaleLock(lockPath: string, staleMs: number): Promise<void
   }
 }
 
-async function readSidecar(path: string): Promise<SessionGcSidecar> {
-  let raw: string
-  try {
-    raw = await readFile(path, "utf8")
-  } catch (error) {
-    if (hasCode(error, "ENOENT")) return {
-      version: SIDECAR_VERSION,
-      meta: { fenceSlots: {} },
-      resources: {},
-    }
-    throw error
-  }
+interface LifecycleInfoRow {
+  seq: number
+  commit_token: string | null
+  imported_json_sha256: string | null
+}
 
+interface LifecycleRows {
+  /** Each resource's record, serialized. A stored record not here is deleted. */
+  records: ReadonlyMap<string, string>
+  /** Counters that may have advanced. Any other is left as stored. */
+  fenceSlots: ReadonlyMap<string, number>
+}
+
+interface LifecycleCache {
+  /** The lifecycle commit the cache reflects. Every lifecycle commit advances it. */
+  seq: number
+  /** Each resource's record, exactly as stored. Every one has been checked. */
+  records: ReadonlyMap<string, string>
+  /**
+   * The fence counters, checked. A transaction's journal reads them through
+   * its prototype chain, so they are advanced in place rather than copied:
+   * they only ever advance, and lifecycle transactions run one at a time.
+   */
+  fenceSlots: Record<string, number>
+}
+
+// The journal as of the latest lifecycle commit this process has read, each
+// row checked once, when it was read. While nothing changed, a transaction's
+// read of it touches one row; after another process commits, only the rows it
+// wrote are read and checked again.
+const lifecycleCaches = new WeakMap<StoreDatabase, LifecycleCache>()
+
+const UPSERT_RESOURCE = "INSERT INTO lifecycle_resources (key, seq, record) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET seq = excluded.seq, record = excluded.record"
+const DELETE_RESOURCE = "DELETE FROM lifecycle_resources WHERE key = ?"
+const UPSERT_FENCE_SLOT = "INSERT INTO lifecycle_fence_slots (slot, counter, seq) VALUES (?, ?, ?) ON CONFLICT(slot) DO UPDATE SET counter = excluded.counter, seq = excluded.seq"
+const UPDATE_LIFECYCLE_INFO = "UPDATE lifecycle_info SET seq = ?, commit_token = ? WHERE id = 1"
+const RECORD_LIFECYCLE_IMPORT = "UPDATE lifecycle_info SET imported_json_sha256 = ?, imported_json_at = ? WHERE id = 1"
+
+function lifecycleDatabase(dir: string): StoreDatabase {
+  return openStoreDatabase(dir, getStoreLockWaitMs())
+}
+
+function readLifecycleInfo(database: StoreDatabase): LifecycleInfoRow {
+  const info = database.get<LifecycleInfoRow>(
+    "SELECT seq, commit_token, imported_json_sha256 FROM lifecycle_info WHERE id = 1",
+  )
+  if (!info || !Number.isSafeInteger(info.seq) || info.seq < 0) {
+    throw new SessionLifecycleCorruptError(`${database.path} has no valid lifecycle_info row`)
+  }
+  return info
+}
+
+/** The cache, brought up to the database's latest lifecycle commit. */
+function freshLifecycleCache(database: StoreDatabase): LifecycleCache {
+  const cached = lifecycleCaches.get(database)
+  if (cached && readLifecycleInfo(database).seq === cached.seq) return cached
+  const fresh = database.snapshot((): LifecycleCache => {
+    const info = readLifecycleInfo(database)
+    if (cached?.seq === info.seq) return cached
+    return cached && cached.seq < info.seq
+      ? caughtUpLifecycleCache(database, cached, info.seq)
+      : loadLifecycleCache(database, info.seq)
+  })
+  lifecycleCaches.set(database, fresh)
+  return fresh
+}
+
+function loadLifecycleCache(database: StoreDatabase, seq: number): LifecycleCache {
+  const fenceSlots = Object.create(null) as Record<string, number>
+  for (const { slot, counter } of database.all<{ slot: string; counter: number }>(
+    "SELECT slot, counter FROM lifecycle_fence_slots",
+  )) {
+    assertValidFenceSlot(slot, counter, database.path)
+    fenceSlots[slot] = counter
+  }
+  const records = new Map<string, string>()
+  for (const { key, record } of database.all<{ key: string; record: string }>(
+    "SELECT key, record FROM lifecycle_resources",
+  )) {
+    assertValidRecord(key, record, fenceSlots, database.path)
+    records.set(key, record)
+  }
+  return { seq, records, fenceSlots }
+}
+
+/** `cached` with what other processes committed since, read and checked. */
+function caughtUpLifecycleCache(database: StoreDatabase, cached: LifecycleCache, seq: number): LifecycleCache {
+  // Rows carry the sequence of the lifecycle commit that last wrote them.
+  const slots = database.all<{ slot: string; counter: number }>(
+    "SELECT slot, counter FROM lifecycle_fence_slots WHERE seq > ?",
+    cached.seq,
+  )
+  for (const { slot, counter } of slots) assertValidFenceSlot(slot, counter, database.path)
+  // The cached records were checked against the counters the cache holds, so
+  // a counter moved back could leave one ahead of it unnoticed. Counters only
+  // ever advance; for a journal where one did not, check every row again.
+  if (slots.some(({ slot, counter }) => counter < (cached.fenceSlots[slot] ?? 0))) {
+    return loadLifecycleCache(database, seq)
+  }
+  for (const { slot, counter } of slots) cached.fenceSlots[slot] = counter
+  const present = new Set(database.all<{ key: string }>("SELECT key FROM lifecycle_resources").map((row) => row.key))
+  const records = new Map([...cached.records].filter(([key]) => present.has(key)))
+  for (const { key, record } of database.all<{ key: string; record: string }>(
+    "SELECT key, record FROM lifecycle_resources WHERE seq > ?",
+    cached.seq,
+  )) {
+    assertValidRecord(key, record, cached.fenceSlots, database.path)
+    records.set(key, record)
+  }
+  return { seq, records, fenceSlots: cached.fenceSlots }
+}
+
+function assertValidFenceSlot(slot: string, counter: unknown, source: string): void {
+  if (!isValidFenceSlot(slot, counter)) {
+    throw new SessionLifecycleCorruptError(`invalid lifecycle fence slot ${slot} in ${source}`)
+  }
+}
+
+/** Throws unless `record` is a valid record of transcript `key` under these fence counters. */
+function assertValidRecord(
+  key: string,
+  record: string,
+  fenceSlots: Readonly<Record<string, number>>,
+  source: string,
+): void {
+  let resource: unknown
+  try {
+    resource = JSON.parse(record)
+  } catch (error) {
+    throw new SessionLifecycleCorruptError(`cannot parse transcript ${key} in ${source}: ${errorMessage(error)}`)
+  }
+  if (!isValidResource(resource, key, fenceSlots)) {
+    throw new SessionLifecycleCorruptError(`invalid transcript ${key} in ${source}`)
+  }
+}
+
+/** The journal for a transaction to change. Its fence counters read through to the cache's. */
+function draftSidecar(cache: LifecycleCache): SessionGcSidecar {
+  const resources: Record<string, TranscriptResource> = {}
+  for (const [key, record] of cache.records) resources[key] = JSON.parse(record) as TranscriptResource
+  return {
+    version: SIDECAR_VERSION,
+    meta: { fenceSlots: Object.create(cache.fenceSlots) as Record<string, number> },
+    resources,
+  }
+}
+
+/** The rows of `sidecar`. A transaction's journal holds as its own only the counters it advanced. */
+function lifecycleRowsOf(sidecar: SessionGcSidecar): LifecycleRows {
+  return {
+    records: new Map(Object.entries(sidecar.resources).map(([key, resource]) => [key, JSON.stringify(resource)])),
+    fenceSlots: new Map(Object.entries(sidecar.meta.fenceSlots)),
+  }
+}
+
+/**
+ * Make the stored journal `next` in one transaction, writing only the rows
+ * that differ. Fence counters only ever advance, whatever `next` holds, and a
+ * record the next transaction could not read is refused before anything is
+ * committed. Returns whether anything was committed.
+ */
+async function commitLifecycleRows(
+  database: StoreDatabase,
+  next: LifecycleRows,
+  extraOps: readonly WriteOp[] = [],
+): Promise<boolean> {
+  const commitToken = randomUUID()
+  const { committed, result } = await database.transact<{
+    base: LifecycleCache
+    cache: LifecycleCache
+    advanced: ReadonlyMap<string, number>
+  } | undefined>({
+    lockWaitMs: getStoreLockWaitMs(),
+    build: () => {
+      const base = freshLifecycleCache(database)
+      const seq = base.seq + 1
+      const ops: WriteOp[] = []
+      const source = `${database.path} (not committed)`
+      const fenceSlots = Object.create(base.fenceSlots) as Record<string, number>
+      const advanced = new Map<string, number>()
+      for (const [slot, counter] of next.fenceSlots) {
+        if (counter <= (base.fenceSlots[slot] ?? 0)) continue
+        assertValidFenceSlot(slot, counter, source)
+        fenceSlots[slot] = counter
+        advanced.set(slot, counter)
+        ops.push([UPSERT_FENCE_SLOT, [slot, counter, seq]])
+      }
+      for (const [key, record] of next.records) {
+        if (base.records.get(key) === record) continue
+        assertValidRecord(key, record, fenceSlots, source)
+        ops.push([UPSERT_RESOURCE, [key, seq, record]])
+      }
+      for (const key of base.records.keys()) {
+        if (!next.records.has(key)) ops.push([DELETE_RESOURCE, [key]])
+      }
+      if (ops.length === 0 && extraOps.length === 0) return { ops, result: undefined }
+      ops.push(...extraOps, [UPDATE_LIFECYCLE_INFO, [seq, commitToken]])
+      const cache = { seq, records: next.records, fenceSlots: base.fenceSlots }
+      return { ops, result: { base, cache, advanced } }
+    },
+    landedDespiteError: () => readLifecycleInfo(database).commit_token === commitToken,
+  })
+  if (committed && result) {
+    if (lifecycleCaches.get(database) === result.base) {
+      for (const [slot, counter] of result.advanced) result.base.fenceSlots[slot] = counter
+      lifecycleCaches.set(database, result.cache)
+    } else if ((lifecycleCaches.get(database)?.seq ?? -1) < result.cache.seq) {
+      lifecycleCaches.delete(database)
+    }
+  }
+  return committed
+}
+
+/** Parse and validate a session-gc.json, upgrading the v1 format. */
+function parseLegacySidecar(raw: Buffer, path: string): SessionGcSidecar {
   let value: unknown
   try {
-    value = JSON.parse(raw)
+    value = JSON.parse(raw.toString("utf8"))
   } catch (error) {
     throw new SessionLifecycleCorruptError(`cannot parse ${path}: ${errorMessage(error)}`)
   }
@@ -1602,27 +1880,100 @@ async function readSidecar(path: string): Promise<SessionGcSidecar> {
   return upgraded
 }
 
-async function writeSidecar(path: string, sidecar: SessionGcSidecar): Promise<void> {
-  const temp = `${path}.tmp-${process.pid}-${randomUUID()}`
-  let handle: Awaited<ReturnType<typeof open>> | undefined
+/**
+ * The journal after taking a session-gc.json into `base`.
+ *
+ * An empty journal takes the file whole. A journal that already holds records
+ * received the file from a Meridian still on the JSON journal: once the first
+ * import renamed the file aside, that process found none and wrote only what
+ * it did since. Its records replace the stored copies of the same transcripts,
+ * no stored record is removed, and fence counters only ever advance.
+ */
+function mergeLegacySidecar(base: LifecycleCache, legacy: SessionGcSidecar): LifecycleRows {
+  const records = new Map(base.records)
+  for (const [key, resource] of Object.entries(legacy.resources)) records.set(key, JSON.stringify(resource))
+  // Committing them advances only the counters ahead of the stored ones.
+  return { records, fenceSlots: new Map(Object.entries(legacy.meta.fenceSlots)) }
+}
+
+/**
+ * Take in a session-gc.json before the transaction that found it reads the
+ * journal. Every version writes that file only under the lifecycle lock this
+ * transaction holds, so nothing changes it or the stored rows meanwhile. The
+ * file stays authoritative until the import commits; the recorded digest
+ * turns a file found again after a crash between the commit and the rename
+ * into a plain rename. A file that does not parse fails the transaction and
+ * is left untouched.
+ */
+async function importLegacySidecar(database: StoreDatabase, legacyPath: string): Promise<void> {
+  if (!existsSync(legacyPath)) return
+  let raw: Buffer
   try {
-    handle = await open(temp, "wx", 0o600)
-    // Compact on purpose: machine-read only, and indentation costs ~25% of the
-    // bytes and of the serialisation CPU spent under the lock.
-    await handle.writeFile(`${JSON.stringify(sidecar)}\n`, "utf8")
-    await handle.sync()
-    await handle.close()
-    handle = undefined
-    await rename(temp, path)
-    await chmod(path, 0o600)
-    // Persist the rename itself, not only the temporary file contents. This is
-    // the durability boundary before the SDK may create a managed fork.
-    await syncDirectoryDurably(dirname(path))
+    raw = await readFile(legacyPath)
   } catch (error) {
-    await handle?.close().catch(() => undefined)
-    await unlink(temp).catch(() => undefined)
+    if (hasCode(error, "ENOENT")) return
     throw error
   }
+  const digest = fileDigest(raw)
+  if (readLifecycleInfo(database).imported_json_sha256 !== digest) {
+    const legacy = parseLegacySidecar(raw, legacyPath)
+    const merged = mergeLegacySidecar(freshLifecycleCache(database), legacy)
+    await commitLifecycleRows(database, merged, [[RECORD_LIFECYCLE_IMPORT, [digest, Date.now()]]])
+    console.error(`[sessionLifecycle] imported ${Object.keys(legacy.resources).length} transcript records from ${SIDECAR_NAME} into ${basename(database.path)}`)
+  }
+  try {
+    const retiredPath = await retireImportedFile(legacyPath, digest)
+    if (retiredPath) {
+      console.error(`[sessionLifecycle] ${SIDECAR_NAME} is in the database now; the file is kept as ${basename(retiredPath)}`)
+    }
+  } catch (error) {
+    console.error(`[sessionLifecycle] renaming the imported ${SIDECAR_NAME} aside failed; it is retried by the next transaction:`, errorMessage(error))
+  }
+}
+
+async function readSidecar(paths: SidecarPaths): Promise<SessionGcSidecar> {
+  const database = lifecycleDatabase(dirname(paths.sidecar))
+  await importLegacySidecar(database, paths.sidecar)
+  return draftSidecar(freshLifecycleCache(database))
+}
+
+/** Commit the rows of `sidecar` that changed. Durable once it returns. */
+async function writeSidecar(paths: SidecarPaths, sidecar: SessionGcSidecar): Promise<void> {
+  await commitLifecycleRows(lifecycleDatabase(dirname(paths.sidecar)), lifecycleRowsOf(sidecar))
+}
+
+/**
+ * The transcript lifecycle journal as the next lifecycle transaction will
+ * read it, for diagnostics and tests. A session-gc.json not taken in yet is
+ * still the journal, so that is what this returns.
+ */
+export function readSessionGcSnapshot(storeDir: string = getSessionStoreDir()): SessionGcSidecar {
+  const legacyPath = join(storeDir, SIDECAR_NAME)
+  let raw: Buffer | undefined
+  try {
+    raw = readFileSync(legacyPath)
+  } catch (error) {
+    if (!hasCode(error, "ENOENT")) throw error
+  }
+  if (!existsSync(join(storeDir, STORE_DATABASE_NAME))) {
+    return raw
+      ? parseLegacySidecar(raw, legacyPath)
+      : { version: SIDECAR_VERSION, meta: { fenceSlots: {} }, resources: {} }
+  }
+  const database = lifecycleDatabase(storeDir)
+  const cache = freshLifecycleCache(database)
+  const snapshot = draftSidecar(cache)
+  // A copy of the counters, not a view of the cache's, for callers that list them.
+  snapshot.meta.fenceSlots = { ...cache.fenceSlots }
+  if (raw && readLifecycleInfo(database).imported_json_sha256 !== fileDigest(raw)) {
+    // The next transaction takes the file in first.
+    const legacy = parseLegacySidecar(raw, legacyPath)
+    Object.assign(snapshot.resources, legacy.resources)
+    for (const [slot, counter] of Object.entries(legacy.meta.fenceSlots)) {
+      if (counter > (snapshot.meta.fenceSlots[slot] ?? 0)) snapshot.meta.fenceSlots[slot] = counter
+    }
+  }
+  return snapshot
 }
 
 function isValidActiveLeases(value: unknown): value is Record<string, ActiveTranscriptLeaseRecord> {
@@ -1716,22 +2067,32 @@ function upgradeLegacySidecar(value: unknown): unknown {
   return upgraded
 }
 
+function isValidFenceSlot(slot: string, counter: unknown): boolean {
+  return /^[a-f0-9]{4}$/.test(slot)
+    && typeof counter === "number"
+    && Number.isSafeInteger(counter)
+    && counter > 0
+}
+
+/** Whether `resource` is a valid record of transcript `key` under these fence counters. */
+function isValidResource(
+  resource: unknown,
+  key: string,
+  fenceSlots: Readonly<Record<string, unknown>>,
+): resource is TranscriptResource {
+  if (!hasValidTranscriptResourceFields(resource, key)) return false
+  if (!lifecycleGenerationIsValid(resource.generation, key)) return false
+  return Number(fenceSlots[fenceSlotForKey(key)] ?? 0)
+    >= Number(resource.generation.slice(`r:${key}:`.length))
+}
+
 function isValidSidecar(value: unknown): value is SessionGcSidecar {
   if (!isRecord(value) || value.version !== SIDECAR_VERSION
     || !isRecord(value.meta) || !isRecord(value.meta.fenceSlots)
     || !isRecord(value.resources)) return false
   const meta = value.meta as { fenceSlots: Record<string, unknown> }
-  if (!Object.entries(meta.fenceSlots).every(([slot, counter]) =>
-    /^[a-f0-9]{4}$/.test(slot)
-    && typeof counter === "number"
-    && Number.isSafeInteger(counter)
-    && counter > 0)) return false
-  return Object.entries(value.resources).every(([key, resource]) => {
-    if (!hasValidTranscriptResourceFields(resource, key)) return false
-    if (!lifecycleGenerationIsValid(resource.generation, key)) return false
-    return Number(meta.fenceSlots[fenceSlotForKey(key)] ?? 0)
-      >= Number(resource.generation.slice(`r:${key}:`.length))
-  })
+  if (!Object.entries(meta.fenceSlots).every(([slot, counter]) => isValidFenceSlot(slot, counter))) return false
+  return Object.entries(value.resources).every(([key, resource]) => isValidResource(resource, key, meta.fenceSlots))
 }
 
 function assertResourceCapacity(
@@ -1838,6 +2199,38 @@ function pendingResourceCount(sidecar: SessionGcSidecar): number {
     || resource.state === "retired"
     || resource.state === "deleting"
   ).length
+}
+
+/**
+ * A request's preallocation outranks transcript cleanup. Passive retirement
+ * fills the pending budget up to one free slot, and every in-flight turn holds
+ * a prepared slot until it publishes, so a strict budget would refuse
+ * concurrent turns whenever deletion lags behind retirement. A retired
+ * transcript that no deletion has claimed is merely waiting for cleanup:
+ * returning the newest one to live only postpones its deletion until reconcile
+ * finds room again, while the oldest keep their place at the head of the
+ * deletion queue. Admission is refused only when the whole budget is in-flight
+ * preparations and deletions.
+ */
+function deferRetirementForAdmission(
+  sidecar: SessionGcSidecar,
+  options: SessionLifecycleOptions,
+  now: number,
+): void {
+  const maximum = option(options.maxPending, DEFAULT_MAX_PENDING, "maxPending")
+  let excess = pendingResourceCount(sidecar) - maximum + 1
+  if (excess <= 0) return
+  const newestRetired = Object.values(sidecar.resources)
+    .filter((resource) => resource.state === "retired")
+    .sort((left, right) => right.updatedAt - left.updatedAt || left.key.localeCompare(right.key))
+  for (const resource of newestRetired) {
+    if (excess <= 0) return
+    resource.state = "live"
+    resource.updatedAt = now
+    delete resource.nextAttemptAt
+    delete resource.lastError
+    excess--
+  }
 }
 
 function assertPendingCapacity(

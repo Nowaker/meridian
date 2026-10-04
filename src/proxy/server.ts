@@ -27,17 +27,20 @@ import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { stream } from "hono/streaming"
 import { serve, createAdaptorServer } from "@hono/node-server"
+import { getConnInfo } from "@hono/node-server/conninfo"
 import { socketActivationFd, parseIdleExitSeconds, isModelRequestPath } from "./socketActivation"
 import type { Server } from "node:http"
 import { homedir, hostname } from "node:os"
 import { join } from "node:path"
 import { query } from "@anthropic-ai/claude-agent-sdk"
 import { rateLimitStore } from "./rateLimitStore"
-import { guardUpstreamIdle, UpstreamIdleError } from "./streamIdleGuard"
+import { guardUpstreamIdle, UpstreamIdleError, type LateIdleDeadline } from "./streamIdleGuard"
 import { IdleStallCeilingError, IdleStallTracker, idleStallRequestKey } from "./idleStallCeiling"
 import { linkRequestAbort, type RequestAbortLink } from "./requestAbort"
 import { processSessionTree, truncateSessionKey, type SessionTreeRegistration } from "./sessionTree"
 import { AbortableSemaphore, getProcessSdkSemaphore, type SemaphoreLease } from "./concurrency"
+import { InflightRegistry, isLoopbackPeer, onResponseDone, type InflightHandle } from "./inflight"
+import { AdmissionHold, parseDrainOptions } from "./admissionHold"
 import { closeServerWithGracePeriod, trackServerConnections } from "./shutdown"
 import { fetchOAuthUsage, fetchOAuthUsageResult, toUsageEntry, peekOAuthUsage } from "./oauthUsage"
 import { resolveSdkWorkingDirectory } from "./cwd"
@@ -45,6 +48,7 @@ import type { Context } from "hono"
 import { DEFAULT_PROXY_CONFIG, resolveBackendConfig } from "./types"
 import { createAntigravityServer } from "./backends/antigravity"
 import { env, envBool, envInt } from "../env"
+import { installErrorReporter } from "../errorReporting"
 import type { ProxyConfig, ProxyInstance, ProxyServer } from "./types"
 export type { ProxyConfig, ProxyInstance, ProxyServer }
 // Public plugin-authoring types. Plugins import these to type their
@@ -67,6 +71,7 @@ export type {
 // transforms through the same runner meridian uses internally.
 export { runTransformHook, runObserveHook, buildPipeline, createRequestContext } from "./transform"
 import { claudeLog } from "../logger"
+import { replayBudgetFor, trimReplayHistory } from "./replayBudget"
 import { PASSTHROUGH_DENY_REASON } from "./passthroughDenial"
 import { exec as execCallback } from "child_process"
 import { promisify } from "util"
@@ -102,9 +107,10 @@ import {
 import { checkPluginConfigured, isPluginlessOpenCodeRequest, notePluginlessOpenCodeRequest } from "./setup"
 import { describeBuildDrift } from "./buildInfo"
 import { buildRuntime } from "./buildRuntime"
-import { getLatestVersion, startUpdateCheck, stopUpdateCheck } from "./updateCheck"
-import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveClaudeExecutableSync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, expireAuthStatusCache, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, subscriptionIncludesExtendedContext } from "./models"
+import { getLatestVersion, isUpdateCheckEnabled, startUpdateCheck, stopUpdateCheck } from "./updateCheck"
+import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, expireAuthStatusCache, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, subscriptionIncludesExtendedContext } from "./models"
 import { livenessReport, readinessReport, renderProbe } from "./probes"
+import { claudeReachability, DEFAULT_OVERRIDE_TTL_MS, MAX_OVERRIDE_TTL_MS, unreachableDetail, withReachability } from "./upstreamReachability"
 import type { AnthropicSseEvent } from "./openai"
 import { translateOpenAiToAnthropic, translateAnthropicToOpenAi, buildModelList, createSseTranslator } from "./openai"
 import { normalizeJcodeSessionId } from "./adapters/jcode"
@@ -112,12 +118,20 @@ import { extractLettaConversationId, LETTA_CONVERSATION_HEADER } from "./adapter
 import { isClaudeCodeClient } from "./adapters/claudecode"
 import { openAiAdapter, deriveToolLoopSessionId, SYNTHESIZED_SESSION_HEADER } from "./adapters/openai"
 import { translateResponsesToAnthropic, translateAnthropicToResponses, createResponsesSseTranslator, reasoningRequested, buildResponsesToolAliases, resolveCodexThreadIdentity, type ResponsesRequest, type AnthropicSseEvent as ResponsesAnthropicSseEvent } from "./openaiResponses"
-import { flattenAssistantContent, normalizeStructuredUserContent, replayToolResultHeader, frameStructuredReplay, coalesceStructuredUserMessages } from "./replay"
+import { flattenAssistantContent, normalizeStructuredUserContent, replayToolResultHeader, frameStructuredReplay, coalesceStructuredUserMessages, coalesceTrailingSystemReminders } from "./replay"
 import { unstreamedAssistantBlockFrames } from "./unstreamedAssistant"
 import { extractAdvisorModel, extractSystemText, getLastUserMessage, stripAdvisorTools, stripNonStandardStreamFields, MULTIMODAL_TYPES, buildToolUseIndex, frameReplayTurns } from "./messages"
 import { requireAuth, authEnabled } from "./auth"
 import { detectAdapter } from "./adapters/detect"
-import { buildQueryOptions, resolveQueryConfigDir, singleTurnCapLiftRaisesBudget, type QueryContext } from "./query"
+import { buildQueryOptions, isCliThinkingDisplay, resolveQueryConfigDir, singleTurnCapLiftRaisesBudget, type QueryContext } from "./query"
+import {
+  DEFAULT_TRANSCRIPT_RETENTION_DAYS,
+  isTranscriptRetentionDays,
+  meridianTranscriptRetention,
+  resolveTranscriptRetention,
+  TRANSCRIPT_RETENTION_LIMITS,
+} from "./transcriptRetention"
+import { createTranscriptSweep, DEFAULT_TRANSCRIPT_SWEEP_INTERVAL_MS, listSweepRoots, runIdleSweepChild } from "./transcriptSweep"
 import { normalizeEffort } from "./effort"
 import { parseOutputFormat, structuredOutputText } from "./structuredOutput"
 import { runTransformHook, buildPipeline, createRequestContext } from "./transform"
@@ -127,12 +141,10 @@ import type { LoadedPlugin } from "./plugins/types"
 import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, hasProfiles, restoreActiveProfile, invalidateDiskProfileCache, shareableCredentialDir, resetActiveProfile, type ProfileConfig, type ResolvedProfile } from "./profiles" 
 import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
 import { startFollowUsagePolling, stopFollowUsagePolling } from "./followUsage"
-import { startProfileLogin, completeProfileLogin, completeProfileLoginFromCallback, getProfileLoginStatus } from "./profileLogin"
 import { createChatGptLogin } from "./chatgpt/login"
 import { createHookDispatcher, HOOK_EVENTS, HOOK_LIMITS, hookTargetLabel, parseHookSettings, resolveHookTargets } from "./hooks"
 import { createOAuthCallbackRegistry, normalizePublicUrl, requestPublicOrigin } from "./oauthCallbacks"
 import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
-import { startProfileAdd, completeProfileAdd } from "./profileAdd"
 import { filterEligibleProfileIds, mergeRoutingExcludedProfiles, parseRoutingExcludedProfiles } from "./routingExclusions"
 import { canonicalRoutingExcludedProfileIds, evaluateRoutingProfileAccess, noEligibleProfilesResponse, profileExcludedResponse, replacementForExcludedActive } from "./routingExclusionRuntime"
 import { activateProfile } from "./profileActivation"
@@ -166,6 +178,9 @@ import {
   OVERLOADED_RETRY_AFTER_SECONDS,
 } from "./retryAfter"
 import { getSetting, setSetting, saveSettings, TELEMETRY_SETTING_LIMITS, type MeridianSettings } from "../settings" 
+import { startProfileLogin, completeProfileLogin, completeProfileLoginFromCallback, getProfileLoginStatus } from "./profileLogin"
+import { startProfileAdd, completeProfileAdd } from "./profileAdd"
+import { profileStartBody, profileLoginCompleteBody, profileAddCompleteBody } from "./profileOAuthBody"
 import { filterBetasForProfile, getBetaPolicyFromEnv } from "./betas"
 import { createFileChangeHook, extractFileChangesFromMessages, formatFileChangeSummary, type FileChange } from "./fileChanges"
 import { detectTokenAnomalies, formatAnomalyAlerts, type TokenSnapshot } from "./tokenHealth"
@@ -219,7 +234,9 @@ import {
   listStoredSessions,
   readSessionStoreSnapshot,
   readSessionStoreGenerationSnapshot,
+  sessionStoreWritesSettled,
   type StoredSessionGeneration,
+  DEFAULT_PROFILE_COPY_GRACE_MS,
 } from "./sessionStore"
 import {
   abandonFork,
@@ -233,9 +250,11 @@ import {
   publishPinnedTranscript,
   registerLiveTranscript,
   releaseJoinedTranscriptLease,
+  releaseSupersededProfileCopies,
   runGc as runSessionGc,
   getTranscriptResourceKey,
   SessionLifecycleError,
+  SessionLifecycleLockError,
   type SessionLifecycleOptions,
   type TranscriptLocator,
 } from "./sessionLifecycle"
@@ -299,6 +318,11 @@ const DENY_HOLD_TIMEOUT_MS = envInt("DENY_HOLD_TIMEOUT_MS", UPSTREAM_IDLE_MS + 3
 // waste at three idle windows instead of an afternoon. 0 disables the ceiling
 // and restores the pre-ceiling behaviour exactly.
 const UPSTREAM_IDLE_MAX_CONSECUTIVE = envInt("UPSTREAM_IDLE_MAX_CONSECUTIVE", 3)
+// How long a stream that has already answered its client waits for the SDK
+// attempt it abandoned to stop before the turn ends and its session is free
+// again. Above the SDK process gate's 7s join budget, which bounds a healthy
+// teardown, so it only decides anything when that teardown is itself stuck.
+const ABANDONED_ATTEMPT_SETTLE_MS = 10_000
 
 // Bounds how long ProxyInstance.close() waits for in-flight /v1/messages
 // requests to finish (after beginDrain() stops admitting new ones) before it
@@ -332,6 +356,8 @@ interface RequestMeta {
   }
   /** Permanently retain the session lease when mandatory durable cleanup fails. */
   retainSessionTurnFence?: () => void
+  /** This request's `GET /inflight` entry; shared by every failover attempt. */
+  inflight?: InflightHandle
   /**
    * Cancel this request's live session subtree (see `sessionTree.ts`).
    *
@@ -516,7 +542,17 @@ function buildFreshPrompt(
   messages: Array<{ role: string; content: any }>,
   sanitizeOpts: import("./sanitize").SanitizeOptions = {},
   renderToolName?: (name: string) => string,
+  budget?: number,
+  attempt = "fallback",
 ): string | AsyncIterable<any> {
+  if (budget !== undefined) {
+    const trimmed = trimReplayHistory(messages, budget)
+    messages = trimmed.messages
+    if (trimmed.omittedMessages > 0) claudeLog("session.replay_trimmed", {
+      omittedMessages: trimmed.omittedMessages, omittedTokens: trimmed.omittedTokens, budget, attempt,
+    })
+  }
+  messages = coalesceTrailingSystemReminders(messages)
   const hasMultimodal = messages.some((m) => hasMultimodalContent(m.content))
   const toolIndex = buildToolUseIndex(messages)
 
@@ -545,7 +581,7 @@ function buildFreshPrompt(
     }
     // One SDK input keeps historical media visible; frame its provenance
     // before the live user turn (#553, #1155).
-    const prompt = frameStructuredReplay(structured, messages.at(-1)?.role !== "assistant")
+    const prompt = frameStructuredReplay(structured, messages.at(-1)?.role === "user")
     return (async function* () { for (const msg of prompt) yield msg })()
   }
 
@@ -561,7 +597,7 @@ function buildFreshPrompt(
         const assistantText = flattenAssistantContent(m.content, renderToolName)
         return { role: "assistant", text: assistantText ? `[Assistant: ${assistantText}]` : "" }
       }
-      return { role: "user", text: flattenUserContent(m.content, sanitizeOpts, toolIndex) }
+      return { role: m.role, text: flattenUserContent(m.content, sanitizeOpts, toolIndex) }
     })
   )
 }
@@ -574,6 +610,13 @@ function buildFreshPrompt(
 let proxyLogSilent = false
 function plog(message: string): void {
   if (!proxyLogSilent) console.error(message)
+}
+
+function logLateIdleDeadline(mode: string): (late: LateIdleDeadline) => void {
+  return ({ lateMs, sinceLastMs, resumed }) => {
+    plog(`[PROXY] upstream idle deadline fired ${lateMs}ms late (sinceLastMs=${sinceLastMs}, limit=${UPSTREAM_IDLE_MS}ms): ${resumed ? "upstream progress or completion was waiting" : "no model progress observed after yielding"}`)
+    claudeLog("upstream.idle_deadline_late", { mode, lateMs, sinceLastMs, resumed })
+  }
 }
 
 function logUsage(requestId: string, usage: TokenUsage): void {
@@ -661,6 +704,26 @@ type PriorityDispatchOptions = {
   }
 }
 
+/**
+ * Begin the daily registry check, if the operator has asked for one.
+ *
+ * Module scope because two callers need the same banner: the owned server
+ * lifecycle at startup, and the settings route when the toggle is switched on.
+ * Starting is idempotent, and a no-op while the setting is off.
+ */
+function beginUpdateCheck(config: { silent?: boolean; version?: string }): Promise<void> {
+  return startUpdateCheck({
+    onResolved: (latest) => {
+      if (config.silent) return
+      const build = buildRuntime.info(config.version ?? "unknown", latest)
+      if (!build.updateAvailable) return
+      console.log(`\n[meridian] Update available: ${build.version} → ${latest}`)
+      // A checkout cannot follow "npm install -g"; it pulls and rebuilds instead.
+      if (build.source === "npm") console.log(`  npm install -g @rynfar/meridian@latest`)
+    },
+  })
+}
+
 export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServer {
   if (resolveBackendConfig(config).backend === "antigravity") return createAntigravityServer(resolveBackendConfig(config))
   const finalConfig = resolveBackendConfig(config)
@@ -705,10 +768,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     tools: Parameters<typeof createPassthroughMcpServer>[0]
     recovery?: { prefixHashes: string[]; toolIds: string[] }
   }>(getMaxSessionsLimit())
-  // Cache the passthrough MCP server per session. Reusing the same server
-  // across turns (when the tool set is unchanged) avoids subtle prompt-cache
-  // invalidation from MCP server re-creation. Key hashes tool name + schema
-  // so silently-updated tool definitions force a rebuild.
+  // Cache the passthrough tool definitions per session. Reusing the same
+  // definitions across turns (when the tool set is unchanged) avoids subtle
+  // prompt-cache invalidation from rebuilding them. Key hashes tool name +
+  // schema so silently-updated tool definitions force a rebuild. Only the
+  // definitions are shared: each query builds its own server from them.
   const sessionMcpCache = new LRUMap<string, { key: string; mcp: ReturnType<typeof createPassthroughMcpServer> }>(getMaxSessionsLimit())
 
   // The auto-defer decision, pinned for the session's lifetime (#861).
@@ -824,9 +888,34 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   }
   sessionGcOptions.pinProvider = collectSessionGcPins
 
+  const profileCopyPruningEnabled = envBool("SESSION_PROFILE_COPY_PRUNE")
+  const profileCopyGraceMs = Math.max(0, envInt("SESSION_PROFILE_COPY_GRACE_MS", DEFAULT_PROFILE_COPY_GRACE_MS))
+  const pruneSupersededProfileCopies = async (): Promise<void> => {
+    try {
+      const pruned = await releaseSupersededProfileCopies({
+        profileIds: getEffectiveProfiles(finalConfig.profiles).map((profile) => profile.id),
+        graceMs: profileCopyGraceMs,
+        // In this process, a request waits for the store writes already under
+        // way, then snapshots every profile's mapping generation and registers
+        // its turn in one synchronous step, so no local request can see a copy
+        // vanish under it. Another process sharing the store is fenced by
+        // maintenance leases acquired by the lifecycle.
+        isConversationActive: (conversationId) => {
+          const turnKey = `session:${conversationId}`
+          return processSessionTurns.isActive(turnKey)
+        },
+      }, sessionGcOptions, crossProcessSessionTurns)
+      if (pruned > 0) claudeLog("session.profile_copies_pruned", { pruned })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      claudeLog("session.profile_copy_prune_failed", { error: message })
+    }
+  }
+
   const sweepSessionGc = (): Promise<void> => {
     if (sessionGcRunning) return sessionGcRunning
     sessionGcRunning = (async () => {
+      if (profileCopyPruningEnabled) await pruneSupersededProfileCopies()
       const result = await runSessionGc(collectSessionGcPins(), sessionGcOptions)
       if (result.deleted || result.notFound || result.failed) {
         claudeLog("session.gc", { ...result })
@@ -855,6 +944,44 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     : getProcessSdkSemaphore()
   const responseCompletions = new WeakMap<Response, Promise<void>>()
 
+  // Config roots a request's Claude Code process is running in, so the idle
+  // transcript sweep never starts a second process beside one.
+  const busySdkRoots = new Map<string, number>()
+  const markSdkRootBusy = (options: Parameters<typeof query>[0]["options"]): (() => void) => {
+    const root = resolveQueryConfigDir(options?.env ?? {}, false, options?.cwd)
+    busySdkRoots.set(root, (busySdkRoots.get(root) ?? 0) + 1)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      const remaining = (busySdkRoots.get(root) ?? 1) - 1
+      if (remaining > 0) busySdkRoots.set(root, remaining)
+      else busySdkRoots.delete(root)
+    }
+  }
+  const transcriptSweep = createTranscriptSweep({
+    listRoots: () => {
+      const profiles = getEffectiveProfiles(finalConfig.profiles)
+      const resolved = profiles.length === 0
+        ? [resolveProfile(finalConfig.profiles, finalConfig.defaultProfile)]
+        : profiles.map((profile) => resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, profile.id))
+      return listSweepRoots(resolved, process.env)
+    },
+    isRootBusy: (configDir) => busySdkRoots.has(configDir),
+    isDraining: () => draining,
+    credentialsReadOnly: isCredentialsReadOnly,
+    tryAcquireSlot: () => sdkSemaphore.tryAcquire(),
+    readCredentials: (root) => createPlatformCredentialStore(
+      root.explicitConfigDir ? { claudeConfigDir: root.configDir } : undefined,
+    ).read(),
+    runChild: async (root, retentionDays, signal) => {
+      if (!claudeExecutable) claudeExecutable = await resolveClaudeExecutableAsync()
+      return runIdleSweepChild({ root, retentionDays, claudeExecutable, signal })
+    },
+    log: plog,
+    intervalMs: Math.max(0, envInt("TRANSCRIPT_SWEEP_INTERVAL_MS", DEFAULT_TRANSCRIPT_SWEEP_INTERVAL_MS)),
+  })
+
   // Graceful shutdown (#drain): once true, handleWithQueue fast-fails new
   // requests instead of queueing them, and /health reports it so a fleet
   // manager (e.g. a gateway's account-pool scheduler) can stop routing here
@@ -864,6 +991,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   let draining = false
   let durableWritesRevoked = false
   let inFlightRequests = 0
+  /** The same requests as inFlightRequests, broken down for GET /inflight. */
+  const inflight = new InflightRegistry()
+  /** Restart drain (POST /drain): new requests wait here so in-flight can reach 0. */
+  const admissionHold = new AdmissionHold((reason, final) => {
+    claudeLog("drain.end", { reason, held: final.held, admittedAtCap: final.admittedAtCap })
+    plog(`[PROXY] drain ended (${reason}); ${final.held} held request(s) admitted, ${final.admittedAtCap} admitted earlier at the hold cap`)
+  })
   const activeRequestAborts = new Set<AbortController>()
   /** Cause-aware shutdown aborts: each entry labels its request's registry
    * before the controller fires, because the shutdown producer aborts the
@@ -961,6 +1095,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     })
 
   /**
+   * Hold a new request from the wire while a restart drain is active. The
+   * drain only ever delays; the one refusal is the shutdown 503 above, for a
+   * request whose hold ended because this process began shutting down.
+   */
+  const awaitAdmission = async (c: Context, shape: ErrorShape = "anthropic"): Promise<Response | undefined> => {
+    if (!admissionHold.active) return undefined
+    await admissionHold.admit(c.req.raw.signal)
+    return draining ? drainingResponse(shape) : undefined
+  }
+
+  /**
    * Relay what the internal /v1/messages hop actually said.
    *
    * The compat routes used to flatten every inner failure into
@@ -1007,16 +1152,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     // proxyOverheadMs — corrupting the one number that says "the proxy is the
     // bottleneck" precisely under the load that makes clients cancel.
     const acquireStartedAt = Date.now()
+    const leaveSdkQueue = requestMeta.inflight?.enterQueue()
     let lease: SemaphoreLease
     try {
       lease = await sdkSemaphore.acquire(signal)
     } catch (error) {
       requestMeta.sdkQueueWaitMs += Date.now() - acquireStartedAt
       throw error
+    } finally {
+      leaveSdkQueue?.()
     }
     requestMeta.sdkQueueWaitMs += lease.waitedMs
     const startedAt = Date.now()
     requestMeta.currentSdkStartedAt = startedAt
+    const releaseSdkRoot = markSdkRootBusy(params.options)
     let sdkQuery: ReturnType<typeof query> | undefined
     let activeTranscriptLease: Awaited<ReturnType<typeof acquireActiveTranscriptLease>> | undefined
     let processGate: Awaited<ReturnType<typeof createSdkProcessGate>> | undefined
@@ -1046,8 +1195,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       }
       signal.throwIfAborted()
       sdkQuery = query(params)
-      yield* guardUpstreamIdle(sdkQuery, UPSTREAM_IDLE_MS, (sinceLastMs) =>
-        claudeLog("upstream.stalled", { mode, sinceLastMs }))
+      // Read outside the idle guard, never between it and the query: the guard
+      // tears its source down without awaiting it, and a generator in between
+      // would hold that teardown behind a pull that may never settle.
+      yield* withReachability(
+        guardUpstreamIdle(sdkQuery, UPSTREAM_IDLE_MS, (sinceLastMs) =>
+          claudeLog("upstream.stalled", { mode, sinceLastMs }), undefined, logLateIdleDeadline(mode)),
+        claudeReachability,
+      )
     } finally {
       try {
         // Production Query objects expose close(); test doubles and older SDK
@@ -1063,6 +1218,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         }
       } finally {
         requestMeta.sdkActiveDurationMs += Date.now() - startedAt
+        releaseSdkRoot()
         lease.release()
       }
     }
@@ -1103,12 +1259,24 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   app.use("/providers", requireAuth)
   app.use("/providers/*", requireAuth)
   app.use("/antigravity/*", requireAuth)
+  app.use("/upstream-reachability", requireAuth)
 
   // Separate provider routes; Claude retains all existing paths and semantics.
-  app.all('/antigravity/*', c => {
+  app.all('/antigravity/*', async c => {
     if (!antigravity) return c.json({ error: { type: 'not_found_error', message: 'Antigravity is not enabled' } }, 404)
     const url = new URL(c.req.url); url.pathname = url.pathname.slice('/antigravity'.length)
-    return antigravity.app.fetch(new Request(url.toString(), c.req.raw))
+    // Model work arrives as POST; reads and polls are not in-flight work.
+    if (c.req.method === 'POST') await admissionHold.admit(c.req.raw.signal)
+    const entry = c.req.method === 'POST' ? inflight.begin('antigravity') : undefined
+    try {
+      const response = await antigravity.app.fetch(new Request(url.toString(), c.req.raw))
+      if (!entry) return response
+      entry.setStream((response.headers.get('content-type') ?? '').includes('text/event-stream'))
+      return onResponseDone(response, entry.end)
+    } catch (error) {
+      entry?.end()
+      throw error
+    }
   })
   app.get('/providers', c => c.html(withSavedLayout(providerPageHtml)))
   for (const route of ['/providers/status', '/providers/view']) app.get(route, async c => {
@@ -1403,7 +1571,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     let attemptOwnerToken: string | undefined
     if (options.durableRoute && options.publicationTurn) {
       try {
-        const claim = claimPriorityAttempt({
+        const claim = await claimPriorityAttempt({
           routeKey: options.durableRoute.routeKey,
           expectedAssignmentGeneration: options.durableRoute.expectedGeneration,
           turn: options.claimTurn,
@@ -1426,12 +1594,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         }, 503, TRANSIENT_RETRY_AFTER_HEADERS)
       }
     }
-    const settleAttempt = (disposition: "release" | "block"): boolean => {
+    const settleAttempt = async (disposition: "release" | "block"): Promise<boolean> => {
       if (!attemptOwnerToken || !options.durableRoute) return true
       try {
-        return disposition === "block"
+        return await (disposition === "block"
           ? blockPriorityAttempt(options.durableRoute.routeKey, attemptOwnerToken)
-          : releasePriorityAttempt(options.durableRoute.routeKey, attemptOwnerToken)
+          : releasePriorityAttempt(options.durableRoute.routeKey, attemptOwnerToken))
       } catch (error) {
         claudeLog("priority.attempt_settle_failed", {
           routeKey: options.durableRoute.routeKey,
@@ -1538,7 +1706,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // tool side effect even though a non-stream handler ultimately returned
         // an account-shaped error. Never replay that attempt on another account.
         claudeLog("priority.failover_withheld", { profile: candidate, reason: exposure.reason ?? "attempt_exposed" })
-        if (!settleAttempt("block")) return unavailableAttemptResponse()
+        if (!(await settleAttempt("block"))) return unavailableAttemptResponse()
         return sniffed.response
       }
     }
@@ -1558,7 +1726,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     // Every candidate ended before exposure. Release the exact durable claim
     // before the client can retry; failure stays fail-closed and never advances
     // to another account or returns a retryable account-shaped response.
-    if (!settleAttempt("release")) return unavailableAttemptResponse()
+    if (!(await settleAttempt("release"))) return unavailableAttemptResponse()
     // Surface the LAST tried profile's error (owner decision). Stream sniff
     // consumed the inner body, so reconstruct the exact frame for SSE requests.
     // The SSE frame carries its own `retry_after` field, relayed verbatim from
@@ -1631,12 +1799,23 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       let priorityTerminalCommitted = false
       let recoveryPublishedTarget: TranscriptLocator | undefined
       let priorityRollbackRetirement: Promise<void> | undefined
-      const evictSession = (...args: Parameters<typeof evictCachedSession>): boolean => {
+      // Session-store transactions wait on the disk. This attempt runs its own
+      // one at a time, each together with the request state it reads and sets,
+      // so a stream cancel that lands mid-write acts on the state that write
+      // leaves behind, as it did when every transaction was synchronous.
+      let durableTail: Promise<unknown> = Promise.resolve()
+      const inDurableOrder = <T>(operation: () => Promise<T>): Promise<T> => {
+        const run = durableTail.then(operation)
+        durableTail = run.catch(() => undefined)
+        return run
+      }
+      // Only for a caller already running inside inDurableOrder.
+      const evictSessionNow = async (...args: Parameters<typeof evictCachedSession>): Promise<boolean> => {
         try {
           if (priorityTerminalCommitted && options.priorityPublication) return true
           if (options.priorityPublication?.rollback) {
             const rollbackScopeKey = options.priorityPublication.rollback.key
-            const restoredGeneration = rollbackPrioritySessionPublication(
+            const restoredGeneration = await rollbackPrioritySessionPublication(
               args[0],
               args[2] ?? options.body.messages ?? [],
               args[1],
@@ -1680,7 +1859,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             // not be deleted merely to authorize a noncanonical terminal.
             return false
           }
-          const evicted = evictCachedSession(...args)
+          const evicted = await evictCachedSession(...args)
           if (!evicted && resumedMappingMayBeAdvanced) {
             requestMeta.retainSessionTurnFence?.()
           }
@@ -1716,6 +1895,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           throw error
         }
       }
+      const evictSession = (...args: Parameters<typeof evictCachedSession>): Promise<boolean> =>
+        inDurableOrder(() => evictSessionNow(...args))
 
       let managedForkTarget: TranscriptLocator | undefined
       let managedForkSource: TranscriptLocator | undefined
@@ -1778,28 +1959,51 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         managedForkCommitted = true
       }
 
+      // Terminal publication only records where the NEXT turn resumes; this
+      // turn's answer already exists. A lifecycle lock error is raised before
+      // its transaction runs, so the durable mapping is still the pre-turn one
+      // and would resume a transcript without this answer. Invalidating it
+      // degrades the next turn to a replay instead of failing an answered turn
+      // - and every other turn queued behind the same lock - with a 503 the
+      // client can only answer by regenerating the whole turn. A durable
+      // priority attempt cannot finalize without its atomic publication, so it
+      // still fails closed.
+      const deferTerminalPublication = async (
+        error: unknown,
+        mode: string,
+        invalidateMapping: () => Promise<boolean>,
+      ): Promise<boolean> => {
+        if (!(error instanceof SessionLifecycleLockError) || options.priorityPublication) return false
+        if (!(await invalidateMapping())) return false
+        claudeLog("session.publication_deferred", { mode, error: error.message })
+        const deferred = `${requestMeta.requestId} session.publication_deferred mode=${mode} reason=${error.constructor.name}; answer delivered, next turn replays`
+        plog(`[PROXY] ${deferred}`)
+        diagnosticLog.session(deferred, requestMeta.requestId)
+        return true
+      }
+
       const assertPriorityPublicationReady = (): void => {
         if (options.priorityPublication && !options.priorityPublication.rollback) {
           throw new Error("Durable priority attempt reached terminal without atomic publication")
         }
       }
 
-      const finalizePriorityPublication = (): void => {
+      const finalizePriorityPublication = (): Promise<void> => inDurableOrder(async () => {
         assertPriorityPublicationReady()
         const publication = options.priorityPublication
         if (!publication) return
         if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
           throw new Error("Durable priority attempt was revoked before terminal finalization")
         }
-        if (!finalizePrioritySessionPublication(publication)) {
+        if (!(await finalizePrioritySessionPublication(publication))) {
           // Publication is not terminal authority until its exact attempt claim
           // and rollback marker are removed together. Withhold terminal bytes.
           throw new Error("Durable priority attempt changed before terminal finalization")
         }
-        // From this synchronous terminal boundary onward, body cancellation may
-        // discard queued bytes but must never revoke already-authoritative state.
+        // From this terminal boundary onward, body cancellation may discard
+        // queued bytes but must never revoke already-authoritative state.
         priorityTerminalCommitted = true
-      }
+      })
 
       // The outer catch runs outside the profile's scope but still has to
       // answer 429/503, and a Retry-After derived from this account's own
@@ -2346,6 +2550,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
         // Allow transform pipeline to override streaming preference (e.g. LiteLLM requires non-streaming)
         const stream = pipelineCtx.prefersStreaming !== undefined ? pipelineCtx.prefersStreaming : (body.stream ?? false)
+        requestMeta.inflight?.setStream(stream === true)
 
         // --- SDK parameter passthrough ---
         // Extract effort, thinking, taskBudget, and native structured output
@@ -2420,6 +2625,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           sdkFeatures.sharedMemory,
           workingDirectory,
         )
+        const transcriptRetentionDays = resolveTranscriptRetention(transcriptConfigDir).days
         const transcriptLocator = (sessionId: string): TranscriptLocator => ({
           sessionId,
           configDir: transcriptConfigDir,
@@ -2503,6 +2709,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           if (betaFilter.stripped.length > 0) {
             plog(`[PROXY] ${requestMeta.requestId} thinking disabled (thinking beta stripped by ${getBetaPolicyFromEnv()} policy)`)
           }
+        }
+        const requestedDisplay = thinking && thinking.type !== "disabled" ? thinking.display : undefined
+        if (requestedDisplay !== undefined && !isCliThinkingDisplay(requestedDisplay)) {
+          plog(`[PROXY] ${requestMeta.requestId} thinking display ${JSON.stringify(requestedDisplay)} dropped (not accepted by the bundled Claude Code CLI)`)
         }
         const parsedBudget = taskBudgetHeader ? Number.parseInt(taskBudgetHeader, 10) : NaN
         const taskBudget = Number.isFinite(parsedBudget)
@@ -3180,6 +3390,28 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         }
       }
 
+      // Budget only the replay payload, never the lineage or SDK UUID mapping.
+      const replaySource = messagesToConvert
+      const freshReplay = !isResume && !resumeSessionId
+      // Client usage describes its resumed context, not the fresh transcript;
+      // derive replay capacity from the actual SDK model's window instead.
+      let currentReplayBudget = replayBudgetFor(model)
+      let replayTrimRetries = 0
+      let replayOmittedMessages = 0
+      const trimReplay = (attempt: number, reason?: string): boolean => {
+        const trimmed = trimReplayHistory(replaySource, currentReplayBudget)
+        const changed = trimmed.messages.length !== messagesToConvert.length ||
+          trimmed.omittedMessages !== replayOmittedMessages
+        messagesToConvert = trimmed.messages
+        replayOmittedMessages = trimmed.omittedMessages
+        if (reason || (changed && trimmed.omittedMessages > 0)) claudeLog("session.replay_trimmed", {
+          omittedMessages: trimmed.omittedMessages, omittedTokens: trimmed.omittedTokens,
+          budget: currentReplayBudget, model, attempt, ...(reason ? { reason } : {}),
+        })
+        return changed
+      }
+      if (freshReplay) trimReplay(0)
+
       // Multimodal blocks and passthrough tool results must remain structured.
       // In particular, a continuation resumed at an assistant tool_use expects
       // the client's real tool_result blocks, not a flattened transcript string.
@@ -3207,7 +3439,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         const attachedGeneration = lifecycleMappingKey
           ? await attachPinnedTranscript(
             managedForkSource,
-            () => {
+            () => inDurableOrder(async () => {
               assertDurableWritesAllowed()
               return attachSharedTranscriptLocator(
                 lifecycleMappingKey,
@@ -3215,7 +3447,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 managedForkSource!,
                 mappingExpectedGeneration ?? undefined,
               )
-            },
+            }),
             admissionLifecycleOptions,
           )
           : false
@@ -3345,95 +3577,132 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       let structuredMessages: Array<{ type: "user"; message: { role: string; content: any }; parent_tool_use_id: null }> | undefined
       let textPrompt: string | undefined
 
-      if (hasMultimodal || hasPassthroughToolResults) {
-        // Structured messages preserve image/document/file and tool_result blocks.
-        // On resume, only send user messages (SDK has assistant context already).
-        // On first request, include everything.
-        structuredMessages = []
+      function rebuildReplayPrompt(): void {
+        structuredMessages = undefined
+        textPrompt = undefined
+        // Keep a trailing reminder in its live user turn before framing;
+        // otherwise the request becomes history and only metadata stays live.
+        // Original client messages remain untouched for lineage and budgeting.
+        const replayMessages = coalesceTrailingSystemReminders(messagesToConvert ?? [])
+        if (hasMultimodal || hasPassthroughToolResults) {
+          // Structured messages preserve image/document/file and tool_result blocks.
+          // On resume, only send user messages (SDK has assistant context already).
+          // On first request, include everything.
+          structuredMessages = []
 
-        if (isResume) {
-          // Resume: only send user messages from the delta (SDK has the rest)
-          for (const m of messagesToConvert) {
-            if (m.role === "user") {
-              structuredMessages.push({
-                type: "user" as const,
-                message: { role: "user" as const, content: normalizeStructuredUserContent(
-                  stripCacheControlDeep(m.content),
-                  Boolean(passthroughToolCallAssistantUuid)
-                ) },
-                parent_tool_use_id: null,
-              })
-            }
-          }
-        } else {
-          // Fresh replay preserves the text path's role attribution. In-message
-          // reminders are ordinary input; only assistant turns get its marker.
-          for (const m of messagesToConvert) {
-            if (m.role !== "assistant") {
-              structuredMessages.push({
-                type: "user" as const,
-                message: { role: "user" as const, content: normalizeStructuredUserContent(
-                  stripCacheControlDeep(m.content),
-                  Boolean(passthroughToolCallAssistantUuid)
-                ) },
-                parent_tool_use_id: null,
-              })
-            } else {
-              // Preserve assistant text and completed tool calls as replay context.
-              const assistantText = flattenAssistantContent(m.content, renderReplayToolName)
-              if (assistantText) {
+          if (isResume) {
+            // Resume: only send user messages from the delta (SDK has the rest)
+            for (const m of replayMessages) {
+              if (m.role === "user") {
                 structuredMessages.push({
                   type: "user" as const,
-                  message: { role: "user" as const, content: `[Assistant: ${assistantText}]` },
+                  message: { role: "user" as const, content: normalizeStructuredUserContent(
+                    stripCacheControlDeep(m.content),
+                    Boolean(passthroughToolCallAssistantUuid)
+                  ) },
                   parent_tool_use_id: null,
                 })
               }
             }
-          }
-        }
-
-        // SDK stream inputs are independently answered live turns. Deliver the
-        // complete delta before generation so appended context cannot produce
-        // an answer before the final user question arrives. With one input,
-        // media also stays visible in its original relative position (#553).
-        if (structuredMessages.length > 1) {
-          structuredMessages = isResume
-            ? coalesceStructuredUserMessages(structuredMessages)
-            : frameStructuredReplay(structuredMessages, messagesToConvert.at(-1)?.role !== "assistant")
-        }
-
-      } else {
-        // Text prompt — convert messages to string.
-        // Sanitize each text block before flattening to strip orchestration
-        // wrappers (<env>, <task_metadata>, etc.) that harnesses inject.
-        // `<system-reminder>` is only stripped for adapters that leak CWD
-        // through it (Droid) — preserved otherwise so that harness state
-        // like oh-my-opencode's background-task IDs reaches the model.
-        // Tool-result attribution is indexed from the FULL history so ids
-        // resolve even when the originating call sits before a resume-delta
-        // boundary (#552).
-        const toolIndex = buildToolUseIndex(allMessages ?? messagesToConvert ?? [])
-        // NEVER render 'Human:'/'Assistant:' transcript lines — the model
-        // imitates that format, emitting 'Human: ...' turns itself and
-        // self-approving actions (#496 self-talk). Match the structured
-        // path's proven convention instead: user turns plain, assistant
-        // turns bracketed as '[Assistant: ...]'. On resume, drop assistant
-        // messages entirely — the resumed SDK session already contains
-        // those turns; replaying them as user text is the imitation seed.
-        const promptTurns = (messagesToConvert ?? [])
-          .map((m: { role: string; content: any }) => {
-            if (m.role === "assistant") {
-              if (isResume) return { role: "assistant", text: "" }
-              const assistantText = flattenAssistantContent(m.content, renderReplayToolName)
-              return { role: "assistant", text: assistantText ? `[Assistant: ${assistantText}]` : "" }
+          } else {
+            // Fresh replay preserves the text path's role attribution. In-message
+            // reminders are ordinary input; only assistant turns get its marker.
+            for (const m of replayMessages) {
+              if (m.role !== "assistant") {
+                structuredMessages.push({
+                  type: "user" as const,
+                  message: { role: "user" as const, content: normalizeStructuredUserContent(
+                    stripCacheControlDeep(m.content),
+                    Boolean(passthroughToolCallAssistantUuid)
+                  ) },
+                  parent_tool_use_id: null,
+                })
+              } else {
+                // Preserve assistant text and completed tool calls as replay context.
+                const assistantText = flattenAssistantContent(m.content, renderReplayToolName)
+                if (assistantText) {
+                  structuredMessages.push({
+                    type: "user" as const,
+                    message: { role: "user" as const, content: `[Assistant: ${assistantText}]` },
+                    parent_tool_use_id: null,
+                  })
+                }
+              }
             }
-            return { role: "user", text: flattenUserContent(m.content, sanitizeOpts, toolIndex) }
-          })
-        // Fresh (non-resume) replays get the #619 anti-self-play envelope:
-        // history framed as context-only, the live user message terminal.
-        // Resume deltas are tail-only and stay bare.
-        const resumeDelta = promptTurns.map((t: { text: string }) => t.text).filter(Boolean).join("\n\n") || ""
-        textPrompt = isResume ? resumeDelta : frameReplayTurns(promptTurns)
+          }
+
+          // SDK stream inputs are independently answered live turns. Deliver the
+          // complete delta before generation so appended context cannot produce
+          // an answer before the final user question arrives. With one input,
+          // media also stays visible in its original relative position (#553).
+          if (structuredMessages.length > 1) {
+            structuredMessages = isResume
+              ? coalesceStructuredUserMessages(structuredMessages)
+              : frameStructuredReplay(structuredMessages, replayMessages.at(-1)?.role === "user")
+          }
+
+        } else {
+          // Text prompt — convert messages to string.
+          // Sanitize each text block before flattening to strip orchestration
+          // wrappers (<env>, <task_metadata>, etc.) that harnesses inject.
+          // `<system-reminder>` is only stripped for adapters that leak CWD
+          // through it (Droid) — preserved otherwise so that harness state
+          // like oh-my-opencode's background-task IDs reaches the model.
+          // Tool-result attribution is indexed from the FULL history so ids
+          // resolve even when the originating call sits before a resume-delta
+          // boundary (#552).
+          const toolIndex = buildToolUseIndex(allMessages ?? messagesToConvert ?? [])
+          // NEVER render 'Human:'/'Assistant:' transcript lines — the model
+          // imitates that format, emitting 'Human: ...' turns itself and
+          // self-approving actions (#496 self-talk). Match the structured
+          // path's proven convention instead: user turns plain, assistant
+          // turns bracketed as '[Assistant: ...]'. On resume, drop assistant
+          // messages entirely — the resumed SDK session already contains
+          // those turns; replaying them as user text is the imitation seed.
+          const promptTurns = replayMessages
+            .map((m: { role: string; content: any }) => {
+              if (m.role === "assistant") {
+                if (isResume) return { role: "assistant", text: "" }
+                const assistantText = flattenAssistantContent(m.content, renderReplayToolName)
+                return { role: "assistant", text: assistantText ? `[Assistant: ${assistantText}]` : "" }
+              }
+              return { role: m.role, text: flattenUserContent(m.content, sanitizeOpts, toolIndex) }
+            })
+          // Fresh (non-resume) replays get the #619 anti-self-play envelope:
+          // history framed as context-only, the live user message terminal.
+          // Resume deltas are tail-only and stay bare.
+          const resumeDelta = promptTurns.map((t: { text: string }) => t.text).filter(Boolean).join("\n\n") || ""
+          textPrompt = isResume ? resumeDelta : frameReplayTurns(promptTurns)
+        }
+      }
+      rebuildReplayPrompt()
+
+      function rebudgetReplay(reason: string): void {
+        if (!freshReplay) return
+        // Stripping [1m] changes capacity, not only billing: the previously
+        // valid replay must fit the smaller window before another SDK call.
+        currentReplayBudget = replayBudgetFor(model)
+        trimReplay(replayTrimRetries, reason)
+        rebuildReplayPrompt()
+      }
+
+      // Re-estimate from the original input: trimming an already marked replay
+      // would count our own omission notice as history and lose its provenance.
+      function retryReplayOverflow(errMsg: string): boolean {
+        // Resume owns hidden SDK history; shortening its delta cannot compact
+        // that history, and replay recovery must not silently replace a resume.
+        if (!freshReplay || replayTrimRetries >= 2 || extractSdkTermination(errMsg).reason !== "context_overflow") return false
+        const counts = errMsg.match(/(\d+)\s*tokens\s*>\s*(\d+)\s*maximum/i)
+        const shrunkBudget = counts
+          ? Math.floor(currentReplayBudget * (Number(counts[2]) / Number(counts[1])) * 0.9)
+          : Math.floor(currentReplayBudget * 0.5)
+        currentReplayBudget = Math.min(shrunkBudget, replayBudgetFor(model))
+        // A live tail is indivisible. Reissuing the same kept history only
+        // spends another upstream attempt to obtain the identical overflow.
+        if (!trimReplay(replayTrimRetries + 1)) return false
+        replayTrimRetries++
+        rebuildReplayPrompt()
+        return true
       }
 
       // Create a fresh prompt value — can be called multiple times for retry
@@ -3580,7 +3849,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           if (profileSessionId) {
             sessionMcpCache.set(profileSessionId, { key: toolSetKey, mcp: passthroughMcp })
             if (cachedMcp) {
-              plog(`[PROXY] ${requestMeta.requestId} tools_changed: MCP server recreated (prompt cache likely invalidates)`)
+              plog(`[PROXY] ${requestMeta.requestId} tools_changed: tool definitions rebuilt (prompt cache likely invalidates)`)
             }
           }
         }
@@ -3867,9 +4136,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           let nextPassthroughToolCallIds: string[] | undefined
           let sawCanonicalResult = false
           let mappingInvalidated = false
-          const invalidateNonStreamMapping = (): boolean => {
+          const invalidateNonStreamMapping = async (): Promise<boolean> => {
             if (isIndependentSession || mappingInvalidated) return true
-            const evicted = evictSession(
+            const evicted = await evictSession(
               profileSessionId,
               profileScopedCwd,
               lineageMessages,
@@ -3878,7 +4147,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             if (evicted) mappingInvalidated = true
             return evicted
           }
-          const settleInterruptedNonStreamMapping = (): boolean => {
+          const settleInterruptedNonStreamMapping = async (): Promise<boolean> => {
             if (
               options.priorityPublication
               && !options.priorityPublication.rollback
@@ -3958,7 +4227,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     effort, thinking, taskBudget, outputFormat, betas, settingSources,
                     codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                     memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                    webFetchPreflight: sdkFeatures.webFetchPreflight,
+                    webFetchPreflight: sdkFeatures.webFetchPreflight, transcriptRetentionDays,
                     claudeAiConnectors: sdkFeatures.claudeAiConnectors,
                     maxBudgetUsd: sdkFeatures.maxBudgetUsd, maxOutputTokens: clientMaxOutputTokens, fallbackModel: sdkFeatures.fallbackModel,
                     sdkDebug: sdkFeatures.sdkDebug,
@@ -3995,6 +4264,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   // Tool hooks and structured output are committed exposure
                   // even when the iterator has not yielded assistant content.
                   if (didYieldContent || options.priorityAttemptExposure?.committed) throw error
+                  if (retryReplayOverflow(errMsg)) continue
 
                   // Retry: the resume was refused, not answered. Both refusals
                   // that mean "not right now" — the session is busy, or it could
@@ -4044,26 +4314,26 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     plog(`[PROXY] ${requestMeta.requestId} session unusable (${refusal}), evicting and replaying as fresh session`)
                     managedForkSuperseded = true
                     await abandonManagedFork("resume_replay")
-                    if (!evictSession(
+                    if (!(await evictSession(
                       profileSessionId,
                       profileScopedCwd,
                       lineageMessages,
                       mappingExpectedGeneration,
-                    )) throw new Error("Session mapping changed before resume fallback eviction")
+                    ))) throw new Error("Session mapping changed before resume fallback eviction")
                     mappingExpectedGeneration = refreshGenerationAfterEviction()
                     await replaceWithFreshTarget("non_stream_resume_replay")
                     currentSessionId = managedForkTarget?.sessionId
                     sdkUuidMap.length = 0
                     for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
                     yield* runSdkQueryAttempt(buildQueryOptions({
-                      prompt: buildFreshPrompt(allMessages, sanitizeOpts, renderReplayToolName),
+                      prompt: buildFreshPrompt(allMessages, sanitizeOpts, renderReplayToolName, replayBudgetFor(model), "non_stream_resume_replay"),
                       model, workingDirectory, clientWorkingDirectory: promptClientWorkingDirectory, clientEnvironmentMayDifferFromProxy, systemContext, claudeExecutable,
                       passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
                       resumeSessionId: undefined, isUndo: false, resumeSessionAtUuid: undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                       effort, thinking, taskBudget, outputFormat, betas, settingSources,
                       codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                     memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                    webFetchPreflight: sdkFeatures.webFetchPreflight,
+                    webFetchPreflight: sdkFeatures.webFetchPreflight, transcriptRetentionDays,
                     claudeAiConnectors: sdkFeatures.claudeAiConnectors,
                       maxBudgetUsd: sdkFeatures.maxBudgetUsd, maxOutputTokens: clientMaxOutputTokens, fallbackModel: sdkFeatures.fallbackModel,
                       sdkDebug: sdkFeatures.sdkDebug,
@@ -4083,6 +4353,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   if (isExtraUsageRequiredError(errMsg) && hasExtendedContext(model)) {
                     const from = model
                     model = stripExtendedContext(model)
+                    rebudgetReplay("extra_usage_required")
                     recordExtendedContextUnavailable(profile.id)
                     claudeLog("upstream.context_fallback", {
                       mode: "non_stream",
@@ -4104,26 +4375,26 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     plog(`[PROXY] ${requestMeta.requestId} extra usage persisted on resumed ${model}, retrying as fresh session`)
                     managedForkSuperseded = true
                     await abandonManagedFork("fresh_model_fallback")
-                    if (!evictSession(
+                    if (!(await evictSession(
                       profileSessionId,
                       profileScopedCwd,
                       lineageMessages,
                       mappingExpectedGeneration,
-                    )) throw new Error("Session mapping changed before model fallback eviction")
+                    ))) throw new Error("Session mapping changed before model fallback eviction")
                     mappingExpectedGeneration = refreshGenerationAfterEviction()
                     await replaceWithFreshTarget("non_stream_model_fallback")
                     currentSessionId = managedForkTarget?.sessionId
                     sdkUuidMap.length = 0
                     for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
                     yield* runSdkQueryAttempt(buildQueryOptions({
-                      prompt: buildFreshPrompt(allMessages, sanitizeOpts, renderReplayToolName),
+                      prompt: buildFreshPrompt(allMessages, sanitizeOpts, renderReplayToolName, replayBudgetFor(model), "non_stream_model_fallback"),
                       model, workingDirectory, clientWorkingDirectory: promptClientWorkingDirectory, clientEnvironmentMayDifferFromProxy, systemContext, claudeExecutable,
                       passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
                       resumeSessionId: undefined, isUndo: false, resumeSessionAtUuid: undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                       effort, thinking, taskBudget, outputFormat, betas, settingSources,
                       codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                       memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                    webFetchPreflight: sdkFeatures.webFetchPreflight,
+                    webFetchPreflight: sdkFeatures.webFetchPreflight, transcriptRetentionDays,
                     claudeAiConnectors: sdkFeatures.claudeAiConnectors,
                       maxBudgetUsd: sdkFeatures.maxBudgetUsd, maxOutputTokens: clientMaxOutputTokens, fallbackModel: sdkFeatures.fallbackModel,
                       sdkDebug: sdkFeatures.sdkDebug,
@@ -4154,6 +4425,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     if (hasExtendedContext(model)) {
                       const from = model
                       model = stripExtendedContext(model)
+                      rebudgetReplay("rate_limit")
                       // Bench [1m] until the window resets. Without this the next
                       // request maps straight back to [1m], so one rate limit costs
                       // TWO model switches and a cold prompt cache in both directions
@@ -4463,7 +4735,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               (requestAbort.controller.signal.aborted || durableWritesRevoked || failedResumedTurn)
               && !isIndependentSession
             ) {
-              if (!settleInterruptedNonStreamMapping()) {
+              if (!(await settleInterruptedNonStreamMapping())) {
                 throw new Error("Shared session mapping changed before interrupted non-stream invalidation")
               }
               claudeLog("session.interrupted_mapping_evicted", {
@@ -4479,7 +4751,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             ) {
               // A failed durability drain must not leave either a newly cached
               // checkpoint or an older mapping behind for the advanced client.
-              if (!settleInterruptedNonStreamMapping()) {
+              if (!(await settleInterruptedNonStreamMapping())) {
                 throw new Error("Shared session mapping changed before non-stream recovery invalidation")
               }
               claudeLog("passthrough.noncanonical_session_evicted", { mode: "non_stream", reason: "drain_error" })
@@ -4766,21 +5038,22 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   // Iterator visibility is not durability. Never publish a
                   // resumeSessionAt UUID unless the CLI reached its terminal
                   // result and had a chance to commit the transcript.
-                  if (!invalidateNonStreamMapping()) {
+                  if (!(await invalidateNonStreamMapping())) {
                     throw new Error("Shared session mapping changed before non-stream terminal invalidation")
                   }
                   claudeLog("passthrough.noncanonical_session_evicted", { mode: "non_stream" })
                 } else {
                   validateManagedForkResult(currentSessionId)
-                  await commitManagedFork()
-                  let mappingStored: false | StoredSessionGeneration
+                  let mappingStored: false | StoredSessionGeneration = false
+                  let publicationDeferred = false
                   try {
+                    await commitManagedFork()
                     assertDurableWritesAllowed()
                     mappingStored = await publishPinnedTranscript(
                       publicationTranscriptLocator(currentSessionId!),
-                      () => {
+                      () => inDurableOrder(async () => {
                         assertDurableWritesAllowed()
-                        const stored = storeSession(
+                        const stored = await storeSession(
                     profileSessionId,
                     lineageMessages,
                     currentSessionId!,
@@ -4805,26 +5078,28 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                           if (managedForkTarget?.sessionId === currentSessionId) managedForkPublished = true
                         }
                         return stored
-                      },
+                      }),
                       admissionLifecycleOptions,
                     )
                   } catch (error) {
+                    publicationDeferred = await deferTerminalPublication(error, "non_stream", invalidateNonStreamMapping)
                     if (
+                      !publicationDeferred &&
                       (requestAbort.controller.signal.aborted || durableWritesRevoked) &&
                       managedForkPublished &&
-                      !invalidateNonStreamMapping()
+                      !(await invalidateNonStreamMapping())
                     ) {
                       throw new Error("Shared session mapping changed before canceled non-stream publication cleanup")
                     }
-                    throw error
+                    if (!publicationDeferred) throw error
                   }
                   if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
-                    if (mappingStored && !invalidateNonStreamMapping()) {
+                    if (mappingStored && !(await invalidateNonStreamMapping())) {
                       throw new Error("Shared session mapping changed after canceled non-stream publication")
                     }
                     throw new Error("Request canceled after non-stream publication")
                   }
-                  if (!mappingStored) {
+                  if (!mappingStored && !publicationDeferred) {
                     if (profileSessionId) {
                       throw new Error("Shared session mapping changed before publication")
                     }
@@ -4833,7 +5108,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     // own resume state without failing the other successful response.
                     claudeLog("session.fingerprint_publication_lost", {})
                     void sweepSessionGc()
-                  } else {
+                  } else if (mappingStored) {
                     mappingExpectedGeneration = mappingStored
                     if (managedForkTarget?.sessionId === currentSessionId) {
                       managedForkPublished = true
@@ -4845,7 +5120,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 }
               }
 
-              finalizePriorityPublication()
+              await finalizePriorityPublication()
               const responseSessionId = currentSessionId || resumeSessionId || `session_${Date.now()}`
 
               return new Response(JSON.stringify({
@@ -5091,6 +5366,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               ? managedForkTarget?.sessionId
               : undefined
             let nextClientBlockIndex = 0
+            // The attempts behind this stream answer to their own abort, linked
+            // to the request's so every request-wide abort still reaches them.
+            // The catch below answers the client, most often because the idle
+            // guard gave up on `response` while it was mid-await (queued for an
+            // SDK slot, in admission, or backing off), and an async generator
+            // cannot be returned until it next yields. Left alone, that attempt
+            // went on to start Claude Code and spend upstream calls on a request
+            // already answered, while the session's next turn could be running.
+            const attemptAbort = linkRequestAbort(requestAbort.controller.signal)
+            let abandonment: Error | undefined
+            let attempts: AsyncGenerator<unknown, unknown, unknown> | undefined
             try {
               // Same transparent retry wrapper as the non-streaming path.
               // Rate-limit retry strategy:
@@ -5116,6 +5402,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 let singleTurnCapLifted = false
 
                 while (true) {
+                  if (abandonment) throw abandonment
                   if (managedForkTarget) {
                     if (managedCreationAttemptStarted) {
                       await rotateManagedCreationTarget("stream_retry")
@@ -5144,7 +5431,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       effort, thinking, taskBudget, outputFormat, betas, settingSources,
                       codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                     memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                    webFetchPreflight: sdkFeatures.webFetchPreflight,
+                    webFetchPreflight: sdkFeatures.webFetchPreflight, transcriptRetentionDays,
                     claudeAiConnectors: sdkFeatures.claudeAiConnectors,
                       maxBudgetUsd: sdkFeatures.maxBudgetUsd, maxOutputTokens: clientMaxOutputTokens, fallbackModel: sdkFeatures.fallbackModel,
                       sdkDebug: sdkFeatures.sdkDebug,
@@ -5152,10 +5439,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                         : undefined,
                       advisorModel,
-                    }, requestAbort.controller)
+                    }, attemptAbort.controller)
                     attemptMaxTurns = attemptQuery.options.maxTurns
                     lastAttemptMaxTurns = attemptMaxTurns
-                    for await (const event of runSdkQueryAttempt(attemptQuery, requestAbort.controller.signal, requestMeta, "stream", managedSdkAttemptLocators())) {
+                    for await (const event of runSdkQueryAttempt(attemptQuery, attemptAbort.controller.signal, requestMeta, "stream", managedSdkAttemptLocators())) {
                       // Same SDK rate-limit capture as the non-stream path.
                       if ((event as any).type === "rate_limit_event") {
                         rateLimitStore.record(profile.id, (event as any).rate_limit_info)
@@ -5167,11 +5454,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     }
                     return
                   } catch (error) {
+                    // Nothing retries for a client that already has its answer.
+                    if (abandonment) throw error
                     const errMsg = error instanceof Error ? error.message : String(error)
 
                     // Tool hooks and structured output are committed exposure
                     // even before the first client-visible SSE event.
                     if (didYieldClientEvent || options.priorityAttemptExposure?.committed) throw error
+                    if (retryReplayOverflow(errMsg)) continue
 
                     // Retry: the resume was refused, not answered — see the
                     // non-stream branch above for the full rationale. The busy
@@ -5210,26 +5500,26 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       plog(`[PROXY] ${requestMeta.requestId} session unusable (${refusal}), evicting and replaying as fresh session`)
                       managedForkSuperseded = true
                       await abandonManagedFork("resume_replay")
-                      if (!evictSession(
+                      if (!(await evictSession(
                         profileSessionId,
                         profileScopedCwd,
                         lineageMessages,
                         mappingExpectedGeneration,
-                      )) throw new Error("Session mapping changed before resume fallback eviction")
+                      ))) throw new Error("Session mapping changed before resume fallback eviction")
                       mappingExpectedGeneration = refreshGenerationAfterEviction()
                       await replaceWithFreshTarget("stream_resume_replay")
                       currentSessionId = managedForkTarget?.sessionId
                       sdkUuidMap.length = 0
                       for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
                       yield* runSdkQueryAttempt(buildQueryOptions({
-                        prompt: buildFreshPrompt(allMessages, sanitizeOpts, renderReplayToolName),
+                        prompt: buildFreshPrompt(allMessages, sanitizeOpts, renderReplayToolName, replayBudgetFor(model), "stream_resume_replay"),
                         model, workingDirectory, clientWorkingDirectory: promptClientWorkingDirectory, clientEnvironmentMayDifferFromProxy, systemContext, claudeExecutable,
                         passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
                         resumeSessionId: undefined, isUndo: false, resumeSessionAtUuid: undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                         effort, thinking, taskBudget, outputFormat, betas, settingSources,
                         codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                     memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                    webFetchPreflight: sdkFeatures.webFetchPreflight,
+                    webFetchPreflight: sdkFeatures.webFetchPreflight, transcriptRetentionDays,
                     claudeAiConnectors: sdkFeatures.claudeAiConnectors,
                         maxBudgetUsd: sdkFeatures.maxBudgetUsd, maxOutputTokens: clientMaxOutputTokens, fallbackModel: sdkFeatures.fallbackModel,
                         sdkDebug: sdkFeatures.sdkDebug,
@@ -5237,7 +5527,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                           ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                           : undefined,
                         advisorModel,
-                      }, requestAbort.controller), requestAbort.controller.signal, requestMeta, "stream_fresh", managedSdkAttemptLocators())
+                      }, attemptAbort.controller), attemptAbort.controller.signal, requestMeta, "stream_fresh", managedSdkAttemptLocators())
                       return
                     }
 
@@ -5245,6 +5535,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     if (isExtraUsageRequiredError(errMsg) && hasExtendedContext(model)) {
                       const from = model
                       model = stripExtendedContext(model)
+                      rebudgetReplay("extra_usage_required")
                       recordExtendedContextUnavailable(profile.id)
                       claudeLog("upstream.context_fallback", {
                         mode: "stream",
@@ -5266,26 +5557,26 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       plog(`[PROXY] ${requestMeta.requestId} extra usage persisted on resumed ${model}, retrying as fresh session`)
                       managedForkSuperseded = true
                       await abandonManagedFork("fresh_model_fallback")
-                      if (!evictSession(
+                      if (!(await evictSession(
                         profileSessionId,
                         profileScopedCwd,
                         lineageMessages,
                         mappingExpectedGeneration,
-                      )) throw new Error("Session mapping changed before model fallback eviction")
+                      ))) throw new Error("Session mapping changed before model fallback eviction")
                       mappingExpectedGeneration = refreshGenerationAfterEviction()
                       await replaceWithFreshTarget("stream_model_fallback")
                       currentSessionId = managedForkTarget?.sessionId
                       sdkUuidMap.length = 0
                       for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
                       yield* runSdkQueryAttempt(buildQueryOptions({
-                        prompt: buildFreshPrompt(allMessages, sanitizeOpts, renderReplayToolName),
+                        prompt: buildFreshPrompt(allMessages, sanitizeOpts, renderReplayToolName, replayBudgetFor(model), "stream_model_fallback"),
                         model, workingDirectory, clientWorkingDirectory: promptClientWorkingDirectory, clientEnvironmentMayDifferFromProxy, systemContext, claudeExecutable,
                         passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
                         resumeSessionId: undefined, isUndo: false, resumeSessionAtUuid: undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                         effort, thinking, taskBudget, outputFormat, betas, settingSources,
                         codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                         memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming, sharedMemory: sdkFeatures.sharedMemory,
-                        webFetchPreflight: sdkFeatures.webFetchPreflight,
+                        webFetchPreflight: sdkFeatures.webFetchPreflight, transcriptRetentionDays,
                         claudeAiConnectors: sdkFeatures.claudeAiConnectors,
                         maxBudgetUsd: sdkFeatures.maxBudgetUsd, maxOutputTokens: clientMaxOutputTokens, fallbackModel: sdkFeatures.fallbackModel,
                         sdkDebug: sdkFeatures.sdkDebug,
@@ -5293,7 +5584,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                           ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                           : undefined,
                         advisorModel,
-                      }, requestAbort.controller), requestAbort.controller.signal, requestMeta, "stream_fresh", managedSdkAttemptLocators())
+                      }, attemptAbort.controller), attemptAbort.controller.signal, requestMeta, "stream_fresh", managedSdkAttemptLocators())
                       return
                     }
 
@@ -5316,6 +5607,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       if (hasExtendedContext(model)) {
                         const from = model
                         model = stripExtendedContext(model)
+                        rebudgetReplay("rate_limit")
                         // Bench [1m] until the window resets. Without this the next
                         // request maps straight back to [1m], so one rate limit costs
                         // TWO model switches and a cold prompt cache in both directions
@@ -5395,6 +5687,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   }
                 }
               })()
+              attempts = response
 
               const heartbeat = setInterval(() => {
                 heartbeatCount += 1
@@ -5435,6 +5728,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   streamEventsSeen,
                   firstChunkAt: firstChunkAt ?? null,
                 }),
+                undefined,
+                logLateIdleDeadline("stream"),
               )
               try {
                 for await (const message of guardedResponse) {
@@ -5977,7 +6272,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   exitedBeforeCanonicalTerminal ||
                   (checkpointTurn && (!earlyStopFired || !sawCanonicalResult))
                 ) {
-                  const evicted = evictSession(
+                  const evicted = await evictSession(
                     profileSessionId,
                     profileScopedCwd,
                     lineageMessages,
@@ -5989,13 +6284,24 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   claudeLog("passthrough.noncanonical_session_evicted", { mode: "stream" })
                 } else {
                   validateManagedForkResult(currentSessionId)
-                  await commitManagedFork()
+                  let publicationDeferred = false
+                  const deferStreamPublication = async (error: unknown): Promise<false> => {
+                    if (!(await deferTerminalPublication(error, "stream", () => evictSession(
+                      profileSessionId,
+                      profileScopedCwd,
+                      lineageMessages,
+                      mappingExpectedGeneration,
+                    )))) throw error
+                    publicationDeferred = true
+                    return false
+                  }
+                  await commitManagedFork().catch(deferStreamPublication)
                   assertDurableWritesAllowed()
-                  const mappingStored = await publishPinnedTranscript(
+                  const mappingStored = publicationDeferred ? false : await publishPinnedTranscript(
                     publicationTranscriptLocator(currentSessionId!),
-                    () => {
+                    () => inDurableOrder(async () => {
                       assertDurableWritesAllowed()
-                      const stored = storeSession(
+                      const stored = await storeSession(
                     profileSessionId,
                     lineageMessages,
                     currentSessionId!,
@@ -6020,19 +6326,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         if (managedForkTarget?.sessionId === currentSessionId) managedForkPublished = true
                       }
                       return stored
-                    },
+                    }),
                     admissionLifecycleOptions,
-                  )
+                  ).catch(deferStreamPublication)
                   if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
                     if (
                       mappingStored && !isIndependentSession &&
-                      !evictSession(profileSessionId, profileScopedCwd, lineageMessages, mappingExpectedGeneration)
+                      !(await evictSession(profileSessionId, profileScopedCwd, lineageMessages, mappingExpectedGeneration))
                     ) {
                       throw new Error("Shared session mapping changed after canceled stream publication")
                     }
                     throw new Error("Request canceled after stream publication")
                   }
-                  if (!mappingStored) {
+                  if (!mappingStored && !publicationDeferred) {
                     if (profileSessionId) {
                       throw new Error("Shared session mapping changed before publication")
                     }
@@ -6041,7 +6347,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     // own resume state without failing the other successful response.
                     claudeLog("session.fingerprint_publication_lost", {})
                     void sweepSessionGc()
-                  } else {
+                  } else if (mappingStored) {
                     mappingExpectedGeneration = mappingStored
                     if (managedForkTarget?.sessionId === currentSessionId) {
                       managedForkPublished = true
@@ -6155,7 +6461,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   const recoveryAttachedGeneration = recoveryForkSource.sessionId === recoverySourceId
                     ? await attachPinnedTranscript(
                       recoveryForkSource,
-                      () => {
+                      () => inDurableOrder(async () => {
                         assertDurableWritesAllowed()
                         return attachSharedTranscriptLocator(
                           lifecycleMappingKey,
@@ -6163,7 +6469,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                           recoveryForkSource!,
                           mappingExpectedGeneration ?? undefined,
                         )
-                      },
+                      }),
                       admissionLifecycleOptions,
                     )
                     : false
@@ -6210,7 +6516,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
                     memory: sdkFeatures.memory, dreaming: sdkFeatures.dreaming,
                     sharedMemory: sdkFeatures.sharedMemory,
-                    webFetchPreflight: sdkFeatures.webFetchPreflight,
+                    webFetchPreflight: sdkFeatures.webFetchPreflight, transcriptRetentionDays,
                     claudeAiConnectors: sdkFeatures.claudeAiConnectors,
                     maxBudgetUsd: sdkFeatures.maxBudgetUsd,
                     fallbackModel: sdkFeatures.fallbackModel,
@@ -6327,9 +6633,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   assertDurableWritesAllowed()
                   const recoveryMappingStored = await publishPinnedTranscript(
                     recoveryForkTarget,
-                    () => {
+                    () => inDurableOrder(async () => {
                       assertDurableWritesAllowed()
-                      const stored = storeSession(
+                      const stored = await storeSession(
                     profileSessionId,
                     lineageMessages,
                     recoverySessionId!,
@@ -6349,13 +6655,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         recoveryPublishedTarget = recoveryForkTarget
                       }
                       return stored
-                    },
+                    }),
                     admissionLifecycleOptions,
                   )
                   if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
                     if (
                       recoveryMappingStored && !isIndependentSession &&
-                      !evictSession(profileSessionId, profileScopedCwd, lineageMessages, mappingExpectedGeneration)
+                      !(await evictSession(profileSessionId, profileScopedCwd, lineageMessages, mappingExpectedGeneration))
                     ) {
                       throw new Error("Shared session mapping changed after canceled silent-recovery publication")
                     }
@@ -6614,7 +6920,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 // so recovered content lands ahead of them, where clients can
                 // still see it).
                 assertPriorityPublicationReady()
-                finalizePriorityPublication()
+                await finalizePriorityPublication()
                 if (messageStartEmitted) {
                   sendTerminalDelta(streamedToolUseIds.size > 0 ? "tool_use" : unstreamedStopReason)
                   safeEnqueue(encoder.encode(`event: message_stop\ndata: {"type":"message_stop"}\n\n`), "final_message_stop")
@@ -6727,6 +7033,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 }
               }
             } catch (error) {
+              // Every path from here answers the client, so whatever attempt is
+              // still running behind the stream has nobody left to answer.
+              abandonment = new Error("Stream attempt abandoned: its client was already answered")
+              attemptAbort.abort(abandonment)
               // Forced shutdown revokes publication, but cleanup must remain
               // destructive: a client-visible interrupted turn cannot leave its
               // previously published source mapping resumable.
@@ -6738,7 +7048,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 && interruptedMappingMayBeAdvanced
                 && !isIndependentSession
               ) {
-                evictSession(
+                await evictSession(
                   profileSessionId,
                   profileScopedCwd,
                   lineageMessages,
@@ -6774,7 +7084,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 const mayEvictInterruptedMapping =
                   !managedForkTarget || managedForkPublished || clientAssistantContentExposed
                 if (disposition.action === "evict" && mayEvictInterruptedMapping) {
-                  evictSession(
+                  await evictSession(
                     profileSessionId,
                     profileScopedCwd,
                     lineageMessages,
@@ -6889,11 +7199,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 abortIsOurs: ownSingleStepAbort && sawDuplicateToolUse,
               }) && messageStartEmitted
 
-              // Uncaptured streamed calls can recover only at this proxy's
-              // one-turn cap, with a complete client-visible envelope and no
-              // cancellation. The opt-in covers the abort-window shape; an
-              // explicit CLI dispatch rejection also qualifies by default,
-              // even if that rejection settled the early-stop tracker.
+              // Uncaptured streamed calls can recover only with a complete
+              // client-visible envelope and no cancellation. The opt-in covers
+              // the abort-window shape at the one-turn cap; an explicit CLI
+              // dispatch rejection also qualifies by default, at any turn
+              // budget, even if that rejection settled the early-stop tracker.
               // A generic failed result may follow an executed tool. Only the
               // CLI's explicit dispatch rejection for EVERY streamed id proves
               // these calls were never run. The existing opt-in abort-window
@@ -6986,7 +7296,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               ) {
                 // Do not grant a terminal tool checkpoint while the durable
                 // mapping still names an ancestry that lacks those calls.
-                const evicted = evictSession(
+                const evicted = await evictSession(
                   profileSessionId,
                   profileScopedCwd,
                   lineageMessages,
@@ -7064,9 +7374,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   assertDurableWritesAllowed()
                   const mappingStored = await publishPinnedTranscript(
                     publicationTranscriptLocator(currentSessionId!),
-                    () => {
+                    () => inDurableOrder(async () => {
                       assertDurableWritesAllowed()
-                      const stored = storeSession(
+                      const stored = await storeSession(
                     profileSessionId,
                     lineageMessages,
                     currentSessionId!,
@@ -7091,13 +7401,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         if (managedForkTarget?.sessionId === currentSessionId) managedForkPublished = true
                       }
                       return stored
-                    },
+                    }),
                     admissionLifecycleOptions,
                   )
                   if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
                     if (
                       mappingStored && !isIndependentSession &&
-                      !evictSession(profileSessionId, profileScopedCwd, lineageMessages, mappingExpectedGeneration)
+                      !(await evictSession(profileSessionId, profileScopedCwd, lineageMessages, mappingExpectedGeneration))
                     ) {
                       throw new Error("Shared session mapping changed after canceled recovery publication")
                     }
@@ -7130,7 +7440,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 // now may the terminal pair authorize the client to submit the
                 // recovered tool results.
                 assertPriorityPublicationReady()
-                finalizePriorityPublication()
+                await finalizePriorityPublication()
                 const terminalDeltaEnqueued = safeEnqueue(encoder.encode(
                   `event: message_delta\ndata: ${JSON.stringify({
                     type: "message_delta",
@@ -7499,8 +7809,32 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 streamClosed = true
               }
             } finally {
+              if (abandonment && attempts) {
+                // The turn ends, and frees its session for the next one, only
+                // once the abandoned attempt has actually stopped. Its return()
+                // settles when the generator finishes, including the SDK
+                // process join in runSdkQueryAttempt's cleanup.
+                let settleTimer: ReturnType<typeof setTimeout> | undefined
+                const settled = await Promise.race([
+                  attempts.return(undefined).then(() => true, () => true),
+                  new Promise<boolean>((resolve) => {
+                    settleTimer = setTimeout(() => resolve(false), ABANDONED_ATTEMPT_SETTLE_MS)
+                  }),
+                ])
+                clearTimeout(settleTimer)
+                if (!settled) claudeLog("stream.abandoned_attempt_unsettled", { waitedMs: ABANDONED_ATTEMPT_SETTLE_MS })
+              }
+              attemptAbort.detach()
               await abandonManagedFork("stream_complete_without_commit")
-              if (priorityRollbackRetirement) await priorityRollbackRetirement
+              // A client cancel during this cleanup queues an eviction that may
+              // yet fence the turn or start a rollback retirement. The turn ends,
+              // and releases its session, only once every queued store write has
+              // landed, as when an eviction completed inside cancel() itself.
+              for (let settled: Promise<unknown> | undefined; settled !== durableTail;) {
+                settled = durableTail
+                await settled
+                if (priorityRollbackRetirement) await priorityRollbackRetirement
+              }
               // Detach only when this handler owns the link. An ADOPTED
               // request-wide link must stay attached: a later profile-failover
               // attempt re-enters this handler with the same link, and a
@@ -7523,20 +7857,24 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             // cancelled here as well, latched so a real socket teardown —
             // which trips both this and the request signal — propagates once.
             requestMeta.cascadeSubtreeCancel?.("stream_cancel")
-            if (!isIndependentSession && (
-              !managedForkTarget || managedForkPublished || clientAssistantContentExposed
-            )) {
-              // A direct resume or already-published target may have advanced.
-              // An unpublished managed fork writes only its isolated target, so
-              // preserve the still-authoritative source mapping and abandon it.
-              evictSession(
-                    profileSessionId,
-                    profileScopedCwd,
-                    lineageMessages,
-                    mappingExpectedGeneration,
-                  )
-              claudeLog("passthrough.client_abort_settled", { action: "evict", source: "stream_cancel" })
-            }
+            // Decided in order, after any store write this request already has
+            // in flight, so the eviction sees the mapping that write published.
+            return inDurableOrder(async () => {
+              if (!isIndependentSession && (
+                !managedForkTarget || managedForkPublished || clientAssistantContentExposed
+              )) {
+                // A direct resume or already-published target may have advanced.
+                // An unpublished managed fork writes only its isolated target, so
+                // preserve the still-authoritative source mapping and abandon it.
+                await evictSessionNow(
+                      profileSessionId,
+                      profileScopedCwd,
+                      lineageMessages,
+                      mappingExpectedGeneration,
+                    )
+                claudeLog("passthrough.client_abort_settled", { action: "evict", source: "stream_cancel" })
+              }
+            })
           },
         })
 
@@ -7699,8 +8037,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     // An internal hop carries a request the public route already admitted;
     // re-checking the gate here would refuse work that is legitimately in
     // flight. Everything arriving from the wire is gated normally.
-    if (draining && c.req.header("x-meridian-internal-hop") !== internalHopToken) {
+    const fromWire = c.req.header("x-meridian-internal-hop") !== internalHopToken
+    if (draining && fromWire) {
       return drainingResponse()
+    }
+    if (fromWire) {
+      const refused = await awaitAdmission(c)
+      if (refused) return refused
     }
     const requestId = c.req.header("x-request-id") || randomUUID()
     const queueEnteredAt = Date.now()
@@ -7764,6 +8107,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     let retainSessionTurnFence = false
     let leaseWatchdog: ReturnType<typeof setTimeout> | undefined
     inFlightRequests++
+    const inflightEntry = inflight.begin("claude", queueEnteredAt)
+    const finishHttpEntry = () => {
+      inflightEntry.end()
+      c.req.raw.signal.removeEventListener("abort", finishHttpEntry)
+    }
+    if (c.req.raw.signal.aborted) finishHttpEntry()
+    else c.req.raw.signal.addEventListener("abort", finishHttpEntry, { once: true })
+    const trackedResponse = (response: Response) => {
+      const tracked = onResponseDone(response, finishHttpEntry)
+      // Internal OpenAI/priority relays still await the SDK publication promise.
+      const completion = responseCompletions.get(response)
+      if (completion) responseCompletions.set(tracked, completion)
+      return tracked
+    }
     // Releasing the lease is deliberately separate from finishing the request:
     // the watchdog must be able to unblock the session without also corrupting
     // the in-flight count that the shutdown drain reads.
@@ -7822,17 +8179,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       } catch (error) {
         if (c.req.raw.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
           finishRequest()
-          return new Response(JSON.stringify({
+          return trackedResponse(new Response(JSON.stringify({
             type: "error",
             error: { type: "request_cancelled", message: "The request was cancelled" },
-          }), { status: 499, headers: { "Content-Type": "application/json" } })
+          }), { status: 499, headers: { "Content-Type": "application/json" } }))
         }
         finishRequest()
-        return new Response(JSON.stringify({
+        return trackedResponse(new Response(JSON.stringify({
           type: "error",
           error: { type: "invalid_request_error", message: "Request body must be valid JSON" },
-        }), { status: 400, headers: { "Content-Type": "application/json" } })
+        }), { status: 400, headers: { "Content-Type": "application/json" } }))
       }
+      inflightEntry.setStream(body?.stream === true)
 
       // Fingerprints are intentionally excluded here: they only hash the first
       // user message + cwd and cannot distinguish independent headerless chats.
@@ -7873,6 +8231,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           )
           const explicitlyRequestedProfile = c.req.header("x-meridian-profile")?.trim()
           if (explicitlyRequestedProfile) arrivalProfileIds.add(explicitlyRequestedProfile)
+          // A store write this process started before the request arrived,
+          // such as the eviction a cancelled stream leaves behind, must be
+          // visible to it, as it was when a write finished before anything else
+          // could run. Snapshot and turn registration stay one synchronous step.
+          await sessionStoreWritesSettled()
           sharedSessionRevisionsAtArrival = readSessionStoreGenerationSnapshot(
             agentSessionId,
             [...arrivalProfileIds],
@@ -7890,8 +8253,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             }, SESSION_TURN_MAX_HOLD_MS)
             leaseWatchdog.unref?.()
             const acquireSignal = AbortSignal.any([c.req.raw.signal, turnWatchdogAbort.signal])
-            sessionTurnLease = await processSessionTurns.acquire(turnKey, acquireSignal)
-            crossProcessTurnLease = await crossProcessSessionTurns.acquire(turnKey, acquireSignal)
+            const leaveTurnQueue = inflightEntry.enterQueue()
+            try {
+              sessionTurnLease = await processSessionTurns.acquire(turnKey, acquireSignal)
+              crossProcessTurnLease = await crossProcessSessionTurns.acquire(turnKey, acquireSignal)
+            } finally {
+              leaveTurnQueue()
+            }
           } catch (error) {
             if (
               c.req.raw.signal.aborted
@@ -7932,23 +8300,23 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 error: "request_cancelled",
               })
               finishRequest()
-              return new Response(JSON.stringify({
+              return trackedResponse(new Response(JSON.stringify({
                 type: "error",
                 error: { type: "request_cancelled", message: "The request was cancelled" },
-              }), { status: 499, headers: { "Content-Type": "application/json" } })
+              }), { status: 499, headers: { "Content-Type": "application/json" } }))
             }
             // The local lease may already be held when the cross-process
             // acquisition fails. Never leave it wedged until the watchdog.
             releaseSessionTurn(false)
             if (error instanceof CrossProcessTurnAcquireTimeoutError) {
               finishRequest()
-              return new Response(JSON.stringify({
+              return trackedResponse(new Response(JSON.stringify({
                 type: "error",
                 error: {
                   type: "overloaded_error",
                   message: "Timed out waiting for another process to finish this session turn",
                 },
-              }), { status: 529, headers: { "Content-Type": "application/json", ...TRANSIENT_RETRY_AFTER_HEADERS } })
+              }), { status: 529, headers: { "Content-Type": "application/json", ...TRANSIENT_RETRY_AFTER_HEADERS } }))
             }
             throw error
           }
@@ -7967,6 +8335,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         routingTurnIdentity,
         retainSessionTurnFence: () => { retainSessionTurnFence = true },
         cascadeSubtreeCancel,
+        inflight: inflightEntry,
       }
       const response = await handleMessages(c, requestMeta, {
         body,
@@ -7982,9 +8351,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       } else {
         finishRequest()
       }
-      return response
+      return trackedResponse(response)
     } catch (error) {
       finishRequest()
+      finishHttpEntry()
       throw error
     }
   }
@@ -8590,6 +8960,101 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return c.json({ success: true, restartRequired: true, supervision: detectSupervision() })
   })
 
+  function updateSettingsState() {
+    return {
+      checkForUpdates: getSetting("checkForUpdates") === true,
+      envOptOut: envBool("NO_UPDATE_CHECK"),
+      enabled: isUpdateCheckEnabled(),
+      build: currentBuild(),
+    }
+  }
+
+  app.get("/settings/api/updates", (c) => c.json(updateSettingsState()))
+  app.put("/settings/api/updates", async (c) => {
+    let input: unknown
+    try { input = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
+    if (typeof input !== "object" || input === null || Array.isArray(input)) {
+      return c.json({ error: "Settings must be a JSON object" }, 400)
+    }
+    const body = input as Record<string, unknown>
+
+    if (body.checkForUpdates !== undefined) {
+      if (body.checkForUpdates !== null && typeof body.checkForUpdates !== "boolean") {
+        return c.json({ error: "checkForUpdates must be a boolean, or null to unset" }, 400)
+      }
+      setSetting("checkForUpdates", body.checkForUpdates ?? undefined)
+    }
+
+    // Takes effect now rather than on the next start: the checker is one
+    // unref'd timer with no store to swap out from under in-flight work, so
+    // there is nothing to justify making someone restart for it. Switching on
+    // waits for the first answer (bounded by the fetch timeout) so the reply
+    // already says whether an update exists.
+    if (isUpdateCheckEnabled()) await beginUpdateCheck(finalConfig)
+    else stopUpdateCheck()
+
+    return c.json(updateSettingsState())
+  })
+
+  function headerSettingsState() {
+    return { showHostname: getSetting("showHostname") === true, hostname: hostname() }
+  }
+
+  app.get("/settings/api/header", (c) => c.json(headerSettingsState()))
+  app.put("/settings/api/header", async (c) => {
+    let input: unknown
+    try { input = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
+    if (typeof input !== "object" || input === null || Array.isArray(input)) {
+      return c.json({ error: "Settings must be a JSON object" }, 400)
+    }
+    const body = input as Record<string, unknown>
+    if (body.showHostname !== undefined) {
+      if (body.showHostname !== null && typeof body.showHostname !== "boolean") {
+        return c.json({ error: "showHostname must be a boolean, or null to unset" }, 400)
+      }
+      setSetting("showHostname", body.showHostname ?? undefined)
+    }
+    return c.json(headerSettingsState())
+  })
+
+  /**
+   * How long Claude Code keeps the transcripts requests leave on disk. Read on
+   * every request, so unlike telemetry there is no pending-restart state:
+   * `effective` is what the next SDK child gets, unless its config root's own
+   * settings.json names a period (see transcriptRetention.ts).
+   */
+  function transcriptRetentionState() {
+    const saved = getSetting("transcriptRetentionDays")
+    const effective = meridianTranscriptRetention()
+    return {
+      saved: isTranscriptRetentionDays(saved) ? saved : null,
+      effective,
+      envOverride: effective.source === "env",
+      default: DEFAULT_TRANSCRIPT_RETENTION_DAYS,
+      limits: TRANSCRIPT_RETENTION_LIMITS,
+    }
+  }
+
+  app.get("/settings/api/transcripts", (c) => c.json(transcriptRetentionState()))
+  app.put("/settings/api/transcripts", async (c) => {
+    let input: unknown
+    try { input = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
+    if (typeof input !== "object" || input === null || Array.isArray(input)) {
+      return c.json({ error: "Settings must be a JSON object" }, 400)
+    }
+    const value = (input as Record<string, unknown>).transcriptRetentionDays
+    if (value !== undefined) {
+      if (value !== null && !isTranscriptRetentionDays(value)) {
+        const { min, max } = TRANSCRIPT_RETENTION_LIMITS
+        return c.json({ error: `transcriptRetentionDays must be an integer between ${min} and ${max}, or null to unset` }, 400)
+      }
+      setSetting("transcriptRetentionDays", value ?? undefined)
+    }
+    const state = transcriptRetentionState()
+    plog(`[PROXY] Transcript retention updated: ${state.effective.days === 0 ? "off" : `${state.effective.days}d`} (${state.effective.source})`)
+    return c.json(state)
+  })
+
   // Event hooks (hooks.ts). `saved` is what the form edits; `environment`
   // names the env targets by label only, since a command line or webhook URL
   // may carry a credential. `recent` is the last deliveries, newest first.
@@ -8729,6 +9194,76 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     })
   })
 
+  // Observed client HTTP requests only, not an atomic restart/drain barrier.
+  // Background jobs and pending backend continuations are outside this scope. Open like
+  // /health (no API key), but answered only to a loopback peer: the counts say
+  // when this machine is being used, which nobody off the host needs to know.
+  const refuseUnlessLoopback = (c: Context, route: string): Response | undefined => {
+    let remoteAddress: string | undefined
+    try {
+      remoteAddress = getConnInfo(c).remote.address
+    } catch {
+      // Served by something other than @hono/node-server: no peer to trust.
+      remoteAddress = undefined
+    }
+    if (isLoopbackPeer(remoteAddress, c.req.raw.headers)) return undefined
+    return c.json({ error: { type: "forbidden", message: `${route} is answered only to loopback clients` } }, 403)
+  }
+  app.get("/inflight", (c) => {
+    const refused = refuseUnlessLoopback(c, "/inflight")
+    if (refused) return refused
+    c.header("Cache-Control", "no-store")
+    return c.json({
+      ...inflight.snapshot(antigravity ? ["claude", "antigravity"] : ["claude"]),
+      draining: admissionHold.active,
+      drain: admissionHold.snapshot(),
+    })
+  })
+
+  // Restart drain: hold NEW requests (never refuse them) so the ones running
+  // can finish and /inflight can reach 0 under steady traffic. Loopback only,
+  // like /inflight, and never from a browser page: cors() answers every
+  // origin, and a page on this host must not be able to slow its clients.
+  const refuseDrainCaller = (c: Context): Response | undefined => {
+    const refused = refuseUnlessLoopback(c, "/drain")
+    if (refused) return refused
+    if (c.req.header("origin") !== undefined) {
+      return c.json({ error: { type: "forbidden", message: "/drain is not answered to browser pages" } }, 403)
+    }
+    return undefined
+  }
+  app.post("/drain", async (c) => {
+    const refused = refuseDrainCaller(c)
+    if (refused) return refused
+    if (draining) return drainingResponse()
+    const text = await c.req.text()
+    let body: unknown
+    try {
+      body = text.trim() === "" ? undefined : JSON.parse(text)
+    } catch {
+      return c.json({ error: { type: "invalid_request_error", message: "body must be JSON" } }, 400)
+    }
+    const options = parseDrainOptions(body)
+    if (typeof options === "string") {
+      return c.json({ error: { type: "invalid_request_error", message: options } }, 400)
+    }
+    const started = !admissionHold.active
+    const drain = admissionHold.start(options)
+    if (started) {
+      claudeLog("drain.start", { holdMs: drain.holdMs, endsAt: drain.endsAt })
+      plog(`[PROXY] drain started: new requests held up to ${drain.holdMs}ms each, ends by ${drain.endsAt}`)
+    }
+    c.header("Cache-Control", "no-store")
+    return c.json({ started, drain })
+  })
+  app.delete("/drain", (c) => {
+    const refused = refuseDrainCaller(c)
+    if (refused) return refused
+    const ended = admissionHold.end("cancelled")
+    c.header("Cache-Control", "no-store")
+    return c.json({ ended, drain: admissionHold.snapshot() })
+  })
+
   // Liveness — would restarting this process help? Answered without touching
   // anything: no subprocess, no credential read, no upstream. /health is NOT
   // this, and pointing a supervisor at it is a restart loop, because it 503s
@@ -8741,20 +9276,60 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // Readiness — should traffic come HERE rather than to another instance? Only
   // per-instance checks earn a place; one that every instance fails together
   // cannot move traffic anywhere and only turns a clear error into a 502.
-  app.get("/readyz", (c) => {
+  app.get("/readyz", async (c) => {
+    // Cold embedded instances must not run the CLI's synchronous PATH/version
+    // probes on the HTTP event loop. Startup and concurrent probes share the
+    // asynchronous resolver; a miss keeps the existing unready response.
+    const executableResolved = getResolvedClaudeExecutableInfo() !== null
+      || await resolveClaudeExecutableAsync().then(() => true, () => false)
     const report = readinessReport({
       profileCount: listProfiles(finalConfig.profiles, finalConfig.defaultProfile).length,
-      // Cached answer first, so the steady state costs nothing; the sync
-      // lookup runs only before the first SDK call has populated that cache,
-      // where the alternative is reporting a freshly started instance unready.
-      claudeExecutableResolved:
-        (getResolvedClaudeExecutableInfo() ?? resolveClaudeExecutableSync()) !== null,
+      claudeExecutableResolved: executableResolved,
+      claudeUnreachable: unreachableDetail(claudeReachability.snapshot()),
       ...(chatGptSource ? { chatGptAccounts: chatGptSource.seats().length } : {}),
     })
     return c.text(
       renderProbe("readyz", report, c.req.query("verbose") !== undefined),
       report.ok ? 200 : 503,
     )
+  })
+
+  // Force the reachability state, so a load balancer's failover can be tested
+  // without breaking a host's DNS. Loopback only, like /inflight, and behind the
+  // API key when one is set: it takes an instance out of rotation. A forced
+  // state expires on its own, so a forgotten test cannot.
+  app.put("/upstream-reachability", async (c) => {
+    let remoteAddress: string | undefined
+    try {
+      remoteAddress = getConnInfo(c).remote.address
+    } catch {
+      // Served by something other than @hono/node-server: no peer to trust.
+      remoteAddress = undefined
+    }
+    if (!isLoopbackPeer(remoteAddress, c.req.raw.headers)) {
+      return c.json({ error: { type: "forbidden", message: "/upstream-reachability is answered only to loopback clients" } }, 403)
+    }
+    let input: unknown
+    try { input = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
+    if (typeof input !== "object" || input === null || Array.isArray(input)) {
+      return c.json({ error: "Body must be a JSON object" }, 400)
+    }
+    const body = input as Record<string, unknown>
+    if (body.upstream !== undefined && body.upstream !== "claude") {
+      return c.json({ error: "upstream must be \"claude\"" }, 400)
+    }
+    if (body.state !== null && body.state !== "unreachable" && body.state !== "ok") {
+      return c.json({ error: "state must be \"unreachable\", \"ok\", or null to clear" }, 400)
+    }
+    const ttlMs = body.ttlMs ?? DEFAULT_OVERRIDE_TTL_MS
+    if (typeof ttlMs !== "number" || !Number.isInteger(ttlMs) || ttlMs < 1 || ttlMs > MAX_OVERRIDE_TTL_MS) {
+      return c.json({ error: `ttlMs must be an integer from 1 to ${MAX_OVERRIDE_TTL_MS}` }, 400)
+    }
+    if (body.state === null) claudeReachability.clearOverride()
+    else claudeReachability.force(body.state, ttlMs)
+    plog(`[PROXY] upstream reachability override: ${body.state === null ? "cleared" : `${body.state} for ${ttlMs}ms`}`)
+    c.header("Cache-Control", "no-store")
+    return c.json({ upstream: { claude: claudeReachability.snapshot() } })
   })
 
   // Health check endpoint — verifies auth status
@@ -8794,6 +9369,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   const servesClaude = (auth: { loggedIn?: boolean } | null | undefined) =>
     !chatGptSource || hasProfiles(finalConfig.profiles) || auth?.loggedIn === true
   app.get("/health", async (c) => {
+    const upstream = { claude: claudeReachability.snapshot() }
+    const machine = getSetting("showHostname") === true ? { hostname: hostname() } : {}
     // Checked first and unconditionally: a fleet manager routing on this
     // endpoint (e.g. a gateway's account-pool scheduler) needs to learn
     // "stop sending here" as fast as possible during shutdown, without
@@ -8803,6 +9380,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         status: "draining",
         version: serverVersion,
         backend: finalConfig.backend ?? "claude",
+        ...machine,
+        upstream,
         message: "Meridian is shutting down; route new requests to another instance.",
       }, 503)
     }
@@ -8817,6 +9396,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         status: "unhealthy",
         version: serverVersion,
         backend: finalConfig.backend ?? "claude",
+        ...machine,
+        upstream,
         error: "Cannot capture a process incarnation, so no request that touches a session can be served.",
         bootIdentity,
       }, 503)
@@ -8835,6 +9416,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           status: "degraded",
           version: serverVersion,
           backend: finalConfig.backend ?? "claude",
+          ...machine,
+          upstream,
           build: currentBuild(),
           error: "Could not verify auth status",
           mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
@@ -8845,6 +9428,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           status: "unhealthy",
           version: serverVersion,
           backend: finalConfig.backend ?? "claude",
+          ...machine,
+          upstream,
           build: currentBuild(),
           error: "Not logged in. Run: claude login",
           auth: { loggedIn: false }
@@ -8866,15 +9451,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // are separate auth contexts keyed by CLAUDE_CONFIG_DIR, so the default
       // store would report an unrelated account's expiry.
       const renewalConfigDir = profileEnvOverrides?.CLAUDE_CONFIG_DIR
-      const healthStore = renewalConfigDir
-        ? createPlatformCredentialStore({ claudeConfigDir: renewalConfigDir })
+      // API keys and supplied setup tokens do not authenticate with this
+      // store. Falling back to it would report another account's plan/expiry.
+      const healthStore = healthProfile.type === "claude-max"
+        ? createPlatformCredentialStore(renewalConfigDir ? { claudeConfigDir: renewalConfigDir } : undefined)
         : undefined
-      const renewal = await getAuthRenewalStatus(healthStore, warnDays)
-        .catch(() => ({ renewalRequiredSoon: false }))
+      const renewal = healthStore
+        ? await getAuthRenewalStatus(healthStore, warnDays).catch(() => ({ renewalRequiredSoon: false }))
+        : { renewalRequiredSoon: false }
       // `claude auth status` reports the plan family (`max`) but not the tier
       // that sizes it, so the 5x-vs-20x distinction can only come off disk.
       // Same store, same cached read as the renewal window above.
-      const plan = await getStoredPlanFields(healthStore).catch((): StoredPlanFields => ({}))
+      const plan = healthStore
+        ? await getStoredPlanFields(healthStore).catch((): StoredPlanFields => ({}))
+        : {}
       // Spread the live status only WHEN IT HAS ONE. `subscriptionType:
       // undefined` overwrites the value read off disk, so an account whose
       // `claude auth status` omits the field lost its stored plan entirely -
@@ -8888,6 +9478,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         status: "healthy",
         version: serverVersion,
         backend: finalConfig.backend ?? "claude",
+        ...machine,
+        upstream,
         build: currentBuild(),
         auth: {
           loggedIn: true,
@@ -8913,6 +9505,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         status: "degraded",
         version: serverVersion,
         backend: finalConfig.backend ?? "claude",
+        ...machine,
+        upstream,
         build: currentBuild(),
         error: "Could not verify auth status",
         mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
@@ -8971,12 +9565,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // The tier that sizes the plan is never in `claude auth status` — only
       // the family (`max`), which covers both 5x and 20x. It is on disk, in
       // the profile's own credential file.
-      const profileStore = createPlatformCredentialStore(
-        envOverrides?.CLAUDE_CONFIG_DIR
-          ? { claudeConfigDir: envOverrides.CLAUDE_CONFIG_DIR }
-          : undefined,
-      )
-      const plan = await getStoredPlanFields(profileStore).catch((): StoredPlanFields => ({}))
+      const profileStore = resolved.type === "claude-max"
+        ? createPlatformCredentialStore(
+            envOverrides?.CLAUDE_CONFIG_DIR
+              ? { claudeConfigDir: envOverrides.CLAUDE_CONFIG_DIR }
+              : undefined,
+          )
+        : undefined
+      const plan = profileStore
+        ? await getStoredPlanFields(profileStore).catch((): StoredPlanFields => ({}))
+        : {}
       const allowance = planAllowance({
         ...plan,
         ...(auth?.subscriptionType ? { subscriptionType: auth.subscriptionType } : {}),
@@ -8989,16 +9587,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // a request actually presents, so an access token that is not there
       // outranks a cheerful probe. Only `absent` demotes: see
       // `readStoredCredentialPresence` for why `unknown` must not.
-      const stored = await readStoredCredentialSnapshot(profileStore)
-      const presence = stored.presence
+      // A supplied API key/setup token is not the grant in this store; an
+      // empty stored OAuth grant cannot invalidate those credentials.
+      const stored = profileStore ? await readStoredCredentialSnapshot(profileStore) : undefined
+      const presence = stored?.presence ?? "unknown"
       // How long the login has left, and what is on record about it. Only an
       // account with its own OAuth credential has a login: an API-key profile
       // would otherwise be credited with the host's own ~/.claude.
-      const hasOAuthLogin = resolved.type === "claude-max"
-      const renewal: AuthRenewalStatus = hasOAuthLogin
+      const renewal: AuthRenewalStatus = stored
         ? renewalStatusFor(stored.refreshTokenExpiresAt, renewalWarnDays)
         : { renewalRequiredSoon: false }
-      const lifecycle = hasOAuthLogin
+      const lifecycle = profileStore && stored
         ? noteCredentialObserved(profileStore.refreshKey, { presence, refreshTokenExpiresAt: stored.refreshTokenExpiresAt })
         : undefined
       return {
@@ -9029,7 +9628,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         refreshTokenExpiresAt: renewal.refreshTokenExpiresAt ?? null,
         daysUntilRenewal: renewal.daysUntilRenewal ?? null,
         renewalRequiredSoon: renewal.renewalRequiredSoon,
-        accessTokenExpiresAt: hasOAuthLogin ? stored.accessTokenExpiresAt ?? null : null,
+        accessTokenExpiresAt: stored?.accessTokenExpiresAt ?? null,
         authObtainedAt: lifecycle?.authObtainedAt ?? null,
         authObtainedVia: lifecycle?.authObtainedVia ?? null,
         lastRefreshAt: lifecycle?.lastRefreshAt ?? null,
@@ -9265,190 +9864,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       }),
       signal: c.req.raw.signal,
     }))
-  })
-
-  // --- Profile login routes (browser-completable OAuth) ---
-  //
-  // /start mints one PKCE challenge and hands the browser an opaque login id
-  // plus an authorize URL. A browser on this host gets one that redirects to
-  // GET /callback below, and the login finishes on its own; a browser anywhere
-  // else gets the code-display page and finishes via /complete with a paste.
-  // /status is how the page learns which happened. Decisions live in
-  // profileLogin.ts.
-
-  app.post("/profiles/login/start", async (c) => {
-    let body: { profile?: string }
-    try {
-      body = await c.req.json() as { profile?: string }
-    } catch {
-      return c.json({ error: "Invalid JSON in request body" }, 400)
-    }
-    const result = startProfileLogin({
-      profiles: finalConfig.profiles,
-      profileId: body.profile ?? "",
-      hostHeader: c.req.header("host"),
-      serverPort: finalConfig.port,
-    })
-    if (!result.ok) {
-      claudeLog("profile.login_refused", {
-        profile: body.profile ?? null,
-        reason: result.code,
-        userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
-      })
-      return c.json({ error: result.message, code: result.code }, result.status as 400)
-    }
-    plog(`[PROXY] Profile login started for "${result.profileId}" (mode=${result.mode}, expires in ${Math.round((result.expiresAt - Date.now()) / 1000)}s)`)
-    return c.json({
-      loginId: result.loginId,
-      mode: result.mode,
-      authorizeUrl: result.authorizeUrl,
-      pasteAuthorizeUrl: result.pasteAuthorizeUrl,
-      ...(result.loopbackAuthorizeUrl ? { loopbackAuthorizeUrl: result.loopbackAuthorizeUrl } : {}),
-      ...(result.loopbackProbeUrl ? { loopbackProbeUrl: result.loopbackProbeUrl } : {}),
-      expiresAt: result.expiresAt,
-      profile: result.profileId,
-    })
-  })
-
-  app.get("/profiles/login/status", (c) => {
-    const loginId = c.req.query("loginId")
-    if (!loginId) {
-      return c.json({ error: "Missing 'loginId' query parameter", code: "invalid_request" }, 400)
-    }
-    const status = getProfileLoginStatus(loginId)
-    if (!status) {
-      return c.json({
-        error: "This login is no longer open — it expired, or it was already completed. Start it again.",
-        code: "expired_login",
-      }, 410)
-    }
-    return c.json(status)
-  })
-
-  app.post("/profiles/login/complete", async (c) => {
-    let body: { loginId?: string; code?: string }
-    try {
-      body = await c.req.json() as { loginId?: string; code?: string }
-    } catch {
-      return c.json({ error: "Invalid JSON in request body" }, 400)
-    }
-    if (!body.loginId) {
-      return c.json({ error: "Missing 'loginId' in request body", code: "invalid_request" }, 400)
-    }
-    const result = await completeProfileLogin({ loginId: body.loginId, input: body.code ?? "" })
-    if (!result.ok) {
-      // The paste itself is never logged — it is a one-time credential.
-      claudeLog("profile.login_failed", { reason: result.code })
-      return c.json({
-        error: result.message,
-        code: result.code,
-        ...(result.retryable ? { retryable: true } : {}),
-      }, result.status as 400)
-    }
-    // The auth-status cache holds a 60s "not logged in" answer for this profile;
-    // drop it so /profiles/list reflects the login on the UI's next poll.
-    expireAuthStatusCache()
-    claudeLog("profile.login_completed", {
-      profile: result.profileId,
-      userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
-    })
-    plog(`[PROXY] Profile login completed for "${result.profileId}"`)
-    return c.json({ success: true, profile: result.profileId })
-  })
-
-  // --- Profile creation routes (browser-completable OAuth) ---
-  //
-  // Same two-step shape as the login routes above, deliberately NOT the same
-  // routes: /profiles/login/start refuses unknown ids, and that refusal is what
-  // stops a typo in a re-authentication from creating an account slot. Creating
-  // one is its own act, so it is its own explicit route. Decisions live in
-  // profileAdd.ts.
-
-  app.post("/profiles/add/start", async (c) => {
-    let body: { profile?: string }
-    try {
-      body = await c.req.json() as { profile?: string }
-    } catch {
-      return c.json({ error: "Invalid JSON in request body" }, 400)
-    }
-    if (body.profile && chatGptProfiles?.profiles().some(p => p.id === body.profile)) {
-      return c.json({ error: `Profile "${body.profile}" already exists: it is a ChatGPT seat.`, code: "profile_exists" }, 400)
-    }
-    const result = startProfileAdd({ profiles: finalConfig.profiles, profileId: body.profile ?? "" })
-    if (!result.ok) {
-      claudeLog("profile.add_refused", {
-        profile: body.profile?.slice(0, 64) ?? null,
-        reason: result.code,
-        userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
-      })
-      return c.json({ error: result.message, code: result.code }, result.status as 400)
-    }
-    plog(`[PROXY] Profile creation started for "${result.profileId}" (expires in ${Math.round((result.expiresAt - Date.now()) / 1000)}s)`)
-    return c.json({
-      addId: result.addId,
-      authorizeUrl: result.authorizeUrl,
-      expiresAt: result.expiresAt,
-      profile: result.profileId,
-    })
-  })
-
-  app.post("/profiles/add/complete", async (c) => {
-    let body: { addId?: string; code?: string }
-    try {
-      body = await c.req.json() as { addId?: string; code?: string }
-    } catch {
-      return c.json({ error: "Invalid JSON in request body" }, 400)
-    }
-    if (!body.addId) {
-      return c.json({ error: "Missing 'addId' in request body", code: "invalid_request" }, 400)
-    }
-    const result = await completeProfileAdd({ addId: body.addId, input: body.code ?? "" })
-    if (!result.ok) {
-      // The paste itself is never logged — it is a one-time credential.
-      claudeLog("profile.add_failed", { reason: result.code })
-      return c.json({
-        error: result.message,
-        code: result.code,
-        ...(result.retryable ? { retryable: true } : {}),
-      }, result.status as 400)
-    }
-    // A profile that did not exist a moment ago has no cached auth answer, but
-    // the list-wide cache does — drop it so the new card renders authenticated
-    // on the UI's next poll rather than after the 60s TTL.
-    expireAuthStatusCache()
-    claudeLog("profile.add_completed", {
-      profile: result.profileId,
-      userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
-    })
-    plog(`[PROXY] Profile "${result.profileId}" created from the web UI`)
-    return c.json({ success: true, profile: result.profileId })
-  })
-
-  // PUBLIC — no requireAuth. Anthropic redirects the user's browser here and
-  // that redirect carries no API key, so gating it would break the flow for
-  // every instance running with MERIDIAN_API_KEY set. The path and root
-  // placement are Anthropic's, not ours: the client's registered loopback
-  // redirect URIs are `http://localhost/callback` and
-  // `http://127.0.0.1/callback`. Its security review is in
-  // proxy-settings-auth.test.ts beside the allowlist entry.
-  app.get("/callback", async (c) => {
-    const result = await completeProfileLoginFromCallback({
-      state: c.req.query("state"),
-      code: c.req.query("code"),
-      error: c.req.query("error"),
-      errorDescription: c.req.query("error_description"),
-    })
-    if (!result.ok) {
-      // Neither the code nor the state is logged — both are one-time
-      // credentials for this login.
-      claudeLog("profile.login_failed", { reason: result.code, via: "callback" })
-      plog(`[PROXY] Profile login callback failed: ${result.code}`)
-      return c.html(renderLoginCallbackPage({ ok: false, message: result.message }), result.status as 400)
-    }
-    expireAuthStatusCache()
-    claudeLog("profile.login_completed", { profile: result.profileId, via: "callback" })
-    plog(`[PROXY] Profile login completed for "${result.profileId}" (browser redirect)`)
-    return c.html(renderLoginCallbackPage({ ok: true, profileId: result.profileId }))
   })
 
   // --- ChatGPT seat sign-in (owned mode only) ---
@@ -9802,6 +10217,193 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     })
   })
 
+  // --- Profile login routes (browser-completable OAuth) ---
+  //
+  // /start mints one PKCE challenge and hands the browser an opaque login id
+  // plus an authorize URL. A browser on this host gets one that redirects to
+  // GET /callback below, and the login finishes on its own; a browser anywhere
+  // else gets the code-display page and finishes via /complete with a paste.
+  // /status is how the page learns which happened. Decisions live in
+  // profileLogin.ts.
+
+  app.post("/profiles/login/start", async (c) => {
+    let body: { profile?: string }
+    try {
+      body = profileStartBody.parse(await c.req.json())
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    const result = startProfileLogin({
+      profiles: finalConfig.profiles,
+      profileId: body.profile ?? "",
+      hostHeader: c.req.header("host"),
+      forwardedFor: c.req.header("x-forwarded-for"),
+      serverPort: finalConfig.port,
+    })
+    if (!result.ok) {
+      claudeLog("profile.login_refused", {
+        profile: body.profile ?? null,
+        reason: result.code,
+        userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+      })
+      return c.json({ error: result.message, code: result.code }, result.status as 400)
+    }
+    plog(`[PROXY] Profile login started for "${result.profileId}" (mode=${result.mode}, expires in ${Math.round((result.expiresAt - Date.now()) / 1000)}s)`)
+    return c.json({
+      loginId: result.loginId,
+      mode: result.mode,
+      authorizeUrl: result.authorizeUrl,
+      pasteAuthorizeUrl: result.pasteAuthorizeUrl,
+      ...(result.loopbackAuthorizeUrl ? { loopbackAuthorizeUrl: result.loopbackAuthorizeUrl } : {}),
+      ...(result.loopbackProbeUrl ? { loopbackProbeUrl: result.loopbackProbeUrl } : {}),
+      expiresAt: result.expiresAt,
+      profile: result.profileId,
+    })
+  })
+
+  app.get("/profiles/login/status", (c) => {
+    const loginId = c.req.query("loginId")
+    if (!loginId) {
+      return c.json({ error: "Missing 'loginId' query parameter", code: "invalid_request" }, 400)
+    }
+    const status = getProfileLoginStatus(loginId)
+    if (!status) {
+      return c.json({
+        error: "This login is no longer open — it expired, or it was already completed. Start it again.",
+        code: "expired_login",
+      }, 410)
+    }
+    return c.json(status)
+  })
+
+  app.post("/profiles/login/complete", async (c) => {
+    let body: { loginId?: string; code?: string }
+    try {
+      body = profileLoginCompleteBody.parse(await c.req.json())
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    if (!body.loginId) {
+      return c.json({ error: "Missing 'loginId' in request body", code: "invalid_request" }, 400)
+    }
+    const result = await completeProfileLogin({ loginId: body.loginId, input: body.code ?? "" })
+    if (!result.ok) {
+      // The paste itself is never logged — it is a one-time credential.
+      claudeLog("profile.login_failed", { reason: result.code })
+      return c.json({
+        error: result.message,
+        code: result.code,
+        ...(result.retryable ? { retryable: true } : {}),
+      }, result.status as 400)
+    }
+    // The auth-status cache holds a 60s "not logged in" answer for this profile;
+    // drop it so /profiles/list reflects the login on the UI's next poll.
+    expireAuthStatusCache()
+    claudeLog("profile.login_completed", {
+      profile: result.profileId,
+      userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+    })
+    plog(`[PROXY] Profile login completed for "${result.profileId}"`)
+    return c.json({ success: true, profile: result.profileId })
+  })
+
+  // PUBLIC — no requireAuth. Anthropic redirects the user's browser here and
+  // that redirect carries no API key, so gating it would break the flow for
+  // every instance running with MERIDIAN_API_KEY set. The path and root
+  // placement are Anthropic's, not ours: the client's registered loopback
+  // redirect URIs are `http://localhost/callback` and
+  // `http://127.0.0.1/callback`. Its security review is in
+  // proxy-settings-auth.test.ts beside the allowlist entry.
+  app.get("/callback", async (c) => {
+    const { renderLoginCallbackPage } = await import("../telemetry/loginCallbackPage")
+    const result = await completeProfileLoginFromCallback({
+      state: c.req.query("state"),
+      code: c.req.query("code"),
+      error: c.req.query("error"),
+      errorDescription: c.req.query("error_description"),
+    })
+    if (!result.ok) {
+      // Neither the code nor the state is logged — both are one-time
+      // credentials for this login.
+      claudeLog("profile.login_failed", { reason: result.code, via: "callback" })
+      plog(`[PROXY] Profile login callback failed: ${result.code}`)
+      return c.html(renderLoginCallbackPage({ ok: false, message: result.message }), result.status as 400)
+    }
+    expireAuthStatusCache()
+    claudeLog("profile.login_completed", { profile: result.profileId, via: "callback" })
+    plog(`[PROXY] Profile login completed for "${result.profileId}" (browser redirect)`)
+    return c.html(renderLoginCallbackPage({ ok: true, profileId: result.profileId }))
+  })
+
+  // --- Profile creation routes (browser-completable OAuth) ---
+  //
+  // Same two-step shape as the login routes above, deliberately NOT the same
+  // routes: /profiles/login/start refuses unknown ids, and that refusal is what
+  // stops a typo in a re-authentication from creating an account slot. Creating
+  // one is its own act, so it is its own explicit route. Decisions live in
+  // profileAdd.ts.
+
+  app.post("/profiles/add/start", async (c) => {
+    let body: { profile?: string }
+    try {
+      body = profileStartBody.parse(await c.req.json())
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    if (body.profile && chatGptProfiles?.profiles().some(p => p.id === body.profile)) {
+      return c.json({ error: `Profile "${body.profile}" already exists: it is a ChatGPT seat.`, code: "profile_exists" }, 400)
+    }
+    const result = startProfileAdd({ profiles: finalConfig.profiles, profileId: body.profile ?? "" })
+    if (!result.ok) {
+      claudeLog("profile.add_refused", {
+        profile: body.profile?.slice(0, 64) ?? null,
+        reason: result.code,
+        userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+      })
+      return c.json({ error: result.message, code: result.code }, result.status as 400)
+    }
+    plog(`[PROXY] Profile creation started for "${result.profileId}" (expires in ${Math.round((result.expiresAt - Date.now()) / 1000)}s)`)
+    return c.json({
+      addId: result.addId,
+      authorizeUrl: result.authorizeUrl,
+      expiresAt: result.expiresAt,
+      profile: result.profileId,
+    })
+  })
+
+  app.post("/profiles/add/complete", async (c) => {
+    let body: { addId?: string; code?: string }
+    try {
+      body = profileAddCompleteBody.parse(await c.req.json())
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    if (!body.addId) {
+      return c.json({ error: "Missing 'addId' in request body", code: "invalid_request" }, 400)
+    }
+    const result = await completeProfileAdd({ addId: body.addId, input: body.code ?? "" })
+    if (!result.ok) {
+      // The paste itself is never logged — it is a one-time credential.
+      claudeLog("profile.add_failed", { reason: result.code })
+      return c.json({
+        error: result.message,
+        code: result.code,
+        ...(result.retryable ? { retryable: true } : {}),
+      }, result.status as 400)
+    }
+    invalidateDiskProfileCache()
+    // A profile that did not exist a moment ago has no cached auth answer, but
+    // the list-wide cache does — drop it so the new card renders authenticated
+    // on the UI's next poll rather than after the 60s TTL.
+    expireAuthStatusCache()
+    claudeLog("profile.add_completed", {
+      profile: result.profileId,
+      userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+    })
+    plog(`[PROXY] Profile "${result.profileId}" created from the web UI`)
+    return c.json({ success: true, profile: result.profileId })
+  })
+
   // --- Plugin management routes ---
 
   app.get("/plugins/list", async (c) => {
@@ -9875,6 +10477,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // See src/proxy/openai.ts for the translation logic and design rationale.
   app.post("/v1/chat/completions", async (c) => {
     if (draining) return drainingResponse()
+    const refused = await awaitAdmission(c)
+    if (refused) return refused
     const rawBody = await c.req.json() as Record<string, unknown>
     const userAgent = c.req.header("user-agent") ?? ""
     const jcodeSessionId = userAgent.startsWith("jcode/")
@@ -10118,6 +10722,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // See src/proxy/openaiResponses.ts for the translation logic.
   const handleResponsesClaude = async (c: Context) => {
     if (draining) return drainingResponse("openai")
+    const refused = await awaitAdmission(c, "openai")
+    if (refused) return refused
     const rawBody = await c.req.json() as ResponsesRequest
     const anthropicBody = translateResponsesToAnthropic(rawBody)
 
@@ -10678,6 +11284,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     closeBackend: antigravity?.closeBackend,
     beginDrain: () => {
       draining = true
+      // Held requests are released into the shutdown 503 rather than left
+      // hanging until the grace period cuts their connections.
+      admissionHold.end("shutdown")
       antigravity?.beginDrain?.()
       // Closes the sign-in listener and tells relays to stop forwarding to it.
       chatGptLogin?.close()
@@ -10702,6 +11311,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       acquire: () => chatGptSource.acquire(),
       release: () => chatGptSource.release(),
     } } : {}),
+    transcriptSweep,
   }
 }
 
@@ -10730,12 +11340,19 @@ export function installProxyProcessErrorHandlers(): void {
 }
 
 export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promise<ProxyInstance> {
+  // OAuth returns to localhost, whose cookies are shared by unrelated local
+  // apps. A real browser's 16 KiB cookie jar exceeded Node's default ingress
+  // limit before /callback could run. Keep a finite 32 KiB header budget.
+  const serverOptions = { maxHeaderSize: 32 * 1024 }
   const selectedConfig = resolveBackendConfig(config)
   if (selectedConfig.backend === "antigravity") {
     const backend = createAntigravityServer(selectedConfig)
     await backend.initPlugins?.()
-    if (selectedConfig.installProcessErrorHandlers) installProxyProcessErrorHandlers()
-    const server = serve({ fetch: backend.app.fetch, port: selectedConfig.port, hostname: selectedConfig.host, overrideGlobalObjects: false }, info => {
+    if (selectedConfig.installProcessErrorHandlers) {
+      installErrorReporter({ version: selectedConfig.version })
+      installProxyProcessErrorHandlers()
+    }
+    const server = serve({ fetch: backend.app.fetch, port: selectedConfig.port, hostname: selectedConfig.host, serverOptions, overrideGlobalObjects: false }, info => {
       if (!selectedConfig.silent) console.log(`Meridian Antigravity backend: http://${selectedConfig.host}:${info.port}`)
     }) as Server
     const tracker = trackServerConnections(server)
@@ -10755,7 +11372,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
     } }
   }
   // Refuse to bind a port we cannot serve from (#906). Without a boot identity
-  // every session-store write throws, so every request that touches a session
+  // every session lock acquisition throws, so every request that touches a session
   // returns a 500 — a total, non-transient failure. Binding anyway is what let
   // a container missing /etc/machine-id report healthy to Docker for three days
   // while serving nothing.
@@ -10805,6 +11422,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
     sweepSessionGc,
     closeBackend,
     chatGpt,
+    transcriptSweep,
   } = createProxyServer(config)
   if (initPlugins) await initPlugins()
   // Fail startup rather than degrade: an instance that owns ChatGPT accounts
@@ -10820,21 +11438,18 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
     : undefined
   sessionGcInterval?.unref?.()
   if (sweepSessionGc) void sweepSessionGc()
+  transcriptSweep?.start()
 
-  // Cached, once a day, never on the request path. Opt out with
-  // MERIDIAN_NO_UPDATE_CHECK=1. The banner below reports build-source drift
+  // Cached, once a day, never on the request path, and only when the
+  // checkForUpdates setting is on. The banner below reports build-source drift
   // synchronously; this callback reports version drift whenever it resolves.
-  startUpdateCheck({
-    onResolved: (latest) => {
-      if (finalConfig.silent) return
-      const build = buildRuntime.info(finalConfig.version ?? "unknown", latest)
-      if (build.source !== "npm" || !build.updateAvailable) return
-      console.log(`\n[meridian] Update available: ${build.version} → ${latest}`)
-      console.log(`  npm install -g @rynfar/meridian@latest`)
-    },
-  })
+  void beginUpdateCheck(finalConfig)
 
   if (finalConfig.installProcessErrorHandlers) {
+    // Opt-in (a configured DSN) and idempotent: the CLI installs it earlier so
+    // a startup failure is reported too; an embedder that asks Meridian to own
+    // the process error handlers gets it here.
+    installErrorReporter({ version: finalConfig.version })
     installProxyProcessErrorHandlers()
   }
 
@@ -10879,7 +11494,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
   if (fd !== undefined) {
     delete process.env.LISTEN_FDS
     delete process.env.LISTEN_PID
-    server = createAdaptorServer({ fetch: app.fetch, overrideGlobalObjects: false }) as Server
+    server = createAdaptorServer({ fetch: app.fetch, serverOptions, overrideGlobalObjects: false }) as Server
     server.listen({ fd }, () => {
       const addr = server.address()
       onListening(typeof addr === "object" && addr !== null ? addr.port : finalConfig.port)
@@ -10891,6 +11506,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
         fetch: app.fetch,
         port: finalConfig.port,
         hostname: finalConfig.host,
+        serverOptions,
         overrideGlobalObjects: false,
       },
       (info) => onListening(info.port),
@@ -10989,6 +11605,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
         if (profileTokenRefreshInterval) clearInterval(profileTokenRefreshInterval)
         if (authKeepaliveInterval) clearInterval(authKeepaliveInterval)
         if (sessionGcInterval) clearInterval(sessionGcInterval)
+        const transcriptSweepStopped = transcriptSweep?.stop()
         // Refuse new work before potentially waiting for a deletion child.
         beginDrain?.()
         stopFollowPolling()
@@ -11015,6 +11632,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
           connectionTracker.dispose()
           await closeBackend?.()
           chatGpt?.release()
+          await transcriptSweepStopped
         }
         // Give aborted SDK iterators one short bounded window to observe the
         // revocation and release their fencing leases. Durable callbacks also

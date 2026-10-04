@@ -8,7 +8,7 @@
  * stays here.
  *
  * A login started from a browser ON THE MERIDIAN HOST finishes by itself:
- * Anthropic redirects to `http://127.0.0.1:<port>/callback`, this module
+ * Anthropic redirects to `http://localhost:<port>/callback`, this module
  * exchanges the code, and the page notices via `GET /profiles/login/status`.
  * Anthropic's published client metadata for the Claude Code client
  * (`https://claude.ai/oauth/claude-code-client-metadata`) registers
@@ -27,13 +27,13 @@
  */
 
 import { randomBytes } from "node:crypto"
+import { networkInterfaces } from "node:os"
 import { envBool } from "../env"
 import {
   buildAuthorizeUrl,
   createOAuthPkce,
   exchangeAuthorizationCodeForCredentials,
   parseAuthorizationCodeInput,
-  profileConfigDirFor,
   OAUTH_LOOPBACK_CALLBACK_PATH,
   OAUTH_REDIRECT_URI,
 } from "./profileCli"
@@ -92,6 +92,7 @@ interface FinishedLogin {
  * interfere — each carries its own verifier, state and target directory.
  */
 const pendingLogins = new Map<string, PendingLogin>()
+const exchangingLogins = new Map<string, string>()
 
 /**
  * `state` → login id.
@@ -111,6 +112,7 @@ export type LoginErrorCode =
   | "no_profiles"
   | "unknown_profile"
   | "unsupported_profile_type"
+  | "missing_config_dir"
   | "invalid_request"
   | "expired_login"
   | "no_code"
@@ -184,6 +186,13 @@ export interface StartLoginParams {
    * which decides whether a loopback redirect can reach this instance.
    */
   hostHeader?: string
+  /**
+   * The request's `X-Forwarded-For`, which a reverse proxy in front of this
+   * instance fills with the browser's own address. It answers the question
+   * `hostHeader` cannot: whether a browser that reached us under some other
+   * name is nonetheless on this host.
+   */
+  forwardedFor?: string
   /** Port this instance listens on, used to offer a loopback candidate when
    *  `hostHeader` is some other name. */
   serverPort?: number
@@ -232,15 +241,18 @@ function consume(loginId: string): PendingLogin | undefined {
   if (!pending) return undefined
   pendingLogins.delete(loginId)
   loginIdByState.delete(pending.state)
+  exchangingLogins.set(loginId, pending.profileId)
   return pending
 }
 
 function restore(loginId: string, pending: PendingLogin): void {
+  exchangingLogins.delete(loginId)
   pendingLogins.set(loginId, pending)
   loginIdByState.set(pending.state, loginId)
 }
 
 function finish(loginId: string, profileId: string, now: number, failure?: LoginFailure): void {
+  exchangingLogins.delete(loginId)
   finishedLogins.set(loginId, {
     profileId,
     status: failure ? "failed" : "completed",
@@ -277,7 +289,9 @@ export function resolveLoopbackRedirectUri(hostHeader: string | undefined): stri
     return undefined
   }
   if (!LOOPBACK_HOSTNAMES.has(parsed.hostname)) return undefined
-  return `http://${parsed.host}${OAUTH_LOOPBACK_CALLBACK_PATH}`
+  // Claude canonicalizes 127.0.0.1 to localhost on its consent page. Use that
+  // spelling for both authorization and exchange, retaining the reached port.
+  return `http://localhost${parsed.port ? `:${parsed.port}` : ""}${OAUTH_LOOPBACK_CALLBACK_PATH}`
 }
 
 /**
@@ -286,10 +300,10 @@ export function resolveLoopbackRedirectUri(hostHeader: string | undefined): stri
  *
  * `Host` proves a loopback redirect will work; its absence proves nothing. A
  * user browsing `https://meridian.example.net` from the very machine Meridian
- * runs on can still be redirected to `http://127.0.0.1:<port>/callback` — the
+ * runs on can still be redirected to `http://localhost:<port>/callback` — the
  * browser is on that host, it simply did not say so. Measured in Chromium: a
  * page on an HTTPS origin may both `fetch` and be navigated to loopback, since
- * `127.0.0.1` is a potentially-trustworthy origin and so is exempt from
+ * `localhost` is a potentially-trustworthy origin and so is exempt from
  * mixed-content blocking.
  *
  * So this returns a CANDIDATE, offered alongside the paste URL rather than
@@ -299,7 +313,100 @@ export function resolveLoopbackRedirectUri(hostHeader: string | undefined): stri
  */
 export function loopbackRedirectUriForPort(port: number | undefined): string | undefined {
   if (!port || !Number.isInteger(port) || port <= 0 || port > 65535) return undefined
-  return `http://127.0.0.1:${port}${OAUTH_LOOPBACK_CALLBACK_PATH}`
+  return `http://localhost:${port}${OAUTH_LOOPBACK_CALLBACK_PATH}`
+}
+
+/**
+ * One address, spelled the one way, so the three spellings of it compare equal.
+ *
+ * A proxy may write a port (`10.0.0.4:51234`, `[fd7a::1]:51234`), a zone id
+ * (`fe80::1%eth0`), or an IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) — all
+ * of which name a host that `networkInterfaces()` reports plainly.
+ *
+ * The port is only stripped from a bracketed address or a dotted quad: a bare
+ * IPv6 address is nothing but colons, so treating its last group as a port
+ * would truncate the address itself.
+ */
+export function normalizeClientAddress(raw: string): string {
+  let addr = raw.trim().toLowerCase()
+  if (!addr) return ""
+
+  if (addr.startsWith("[")) {
+    const close = addr.indexOf("]")
+    if (close === -1) return ""
+    addr = addr.slice(1, close)
+  } else if (addr.includes(".") && addr.split(":").length === 2) {
+    addr = addr.slice(0, addr.indexOf(":"))
+  }
+
+  const zone = addr.indexOf("%")
+  if (zone !== -1) addr = addr.slice(0, zone)
+
+  if (addr.startsWith("::ffff:") && addr.includes(".")) addr = addr.slice("::ffff:".length)
+  return addr
+}
+
+/** Every address this machine answers on, as `networkInterfaces()` spells it. */
+function ownHostAddresses(): Set<string> {
+  const own = new Set<string>()
+  for (const addresses of Object.values(networkInterfaces())) {
+    for (const address of addresses ?? []) own.add(normalizeClientAddress(address.address))
+  }
+  return own
+}
+
+/**
+ * Whether the browser that made this request is on the Meridian host itself,
+ * according to the address a reverse proxy recorded for it.
+ *
+ * This is the case `Host` cannot answer. A user browsing
+ * `https://meridian.example.net` from the very machine Meridian runs on sends
+ * a `Host` of `meridian.example.net`, so `resolveLoopbackRedirectUri` refuses —
+ * yet a loopback redirect would reach this instance perfectly. The proxy in
+ * front knows what `Host` lost: it saw the browser's own address and wrote it
+ * into `X-Forwarded-For`. When that address is one this machine answers on,
+ * the browser is provably here.
+ *
+ * Only the FIRST entry is read. `X-Forwarded-For` accumulates left to right,
+ * so the first is the original client and every later one is a proxy.
+ *
+ * SECURITY. The header is client-settable, so a request may claim to be local
+ * and be believed. That grants nothing: the only effect is that this login's
+ * `authorizeUrl` becomes the loopback one — which the response already returns
+ * unconditionally as `loopbackAuthorizeUrl` for the page to upgrade to. A
+ * forger gains a URL they were handed anyway, pointed at loopback on THEIR
+ * machine, and the code it carries is still redeemable only against a verifier
+ * that never left this process.
+ */
+export function clientIsOnThisHost(forwardedFor: string | undefined): boolean {
+  const first = forwardedFor?.split(",")[0]
+  if (!first) return false
+  const addr = normalizeClientAddress(first)
+  if (!addr) return false
+  if (addr === "::1" || addr.startsWith("127.")) return true
+  return ownHostAddresses().has(addr)
+}
+
+/**
+ * Whether a paste is the address bar of a loopback callback rather than a code
+ * from Anthropic's code-display page.
+ *
+ * Which one it is decides the `redirect_uri` the grant must name, because
+ * Anthropic binds a code to the URI its authorize request carried. A user who
+ * took the loopback link and could not be redirected back — a browser on
+ * another machine, a tab that failed to load — still has the code in that
+ * tab's address bar, and the panel invites them to paste it.
+ */
+export function isLoopbackCallbackInput(input: string): boolean {
+  let url: URL
+  try {
+    url = new URL(input.trim())
+  } catch {
+    return false
+  }
+  return url.protocol === "http:"
+    && LOOPBACK_HOSTNAMES.has(url.hostname)
+    && url.pathname === OAUTH_LOOPBACK_CALLBACK_PATH
 }
 
 /**
@@ -373,12 +480,25 @@ export function startProfileLogin(params: StartLoginParams): StartLoginSuccess |
     }
   }
 
+  const claudeConfigDir = resolved.env.CLAUDE_CONFIG_DIR || process.env.CLAUDE_CONFIG_DIR
+  if (!claudeConfigDir) {
+    return {
+      ok: false,
+      code: "missing_config_dir",
+      status: 400,
+      message: `Profile "${profileId}" has no explicit Claude credential directory. Configure claudeConfigDir or CLAUDE_CONFIG_DIR before using browser login.`,
+    }
+  }
+
   const pkce = createOAuthPkce()
-  // Two questions, not one: whether a loopback redirect is CERTAIN (the browser
-  // said it reached us on loopback) and whether one is POSSIBLE (it may be on
-  // this host under another name). The first picks the mode; the second is
-  // offered for the page to probe.
+  // Two questions, not one: whether a loopback redirect is CERTAIN and whether
+  // one is merely POSSIBLE. Certain has two proofs — the browser reached us ON
+  // loopback (`Host`), or a proxy in front recorded it at an address this host
+  // answers on (`X-Forwarded-For`). Possible is everything else with a port to
+  // guess at. The first picks the mode; the second is offered for the page to
+  // probe.
   const certainLoopbackUri = resolveLoopbackRedirectUri(params.hostHeader)
+    ?? (clientIsOnThisHost(params.forwardedFor) ? loopbackRedirectUriForPort(params.serverPort) : undefined)
   const loopbackRedirectUri = certainLoopbackUri ?? loopbackRedirectUriForPort(params.serverPort)
   const pasteAuthorizeUrl = buildAuthorizeUrl({
     codeChallenge: pkce.codeChallenge,
@@ -399,7 +519,7 @@ export function startProfileLogin(params: StartLoginParams): StartLoginSuccess |
   prune(now)
   restore(loginId, {
     profileId,
-    claudeConfigDir: resolved.env.CLAUDE_CONFIG_DIR ?? profileConfigDirFor(profileId),
+    claudeConfigDir,
     codeVerifier: pkce.codeVerifier,
     state: pkce.state,
     expiresAt,
@@ -458,16 +578,24 @@ export async function completeProfileLogin(params: CompleteLoginParams): Promise
   // same login id.
   consume(params.loginId)
 
-  // A pasted code always comes from the code-display page, so it is bound to
-  // THAT redirect_uri — even when this login also issued a loopback URL the
-  // user chose not to use.
+  // Which sign-in this code came from decides the redirect_uri the grant must
+  // name. A paste is USUALLY the code-display page, but not always: a user sent
+  // to the loopback URL whose browser could not be redirected back still has
+  // the code in the failed tab's address bar, and the panel asks for exactly
+  // that. Reading the shape of the paste is what tells the two apart. The URI
+  // itself comes from the login, never from the paste, so a pasted address is
+  // evidence and not input.
+  const redirectUri = pending.loopbackRedirectUri && isLoopbackCallbackInput(params.input)
+    ? pending.loopbackRedirectUri
+    : OAUTH_REDIRECT_URI
+
   const result = await exchangeAuthorizationCodeForCredentials({
     code: parsed.code,
     returnedState: parsed.state,
     sessionState: pending.state,
     codeVerifier: pending.codeVerifier,
     claudeConfigDir: pending.claudeConfigDir,
-    redirectUri: OAUTH_REDIRECT_URI,
+    redirectUri,
     fetchFn: params.fetchFn,
   })
 
@@ -608,6 +736,8 @@ export function getProfileLoginStatus(loginId: string, now: number = Date.now())
   prune(now)
   const pending = pendingLogins.get(loginId)
   if (pending) return { status: "waiting", profileId: pending.profileId }
+  const exchangingProfile = exchangingLogins.get(loginId)
+  if (exchangingProfile) return { status: "waiting", profileId: exchangingProfile }
   const finished = finishedLogins.get(loginId)
   if (!finished) return null
   if (finished.status === "completed") return { status: "completed", profileId: finished.profileId }
@@ -626,6 +756,7 @@ export function pendingLoginCount(): number {
 /** Drop all pending logins — for testing only. */
 export function resetPendingLogins(): void {
   pendingLogins.clear()
+  exchangingLogins.clear()
   loginIdByState.clear()
   finishedLogins.clear()
 }

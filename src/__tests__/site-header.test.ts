@@ -19,6 +19,7 @@ import { profileBarCss, profileBarHtml, profileBarJs } from "../telemetry/profil
 import { ICON_PATH } from "../telemetry/icon"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "../telemetry/profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT } from "../telemetry/profileSpent"
+import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
 
 const allPages: Array<[string, string]> = [
   ["providers", providerPageHtml],
@@ -47,6 +48,29 @@ describe("shared site header", () => {
     expect(profileBarJs).toContain("/health")
   })
 
+  // An unreachable upstream renders as an alert pill, and keeps its text at
+  // phone width where the plain status shows only its dot.
+  test("status pill can render an upstream outage", () => {
+    expect(profileBarJs).toContain("statusPillView")
+    expect(profileBarJs).toContain("Can't reach Anthropic")
+    expect(profileBarCss).toContain(".mh-status.outage")
+    expect(profileBarCss).toContain(".mh-status.recovering")
+    expect(profileBarCss).toMatch(/@media \(max-width: 720px\)[\s\S]*\.mh-status\.outage \.mh-status-text[\s\S]*display: inline/)
+  })
+
+  test("status pill can name the machine, hidden until /health reports one", () => {
+    expect(profileBarHtml).toContain('<span class="mh-host" id="mhHost" hidden></span>')
+    expect(profileBarJs).toContain("hostLabelView")
+    expect(profileBarJs).toContain("renderHost(h.hostname)")
+    expect(settingsPageHtml).toContain("/settings/api/header")
+  })
+
+  // At phone width the plain status drops its text, and the separator before
+  // the hostname with it; an outage keeps its text, so it keeps the separator.
+  test("an outage pill at phone width still separates its text from the hostname", () => {
+    expect(profileBarCss).toMatch(/@media \(max-width: 720px\)[\s\S]*\.mh-status\.outage \.mh-host::before[\s\S]*content: "·"/)
+  })
+
   test("header shows active profile chip, not a dropdown", () => {
     expect(profileBarHtml).not.toContain("meridianProfileSelect")
     expect(profileBarHtml).not.toContain("<select")
@@ -54,8 +78,10 @@ describe("shared site header", () => {
     expect(profileBarJs).toContain("/profiles/list")
   })
 
-  test("header shows a build chip fed by /health's build block", () => {
+  test("header shows the running version and an update badge, fed by /health's build block", () => {
     expect(profileBarHtml).toContain("mhBuild")
+    expect(profileBarHtml).toContain("mhProv")
+    expect(profileBarHtml).toContain("mhUpdate")
     expect(profileBarJs).toContain("renderBuild")
     expect(profileBarJs).toContain("updateAvailable")
   })
@@ -73,7 +99,7 @@ describe("shared site header", () => {
       return profileBarCss.slice(start, profileBarCss.indexOf("}", start))
     }
 
-    const updateRule = rule(".mh-build.update")
+    const updateRule = rule(".mh-update")
     expect(updateRule).toContain("var(--accent, #58a6ff)")
     expect(updateRule).not.toContain("--accent2")
 
@@ -95,7 +121,21 @@ describe("shared site header", () => {
 
     // Pieces without a safe URL render as spans, never as href-less anchors.
     expect(profileBarJs).toContain("document.createElement(part.href ? 'a' : 'span')")
-    expect(profileBarJs).toContain("removeAttribute('href')")
+    expect(profileBarHtml).toContain('id="mhUpdate"')
+  })
+
+  test("header css is brace-balanced, so no rule swallows the ones below it", () => {
+    // An unclosed rule nests every rule after it and CSS drops them all,
+    // which neither review nor a screenshot of what still renders catches.
+    let depth = 0
+    let lowest = 0
+    for (const ch of profileBarCss) {
+      if (ch === "{") depth++
+      else if (ch === "}") depth--
+      lowest = Math.min(lowest, depth)
+    }
+    expect(lowest).toBe(0)
+    expect(depth).toBe(0)
   })
 
   test("drift is polled only for local builds, never overlapping, and bypasses the cache", () => {
@@ -120,6 +160,16 @@ describe("shared site header", () => {
       const head = html.slice(0, html.indexOf("</head>"))
       expect(head, `${name} page should link the favicon`).toContain(`<link rel="icon" type="image/svg+xml" href="${ICON_PATH}">`)
     }
+  })
+
+  test("the OAuth callback page is the deliberate exception", () => {
+    // /callback is reachable WITHOUT the API key — Anthropic's redirect carries
+    // none — while the header polls /health and /profiles/list, which are gated.
+    // Embedding it would render broken "offline" chrome on the one page a user
+    // sees mid-login. This pins that exception so it is not "fixed" by hand.
+    const html = renderLoginCallbackPage({ ok: true, profileId: "personal" })
+    expect(html).not.toContain("meridian-header")
+    expect(html).toContain("href=\"/profiles\"")
   })
 })
 
@@ -335,6 +385,7 @@ describe("design-system conformance (DESIGN.md)", () => {
     "src/telemetry/settingsPage.ts",
     "src/telemetry/profilePage.ts",
     "src/telemetry/profileProviders.ts",
+    "src/telemetry/loginCallbackPage.ts",
     "src/proxy/plugins/pluginPage.ts",
   ]
 
@@ -369,10 +420,83 @@ describe("settings page layout", () => {
     // border, which border-box sizing would otherwise take out of the text.
     expect(settingsPageHtml).toMatch(/\.pricing-table \.pricing-input \{[^}]*width: calc\(7ch \+ 18px\)/)
   })
-
   test("offers the page layout setting", () => {
     expect(settingsPageHtml).toContain('id="layout-body"')
     expect(settingsPageHtml).toContain("fetch('/settings/api/layout'")
+  })
+})
+
+describe("profiles page — the sign-in control is a real link", () => {
+  // Someone signed into several Claude accounts needs the browser's own
+  // context menu — "Open Link in Incognito Window", "Copy Link Address" — to
+  // choose which session answers the sign-in. Chrome and Firefox offer that
+  // for an anchor with an href and for nothing else, so these assertions are
+  // the feature, not decoration.
+  test("renders an anchor with an href, not a button", () => {
+    expect(profilePageHtml).toContain('<a class="login-btn login-link"')
+    expect(profilePageHtml).toContain("loginHrefFor(p.id)")
+    expect(profilePageHtml).toContain('rel="noopener noreferrer"')
+    expect(profilePageHtml).not.toContain('<button class="login-btn" onclick="startLogin')
+  })
+
+  test("nothing in the login flow opens a window from script", () => {
+    // A scripted window.open is exactly what denies the context menu, and it
+    // also ignores ctrl-click and middle-click. Scoped to the login section so
+    // this says something precise about THIS flow rather than policing every
+    // other feature on the page.
+    const start = profilePageHtml.indexOf("// --- Browser login ---")
+    expect(start).toBeGreaterThan(-1)
+    const next = profilePageHtml.indexOf("// --- ", start + 24)
+    const loginSection = next === -1 ? profilePageHtml.slice(start) : profilePageHtml.slice(start, next)
+    expect(loginSection).not.toContain("window.open(")
+  })
+
+  test("the fallback to pasting a code is also a real link", () => {
+    expect(profilePageHtml).toContain('onclick="switchToPaste();return true;"')
+    expect(profilePageHtml).not.toContain('href="#" onclick="switchToPaste()')
+  })
+
+  test("hrefs survive a re-render and are refreshed before they expire", () => {
+    expect(profilePageHtml).toContain("applyLoginHrefs()")
+    expect(profilePageHtml).toContain("ensureLoginLinks(profiles)")
+  })
+
+  test("no PKCE material is ever put in a link", () => {
+    expect(profilePageHtml).not.toContain("codeVerifier")
+    expect(profilePageHtml).not.toContain("code_verifier")
+  })
+})
+
+describe("home page spacing on a phone", () => {
+  test("the page edge is a third and a card's padding half of the desktop values", () => {
+    expect(landingHtml).toContain(".container { max-width: 960px; margin: 0 auto; padding: 28px 24px; }")
+    expect(landingHtml).toMatch(/\.profile-card \{[^}]*padding: 18px 20px;/)
+    expect(landingHtml).toMatch(/@media \(max-width: 720px\) \{\s*\.container, :root\[data-layout="wide"\] \.container \{ padding-left: 8px; padding-right: 8px; \}\s*\.profile-card \{ padding: 9px 10px; \}\s*\}/)
+  })
+})
+
+describe("header build info collapses to the room it has", () => {
+  test("the calm drift chip goes first, warnings never", () => {
+    expect(profileBarCss).toContain('.meridian-header[data-prov-calm="hidden"] .mh-drift.calm { display: none; }')
+    expect(profileBarCss).not.toMatch(/data-prov-calm[^{]*\.mh-drift\.(warning|neutral)/)
+    expect(profileBarCss).not.toMatch(/data-prov-[a-z]+="[a-z]+"\][^{]*\.mh-update/)
+  })
+
+  test("each compact form shows only its own pieces", () => {
+    const shown = (form: string) => profileBarCss.match(new RegExp(`\\[data-prov-form="${form}"\\] (\\.[a-z-]+)[,\\s]`, "g")) ?? []
+    expect(shown("commit").join(" ")).toContain(".mh-prov-short-commit")
+    expect(shown("run").join(" ")).toContain(".mh-prov-short-run")
+    expect(shown("version").join(" ")).not.toMatch(/short-(commit|run)/)
+  })
+
+  test("the fit follows the header's width and content, largest form first", () => {
+    expect(profileBarJs).toContain("[['shown', 'full'], ['hidden', 'full']].concat(provForms.map(")
+    expect(profileBarJs).toContain("new ResizeObserver(")
+    expect(profileBarJs).toContain("new MutationObserver(queueFit)")
+    expect(profileBarJs).toContain("attributeFilter: ['class', 'hidden']")
+    // The short forms are appended beside the full parts, so the full pill's
+    // tooltip and links are untouched and switching never rebuilds a link.
+    expect(profileBarJs).toContain("provForms = appendShortForms(view.parts);")
   })
 })
 
@@ -422,39 +546,6 @@ describe("wide page layout", () => {
     expect(ruleIn(settingsPageHtml, 'html[data-layout="wide"] .pricing-table')).toContain("width: auto")
     expect(providerPageHtml)
       .toContain('html[data-layout="wide"] .provider-grid{grid-template-columns:repeat(auto-fill,minmax(min(480px,100%),1fr))}')
-  })
-})
-
-describe("home page spacing on a phone", () => {
-  test("the page edge is a third and a card's padding half of the desktop values", () => {
-    expect(landingHtml).toContain(".container { max-width: 960px; margin: 0 auto; padding: 28px 24px; }")
-    expect(landingHtml).toMatch(/\.profile-card \{[^}]*padding: 18px 20px;/)
-    expect(landingHtml).toMatch(/@media \(max-width: 720px\) \{\s*\.container, :root\[data-layout="wide"\] \.container \{ padding-left: 8px; padding-right: 8px; \}\s*\.profile-card \{ padding: 9px 10px; \}\s*\}/)
-  })
-})
-
-describe("header build info collapses to the room it has", () => {
-  test("the calm drift chip goes first, warnings never", () => {
-    expect(profileBarCss).toContain('.meridian-header[data-prov-calm="hidden"] .mh-drift.calm { display: none; }')
-    expect(profileBarCss).not.toMatch(/data-prov-calm[^{]*\.mh-drift\.(warning|neutral)/)
-    expect(profileBarCss).not.toMatch(/data-prov-[a-z]+="[a-z]+"\][^{]*\.mh-update/)
-  })
-
-  test("each compact form shows only its own pieces", () => {
-    const shown = (form: string) => profileBarCss.match(new RegExp(`\\[data-prov-form="${form}"\\] (\\.[a-z-]+)[,\\s]`, "g")) ?? []
-    expect(shown("commit").join(" ")).toContain(".mh-prov-short-commit")
-    expect(shown("run").join(" ")).toContain(".mh-prov-short-run")
-    expect(shown("version").join(" ")).not.toMatch(/short-(commit|run)/)
-  })
-
-  test("the fit follows the header's width and content, largest form first", () => {
-    expect(profileBarJs).toContain("[['shown', 'full'], ['hidden', 'full']].concat(provForms.map(")
-    expect(profileBarJs).toContain("new ResizeObserver(")
-    expect(profileBarJs).toContain("new MutationObserver(queueFit)")
-    expect(profileBarJs).toContain("attributeFilter: ['class', 'hidden']")
-    // The short forms are appended beside the full parts, so the full pill's
-    // tooltip and links are untouched and switching never rebuilds a link.
-    expect(profileBarJs).toContain("provForms = appendShortForms(view.parts);")
   })
 })
 
@@ -524,29 +615,29 @@ describe("header active-profile chip", () => {
 
   test("names the active profile of each provider, and only those", async () => {
     const chip = await chipFor({ profiles: [claude("work", true), claude("spare", false), seat("oferty-c487c4", true), seat("damian-989a40", false)], follow: null })
-    expect(chip.innerHTML).toBe('work <span class="mh-profile-type">claude-max</span> \u00b7 oferty-c487c4 <span class="mh-profile-type">chatgpt</span>')
-    expect(chip.title).toBe("Active profiles, one per provider — switch from the home page")
+    expect(chip.innerHTML).toBe('<span class="mh-profile-name">work</span> <span class="mh-profile-type">claude-max</span> \u00b7 <span class="mh-profile-name">oferty-c487c4</span> <span class="mh-profile-type">chatgpt</span>')
+    expect(chip.title).toBe("Active profiles, one per provider — switch from the home page — work, oferty-c487c4")
     expect(chip.classes.has("visible")).toBe(true)
     expect(chip.classes.has("following")).toBe(false)
   })
 
   test("a ChatGPT-only instance shows its active seat", async () => {
     const chip = await chipFor({ profiles: [seat("oferty-c487c4", false), seat("enriquetrevino1011-e1dde4", true)], follow: null })
-    expect(chip.innerHTML).toBe('enriquetrevino1011-e1dde4 <span class="mh-profile-type">chatgpt</span>')
-    expect(chip.title).toBe("Active profile — switch from the home page")
+    expect(chip.innerHTML).toBe('<span class="mh-profile-name">enriquetrevino1011-e1dde4</span> <span class="mh-profile-type">chatgpt</span>')
+    expect(chip.title).toBe("Active profile — switch from the home page — enriquetrevino1011-e1dde4")
   })
 
   test("follow mode labels the Claude profile it follows, never the seat beside it", async () => {
     const chip = await chipFor({ profiles: [claude("work", true), seat("oferty-c487c4", true)], follow })
-    expect(chip.innerHTML).toBe('work <span class="mh-profile-type">claude-max</span> <span class="mh-profile-follow">following</span> \u00b7 oferty-c487c4 <span class="mh-profile-type">chatgpt</span>')
+    expect(chip.innerHTML).toBe('<span class="mh-profile-name">work</span> <span class="mh-profile-type">claude-max</span> <span class="mh-profile-follow">following</span> \u00b7 <span class="mh-profile-name">oferty-c487c4</span> <span class="mh-profile-type">chatgpt</span>')
     expect(chip.classes.has("following")).toBe(true)
     expect(chip.title).toContain("Switching here is refused; switch on the followed instance. The ChatGPT seat beside it is not followed and switches from the home page.")
   })
 
   test("follow mode says nothing about following when only a seat is active", async () => {
     const chip = await chipFor({ profiles: [claude("work", false), seat("oferty-c487c4", true)], follow })
-    expect(chip.innerHTML).toBe('oferty-c487c4 <span class="mh-profile-type">chatgpt</span>')
+    expect(chip.innerHTML).toBe('<span class="mh-profile-name">oferty-c487c4</span> <span class="mh-profile-type">chatgpt</span>')
     expect(chip.classes.has("following")).toBe(false)
-    expect(chip.title).toBe("Active profile — switch from the home page")
+    expect(chip.title).toBe("Active profile — switch from the home page — oferty-c487c4")
   })
 })

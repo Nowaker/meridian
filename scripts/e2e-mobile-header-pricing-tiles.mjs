@@ -36,6 +36,18 @@ const pricing = { builtin: {
 const { iconResponse } = await import('../src/telemetry/icon.ts')
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://fixture.invalid')
+  // A same-origin frame supplies a real CSS viewport when the collaborative
+  // preview host cannot resize its outer window. Measure the frame, not the host.
+  if (url.pathname === '/frame') {
+    const width = Number(url.searchParams.get('width') || 375)
+    const view = url.searchParams.get('view') || 'after/'
+    if (!Number.isInteger(width) || width < 320 || width > 2560 || !/^(before|after)\/(settings)?$/.test(view)) {
+      res.statusCode = 400; res.end('Invalid fixture viewport'); return
+    }
+    res.setHeader('Content-Type', 'text/html')
+    res.end(`<iframe id="fixtureViewport" title="Synthetic Meridian viewport" style="border:0;width:${width}px;height:900px" src="/${view}"></iframe>`)
+    return
+  }
   const match = url.pathname.match(/^\/(after|before)(\/settings)?\/?$/)
   if (match) { res.setHeader('Content-Type', 'text/html'); res.end(pages[match[1]][match[2] ? 'settings' : 'home']); return }
   if (url.pathname === '/telemetry/icon.svg') {

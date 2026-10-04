@@ -74,8 +74,8 @@ async function post(app: any, body: any, sessionId = SESSION_ID) {
 }
 
 describe("Session tool cache", () => {
-  beforeEach(() => {
-    clearSessionCache()
+  beforeEach(async () => {
+    await clearSessionCache()
     capturedQueryParams = null
     mockQueryError = undefined
     mockMessages = [
@@ -112,6 +112,31 @@ describe("Session tool cache", () => {
 
     const opts2 = capturedQueryParams?.options
     expect(opts2?.mcpServers).toBeDefined()
+  })
+
+  it("gives every query of a session its own MCP server", async () => {
+    const app = createTestApp()
+    await post(app, makeRequest({
+      stream: false,
+      tools: [TOOL_A],
+      messages: [{ role: "user", content: "hello" }],
+    }))
+    const first = capturedQueryParams?.options?.mcpServers?.oc
+
+    await post(app, makeRequest({
+      stream: false,
+      tools: [TOOL_A],
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "Done." },
+        { role: "user", content: "continue" },
+      ],
+    }))
+    const second = capturedQueryParams?.options?.mcpServers?.oc
+
+    expect(first).toBeDefined()
+    expect(second).toBeDefined()
+    expect(second).not.toBe(first)
   })
 
   for (const stream of [false, true]) {

@@ -87,6 +87,42 @@ export interface MeridianSettings {
    * neither is set, the address the sign-in was started from is used.
    */
   publicUrl?: string
+  /**
+   * Sentry-protocol DSN (GlitchTip, Sentry) that Meridian's own uncaught
+   * exceptions and unhandled rejections are reported to. Unset means off.
+   * MERIDIAN_ERROR_REPORTING_DSN wins. Read once at startup.
+   */
+  errorReportingDsn?: string
+  /**
+   * Days Claude Code keeps the transcripts requests leave on disk before its
+   * own sweep deletes them; 0 keeps every one. Unset means 30, Claude Code's
+   * default. MERIDIAN_TRANSCRIPT_RETENTION_DAYS wins, and a profile whose own
+   * settings.json names `cleanupPeriodDays` keeps that. Re-read on every
+   * request; see proxy/transcriptRetention.ts.
+   */
+  transcriptRetentionDays?: number
+  /** Ask the npm registry once a day whether a newer Meridian is published.
+   *  Off unless switched on: an instance only reaches a third party on a timer
+   *  because someone asked it to. The header shows the running version either
+   *  way. MERIDIAN_NO_UPDATE_CHECK=1 forces it off regardless. */
+  checkForUpdates?: boolean
+  /** Name the machine Meridian runs on beside the site header's status, so
+   *  several instances can be told apart at a glance. Off unless switched on,
+   *  because it also publishes the hostname in the unauthenticated /health. */
+  showHostname?: boolean
+
+  /**
+   * When `/readyz` concludes Anthropic is unreachable from this host: after at
+   * least `upstreamUnreachableMinFailures` connection failures (default 3)
+   * spanning `upstreamUnreachableAfterMs` (default 120000) with no answer from
+   * Anthropic in between. It then holds for `upstreamUnreachableHoldMs` after
+   * the latest failure (default 300000; 0 never fails readiness) before letting
+   * traffic back in. MERIDIAN_UPSTREAM_UNREACHABLE_AFTER_MS / _HOLD_MS /
+   * _MIN_FAILURES win. Re-read on every evaluation.
+   */
+  upstreamUnreachableAfterMs?: number
+  upstreamUnreachableHoldMs?: number
+  upstreamUnreachableMinFailures?: number
   /** How much of the window the web pages use: "contained" (default) keeps
    *  them in a centered column, "wide" spans the window. Read on every page
    *  load, so a change shows on the next reload. */

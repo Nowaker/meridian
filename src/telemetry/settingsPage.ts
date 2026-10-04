@@ -235,6 +235,43 @@ ${profileBarHtml}
     <div id="telemetry-body">Loading…</div>
   </div>
 
+  <h1 style="margin-top:40px">Transcript Retention</h1>
+  <p class="subtitle" style="max-width:720px;line-height:1.6">
+    Every request leaves a Claude Code transcript on disk, under <code>projects/</code> in the config directory of
+    the profile that served it. Claude Code deletes transcripts nobody has touched for this many days, the same
+    cleanup it runs for your own Claude Code sessions, so that directory stops growing forever. The cleanup runs
+    inside Meridian's Claude Code processes, at most once a day per profile. For a profile that is idle and has not
+    been cleaned for a day, Meridian starts one Claude Code process just for the cleanup every few hours; it gets no
+    prompt and cannot reach the network. A conversation idle for longer than this has no transcript left to resume from;
+    Meridian then replays its history into a fresh session. 0 keeps every transcript. A profile whose own
+    <code>settings.json</code> sets <code>cleanupPeriodDays</code> keeps its own value.
+    Changes apply to the next request - no restart needed.
+  </p>
+  <div class="adapter-card" id="transcripts-card">
+    <div id="transcripts-body">Loading…</div>
+  </div>
+
+  <h1 style="margin-top:40px">Updates</h1>
+  <p class="subtitle" style="max-width:720px;line-height:1.6">
+    Meridian is installed and updated by hand, so an instance can sit on an old version for weeks without
+    anyone noticing. Switch this on and it asks the npm registry once a day whether a newer version is
+    published; the site header then says so, beside the version it is running. Off unless you turn it on —
+    nothing contacts the registry until then. The header shows the running version either way.
+  </p>
+  <div class="adapter-card" id="updates-card">
+    <div id="updates-body">Loading…</div>
+  </div>
+
+  <h1 style="margin-top:40px">Site Header</h1>
+  <p class="subtitle" style="max-width:720px;line-height:1.6">
+    With several Meridian instances open in tabs, they all look the same. Switch this on and the header names
+    the machine this one runs on, beside its status. Off unless you turn it on, because the hostname is then
+    also reported by <code>/health</code>, which answers without the API key.
+  </p>
+  <div class="adapter-card" id="header-card">
+    <div id="header-body">Loading…</div>
+  </div>
+
   <h1 style="margin-top:40px">Event Hooks</h1>
   <p class="subtitle" style="max-width:720px;line-height:1.6">
     Tell other programs when something happens here. A <strong style="color:var(--text)">webhook</strong> gets each
@@ -876,6 +913,106 @@ async function putTelemetry(body) {
   await loadTelemetry();
 }
 
+async function loadTranscripts() {
+  const cfg = await (await fetch('/settings/api/transcripts')).json();
+  const lim = cfg.limits || { min: 0, max: 3650 };
+  const eff = cfg.effective || {};
+  const now = eff.days === 0 ? 'off, every transcript is kept'
+    : eff.days + ' days' + (eff.source === 'default' ? ' (default)' : '');
+
+  document.getElementById('transcripts-body').innerHTML = telemetryRow('Delete after',
+    '<input type="number" id="tr-days" value="' + (cfg.saved == null ? '' : cfg.saved) + '"'
+      + ' min="' + lim.min + '" max="' + lim.max + '" step="1" placeholder="' + cfg.default + '"'
+      + ' style="width:110px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px">'
+      + ' <span style="color:var(--muted);font-size:12px">days</span>',
+    telemetryEsc(now),
+    cfg.envOverride ? ' <span style="font-size:11px;color:var(--yellow)">(MERIDIAN_TRANSCRIPT_RETENTION_DAYS wins over this setting)</span>' : '')
+    + '<div class="pricing-note" style="margin-top:4px">Leave blank for the default of ' + cfg.default + ' days.</div>';
+
+  document.getElementById('tr-days').addEventListener('change', async (e) => {
+    const raw = e.target.value.trim();
+    await putTranscripts({ transcriptRetentionDays: raw === '' ? null : Number(raw) });
+  });
+}
+
+async function putTranscripts(body) {
+  const res = await fetch('/settings/api/transcripts', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    alert(err.error || 'Failed to save transcript retention');
+  } else {
+    showSaved();
+  }
+  await loadTranscripts();
+}
+
+async function loadUpdates() {
+  const cfg = await (await fetch('/settings/api/updates')).json();
+  const build = cfg.build || {};
+
+  let state;
+  if (cfg.envOptOut) state = 'forced off';
+  else if (!cfg.checkForUpdates) state = 'not checking';
+  else if (!build.latest) state = 'checking…';
+  else state = build.updateAvailable ? telemetryEsc(build.latest) + ' available' : 'up to date';
+
+  document.getElementById('updates-body').innerHTML = telemetryRow('Check for updates',
+    '<input type="checkbox" id="upd-enabled"' + (cfg.checkForUpdates ? ' checked' : '') + (cfg.envOptOut ? ' disabled' : '') + '>',
+    state,
+    cfg.envOptOut ? ' <span style="font-size:11px;color:var(--yellow)">(MERIDIAN_NO_UPDATE_CHECK=1 wins over this setting)</span>' : '')
+    + '<div class="pricing-note" style="margin-top:4px">Running ' + telemetryEsc(build.version || 'unknown')
+      + (build.source && build.source !== 'npm' ? ' from a ' + telemetryEsc(build.source) + ' build; the header shows its separate release and runtime provenance' : '')
+      + '.</div>';
+
+  const box = document.getElementById('upd-enabled');
+  if (box && !cfg.envOptOut) box.addEventListener('change', (e) => putUpdates(e.target.checked));
+}
+
+async function putUpdates(checkForUpdates) {
+  const res = await fetch('/settings/api/updates', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ checkForUpdates }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    alert(err.error || 'Failed to save update settings');
+  } else {
+    showSaved();
+    if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
+  }
+  await loadUpdates();
+}
+
+async function loadHeaderSettings() {
+  const cfg = await (await fetch('/settings/api/header')).json();
+  document.getElementById('header-body').innerHTML = telemetryRow('Show hostname',
+    '<input type="checkbox" id="hdr-hostname"' + (cfg.showHostname ? ' checked' : '') + '>',
+    cfg.showHostname ? 'shown' : 'hidden',
+    ' <span style="font-size:12px;color:var(--muted)">This machine: <code>' + telemetryEsc(cfg.hostname || 'unknown') + '</code></span>');
+  document.getElementById('hdr-hostname').addEventListener('change', (e) => putHeaderSettings(e.target.checked));
+}
+
+async function putHeaderSettings(showHostname) {
+  const res = await fetch('/settings/api/header', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ showHostname }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    alert(err.error || 'Failed to save header settings');
+  } else {
+    showSaved();
+    if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
+  }
+  await loadHeaderSettings();
+}
+
 // Event hooks (/settings/api/hooks). Targets are edited in place and saved
 // together; each keeps the events it was saved with.
 let hooksState = null;
@@ -1047,6 +1184,9 @@ loadChatGpt();
 loadPricing();
 loadRouting();
 loadTelemetry();
+loadTranscripts();
+loadUpdates();
+loadHeaderSettings();
 loadHooks();
 loadLayout();
 ${profileBarJs}

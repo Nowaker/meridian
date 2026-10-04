@@ -22,11 +22,11 @@
 
 import { existsSync, rmSync } from "node:fs"
 import { join } from "node:path"
+import { readProfileConfigForUpdate, withProfileConfigLockSync } from "./profileConfigStore"
 import type { ProfileConfig } from "./profiles"
 import {
   defaultProfilesConfigFile,
   defaultProfilesDir,
-  loadProfileConfigFrom,
   saveProfileConfigTo,
 } from "./profileRename"
 
@@ -123,10 +123,16 @@ export function applyProfileRemove(
   id: string,
   options: ApplyProfileRemoveOptions = {},
 ): ApplyProfileRemoveResult {
+  const configFile = options.configFile ?? defaultProfilesConfigFile()
+  try { return withProfileConfigLockSync(configFile, () => applyProfileRemoveLocked(id, options)) }
+  catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) } }
+}
+
+function applyProfileRemoveLocked(id: string, options: ApplyProfileRemoveOptions): ApplyProfileRemoveResult {
   const profilesDir = options.profilesDir ?? defaultProfilesDir()
   const configFile = options.configFile ?? defaultProfilesConfigFile()
 
-  const profiles = loadProfileConfigFrom(configFile)
+  const profiles = readProfileConfigForUpdate(configFile)
   const planned = planProfileRemove(profiles, id, profilesDir)
   if (!planned.ok) return planned
   const { plan } = planned

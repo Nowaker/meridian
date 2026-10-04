@@ -2,7 +2,7 @@
  * Model mapping and Claude executable resolution.
  */
 
-import { exec as execCallback, execFile as execFileCallback } from "child_process"
+import { exec as execCallback, execFile as execFileCallback, execFileSync } from "child_process"
 import { existsSync, statSync } from "fs"
 import { fileURLToPath } from "url"
 import { join, dirname } from "path"
@@ -46,7 +46,7 @@ export type ClaudeModel = "sonnet" | "sonnet[1m]" | "opus" | "opus[1m]" | "haiku
  */
 export const CANONICAL_FABLE_MODEL = "claude-fable-5-1"
 export const CANONICAL_OPUS_MODEL = "claude-opus-5-5"
-export const CANONICAL_SONNET_MODEL = "claude-sonnet-5"
+export const CANONICAL_SONNET_MODEL = "claude-sonnet-5-5"
 export const CANONICAL_HAIKU_MODEL = "claude-haiku-4-5"
 
 /**
@@ -98,8 +98,21 @@ export interface ClaudeAuthStatus {
 
 
 const AUTH_STATUS_CACHE_TTL_MS = 60_000
-/** Shorter TTL for failed auth checks — retry sooner to recover */
+/** Retry delay after the first failed auth check. */
 const AUTH_STATUS_FAILURE_TTL_MS = 5_000
+const AUTH_STATUS_FAILURE_MAX_TTL_MS = 5 * 60_000
+
+/**
+ * How long a failed auth check is trusted before the next attempt: 5 s after
+ * the first failure, doubling with each consecutive one up to 5 min. A
+ * success resets the count. A flat 5 s retry spawned `claude auth status`
+ * every few seconds for as long as the check kept failing - under host load
+ * that is the very thing keeping it slow.
+ */
+export function authStatusFailureTtlMs(consecutiveFailures: number): number {
+  const doublings = Math.max(0, consecutiveFailures - 1)
+  return Math.min(AUTH_STATUS_FAILURE_TTL_MS * 2 ** doublings, AUTH_STATUS_FAILURE_MAX_TTL_MS)
+}
 
 let cachedAuthStatus: ClaudeAuthStatus | null = null
 /** Last successfully retrieved auth status — survives transient failures
@@ -107,6 +120,7 @@ let cachedAuthStatus: ClaudeAuthStatus | null = null
 let lastKnownGoodAuthStatus: ClaudeAuthStatus | null = null
 let cachedAuthStatusAt = 0
 let cachedAuthStatusIsFailure = false
+let cachedAuthStatusFailures = 0
 let cachedAuthStatusPromise: Promise<ClaudeAuthStatus | null> | null = null
 let cachedAuthStatusCredMtimeMs = 0
 
@@ -489,6 +503,8 @@ interface AuthCache {
   lastKnownGood: ClaudeAuthStatus | null
   at: number
   isFailure: boolean
+  /** Consecutive failed checks, for the retry backoff. 0 after a success. */
+  failures: number
   promise: Promise<ClaudeAuthStatus | null> | null
   lastSuccessAt: number
   credMtimeMs: number
@@ -509,7 +525,7 @@ export function getAuthCacheInfo(profileId?: string): { lastCheckedAt: number; l
 function getAuthCache(key: string): AuthCache {
   let cache = profileAuthCaches.get(key)
   if (!cache) {
-    cache = { status: null, lastKnownGood: null, at: 0, isFailure: false, promise: null, lastSuccessAt: 0, credMtimeMs: 0 }
+    cache = { status: null, lastKnownGood: null, at: 0, isFailure: false, failures: 0, promise: null, lastSuccessAt: 0, credMtimeMs: 0 }
     profileAuthCaches.set(key, cache)
   }
   return cache
@@ -531,21 +547,39 @@ export async function getClaudeAuthStatusAsync(profileId?: string, envOverrides?
   const c_lastKnownGood = cache ? cache.lastKnownGood : lastKnownGoodAuthStatus
   const c_at = cache ? cache.at : cachedAuthStatusAt
   const c_isFailure = cache ? cache.isFailure : cachedAuthStatusIsFailure
-  let c_promise = cache ? cache.promise : cachedAuthStatusPromise
+  const c_failures = cache ? cache.failures : cachedAuthStatusFailures
+  const c_promise = cache ? cache.promise : cachedAuthStatusPromise
 
   const c_credMtime = cache ? cache.credMtimeMs : cachedAuthStatusCredMtimeMs
 
-  const ttl = c_isFailure ? AUTH_STATUS_FAILURE_TTL_MS : AUTH_STATUS_CACHE_TTL_MS
+  const ttl = c_isFailure ? authStatusFailureTtlMs(c_failures) : AUTH_STATUS_CACHE_TTL_MS
   // A changed credential file means the other instance rotated the token, so
   // the cached answer predates it regardless of how recently it was taken.
   // Always 0 === 0 unless MERIDIAN_CREDENTIALS_READONLY is set.
   const credMtime = credentialFileMtimeMs(envOverrides)
+  const previous = c_status ?? c_lastKnownGood
   if (c_at > 0 && Date.now() - c_at < ttl && credMtime === c_credMtime) {
-    return c_status ?? c_lastKnownGood
+    return previous
   }
-  if (c_promise) return c_promise
 
-  c_promise = (async () => {
+  // Stale-while-revalidate. `/health` reads this on every probe, and the
+  // refresh spawns the claude binary with a 5 s timeout; a load balancer
+  // probing with a shorter timeout marked a healthy proxy down each time the
+  // cache expired on a loaded host. With a previous answer in hand, serve it
+  // and refresh in the background - a changed answer reaches the next caller.
+  // Only a caller with nothing to fall back on waits. One refresh at a time:
+  // concurrent callers share the in-flight one.
+  const inflight = c_promise ?? startAuthStatusRefresh(cache, profileId, envOverrides, credMtime)
+  return previous ?? inflight
+}
+
+function startAuthStatusRefresh(
+  cache: AuthCache | null,
+  profileId: string | undefined,
+  envOverrides: Record<string, string> | undefined,
+  credMtime: number,
+): Promise<ClaudeAuthStatus | null> {
+  const refresh = (async (): Promise<ClaudeAuthStatus | null> => {
     try {
       // Route through the resolver instead of relying on `claude` being
       // on PATH. Stefan's case (#478): bunx-installed meridian under
@@ -559,6 +593,7 @@ export async function getClaudeAuthStatusAsync(profileId?: string, envOverrides?
       const claudePath = await resolveClaudeExecutableAsync()
       const { stdout } = await execFile(claudePath, ["auth", "status"], {
         timeout: 5000,
+        windowsHide: true,
         ...(envOverrides ? { env: { ...process.env, ...envOverrides } } : {}),
       })
       const parsed = JSON.parse(stdout) as ClaudeAuthStatus
@@ -574,27 +609,30 @@ export async function getClaudeAuthStatusAsync(profileId?: string, envOverrides?
       })
       if (cache) {
         cache.status = parsed; cache.lastKnownGood = parsed
-        cache.at = Date.now(); cache.isFailure = false; cache.lastSuccessAt = Date.now()
+        cache.at = Date.now(); cache.isFailure = false; cache.failures = 0; cache.lastSuccessAt = Date.now()
         cache.credMtimeMs = credMtime
       } else {
         cachedAuthStatus = parsed; lastKnownGoodAuthStatus = parsed
-        cachedAuthStatusAt = Date.now(); cachedAuthStatusIsFailure = false
+        cachedAuthStatusAt = Date.now(); cachedAuthStatusIsFailure = false; cachedAuthStatusFailures = 0
         cachedAuthStatusCredMtimeMs = credMtime
       }
       return parsed
     } catch (err) {
+      const failures = (cache ? cache.failures : cachedAuthStatusFailures) + 1
       claudeLog("auth.status_failed", {
         source: "cli_async",
         profile: profileId ?? "default",
         error: String(err),
         servingLastKnownGood: Boolean(cache ? cache.lastKnownGood : lastKnownGoodAuthStatus),
+        consecutiveFailures: failures,
+        retryInMs: authStatusFailureTtlMs(failures),
       })
       if (cache) {
-        cache.isFailure = true; cache.at = Date.now(); cache.status = null
+        cache.isFailure = true; cache.failures = failures; cache.at = Date.now(); cache.status = null
         cache.credMtimeMs = credMtime
         return cache.lastKnownGood
       } else {
-        cachedAuthStatusIsFailure = true; cachedAuthStatusAt = Date.now()
+        cachedAuthStatusIsFailure = true; cachedAuthStatusFailures = failures; cachedAuthStatusAt = Date.now()
         cachedAuthStatus = null
         cachedAuthStatusCredMtimeMs = credMtime
         return lastKnownGoodAuthStatus
@@ -602,15 +640,25 @@ export async function getClaudeAuthStatusAsync(profileId?: string, envOverrides?
     }
   })()
 
-  if (cache) cache.promise = c_promise
-  else cachedAuthStatusPromise = c_promise
+  // The refresh never rejects (failures resolve to last-known-good), so the
+  // `finally` below cannot surface an unhandled rejection. It releases the
+  // slot only if it still holds this refresh - a test reset may have replaced it.
+  const inflight = refresh.finally(() => {
+    if (cache) {
+      if (cache.promise === inflight) cache.promise = null
+    } else if (cachedAuthStatusPromise === inflight) {
+      cachedAuthStatusPromise = null
+    }
+  })
+  if (cache) cache.promise = inflight
+  else cachedAuthStatusPromise = inflight
+  return inflight
+}
 
-  try {
-    return await c_promise
-  } finally {
-    if (cache) cache.promise = null
-    else cachedAuthStatusPromise = null
-  }
+/** The auth-status refresh currently in flight, if any - for testing only. */
+export function pendingAuthStatusRefresh(profileId?: string): Promise<ClaudeAuthStatus | null> | null {
+  if (!profileId) return cachedAuthStatusPromise
+  return profileAuthCaches.get(profileId)?.promise ?? null
 }
 
 // --- Claude Executable Resolution ---
@@ -643,7 +691,7 @@ let cachedClaudePathPromise: Promise<string> | null = null
  * Uses a three-tier cache:
  * 1. cachedClaudePath — resolved path, returned immediately on subsequent calls
  * 2. cachedClaudePathPromise — deduplicates concurrent calls during resolution
- * 3. Falls through to resolution logic (SDK cli.js → system `which claude`)
+ * 3. Falls through to env → usable PATH → packaged CLI → legacy SDK resolution
  *
  * The promise is cleared in `finally` to allow retry on failure while
  * cachedClaudePath prevents re-resolution on success.
@@ -657,6 +705,9 @@ type ResolverDeps = {
   existsSync: (p: string) => boolean
   statSync: (p: string) => { size: number }
   exec: (cmd: string) => Promise<{ stdout: string }>
+  execLookupSync?: (command: string, args: string[]) => string
+  probeClaude?: (candidate: string) => Promise<boolean>
+  probeClaudeSync?: (candidate: string) => boolean
   resolvePackage: (specifier: string) => string
   envGet: (name: string) => string | undefined
   platform: NodeJS.Platform
@@ -667,7 +718,29 @@ type ResolverDeps = {
 const DEFAULT_DEPS: ResolverDeps = {
   existsSync,
   statSync: (p) => statSync(p),
-  exec,
+  exec: (cmd) => exec(cmd, { windowsHide: true, timeout: 2000, maxBuffer: 64 * 1024 }),
+  execLookupSync: (command, args) => execFileSync(command, args, {
+    encoding: "utf8", windowsHide: true, timeout: 2000, maxBuffer: 64 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+  }),
+  probeClaude: async candidate => {
+    try {
+      const { stdout } = await execFile(candidate, ["--version"], { encoding: "utf8", windowsHide: true, timeout: 2000, maxBuffer: 16 * 1024 })
+      return isClaudeVersionOutput(stdout)
+    } catch {
+      return false
+    }
+  },
+  probeClaudeSync: candidate => {
+    try {
+      return isClaudeVersionOutput(execFileSync(candidate, ["--version"], {
+        encoding: "utf8", windowsHide: true, timeout: 2000, maxBuffer: 16 * 1024,
+        stdio: ["ignore", "pipe", "pipe"],
+      }))
+    } catch {
+      return false
+    }
+  },
   resolvePackage: (specifier) => fileURLToPath(import.meta.resolve(specifier)),
   envGet: (name) => process.env[name],
   platform: process.platform,
@@ -688,7 +761,7 @@ function tryEnvOverride(deps: ResolverDeps): string | null {
 }
 
 /**
- * Step 1: bundled `@anthropic-ai/claude-code/bin/claude.exe`.
+ * Step 2: bundled `@anthropic-ai/claude-code/bin/claude.exe`.
  *
  * Skips the placeholder stub (≤4 KB) so we don't return a non-functional
  * file when the upstream postinstall failed (issue #445). The real
@@ -708,7 +781,7 @@ function tryBundledBinary(deps: ResolverDeps): string | null {
 }
 
 /**
- * Step 2: platform-specific peer package
+ * Step 3: platform-specific peer package
  * (`@anthropic-ai/claude-code-<platform>-<arch>`). This is where the
  * actual binary lives in the SDK ≥ 0.2.x split layout — the wrapper at
  * `claude-code/bin/claude.exe` is just a hardlink/copy from here.
@@ -740,11 +813,11 @@ function tryPlatformPackage(deps: ResolverDeps): string | null {
 }
 
 /**
- * Step 3: PATH lookup via `where claude` on Windows or `which claude` on POSIX.
+ * Step 1: PATH lookup via `where claude` on Windows or `which claude` on POSIX.
  *
  * Windows nuances handled here:
  *   - `where` returns multiple newline-separated paths when multiple
- *     binaries match — pick the first one that exists.
+ *     binaries match — pick the first existing one that can run Claude.
  *   - On systems with Git for Windows installed, plain `which claude`
  *     would invoke `which.exe` from `usr/bin/` which emits mingw-style
  *     paths like `/c/nvm4w/nodejs/claude` that `existsSync` rejects.
@@ -759,15 +832,38 @@ async function tryPathLookup(deps: ResolverDeps): Promise<string | null> {
   const cmd = deps.platform === "win32" ? "where claude" : "which claude"
   try {
     const { stdout } = await deps.exec(cmd)
-    const candidates = stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
-    for (const candidate of candidates) {
-      if (deps.platform === "win32" && candidate.startsWith("/")) continue
-      if (deps.existsSync(candidate)) return candidate
+    for (const candidate of existingPathCandidates(stdout, deps)) {
+      if (!deps.probeClaude || await deps.probeClaude(candidate)) return candidate
     }
   } catch {
     // No `claude` on PATH (or `where`/`which` not available).
   }
   return null
+}
+
+/** A broken installation or unrelated shim must not outrank the package. */
+function isClaudeVersionOutput(stdout: string): boolean {
+  return /^\d+\.\d+\.\d+(?:[-+][\w.-]+)? \(Claude Code\)$/.test(stdout.trim())
+}
+
+/** Share candidate filtering between startup/query resolution and CLI auth. */
+function existingPathCandidates(stdout: string, deps: ResolverDeps): string[] {
+  return stdout.split(/\r?\n/).map(s => s.trim()).filter(candidate =>
+    candidate.length > 0 && !(deps.platform === "win32" && candidate.startsWith("/")) && deps.existsSync(candidate))
+}
+
+function tryPathLookupSync(deps: ResolverDeps): string | null {
+  if (!deps.execLookupSync) return null
+  try {
+    const stdout = deps.execLookupSync(deps.platform === "win32" ? "where" : "which", ["claude"])
+    for (const candidate of existingPathCandidates(stdout, deps)) {
+      if (!deps.probeClaudeSync || deps.probeClaudeSync(candidate)) return candidate
+    }
+    return null
+  } catch {
+    // A missing/failed lookup must still allow the packaged fallback.
+    return null
+  }
 }
 
 /**
@@ -791,9 +887,8 @@ function tryLegacySdkCliJs(deps: ResolverDeps): string | null {
  * first hit (path + source tag), or null when all steps miss.
  *
  * Order matters: `env` wins unconditionally (operator escape hatch), then
- * `bundled` (the path the SDK expects), then `platform-package` (postinstall
- * fallback), then `path-lookup` (system PATH — most likely to surface
- * unintended shims, see #478), then `legacy-cli-js` (only matters on stale
+ * `path-lookup` (the operator-managed installation), then `bundled` and
+ * `platform-package` (packaged fallbacks), then `legacy-cli-js` (only matters on stale
  * Bun installs of SDK < 0.2.98).
  */
 export async function resolveClaudeExecutableWithSource(
@@ -801,12 +896,12 @@ export async function resolveClaudeExecutableWithSource(
 ): Promise<ClaudeExecutableInfo | null> {
   const env = tryEnvOverride(deps)
   if (env) return { path: env, source: "env" }
+  const pathLookup = await tryPathLookup(deps)
+  if (pathLookup) return { path: pathLookup, source: "path-lookup" }
   const bundled = tryBundledBinary(deps)
   if (bundled) return { path: bundled, source: "bundled" }
   const platformPkg = tryPlatformPackage(deps)
   if (platformPkg) return { path: platformPkg, source: "platform-package" }
-  const pathLookup = await tryPathLookup(deps)
-  if (pathLookup) return { path: pathLookup, source: "path-lookup" }
   const legacy = tryLegacySdkCliJs(deps)
   if (legacy) return { path: legacy, source: "legacy-cli-js" }
   return null
@@ -827,12 +922,10 @@ export async function resolveClaudeExecutable(deps: ResolverDeps = DEFAULT_DEPS)
  * (`meridian profile list`, `profileAdd`, etc.) that can't await before
  * spawning `claude auth status`.
  *
- * Skips two steps that the async resolver runs:
- *   - `path-lookup` — running `which`/`where` synchronously is awkward
- *     and platform-fragile; the audit showed bundled + platform-package
- *     covers every supported install layout (npm-global, npx/bunx
- *     download, Docker, NixOS).
- *   - `legacy-cli-js` — only matters for stale Bun installs of SDK < 0.2.98.
+ * Uses the same env → PATH → bundled → platform-package precedence as the
+ * async resolver. Its bounded shell-free lookup is limited to these synchronous
+ * CLI commands; live server probes use the async resolver. The legacy SDK
+ * cli.js fallback remains limited to the async Bun resolver.
  *
  * Closes the diagnostic gap from #478: `getAuthStatus` in profileCli.ts
  * and `getClaudeAuthStatusAsync` in this file previously called
@@ -845,6 +938,8 @@ export function resolveClaudeExecutableSync(
 ): ClaudeExecutableInfo | null {
   const env = tryEnvOverride(deps)
   if (env) return { path: env, source: "env" }
+  const pathLookup = tryPathLookupSync(deps)
+  if (pathLookup) return { path: pathLookup, source: "path-lookup" }
   const bundled = tryBundledBinary(deps)
   if (bundled) return { path: bundled, source: "bundled" }
   const platformPkg = tryPlatformPackage(deps)
@@ -897,14 +992,17 @@ export function resetCachedClaudeAuthStatus(): void {
   lastKnownGoodAuthStatus = null
   cachedAuthStatusAt = 0
   cachedAuthStatusIsFailure = false
+  cachedAuthStatusFailures = 0
   cachedAuthStatusPromise = null
   cachedAuthStatusCredMtimeMs = 0
   profileAuthCaches.clear()
 }
 
-/** Expire the auth status cache without clearing lastKnownGoodAuthStatus — for testing only.
- *  This simulates the TTL expiring so the next call re-executes `claude auth status`,
- *  while preserving the "last known good" fallback state. */
+/** Expire the auth status cache without clearing lastKnownGoodAuthStatus.
+ *  The next call re-executes `claude auth status` while the "last known good"
+ *  fallback state survives. Used by tests to simulate the TTL elapsing, and by
+ *  the login route so a just-authenticated profile stops reporting the cached
+ *  "not logged in". */
 export function expireAuthStatusCache(): void {
   cachedAuthStatusAt = 0
   cachedAuthStatusPromise = null

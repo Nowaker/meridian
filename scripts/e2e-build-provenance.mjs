@@ -2,22 +2,25 @@
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import { once } from "node:events"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs"
 import { createRequire } from "node:module"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..")
-const originalHome = process.env.HOME
-const home = mkdtempSync(join(tmpdir(), "meridian-provenance-e2e-"))
-process.env.HOME = home
+const fixtureRoot = mkdtempSync(join(tmpdir(), "meridian-provenance-e2e-"))
+for (const key of Object.keys(process.env)) if (/^(MERIDIAN_|CLAUDE_PROXY_|CLAUDE_|ANTHROPIC_|OPENAI_)/.test(key)) delete process.env[key]
+process.env.MERIDIAN_CONFIG_DIR = join(fixtureRoot, "config")
+process.env.MERIDIAN_SESSION_DIR = join(fixtureRoot, "sessions")
+process.env.CLAUDE_CONFIG_DIR = join(fixtureRoot, "credentials")
+mkdirSync(process.env.CLAUDE_CONFIG_DIR, { mode: 0o700 })
 process.env.MERIDIAN_NO_UPDATE_CHECK = "1"
 delete process.env.MERIDIAN_API_KEY
 const require = createRequire(import.meta.url)
 const { serve } = require("@hono/node-server")
 const { createProxyServer } = await import("../dist/server.js")
-const { app } = createProxyServer({ port: 0, host: "127.0.0.1", silent: true, profiles: [] })
+const { app } = createProxyServer({ port: 0, host: "127.0.0.1", silent: true, profiles: [{ id: "build-verification", claudeConfigDir: process.env.CLAUDE_CONFIG_DIR }] })
 const server = serve({ fetch: app.fetch, port: 0, hostname: "127.0.0.1" })
 await once(server, "listening")
 const url = "http://127.0.0.1:" + server.address().port
@@ -45,7 +48,7 @@ try {
   assert.equal(initial.runtime.counter, initial.latest.counter)
   console.log(JSON.stringify({ phase: "current", counter: initial.runtime.counter, identity: initial.runtime.displayVersion }))
   for (let n = 0; n < 3; n++) {
-    const child = spawn("bun", ["scripts/build.ts"], { cwd: root, env: { ...process.env, HOME: originalHome }, stdio: "inherit" })
+    const child = spawn("bun", ["scripts/build.ts"], { cwd: root, env: { ...process.env }, stdio: "inherit" })
     const [code] = await once(child, "exit")
     assert.equal(code, 0, "actual rebuild passed")
   }
@@ -58,6 +61,6 @@ try {
     buildsBehind: behind.buildsBehind, runtimeImmutable: true, concurrentRequests: responses.length }))
 } finally {
   server.close()
-  rmSync(home, { recursive: true, force: true })
+  rmSync(fixtureRoot, { recursive: true, force: true })
 }
 process.exit(0)

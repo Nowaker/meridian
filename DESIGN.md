@@ -96,7 +96,14 @@ green `rgba(63,185,80,α)`, yellow `rgba(210,153,34,α)`, red
 
 Usage bars and percentage readouts color by value: `< 60%` green,
 `≥ 60%` yellow, `≥ 85%` red. Health dot: healthy green (with soft glow),
-degraded yellow, offline red.
+degraded yellow, offline red. When Anthropic is unreachable from the host the
+whole health pill becomes a red tinted pill ("Can't reach Anthropic", details on
+hover), and a yellow one ("Rechecking Anthropic") while traffic is let back in;
+both keep their text at phone width, where the plain status shows only its dot.
+With the opt-in `showHostname` setting the pill names the machine after its
+status (`Operational · nwkr-desktop`), first DNS label only with the full name
+on hover; at phone width the name stays, ellipsized, and keeps its separator
+only where the status text stays too.
 
 ### Provider brands
 
@@ -177,7 +184,9 @@ carries no attribute, so it renders as before.
 
 **The header owns the brand.** It shows the mark + wordmark (links home),
 the site nav (Home · Telemetry · Profiles · Settings · Plugins), the
-active-profile chip, and the live health pill. Consequences:
+active-profile chip, the live health pill, the running version to its right,
+and — when the update check is on and a newer release exists — a blue
+update badge after that. Consequences:
 
 - Page `<h1>` is the *page name* (“Telemetry”, “Profiles”) — never
   “Meridian”, never a logo. Subtitle below it: 13–14px `--muted`.
@@ -282,10 +291,15 @@ missing or stale quota data never looks like unused capacity.
 Menu-bar accounts use compact rows with side-by-side quota bars, so multiple
 accounts and their switch controls remain visible together. The active account
 shows its next reset; each limit retains full reset detail in its tooltip and
-accessible name. Account lists scroll only when they exceed the available space.
+accessible name. Account lists scroll only when they exceed the available space. Each account
+reserves a separate line for its name and action; plan/allowance and organization
+are secondary text, never a row of non-shrinking badges. The 5-hour and weekly
+limits are primary; model-specific limits live in a disclosure that stays open
+through refresh. Service controls stay outside the scrolling account list.
 
 The macOS menu-bar icon uses a transparent monochrome Meridian template, tinted
-by the system. The Dock retains the full-color app icon. Committed 18-point
+by the system. The Dock retains the full-color app icon unless the macOS **Hide Dock icon**
+preference is enabled; the menu-bar icon and dashboard remain available. Committed 18-point
 assets include 1x, 2x and 3x representations; regenerate them with
 `swift scripts/render-tray-icon.swift`.
 
