@@ -607,6 +607,15 @@ const warnedAuthStatusFailures = new Map<string, string>()
 const authContextLabel = (profileId: string | undefined) => profileId ? `profile "${profileId}"` : "the default account"
 const formatSeconds = (ms: number) => `${(ms / 1000).toFixed(1)}s`
 
+function reportedLoggedIn(stdout: unknown): boolean | undefined {
+  try {
+    const loggedIn: unknown = JSON.parse(String(stdout))?.loggedIn
+    return typeof loggedIn === "boolean" ? loggedIn : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * Why a `claude auth status` run gave no answer, in terms an operator can act
  * on. Never quotes the CLI's output, which carries the account's email.
@@ -615,9 +624,8 @@ function describeAuthStatusFailure(err: unknown): string {
   const e = err as { killed?: boolean; signal?: string | null; code?: unknown; stdout?: unknown } | null
   if (e?.killed) return `no answer within ${AUTH_STATUS_SPAWN_TIMEOUT_MS / 1000}s, so the check was killed`
   if (typeof e?.code === "number") {
-    let loggedIn: unknown
-    try { loggedIn = JSON.parse(String(e.stdout)).loggedIn } catch {}
-    return `\`claude auth status\` exited with code ${e.code}${typeof loggedIn === "boolean" ? ` reporting loggedIn: ${loggedIn}` : ""}`
+    const loggedIn = reportedLoggedIn(e.stdout)
+    return `\`claude auth status\` exited with code ${e.code}${loggedIn === undefined ? "" : ` reporting loggedIn: ${loggedIn}`}`
   }
   if (e?.signal) return `\`claude auth status\` was terminated by ${e.signal}`
   if (typeof e?.code === "string") return `could not run \`claude auth status\` (${e.code})`

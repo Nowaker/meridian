@@ -30,7 +30,7 @@ import { join } from "node:path"
  * "hang" models a spawn stalled on a loaded host: the callback is parked in
  * `hungSpawns` until the test settles it with `releaseHungSpawns`.
  */
-let authBehavior: "success" | "fail" | "hang" | "timeout" | "exit1" = "success"
+let authBehavior: "success" | "fail" | "hang" | "timeout" | "exit1" | "exit2" = "success"
 let execFileCalls = 0
 /** Options the probe passed to execFile, so spawn flags can be asserted. */
 let execFileOptions: any
@@ -73,14 +73,20 @@ mock.module("child_process", () => ({
       done?.(new Error("claude auth status failed"), { stdout: "", stderr: "" })
       return
     }
-    // A non-zero exit still carries the CLI's JSON (and the account email).
     if (authBehavior === "timeout") {
       done?.(timeoutError(), { stdout: "", stderr: "" })
       return
     }
+    // A non-zero exit still carries the CLI's stdout: its JSON, account email
+    // included (exit1), or output that is not JSON at all (exit2).
     if (authBehavior === "exit1") {
       const stdout = JSON.stringify({ loggedIn: false, email: "private@test.com" })
       done?.(Object.assign(new Error("Command failed: /fake/claude auth status\n"), { killed: false, signal: null, code: 1, stdout }), { stdout, stderr: "" })
+      return
+    }
+    if (authBehavior === "exit2") {
+      const stdout = "not json"
+      done?.(Object.assign(new Error("Command failed: /fake/claude auth status\n"), { killed: false, signal: null, code: 2, stdout }), { stdout, stderr: "" })
       return
     }
     done?.(null, { stdout: JSON.stringify(currentPayload), stderr: "" })
@@ -488,6 +494,12 @@ describe("auth-status warnings", () => {
     await getClaudeAuthStatusAsync(p)
     expect(warnings()[0]).toContain("exited with code 1 reporting loggedIn: false")
     expect(warnings().join("\n")).not.toContain("private@test.com")
+  })
+
+  it("reports a non-zero exit whose output is not JSON by its code alone", async () => {
+    authBehavior = "exit2"
+    await getClaudeAuthStatusAsync(nextProfile())
+    expect(warnings()[0]).toContain("`claude auth status` exited with code 2 (1 in a row")
   })
 
   it("notes a first answer that outlived the caller's wait", async () => {
