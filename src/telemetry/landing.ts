@@ -158,6 +158,7 @@ export const landingHtml = `<!DOCTYPE html>
   .prof-pop-value.status-err { color: var(--red); }
   .prof-pop-link { display: block; margin-top: 10px; font-size: 11px; color: var(--accent); text-decoration: none; }
   .prof-pop-link:hover { text-decoration: underline; }
+  .prof-pop-value.status-warn { color: var(--yellow); }
   /* A hidden overlay still counts toward the page's scroll width, and one
      hung off the icon at 256px or more reaches past a phone's right edge.
      On a narrow screen it spans the card's header row instead. */
@@ -458,7 +459,7 @@ function infoIcon(entry,type){
   var rows='';
   for(var i=0;i<facts.length;i++){
     var f=facts[i];
-    var tone=f.tone==='ok'?' status-ok':f.tone==='err'?' status-err':'';
+    var tone=f.tone==='ok'?' status-ok':f.tone==='err'?' status-err':f.tone==='warn'?' status-warn':'';
     rows+='<span class="prof-pop-label">'+esc(f.label)+'</span>'
       +'<span class="prof-pop-value'+tone+'">'+esc(f.value)+'</span>';
   }
