@@ -293,6 +293,11 @@ const DENY_HOLD_TIMEOUT_MS = envInt("DENY_HOLD_TIMEOUT_MS", UPSTREAM_IDLE_MS + 3
 // waste at three idle windows instead of an afternoon. 0 disables the ceiling
 // and restores the pre-ceiling behaviour exactly.
 const UPSTREAM_IDLE_MAX_CONSECUTIVE = envInt("UPSTREAM_IDLE_MAX_CONSECUTIVE", 3)
+// How long a stream that has already answered its client waits for the SDK
+// attempt it abandoned to stop before the turn ends and its session is free
+// again. Above the SDK process gate's 7s join budget, which bounds a healthy
+// teardown, so it only decides anything when that teardown is itself stuck.
+const ABANDONED_ATTEMPT_SETTLE_MS = 10_000
 
 // Bounds how long ProxyInstance.close() waits for in-flight /v1/messages
 // requests to finish (after beginDrain() stops admitting new ones) before it
@@ -5314,6 +5319,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               ? managedForkTarget?.sessionId
               : undefined
             let nextClientBlockIndex = 0
+            // The attempts behind this stream answer to their own abort, linked
+            // to the request's so every request-wide abort still reaches them.
+            // The catch below answers the client, most often because the idle
+            // guard gave up on `response` while it was mid-await (queued for an
+            // SDK slot, in admission, or backing off), and an async generator
+            // cannot be returned until it next yields. Left alone, that attempt
+            // went on to start Claude Code and spend upstream calls on a request
+            // already answered, while the session's next turn could be running.
+            const attemptAbort = linkRequestAbort(requestAbort.controller.signal)
+            let abandonment: Error | undefined
+            let attempts: AsyncGenerator<unknown, unknown, unknown> | undefined
             try {
               // Same transparent retry wrapper as the non-streaming path.
               // Rate-limit retry strategy:
@@ -5339,6 +5355,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 let singleTurnCapLifted = false
 
                 while (true) {
+                  if (abandonment) throw abandonment
                   if (managedForkTarget) {
                     if (managedCreationAttemptStarted) {
                       await rotateManagedCreationTarget("stream_retry")
@@ -5375,10 +5392,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                         : undefined,
                       advisorModel,
-                    }, requestAbort.controller)
+                    }, attemptAbort.controller)
                     attemptMaxTurns = attemptQuery.options.maxTurns
                     lastAttemptMaxTurns = attemptMaxTurns
-                    for await (const event of runSdkQueryAttempt(attemptQuery, requestAbort.controller.signal, requestMeta, "stream", managedSdkAttemptLocators())) {
+                    for await (const event of runSdkQueryAttempt(attemptQuery, attemptAbort.controller.signal, requestMeta, "stream", managedSdkAttemptLocators())) {
                       // Same SDK rate-limit capture as the non-stream path.
                       if ((event as any).type === "rate_limit_event") {
                         rateLimitStore.record(profile.id, (event as any).rate_limit_info)
@@ -5390,6 +5407,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     }
                     return
                   } catch (error) {
+                    // Nothing retries for a client that already has its answer.
+                    if (abandonment) throw error
                     const errMsg = error instanceof Error ? error.message : String(error)
 
                     // Tool hooks and structured output are committed exposure
@@ -5461,7 +5480,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                           ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                           : undefined,
                         advisorModel,
-                      }, requestAbort.controller), requestAbort.controller.signal, requestMeta, "stream_fresh", managedSdkAttemptLocators())
+                      }, attemptAbort.controller), attemptAbort.controller.signal, requestMeta, "stream_fresh", managedSdkAttemptLocators())
                       return
                     }
 
@@ -5518,7 +5537,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                           ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                           : undefined,
                         advisorModel,
-                      }, requestAbort.controller), requestAbort.controller.signal, requestMeta, "stream_fresh", managedSdkAttemptLocators())
+                      }, attemptAbort.controller), attemptAbort.controller.signal, requestMeta, "stream_fresh", managedSdkAttemptLocators())
                       return
                     }
 
@@ -5621,6 +5640,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   }
                 }
               })()
+              attempts = response
 
               const heartbeat = setInterval(() => {
                 heartbeatCount += 1
@@ -6966,6 +6986,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 }
               }
             } catch (error) {
+              // Every path from here answers the client, so whatever attempt is
+              // still running behind the stream has nobody left to answer.
+              abandonment = new Error("Stream attempt abandoned: its client was already answered")
+              attemptAbort.abort(abandonment)
               // Forced shutdown revokes publication, but cleanup must remain
               // destructive: a client-visible interrupted turn cannot leave its
               // previously published source mapping resumable.
@@ -7738,6 +7762,22 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 streamClosed = true
               }
             } finally {
+              if (abandonment && attempts) {
+                // The turn ends, and frees its session for the next one, only
+                // once the abandoned attempt has actually stopped. Its return()
+                // settles when the generator finishes, including the SDK
+                // process join in runSdkQueryAttempt's cleanup.
+                let settleTimer: ReturnType<typeof setTimeout> | undefined
+                const settled = await Promise.race([
+                  attempts.return(undefined).then(() => true, () => true),
+                  new Promise<boolean>((resolve) => {
+                    settleTimer = setTimeout(() => resolve(false), ABANDONED_ATTEMPT_SETTLE_MS)
+                  }),
+                ])
+                clearTimeout(settleTimer)
+                if (!settled) claudeLog("stream.abandoned_attempt_unsettled", { waitedMs: ABANDONED_ATTEMPT_SETTLE_MS })
+              }
+              attemptAbort.detach()
               await abandonManagedFork("stream_complete_without_commit")
               // A client cancel during this cleanup queues an eviction that may
               // yet fence the turn or start a rollback retirement. The turn ends,
