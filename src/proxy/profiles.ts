@@ -244,7 +244,7 @@ export function enableDiskProfileDiscovery(): void {
   diskDiscoveryEnabled = true
 }
 
-/** Turn disk auto-discovery back off.
+/** Disable disk auto-discovery — for testing only.
  *
  *  The flag is process-global and one-way, so a test file that imports
  *  `bin/cli.ts` turns it on for every file that runs after it in the same

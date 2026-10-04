@@ -125,8 +125,9 @@ export const profileBarCss = `
   }
   .meridian-header .mh-profile:hover { border-color: var(--accent, #58a6ff); }
   .meridian-header .mh-profile.visible { display: inline-flex; }
+  .meridian-header .mh-profile-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .meridian-header .mh-profile .mh-profile-type {
-    color: var(--muted, #8b949e); font-size: 10px;
+    color: var(--muted, #8b949e); font-size: 10px; flex-shrink: 0; white-space: nowrap;
   }
   /* npm update chip — a link to the releases page, so it is blue
      (interactive). Local/dev provenance is the separate .mh-prov pill. */
@@ -406,6 +407,7 @@ export const profileBarJs = `
   }
 
   function fitBuildChip() {
+    profileChip.style.maxWidth = '';
     var steps = [['shown', 'full'], ['hidden', 'full']].concat(provForms.map(function(form) { return ['hidden', form]; }));
     function apply(step) { headerEl.setAttribute('data-prov-calm', step[0]); headerEl.setAttribute('data-prov-form', step[1]); }
     for (var pass = 0; pass < 2; pass++) {
@@ -413,6 +415,17 @@ export const profileBarJs = `
         apply(steps[i]);
         if (rightFits(pass === 0)) return;
       }
+    }
+    // Native scrollbars and long account names can exhaust the row even with
+    // version-only provenance. Preserve health/update/warning chips and give
+    // the account name the remaining space; its full identity stays in title.
+    var visible = Array.from(rightEl.children).filter(function(el) { return el.getBoundingClientRect().width > 0; });
+    var used = visible.filter(function(el) { return el !== profileChip; }).reduce(function(sum, el) { return sum + el.getBoundingClientRect().width; }, 0);
+    var gap = parseFloat(getComputedStyle(rightEl).columnGap) || 0;
+    var budget = Math.floor(rightEl.clientWidth - used - gap * Math.max(0, visible.length - 1));
+    if (profileChip.getBoundingClientRect().width > budget && budget >= 96) {
+      profileChip.style.maxWidth = budget + 'px';
+      if (!rightFits(false)) profileChip.style.maxWidth = '';
     }
   }
 
@@ -557,7 +570,7 @@ export const profileBarJs = `
       var follow = data.follow;
       var followLabel = follow ? (follow.activeProfile ? 'following' : 'follow: local') : '';
       if (follow && follow.stale) followLabel += ' (stale)';
-      profileChip.innerHTML = esc(current.id) + ' <span class="mh-profile-type">' + esc(current.type || '') + '</span>'
+      profileChip.innerHTML = '<span class="mh-profile-name">' + esc(current.id) + '</span> <span class="mh-profile-type">' + esc(current.type || '') + '</span>'
         + (follow ? ' <span class="mh-profile-follow">' + esc(followLabel) + '</span>' : '');
       profileChip.classList.toggle('following', !!follow);
       profileChip.title = follow
@@ -565,6 +578,7 @@ export const profileBarJs = `
           + (follow.activeProfile ? '' : ' — no usable value from it, using the local profile')
           + '. Switching here is refused; switch on the followed instance.'
         : 'Active profile — switch from the home page';
+      profileChip.title += ' — ' + current.id;
       profileChip.classList.add('visible');
     }).catch(function() {});
   }

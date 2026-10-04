@@ -1061,6 +1061,7 @@ curl -s -X PUT -H 'Content-Type: application/json' -d '{"checkForUpdates":false}
 | E66 | [Interrupted turn after a settled checkpoint](#e66-interrupted-turn-after-a-settled-checkpoint) | **Automated, real proxy + SDK + Claude Max**: `bun scripts/e2e-checkpoint-interrupted-turn.mjs`. An OpenCode-keyed tool round whose complete result is followed by a partial assistant turn (what a dropped stream leaves) must resume the stored session; a result for an unknown call is the negative control and must still take the fresh replay. **Run before releases touching the passthrough early-stop checkpoint or checkpoint replay** | 2026-09-26 |
 | E67 | [OpenCode V2 interrupted tool turn](#e67-opencode-v2-interrupted-tool-turn) | **Actual OpenCode 2.0.16 client and Meridian V2 plugin, real SDK/model**: `E2E_OPENCODE_BIN=/path/to/opencode E2E_PLUGIN_PATH=/path/to/opencode-scrub/dist/index.js bun scripts/e2e-opencode-checkpoint-fault.mjs`. Inject one partial SSE failure after the real client tool call; require the client's exact retry shape and SDK resume, plus a same-session recovery. **Run before releases touching keyed checkpoint recovery** | 2026-09-26 |
 | E68 | [OpenCode V2 user-invoked skill](#e68-opencode-v2-user-invoked-skill) | **Actual OpenCode V2 server, real SDK/model**: `E2E_OPENCODE_BIN=/path/to/opencode E2E_PLUGIN_PATH=/path/to/opencode-scrub/dist/index.js bun scripts/e2e-opencode-skill-content.mjs`. A skill invoked with no typed text must reach the SDK prompt inside `<skill_content>` and drive the reply. **Run before releases touching user-text sanitization** | 2026-09-27 |
+| E73 | [Unknown thinking display values](#e73-unknown-thinking-display-values) | **Automated**: `bun scripts/e2e-thinking-display-interactive.mjs` — actual Claude Code 2.1.287 TUI in a PTY, real proxy/SDK/bundled subprocess. Requires an answer rendered in the client, live-prompt framing, supported-display controls and joined cleanup. The separate HTTP-shaped gate remains a backend smoke test. **Run before releases touching thinking passthrough or the SDK/CLI version** | 2026-10-01 |
 
 | P1 | [Profile: List & Auth Status](#p1-profile-list--auth-status) | `/profiles/list` returns profiles with emails, login status, auth timestamps | - |
 | P2 | [Profile: Switch via API](#p2-profile-switch-via-api) | `POST /profiles/active` switches profile; health endpoint reflects new email | - |
@@ -5932,6 +5933,77 @@ trimmed 12 messages (~3114 estimated tokens) and answered from the kept tail.
 not reproduced live, and neither was the reactive retry, which needs a real
 overflow from the model. Those remain covered only by the mocked envelope tests.
 
+## E73: Unknown thinking display values
+
+**What it proves:** a request whose `thinking.display` the bundled Claude Code
+CLI does not know still runs, instead of killing the SDK subprocess.
+
+Interactive Claude Code in connector-text mode (seen on 2.1.287) sends
+`thinking: { type: "adaptive", display: "updates" }`. Meridian forwarded it to
+the Agent SDK, which passes `display` to its subprocess as
+`--thinking-display updates`; the bundled CLI accepts only
+`summarized|omitted|highlights` and exited 1 before the turn started
+(`sdk_termination reason=process_exit exit=1`), so every such turn failed.
+`buildQueryOptions` now forwards `display` only when the bundled CLI accepts
+it (`summarized`, `omitted`, `highlights`) and drops anything else, logging
+`thinking display "<value>" dropped`; the CLI then uses its default display.
+
+```bash
+bun scripts/e2e-thinking-display.mjs
+```
+
+The HTTP-shaped smoke test above uses the real proxy, Agent SDK and bundled
+subprocess; model `sonnet` (`PROBE_MODEL`). It clears `MERIDIAN_*` settings and
+uses its own config directory so disabled-thinking settings cannot mask the
+subprocess failure. It does not establish actual interactive-client behavior.
+
+The actual-client gate drives Claude Code 2.1.287 in a POSIX PTY, types the
+request after the TUI is ready, and reconstructs its terminal screen with
+Python 3, `pyte==0.8.2` and `wcwidth==0.2.13`. Build first; use an isolated native
+credential directory and the explicitly pinned client executable:
+
+```sh
+npm run build
+E2E_CLAUDE_CLIENT=/absolute/path/to/claude-2.1.287 \
+E2E_PROFILE_CLAUDE_DIR=/absolute/path/to/owned-native-credentials \
+bun scripts/e2e-thinking-display-interactive.mjs
+```
+
+Run that same command against a built unchanged checkout with
+`E2E_MERIDIAN_ROOT=/absolute/path/to/baseline` and
+`E2E_EXPECT_DISPLAY_FAILURE=1`: it requires the native `updates` rejection,
+not any arbitrary failure. On the fixed checkout, repeat with
+`E2E_DISPLAY_MODE=summarized`, `highlights`, and `disabled`. For the actual
+print-mode `omitted` control use `E2E_CLIENT_MODE=print E2E_DISPLAY_MODE=omitted`.
+Interactive 2.1.287 sends `updates` even for the `omitted` flag; do not label
+that run evidence that the SDK retained `omitted`.
+
+The harness isolates client settings, project, proxy config and session storage,
+uses the real SDK without replacing its result, observes the actual client HTTP
+body and native served model, requires the random receipt in both the completed
+HTTP turn and client output, and joins cleanup. It also requires the current
+request to be outside the replay-history envelope: this caught a second bug
+where trailing client `system` metadata made the current request historical.
+Only the replay copy now combines that metadata with the current user turn;
+lineage and budgets retain the original request. Preserved results and causal
+controls are in [the integration evidence](docs/maintenance/evidence/1230-interactive-thinking-display.md).
+
+**Pass criteria** (asserted, non-zero exit on any):
+
+- `display: "updates"` returns 200, streams the requested word, and emits no
+  `event: error`.
+- `display: "summarized"` still answers the same way.
+- No `thinking disabled` line: thinking actually reached the SDK.
+- The dropped `"updates"` display is logged exactly once.
+
+**Before/after (2026-10-01, Linux x86_64, Bun 1.3.11, Agent SDK 0.2.141,
+bundled CLI 2.1.284, `sonnet`).** Baseline `3cb65df`: FAIL, 2 checks — the
+`"updates"` request returned 200 with an `event: error` and no text (the
+subprocess had exited on `--thinking-display updates`) and nothing logged a
+drop; `"summarized"` answered. Branch: PASS, 4 of 4: both answered, thinking
+was not forced off, and the drop was logged once. Live, the owner's interactive Claude Code 2.1.287 session failed
+10 of 10 turns through the proxy with this error before the fix.
+
 ## Concurrent transcript publication
 
 Run `bun scripts/e2e-publication-lifetime.mjs` and again with `--stream` after lifecycle or publication changes. This gate uses real Claude Max queries and two concurrent HTTP conversations, each with a fresh and resumed turn. A timing hook pauses each request after its real SDK writer lease is released, promotes its request pin as the owning proxy would, and runs a separate collector process before publication. The collector uses zero grace periods and the supported SDK deleter, exercising the destructive race in an isolated session store and disposable project.
@@ -7185,3 +7257,120 @@ runs. Require liveness answers during those holds, a random tool receipt and
 same-session recall, actual served-model confirmation and zero client exits.
 The direct gate regression additionally requires bounded join and eventual
 sensitive-file cleanup if disk publication remains stuck after child exit.
+
+## Operator-managed Claude executable selection
+
+For PATH/override/package resolver changes, run the actual Linux OpenCode
+consumer gate in `scripts/e2e-claude-path-opencode.mjs`. Pin OpenCode 1.18.34,
+opencode-with-claude 1.10.1 and SDK 0.2.141. Compare a cached Claude 2.1.268
+package with a healthy mise-managed 2.1.288 using actual Opus 5.5. Require the
+baseline version refusal, fixed exact output receipt, native model, identical
+health/SDK executable, intended credential directory, completed SDK iterators
+and zero owned residual processes. Retain explicit override and missing/broken
+PATH controls with a model the fallback CLI supports.
+
+The wrapper observes the real SDK, and only the owned consumer dependency is
+replaced. It does not rewrite provider output or inspect SDK persistence. See
+[versions, commands, causal failures and limits](docs/maintenance/evidence/1246-claude-path-resolution.md).
+
+## Antigravity catalogs above 128 client tools
+
+For catalog-validation changes, run `scripts/e2e-antigravity-tool-catalog.mjs`
+with actual OpenCode 1.18.30, official agy 1.2.7 and
+`gemini-3.8-flash-high`. Two real stdio MCP servers must advertise 129 or 256
+fixture tools to the client. Require the complete client catalog, a tail tool
+beyond index 127, exactly one target invocation, a tool-only random receipt in
+actual frontend output and the returned client tool result in the next request.
+Both client MCP processes must exit, and backend shutdown must join. Preserve
+invalid-name, duplicate-name and malformed-schema HTTP 400 controls beyond the
+former limit. `E2E_EXPECT_TOOL_LIMIT=1` targets an unchanged baseline;
+`E2E_SERVER_MODULE` selects a built baseline or independently installed package.
+See [versioned proof and limits](docs/maintenance/evidence/1238-antigravity-tool-catalog.md).
+
+## Browser account login (#792)
+
+Run `bun scripts/e2e-profile-login-live.mjs`, open its loopback `/profiles`
+page, and complete **Add a profile** with a real Claude account. Keep the
+returned code in the page, never in command arguments, logs or the evidence
+record. The harness uses isolated Meridian/session/credential directories
+and intentionally starts the HTTP application without the host default
+credential-refresh scheduler. After building, run `E2E_PROFILE_CLAUDE_DIR=<published directory>
+E2E_PLUGIN_PATH=<independent installed scrub entrypoint> bun
+scripts/e2e-profile-login-client.mjs` to verify the new account through an
+actual headless client, then
+re-authenticate that account from its card. A synthetic grant does not satisfy
+this live gate.
+
+Independent regressions require no live account:
+
+- `bun scripts/e2e-profile-native-store.mjs`: synthetic-grant round trip through
+  actual macOS Keychain or Linux credential-file storage; cleans its own item.
+- Build `src/proxy/profileCli.ts` for Node, set `E2E_PROFILE_CLI_BUNDLE` to that
+  bundle, then run `node scripts/e2e-profile-creation-concurrent.mjs`. Repeat
+  with `E2E_PROFILE_RACE_MODE=same`. Two independent processes must preserve
+  both distinct accounts, and only one may create a shared name.
+- Build `src/proxy/tokenRefresh.ts` for Node, set
+  `E2E_CREDENTIAL_STORE_BUNDLE` to that bundle, then run
+  `node scripts/e2e-keychain-write-log.mjs`. The controlled failed command must
+  report failure without logging its synthetic password arguments.
+- `bun scripts/e2e-profile-login-page.mjs` serves the actual profile page with
+  synthetic API replies for browser inspection, including valid IDs
+  `__proto__` and `constructor`. `E2E_PAGE_ROOT` selects an older source tree
+  for the before control. This fixture is not OAuth or live-model evidence.
+
+Profile add/remove/rename writers now share `profiles.json.lock` and atomically
+publish mode-0600 snapshots. An interrupted writer leaves its lock in place:
+stop every writer before manually removing that specific lock. Never recover
+it solely because it is old; an active slow writer still owns its snapshot.
+
+For owned existing-account re-authentication through native Node ingress, build
+first, then run `E2E_EXISTING_ROOT=<owned fixture> E2E_PROFILE_ID=<owned id>
+E2E_PORT=<unused port> node scripts/e2e-profile-login-node-live.mjs`. Open its
+Profiles page and authorize in the browser. Run the native-grant harness with
+the same root/id and `E2E_GRANT_ACTION=capture` before authorization, then
+`E2E_GRANT_ACTION=verify` afterward. The mode-0600 before control is private;
+never attach it or OAuth URLs/codes. Require unchanged profile mapping, changed
+native grants and future expiry, then the actual OpenCode client/resume gate.
+`node scripts/e2e-profile-login-header-limit.mjs` separately exercises the
+public factory with 20 KiB synthetic cookies and a refused 40 KiB control;
+`E2E_EXPECT_HEADER_OVERFLOW=1 E2E_SERVER_MODULE=<baseline bundle>` repeats
+the failure control. No grant/model call is involved in that header probe.
+
+## Responsive contained/wide pages
+
+For layout changes, run `bun scripts/e2e-page-layout-http.mjs` for actual
+settings I/O, instance-key refusal, defaults/invalid/null-reset controls and
+all main/standalone provider HTML stamping. Run
+`bun scripts/e2e-page-layout-live.mjs` for the native browser with 14 owned
+synthetic profiles; it explicitly isolates auth/native-store boundaries and
+forbids model requests. Its `/fixture/frame?width=2560&path=/profiles` supplies
+an exact CSS viewport when outer preview resizing is unavailable. Select wide
+and evaluate `scripts/e2e-page-layout-browser.js` in that frame for actual
+reorder/search/anchor/switch HTTP flows. Test home/Profiles at 375/1280/1920/2560
+and retain a contained comparison. Phone controls use
+`e2e-mobile-header-pricing-tiles.mjs` with an unchanged E2E_BASELINE_ROOT and
+its browser probe at 320/375/414/768/1280; require intact warnings/updates,
+uncut pricing values, no new overflow, reversible provenance fitting and
+unchanged desktop geometry. These UI gates do not require SDK/model generation.
+
+## Proposed SQLite migration retirement review
+
+For #1243, use `scripts/e2e-session-store-retirement-review.mjs` with explicit
+E2E_STORE_DATABASE_MODULE and exact E2E_SOURCE_SHA for the reviewed source.
+Default mode asserts that an older writer's unimported atomic replacement
+stays active. E2E_EXPECT_RETIREMENT_RACE=1 records the defective source control
+as REPRODUCED_UNSAFE_RETIREMENT; its zero exit is not acceptance of a fix.
+See docs/maintenance/evidence/1243-migration-retirement-review.md for the real
+filesystem boundary and outstanding migration/parent gates.
+
+## Profile credential metadata isolation
+
+Run `bun scripts/e2e-profile-credential-isolation.mjs` for actual HTTP + CLI
+auth-status + owned native Keychain/file data, with SDK/model requests fenced.
+`E2E_SOURCE_ROOT=<unchanged tree> E2E_SOURCE_SHA=<exact head>
+E2E_EXPECT_METADATA_LEAK=1` repeats the defective native-metadata control.
+API profiles must make zero stored-OAuth metadata reads and stay governed by
+their own auth status. A synthetic API key recognition is not inference-key
+validation. The separately isolated HTTP regression file checks supplied setup
+tokens and preserves stored subscription plan, renewal and missing-token rules.
+See [bounded proof](docs/maintenance/evidence/1257-profile-credential-isolation.md).

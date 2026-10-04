@@ -70,13 +70,12 @@ describe("profile login routes", () => {
   function stubTokenEndpoint(makeResponse: () => Response) {
     const requests: Array<Record<string, unknown>> = []
     globalThis.fetch = Object.assign(
-      async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-        // Token exchanges only. The login also asks Anthropic for the account
-        // plan, and counting that here would make every "exactly one exchange"
-        // assertion read two while proving nothing about them.
-        if (String(input).includes("/oauth/token")) {
-          requests.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>)
+      async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        if (String(_input) === "https://api.anthropic.com/api/oauth/profile") {
+          return Response.json({ organization: { organization_type: "claude_max", rate_limit_tier: "default_claude_max_5x" } })
         }
+        expect(String(_input)).toBe("https://platform.claude.com/v1/oauth/token")
+        requests.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>)
         return makeResponse()
       },
       { preconnect: originalFetch.preconnect },
@@ -97,6 +96,14 @@ describe("profile login routes", () => {
     expect(body.loginId).toBeTruthy()
     expect(body.expiresAt).toBeGreaterThan(Date.now())
     expect(new URL(body.authorizeUrl).searchParams.get("code_challenge")).toBeTruthy()
+  })
+
+  it("rejects malformed OAuth request shapes without entering the login flow", async () => {
+    for (const route of ["/profiles/login/start", "/profiles/add/start", "/profiles/login/complete", "/profiles/add/complete"]) {
+      for (const body of [null, [], { profile: 123, loginId: 123, addId: 123, code: 123 }]) {
+        expect((await post(route, body)).status).toBe(400)
+      }
+    }
   })
 
   it("refuses to start on an instance that must not write credentials", async () => {
@@ -261,7 +268,7 @@ describe("profile login routes", () => {
       const local = await post("/profiles/login/start", { profile: "personal" }, { host: "127.0.0.1:3457" })
       const localBody = await local.json() as { mode: string; authorizeUrl: string; pasteAuthorizeUrl: string }
       expect(localBody.mode).toBe("redirect")
-      expect(new URL(localBody.authorizeUrl).searchParams.get("redirect_uri")).toBe("http://127.0.0.1:3457/callback")
+      expect(new URL(localBody.authorizeUrl).searchParams.get("redirect_uri")).toBe("http://localhost:3457/callback")
       expect(new URL(localBody.pasteAuthorizeUrl).searchParams.get("redirect_uri"))
         .toBe("https://platform.claude.com/oauth/code/callback")
 
@@ -334,11 +341,11 @@ describe("profile login routes", () => {
       expect(body.mode).toBe("paste")
       expect(body.authorizeUrl).toBe(body.pasteAuthorizeUrl)
       expect(new URL(body.loopbackAuthorizeUrl ?? "").searchParams.get("redirect_uri"))
-        .toBe("http://127.0.0.1:3999/callback")
+        .toBe("http://localhost:3999/callback")
       // The probe is this login's own status URL on the loopback origin, so a
       // 200 from it proves the responder is this very instance.
       expect(body.loopbackProbeUrl)
-        .toBe(`http://127.0.0.1:3999/profiles/login/status?loginId=${encodeURIComponent(body.loginId)}`)
+        .toBe(`http://localhost:3999/profiles/login/status?loginId=${encodeURIComponent(body.loginId)}`)
     })
 
     it.skipIf(skipOnDarwin)("completes the login when Claude redirects back, and says so on the page", async () => {
@@ -359,7 +366,7 @@ describe("profile login routes", () => {
       // The one-time code must not survive into the rendered page.
       expect(html).not.toContain("redirect-code")
 
-      expect(requests[0]).toMatchObject({ redirect_uri: "http://127.0.0.1:3457/callback" })
+      expect(requests[0]).toMatchObject({ redirect_uri: "http://localhost:3457/callback" })
       expect(JSON.parse(readFileSync(join(tempDir, "personal", ".credentials.json"), "utf-8")).claudeAiOauth.accessToken)
         .toBe("route-access-token")
 

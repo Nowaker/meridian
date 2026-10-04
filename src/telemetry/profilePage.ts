@@ -753,7 +753,7 @@ function render(data, quotaData) {
   // or have errored — in that case quotaById is empty and the per-card
   // renderer simply hides its usage section.
   const quotaProfiles = (quotaData && Array.isArray(quotaData.profiles)) ? quotaData.profiles : [];
-  const quotaById = {};
+  const quotaById = Object.create(null);
   for (var qi = 0; qi < quotaProfiles.length; qi++) {
     quotaById[quotaProfiles[qi].id] = quotaProfiles[qi];
   }
@@ -859,14 +859,20 @@ function render(data, quotaData) {
     html += '</div>';
   }
 
+  // A refresh already in flight when a login panel opened still renders. Carry
+  // the open panel's node across so the paste, and its focus, survive.
+  var keptSlot = activeLogin ? loginSlot(activeLogin.profile) : null;
+  var keptFocus = keptSlot && keptSlot.contains(document.activeElement) ? document.activeElement : null;
   document.getElementById('content').innerHTML = html;
+  var freshSlot = keptSlot ? loginSlot(activeLogin.profile) : null;
+  if (freshSlot) freshSlot.replaceWith(keptSlot);
+  meridianReorder.restoreFocus(refocusId);
+  if (freshSlot && keptFocus) keptFocus.focus();
   // render() replaces #content wholesale, so the anchors are new elements with
   // whatever href the markup carried. Restore them from the cache, then top up
   // anything missing or near expiry in the background.
   applyLoginHrefs();
   ensureLoginLinks(profiles);
-
-  meridianReorder.restoreFocus(refocusId);
   afterRender();
 }
 
@@ -1032,12 +1038,27 @@ function setLoginMsg(text, kind) {
 // Sign-in links, minted server-side and held per profile so the anchor has a
 // real href before anyone clicks it. Nothing secret lives here: the authorize
 // URL is public by design, and the PKCE verifier never leaves the server.
-var loginLinks = {};
+var loginLinks = Object.create(null);
 // Whether this browser can reach Meridian on loopback. A fact about the
 // BROWSER, not about any one profile, so it is answered once for the page.
 var loopbackOk = null;
 // Set when the refusal is about the instance rather than a profile.
 var loginBlocked = null;
+// Cards whose link is being minted right now, so a render landing mid-mint
+// does not start a second login for the same card.
+var mintingLinks = Object.create(null);
+
+// A card's link names ONE pending login. Once a panel has opened it, that
+// login may be spent - completed, failed, or finished in the sign-in tab
+// before the poll noticed - and its state will not be honoured again. Drop it
+// so the card mints a fresh one rather than sending the next sign-in to a dead
+// state. A link already re-minted underneath the panel is left alone.
+function retireLoginLink(login) {
+  var link = loginLinks[login.profile];
+  if (link && link.loginId === login.loginId) delete loginLinks[login.profile];
+  applyLoginHrefs();
+  if (lastProfiles) ensureLoginLinks(lastProfiles.profiles || []);
+}
 
 function loginHrefFor(id) {
   var link = loginLinks[id];
@@ -1099,17 +1120,22 @@ async function ensureLoginLinks(profiles) {
   var due = [];
   for (var i = 0; i < profiles.length; i++) {
     var p = profiles[i];
-    if ((p.type || 'claude-max') !== 'claude-max') continue;
+    if ((p.type || 'claude-max') !== 'claude-max' || mintingLinks[p.id]) continue;
     var link = loginLinks[p.id];
     if (!link || link.expiresAt - Date.now() < 120000) due.push(p.id);
   }
   if (due.length === 0) return;
+  for (var m = 0; m < due.length; m++) mintingLinks[due[m]] = true;
 
-  // The first alone: a refusal about the INSTANCE (a read-only standby, no
-  // profiles at all) would otherwise repeat once per card, and each one is a
-  // logged refusal on the server.
-  if (await mintLoginLink(due[0]) === 'blocked') { applyLoginHrefs(); return; }
-  await Promise.all(due.slice(1).map(mintLoginLink));
+  try {
+    // The first alone: a refusal about the INSTANCE (a read-only standby, no
+    // profiles at all) would otherwise repeat once per card, and each one is a
+    // logged refusal on the server.
+    if (await mintLoginLink(due[0]) === 'blocked') { applyLoginHrefs(); return; }
+    await Promise.all(due.slice(1).map(mintLoginLink));
+  } finally {
+    for (var n = 0; n < due.length; n++) delete mintingLinks[due[n]];
+  }
 
   if (loopbackOk === null) {
     var probe = null;
@@ -1218,7 +1244,7 @@ function renderOauthPanel(o) {
     + (o.note ? '<div class="login-note">' + esc(o.note) + '</div>' : '')
     + '<ol class="login-steps">'
     +   '<li>A Claude sign-in tab just opened — '
-    +     '<a class="login-reopen" href="' + esc(o.authorizeUrl) + '" target="_blank" rel="noopener">open it again</a>'
+    +     '<a class="login-reopen" href="' + esc(o.authorizeUrl) + '" target="_blank" rel="noopener noreferrer">open it again</a>'
     +     ' if it was blocked.</li>'
     +   '<li>' + o.accountStep + '</li>'
     +   '<li>Paste the code Claude shows you below — or the whole callback URL from the address bar.</li>'
@@ -1299,7 +1325,9 @@ async function checkLoginStatus() {
 
 function finishLogin() {
   stopLoginPoll();
+  var finished = activeLogin;
   activeLogin = null;
+  if (finished) retireLoginLink(finished);
   if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
   refresh();
 }
@@ -1360,6 +1388,7 @@ function cancelLogin() {
   if (previous) {
     var slot = loginSlot(previous.profile);
     if (slot) slot.innerHTML = '';
+    retireLoginLink(previous);
   }
 }
 
@@ -1375,6 +1404,45 @@ var activeAdd = null;
 
 function addSlot() { return document.getElementById('add-slot'); }
 
+// Returning from the provider may reload this page. Retain only the pending
+// handle and public authorize URL in this tab, never the pasted code or tokens.
+function savePendingAdd(add) {
+  try {
+    if (add) sessionStorage.setItem('meridian.pendingAdd', JSON.stringify(add));
+    else sessionStorage.removeItem('meridian.pendingAdd');
+    return true;
+  } catch (error) {
+    // Storage can be disabled; the live form still works while it stays open.
+    return false;
+  }
+}
+
+function restorePendingAdd() {
+  try {
+    var raw = sessionStorage.getItem('meridian.pendingAdd');
+    if (!raw) return false;
+    if (raw.length > 8192) throw new Error('Invalid pending sign-in');
+    var add = JSON.parse(raw);
+    if (!add || typeof add.profile !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(add.profile)
+      || typeof add.addId !== 'string' || !add.addId || typeof add.authorizeUrl !== 'string'
+      || typeof add.expiresAt !== 'number' || !Number.isFinite(add.expiresAt)
+      || add.expiresAt <= Date.now()) throw new Error('Invalid pending sign-in');
+    var url = new URL(add.authorizeUrl);
+    if (url.origin !== 'https://claude.com' || url.pathname !== '/cai/oauth/authorize')
+      throw new Error('Invalid authorization URL');
+    var slot = addSlot();
+    if (!slot) return false;
+    activeAdd = { profile: add.profile, addId: add.addId, authorizeUrl: add.authorizeUrl, expiresAt: add.expiresAt };
+    slot.innerHTML = renderAddPanel(activeAdd.profile, activeAdd.authorizeUrl);
+    var input = slot.querySelector('.login-input');
+    if (input) input.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitAdd(); });
+    return true;
+  } catch (error) {
+    savePendingAdd(null);
+    return false;
+  }
+}
+
 function renderAddForm(prefill) {
   return '<div class="add-intro">Sign in to another Claude account and keep it here alongside the others.</div>'
     + '<div class="login-row">'
@@ -1388,6 +1456,7 @@ function renderAddForm(prefill) {
 
 function resetAddForm(prefill) {
   activeAdd = null;
+  savePendingAdd(null);
   var slot = addSlot();
   if (!slot) return;
   slot.innerHTML = renderAddForm(prefill);
@@ -1433,8 +1502,10 @@ async function startAdd() {
   // is about the name, and retyping it to fix a typo is the wrong ask.
   if (!res.ok) { setPanelMsg(slot, data.error || 'Could not start.', 'err'); return; }
 
-  activeAdd = { profile: name, addId: data.addId };
+  activeAdd = { profile: name, addId: data.addId, authorizeUrl: data.authorizeUrl, expiresAt: data.expiresAt };
+  var retained = savePendingAdd(activeAdd);
   slot.innerHTML = renderAddPanel(name, data.authorizeUrl);
+  if (!retained) setPanelMsg(slot, 'Keep this page open while signing in; this browser cannot retain the pending form.', 'err');
   var codeInput = slot.querySelector('.login-input');
   if (codeInput) {
     codeInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitAdd(); });
@@ -1480,6 +1551,7 @@ async function submitAdd() {
       // The code is spent. Keep the panel so the reason stays readable —
       // Cancel is the way back to the form.
       activeAdd.spent = true;
+      savePendingAdd(null);
     }
     return;
   }
@@ -1497,7 +1569,7 @@ function cancelAdd() {
 
 meridianReorder.init({ onSaved: refresh });
 refresh();
-resetAddForm('');
+if (!restorePendingAdd()) resetAddForm('');
 // A poll re-renders every card, so it must not land while one is being
 // operated on: mid-drag it replaces the cards being dragged, mid-login or
 // mid-add it wipes the panel the code is being pasted into, and mid-copy it

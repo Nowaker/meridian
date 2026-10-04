@@ -79,6 +79,22 @@ describe("OpenCode transient hook lineage", () => {
         { role: "assistant", content: [toolUse("a"), recovery] }]
       expect(canonicalize(messages)).toEqual(messages)
     })
+
+    it("retains recovery wording outside the synthetic trailing tool-result shape", () => {
+      const messages = [
+        { role: "user", content: [recovery, toolResult("a")] },
+        { role: "user", content: [toolResult("a"), recovery, text("A real follow-up.")] },
+        { role: "user", content: [toolResult("a"), text("A real follow-up."), recovery] },
+      ]
+      expect(canonicalize(messages)).toEqual(messages)
+    })
+
+    it("recognizes a batch of tool results and a recognized transient hook", () => {
+      const hook = text('<user-prompt-submit-hook>{"continue":true}</user-prompt-submit-hook>')
+      const results = [toolResult("a"), toolResult("b")]
+      expect(canonicalize([{ role: "user", content: [...results, recovery, hook] }]))
+        .toEqual([{ role: "user", content: results }])
+    })
   })
 
   it("preserves the order and identity of every surviving content block", () => {

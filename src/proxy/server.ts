@@ -87,7 +87,7 @@ import { checkPluginConfigured, isPluginlessOpenCodeRequest, notePluginlessOpenC
 import { describeBuildDrift } from "./buildInfo"
 import { buildRuntime } from "./buildRuntime"
 import { getLatestVersion, isUpdateCheckEnabled, startUpdateCheck, stopUpdateCheck } from "./updateCheck"
-import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveClaudeExecutableSync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, expireAuthStatusCache, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, subscriptionIncludesExtendedContext } from "./models"
+import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, expireAuthStatusCache, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, subscriptionIncludesExtendedContext } from "./models"
 import { livenessReport, readinessReport, renderProbe } from "./probes"
 import { claudeReachability, DEFAULT_OVERRIDE_TTL_MS, MAX_OVERRIDE_TTL_MS, unreachableDetail, withReachability } from "./upstreamReachability"
 import type { AnthropicSseEvent } from "./openai"
@@ -97,12 +97,12 @@ import { extractLettaConversationId, LETTA_CONVERSATION_HEADER } from "./adapter
 import { isClaudeCodeClient } from "./adapters/claudecode"
 import { openAiAdapter, deriveToolLoopSessionId, SYNTHESIZED_SESSION_HEADER } from "./adapters/openai"
 import { translateResponsesToAnthropic, translateAnthropicToResponses, createResponsesSseTranslator, reasoningRequested, buildResponsesToolAliases, resolveCodexThreadIdentity, type ResponsesRequest, type AnthropicSseEvent as ResponsesAnthropicSseEvent } from "./openaiResponses"
-import { flattenAssistantContent, normalizeStructuredUserContent, replayToolResultHeader, frameStructuredReplay, coalesceStructuredUserMessages } from "./replay"
+import { flattenAssistantContent, normalizeStructuredUserContent, replayToolResultHeader, frameStructuredReplay, coalesceStructuredUserMessages, coalesceTrailingSystemReminders } from "./replay"
 import { unstreamedAssistantBlockFrames } from "./unstreamedAssistant"
 import { extractAdvisorModel, extractSystemText, getLastUserMessage, stripAdvisorTools, stripNonStandardStreamFields, MULTIMODAL_TYPES, buildToolUseIndex, frameReplayTurns } from "./messages"
 import { requireAuth, authEnabled } from "./auth"
 import { detectAdapter } from "./adapters/detect"
-import { buildQueryOptions, resolveQueryConfigDir, singleTurnCapLiftRaisesBudget, type QueryContext } from "./query"
+import { buildQueryOptions, isCliThinkingDisplay, resolveQueryConfigDir, singleTurnCapLiftRaisesBudget, type QueryContext } from "./query"
 import {
   DEFAULT_TRANSCRIPT_RETENTION_DAYS,
   isTranscriptRetentionDays,
@@ -120,8 +120,6 @@ import type { LoadedPlugin } from "./plugins/types"
 import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, restoreActiveProfile, invalidateDiskProfileCache, shareableCredentialDir, resetActiveProfile, type ProfileConfig, type ResolvedProfile } from "./profiles" 
 import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
 import { startFollowUsagePolling, stopFollowUsagePolling } from "./followUsage"
-import { startProfileLogin, completeProfileLogin, completeProfileLoginFromCallback, getProfileLoginStatus } from "./profileLogin"
-import { startProfileAdd, completeProfileAdd } from "./profileAdd"
 import { filterEligibleProfileIds, mergeRoutingExcludedProfiles, parseRoutingExcludedProfiles } from "./routingExclusions"
 import { canonicalRoutingExcludedProfileIds, evaluateRoutingProfileAccess, noEligibleProfilesResponse, profileExcludedResponse, replacementForExcludedActive } from "./routingExclusionRuntime"
 import { activateProfile } from "./profileActivation"
@@ -155,6 +153,9 @@ import {
   OVERLOADED_RETRY_AFTER_SECONDS,
 } from "./retryAfter"
 import { getSetting, setSetting, saveSettings, TELEMETRY_SETTING_LIMITS, type MeridianSettings } from "../settings" 
+import { startProfileLogin, completeProfileLogin, completeProfileLoginFromCallback, getProfileLoginStatus } from "./profileLogin"
+import { startProfileAdd, completeProfileAdd } from "./profileAdd"
+import { profileStartBody, profileLoginCompleteBody, profileAddCompleteBody } from "./profileOAuthBody"
 import { filterBetasForProfile, getBetaPolicyFromEnv } from "./betas"
 import { createFileChangeHook, extractFileChangesFromMessages, formatFileChangeSummary, type FileChange } from "./fileChanges"
 import { detectTokenAnomalies, formatAnomalyAlerts, type TokenSnapshot } from "./tokenHealth"
@@ -521,6 +522,7 @@ function buildFreshPrompt(
       omittedMessages: trimmed.omittedMessages, omittedTokens: trimmed.omittedTokens, budget, attempt,
     })
   }
+  messages = coalesceTrailingSystemReminders(messages)
   const hasMultimodal = messages.some((m) => hasMultimodalContent(m.content))
   const toolIndex = buildToolUseIndex(messages)
 
@@ -549,7 +551,7 @@ function buildFreshPrompt(
     }
     // One SDK input keeps historical media visible; frame its provenance
     // before the live user turn (#553, #1155).
-    const prompt = frameStructuredReplay(structured, messages.at(-1)?.role !== "assistant")
+    const prompt = frameStructuredReplay(structured, messages.at(-1)?.role === "user")
     return (async function* () { for (const msg of prompt) yield msg })()
   }
 
@@ -565,7 +567,7 @@ function buildFreshPrompt(
         const assistantText = flattenAssistantContent(m.content, renderToolName)
         return { role: "assistant", text: assistantText ? `[Assistant: ${assistantText}]` : "" }
       }
-      return { role: "user", text: flattenUserContent(m.content, sanitizeOpts, toolIndex) }
+      return { role: m.role, text: flattenUserContent(m.content, sanitizeOpts, toolIndex) }
     })
   )
 }
@@ -2656,6 +2658,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             plog(`[PROXY] ${requestMeta.requestId} thinking disabled (thinking beta stripped by ${getBetaPolicyFromEnv()} policy)`)
           }
         }
+        const requestedDisplay = thinking && thinking.type !== "disabled" ? thinking.display : undefined
+        if (requestedDisplay !== undefined && !isCliThinkingDisplay(requestedDisplay)) {
+          plog(`[PROXY] ${requestMeta.requestId} thinking display ${JSON.stringify(requestedDisplay)} dropped (not accepted by the bundled Claude Code CLI)`)
+        }
         const parsedBudget = taskBudgetHeader ? Number.parseInt(taskBudgetHeader, 10) : NaN
         const taskBudget = Number.isFinite(parsedBudget)
           ? { total: parsedBudget }
@@ -3522,6 +3528,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       function rebuildReplayPrompt(): void {
         structuredMessages = undefined
         textPrompt = undefined
+        // Keep a trailing reminder in its live user turn before framing;
+        // otherwise the request becomes history and only metadata stays live.
+        // Original client messages remain untouched for lineage and budgeting.
+        const replayMessages = coalesceTrailingSystemReminders(messagesToConvert ?? [])
         if (hasMultimodal || hasPassthroughToolResults) {
           // Structured messages preserve image/document/file and tool_result blocks.
           // On resume, only send user messages (SDK has assistant context already).
@@ -3530,7 +3540,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
           if (isResume) {
             // Resume: only send user messages from the delta (SDK has the rest)
-            for (const m of messagesToConvert) {
+            for (const m of replayMessages) {
               if (m.role === "user") {
                 structuredMessages.push({
                   type: "user" as const,
@@ -3545,7 +3555,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           } else {
             // Fresh replay preserves the text path's role attribution. In-message
             // reminders are ordinary input; only assistant turns get its marker.
-            for (const m of messagesToConvert) {
+            for (const m of replayMessages) {
               if (m.role !== "assistant") {
                 structuredMessages.push({
                   type: "user" as const,
@@ -3576,7 +3586,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           if (structuredMessages.length > 1) {
             structuredMessages = isResume
               ? coalesceStructuredUserMessages(structuredMessages)
-              : frameStructuredReplay(structuredMessages, messagesToConvert.at(-1)?.role !== "assistant")
+              : frameStructuredReplay(structuredMessages, replayMessages.at(-1)?.role === "user")
           }
 
         } else {
@@ -3597,14 +3607,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           // turns bracketed as '[Assistant: ...]'. On resume, drop assistant
           // messages entirely — the resumed SDK session already contains
           // those turns; replaying them as user text is the imitation seed.
-          const promptTurns = (messagesToConvert ?? [])
+          const promptTurns = replayMessages
             .map((m: { role: string; content: any }) => {
               if (m.role === "assistant") {
                 if (isResume) return { role: "assistant", text: "" }
                 const assistantText = flattenAssistantContent(m.content, renderReplayToolName)
                 return { role: "assistant", text: assistantText ? `[Assistant: ${assistantText}]` : "" }
               }
-              return { role: "user", text: flattenUserContent(m.content, sanitizeOpts, toolIndex) }
+              return { role: m.role, text: flattenUserContent(m.content, sanitizeOpts, toolIndex) }
             })
           // Fresh (non-resume) replays get the #619 anti-self-play envelope:
           // history framed as context-only, the live user message terminal.
@@ -8716,14 +8726,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // Readiness — should traffic come HERE rather than to another instance? Only
   // per-instance checks earn a place; one that every instance fails together
   // cannot move traffic anywhere and only turns a clear error into a 502.
-  app.get("/readyz", (c) => {
+  app.get("/readyz", async (c) => {
+    // Cold embedded instances must not run the CLI's synchronous PATH/version
+    // probes on the HTTP event loop. Startup and concurrent probes share the
+    // asynchronous resolver; a miss keeps the existing unready response.
+    const executableResolved = getResolvedClaudeExecutableInfo() !== null
+      || await resolveClaudeExecutableAsync().then(() => true, () => false)
     const report = readinessReport({
       profileCount: listProfiles(finalConfig.profiles, finalConfig.defaultProfile).length,
-      // Cached answer first, so the steady state costs nothing; the sync
-      // lookup runs only before the first SDK call has populated that cache,
-      // where the alternative is reporting a freshly started instance unready.
-      claudeExecutableResolved:
-        (getResolvedClaudeExecutableInfo() ?? resolveClaudeExecutableSync()) !== null,
+      claudeExecutableResolved: executableResolved,
       claudeUnreachable: unreachableDetail(claudeReachability.snapshot()),
     })
     return c.text(
@@ -8858,15 +8869,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // are separate auth contexts keyed by CLAUDE_CONFIG_DIR, so the default
       // store would report an unrelated account's expiry.
       const renewalConfigDir = profileEnvOverrides?.CLAUDE_CONFIG_DIR
-      const healthStore = renewalConfigDir
-        ? createPlatformCredentialStore({ claudeConfigDir: renewalConfigDir })
+      // API keys and supplied setup tokens do not authenticate with this
+      // store. Falling back to it would report another account's plan/expiry.
+      const healthStore = healthProfile.type === "claude-max"
+        ? createPlatformCredentialStore(renewalConfigDir ? { claudeConfigDir: renewalConfigDir } : undefined)
         : undefined
-      const renewal = await getAuthRenewalStatus(healthStore, warnDays)
-        .catch(() => ({ renewalRequiredSoon: false }))
+      const renewal = healthStore
+        ? await getAuthRenewalStatus(healthStore, warnDays).catch(() => ({ renewalRequiredSoon: false }))
+        : { renewalRequiredSoon: false }
       // `claude auth status` reports the plan family (`max`) but not the tier
       // that sizes it, so the 5x-vs-20x distinction can only come off disk.
       // Same store, same cached read as the renewal window above.
-      const plan = await getStoredPlanFields(healthStore).catch((): StoredPlanFields => ({}))
+      const plan = healthStore
+        ? await getStoredPlanFields(healthStore).catch((): StoredPlanFields => ({}))
+        : {}
       // Spread the live status only WHEN IT HAS ONE. `subscriptionType:
       // undefined` overwrites the value read off disk, so an account whose
       // `claude auth status` omits the field lost its stored plan entirely -
@@ -8966,12 +8982,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // The tier that sizes the plan is never in `claude auth status` — only
       // the family (`max`), which covers both 5x and 20x. It is on disk, in
       // the profile's own credential file.
-      const profileStore = createPlatformCredentialStore(
-        envOverrides?.CLAUDE_CONFIG_DIR
-          ? { claudeConfigDir: envOverrides.CLAUDE_CONFIG_DIR }
-          : undefined,
-      )
-      const plan = await getStoredPlanFields(profileStore).catch((): StoredPlanFields => ({}))
+      const profileStore = resolved.type === "claude-max"
+        ? createPlatformCredentialStore(
+            envOverrides?.CLAUDE_CONFIG_DIR
+              ? { claudeConfigDir: envOverrides.CLAUDE_CONFIG_DIR }
+              : undefined,
+          )
+        : undefined
+      const plan = profileStore
+        ? await getStoredPlanFields(profileStore).catch((): StoredPlanFields => ({}))
+        : {}
       const allowance = planAllowance({
         ...plan,
         ...(auth?.subscriptionType ? { subscriptionType: auth.subscriptionType } : {}),
@@ -8984,16 +9004,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // a request actually presents, so an access token that is not there
       // outranks a cheerful probe. Only `absent` demotes: see
       // `readStoredCredentialPresence` for why `unknown` must not.
-      const stored = await readStoredCredentialSnapshot(profileStore)
-      const presence = stored.presence
+      // A supplied API key/setup token is not the grant in this store; an
+      // empty stored OAuth grant cannot invalidate those credentials.
+      const stored = profileStore ? await readStoredCredentialSnapshot(profileStore) : undefined
+      const presence = stored?.presence ?? "unknown"
       // How long the login has left, and what is on record about it. Only an
       // account with its own OAuth credential has a login: an API-key profile
       // would otherwise be credited with the host's own ~/.claude.
-      const hasOAuthLogin = resolved.type === "claude-max"
-      const renewal: AuthRenewalStatus = hasOAuthLogin
+      const renewal: AuthRenewalStatus = stored
         ? renewalStatusFor(stored.refreshTokenExpiresAt, renewalWarnDays)
         : { renewalRequiredSoon: false }
-      const lifecycle = hasOAuthLogin
+      const lifecycle = profileStore && stored
         ? noteCredentialObserved(profileStore.refreshKey, { presence, refreshTokenExpiresAt: stored.refreshTokenExpiresAt })
         : undefined
       return {
@@ -9024,7 +9045,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         refreshTokenExpiresAt: renewal.refreshTokenExpiresAt ?? null,
         daysUntilRenewal: renewal.daysUntilRenewal ?? null,
         renewalRequiredSoon: renewal.renewalRequiredSoon,
-        accessTokenExpiresAt: hasOAuthLogin ? stored.accessTokenExpiresAt ?? null : null,
+        accessTokenExpiresAt: stored?.accessTokenExpiresAt ?? null,
         authObtainedAt: lifecycle?.authObtainedAt ?? null,
         authObtainedVia: lifecycle?.authObtainedVia ?? null,
         lastRefreshAt: lifecycle?.lastRefreshAt ?? null,
@@ -9202,188 +9223,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     }))
   })
 
-  // --- Profile login routes (browser-completable OAuth) ---
-  //
-  // /start mints one PKCE challenge and hands the browser an opaque login id
-  // plus an authorize URL. A browser on this host gets one that redirects to
-  // GET /callback below, and the login finishes on its own; a browser anywhere
-  // else gets the code-display page and finishes via /complete with a paste.
-  // /status is how the page learns which happened. Decisions live in
-  // profileLogin.ts.
-
-  app.post("/profiles/login/start", async (c) => {
-    let body: { profile?: string }
-    try {
-      body = await c.req.json() as { profile?: string }
-    } catch {
-      return c.json({ error: "Invalid JSON in request body" }, 400)
-    }
-    const result = startProfileLogin({
-      profiles: finalConfig.profiles,
-      profileId: body.profile ?? "",
-      hostHeader: c.req.header("host"),
-      serverPort: finalConfig.port,
-    })
-    if (!result.ok) {
-      claudeLog("profile.login_refused", {
-        profile: body.profile ?? null,
-        reason: result.code,
-        userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
-      })
-      return c.json({ error: result.message, code: result.code }, result.status as 400)
-    }
-    plog(`[PROXY] Profile login started for "${result.profileId}" (mode=${result.mode}, expires in ${Math.round((result.expiresAt - Date.now()) / 1000)}s)`)
-    return c.json({
-      loginId: result.loginId,
-      mode: result.mode,
-      authorizeUrl: result.authorizeUrl,
-      pasteAuthorizeUrl: result.pasteAuthorizeUrl,
-      ...(result.loopbackAuthorizeUrl ? { loopbackAuthorizeUrl: result.loopbackAuthorizeUrl } : {}),
-      ...(result.loopbackProbeUrl ? { loopbackProbeUrl: result.loopbackProbeUrl } : {}),
-      expiresAt: result.expiresAt,
-      profile: result.profileId,
-    })
-  })
-
-  app.get("/profiles/login/status", (c) => {
-    const loginId = c.req.query("loginId")
-    if (!loginId) {
-      return c.json({ error: "Missing 'loginId' query parameter", code: "invalid_request" }, 400)
-    }
-    const status = getProfileLoginStatus(loginId)
-    if (!status) {
-      return c.json({
-        error: "This login is no longer open — it expired, or it was already completed. Start it again.",
-        code: "expired_login",
-      }, 410)
-    }
-    return c.json(status)
-  })
-
-  app.post("/profiles/login/complete", async (c) => {
-    let body: { loginId?: string; code?: string }
-    try {
-      body = await c.req.json() as { loginId?: string; code?: string }
-    } catch {
-      return c.json({ error: "Invalid JSON in request body" }, 400)
-    }
-    if (!body.loginId) {
-      return c.json({ error: "Missing 'loginId' in request body", code: "invalid_request" }, 400)
-    }
-    const result = await completeProfileLogin({ loginId: body.loginId, input: body.code ?? "" })
-    if (!result.ok) {
-      // The paste itself is never logged — it is a one-time credential.
-      claudeLog("profile.login_failed", { reason: result.code })
-      return c.json({
-        error: result.message,
-        code: result.code,
-        ...(result.retryable ? { retryable: true } : {}),
-      }, result.status as 400)
-    }
-    // The auth-status cache holds a 60s "not logged in" answer for this profile;
-    // drop it so /profiles/list reflects the login on the UI's next poll.
-    expireAuthStatusCache()
-    claudeLog("profile.login_completed", {
-      profile: result.profileId,
-      userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
-    })
-    plog(`[PROXY] Profile login completed for "${result.profileId}"`)
-    return c.json({ success: true, profile: result.profileId })
-  })
-
-  // --- Profile creation routes (browser-completable OAuth) ---
-  //
-  // Same two-step shape as the login routes above, deliberately NOT the same
-  // routes: /profiles/login/start refuses unknown ids, and that refusal is what
-  // stops a typo in a re-authentication from creating an account slot. Creating
-  // one is its own act, so it is its own explicit route. Decisions live in
-  // profileAdd.ts.
-
-  app.post("/profiles/add/start", async (c) => {
-    let body: { profile?: string }
-    try {
-      body = await c.req.json() as { profile?: string }
-    } catch {
-      return c.json({ error: "Invalid JSON in request body" }, 400)
-    }
-    const result = startProfileAdd({ profiles: finalConfig.profiles, profileId: body.profile ?? "" })
-    if (!result.ok) {
-      claudeLog("profile.add_refused", {
-        profile: body.profile?.slice(0, 64) ?? null,
-        reason: result.code,
-        userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
-      })
-      return c.json({ error: result.message, code: result.code }, result.status as 400)
-    }
-    plog(`[PROXY] Profile creation started for "${result.profileId}" (expires in ${Math.round((result.expiresAt - Date.now()) / 1000)}s)`)
-    return c.json({
-      addId: result.addId,
-      authorizeUrl: result.authorizeUrl,
-      expiresAt: result.expiresAt,
-      profile: result.profileId,
-    })
-  })
-
-  app.post("/profiles/add/complete", async (c) => {
-    let body: { addId?: string; code?: string }
-    try {
-      body = await c.req.json() as { addId?: string; code?: string }
-    } catch {
-      return c.json({ error: "Invalid JSON in request body" }, 400)
-    }
-    if (!body.addId) {
-      return c.json({ error: "Missing 'addId' in request body", code: "invalid_request" }, 400)
-    }
-    const result = await completeProfileAdd({ addId: body.addId, input: body.code ?? "" })
-    if (!result.ok) {
-      // The paste itself is never logged — it is a one-time credential.
-      claudeLog("profile.add_failed", { reason: result.code })
-      return c.json({
-        error: result.message,
-        code: result.code,
-        ...(result.retryable ? { retryable: true } : {}),
-      }, result.status as 400)
-    }
-    // A profile that did not exist a moment ago has no cached auth answer, but
-    // the list-wide cache does — drop it so the new card renders authenticated
-    // on the UI's next poll rather than after the 60s TTL.
-    expireAuthStatusCache()
-    claudeLog("profile.add_completed", {
-      profile: result.profileId,
-      userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
-    })
-    plog(`[PROXY] Profile "${result.profileId}" created from the web UI`)
-    return c.json({ success: true, profile: result.profileId })
-  })
-
-  // PUBLIC — no requireAuth. Anthropic redirects the user's browser here and
-  // that redirect carries no API key, so gating it would break the flow for
-  // every instance running with MERIDIAN_API_KEY set. The path and root
-  // placement are Anthropic's, not ours: the client's registered loopback
-  // redirect URIs are `http://localhost/callback` and
-  // `http://127.0.0.1/callback`. Its security review is in
-  // proxy-settings-auth.test.ts beside the allowlist entry.
-  app.get("/callback", async (c) => {
-    const { renderLoginCallbackPage } = await import("../telemetry/loginCallbackPage")
-    const result = await completeProfileLoginFromCallback({
-      state: c.req.query("state"),
-      code: c.req.query("code"),
-      error: c.req.query("error"),
-      errorDescription: c.req.query("error_description"),
-    })
-    if (!result.ok) {
-      // Neither the code nor the state is logged — both are one-time
-      // credentials for this login.
-      claudeLog("profile.login_failed", { reason: result.code, via: "callback" })
-      plog(`[PROXY] Profile login callback failed: ${result.code}`)
-      return c.html(renderLoginCallbackPage({ ok: false, message: result.message }), result.status as 400)
-    }
-    expireAuthStatusCache()
-    claudeLog("profile.login_completed", { profile: result.profileId, via: "callback" })
-    plog(`[PROXY] Profile login completed for "${result.profileId}" (browser redirect)`)
-    return c.html(renderLoginCallbackPage({ ok: true, profileId: result.profileId }))
-  })
-
   app.post("/profiles/rename", async (c) => {
     let body: { from?: string; to?: string }
     try {
@@ -9485,6 +9324,190 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       dirsOrphaned: result.dirsOrphaned,
       remaining: result.profiles.map(p => p.id),
     })
+  })
+
+  // --- Profile login routes (browser-completable OAuth) ---
+  //
+  // /start mints one PKCE challenge and hands the browser an opaque login id
+  // plus an authorize URL. A browser on this host gets one that redirects to
+  // GET /callback below, and the login finishes on its own; a browser anywhere
+  // else gets the code-display page and finishes via /complete with a paste.
+  // /status is how the page learns which happened. Decisions live in
+  // profileLogin.ts.
+
+  app.post("/profiles/login/start", async (c) => {
+    let body: { profile?: string }
+    try {
+      body = profileStartBody.parse(await c.req.json())
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    const result = startProfileLogin({
+      profiles: finalConfig.profiles,
+      profileId: body.profile ?? "",
+      hostHeader: c.req.header("host"),
+      forwardedFor: c.req.header("x-forwarded-for"),
+      serverPort: finalConfig.port,
+    })
+    if (!result.ok) {
+      claudeLog("profile.login_refused", {
+        profile: body.profile ?? null,
+        reason: result.code,
+        userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+      })
+      return c.json({ error: result.message, code: result.code }, result.status as 400)
+    }
+    plog(`[PROXY] Profile login started for "${result.profileId}" (mode=${result.mode}, expires in ${Math.round((result.expiresAt - Date.now()) / 1000)}s)`)
+    return c.json({
+      loginId: result.loginId,
+      mode: result.mode,
+      authorizeUrl: result.authorizeUrl,
+      pasteAuthorizeUrl: result.pasteAuthorizeUrl,
+      ...(result.loopbackAuthorizeUrl ? { loopbackAuthorizeUrl: result.loopbackAuthorizeUrl } : {}),
+      ...(result.loopbackProbeUrl ? { loopbackProbeUrl: result.loopbackProbeUrl } : {}),
+      expiresAt: result.expiresAt,
+      profile: result.profileId,
+    })
+  })
+
+  app.get("/profiles/login/status", (c) => {
+    const loginId = c.req.query("loginId")
+    if (!loginId) {
+      return c.json({ error: "Missing 'loginId' query parameter", code: "invalid_request" }, 400)
+    }
+    const status = getProfileLoginStatus(loginId)
+    if (!status) {
+      return c.json({
+        error: "This login is no longer open — it expired, or it was already completed. Start it again.",
+        code: "expired_login",
+      }, 410)
+    }
+    return c.json(status)
+  })
+
+  app.post("/profiles/login/complete", async (c) => {
+    let body: { loginId?: string; code?: string }
+    try {
+      body = profileLoginCompleteBody.parse(await c.req.json())
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    if (!body.loginId) {
+      return c.json({ error: "Missing 'loginId' in request body", code: "invalid_request" }, 400)
+    }
+    const result = await completeProfileLogin({ loginId: body.loginId, input: body.code ?? "" })
+    if (!result.ok) {
+      // The paste itself is never logged — it is a one-time credential.
+      claudeLog("profile.login_failed", { reason: result.code })
+      return c.json({
+        error: result.message,
+        code: result.code,
+        ...(result.retryable ? { retryable: true } : {}),
+      }, result.status as 400)
+    }
+    // The auth-status cache holds a 60s "not logged in" answer for this profile;
+    // drop it so /profiles/list reflects the login on the UI's next poll.
+    expireAuthStatusCache()
+    claudeLog("profile.login_completed", {
+      profile: result.profileId,
+      userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+    })
+    plog(`[PROXY] Profile login completed for "${result.profileId}"`)
+    return c.json({ success: true, profile: result.profileId })
+  })
+
+  // PUBLIC — no requireAuth. Anthropic redirects the user's browser here and
+  // that redirect carries no API key, so gating it would break the flow for
+  // every instance running with MERIDIAN_API_KEY set. The path and root
+  // placement are Anthropic's, not ours: the client's registered loopback
+  // redirect URIs are `http://localhost/callback` and
+  // `http://127.0.0.1/callback`. Its security review is in
+  // proxy-settings-auth.test.ts beside the allowlist entry.
+  app.get("/callback", async (c) => {
+    const { renderLoginCallbackPage } = await import("../telemetry/loginCallbackPage")
+    const result = await completeProfileLoginFromCallback({
+      state: c.req.query("state"),
+      code: c.req.query("code"),
+      error: c.req.query("error"),
+      errorDescription: c.req.query("error_description"),
+    })
+    if (!result.ok) {
+      // Neither the code nor the state is logged — both are one-time
+      // credentials for this login.
+      claudeLog("profile.login_failed", { reason: result.code, via: "callback" })
+      plog(`[PROXY] Profile login callback failed: ${result.code}`)
+      return c.html(renderLoginCallbackPage({ ok: false, message: result.message }), result.status as 400)
+    }
+    expireAuthStatusCache()
+    claudeLog("profile.login_completed", { profile: result.profileId, via: "callback" })
+    plog(`[PROXY] Profile login completed for "${result.profileId}" (browser redirect)`)
+    return c.html(renderLoginCallbackPage({ ok: true, profileId: result.profileId }))
+  })
+
+  // --- Profile creation routes (browser-completable OAuth) ---
+  //
+  // Same two-step shape as the login routes above, deliberately NOT the same
+  // routes: /profiles/login/start refuses unknown ids, and that refusal is what
+  // stops a typo in a re-authentication from creating an account slot. Creating
+  // one is its own act, so it is its own explicit route. Decisions live in
+  // profileAdd.ts.
+
+  app.post("/profiles/add/start", async (c) => {
+    let body: { profile?: string }
+    try {
+      body = profileStartBody.parse(await c.req.json())
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    const result = startProfileAdd({ profiles: finalConfig.profiles, profileId: body.profile ?? "" })
+    if (!result.ok) {
+      claudeLog("profile.add_refused", {
+        profile: body.profile?.slice(0, 64) ?? null,
+        reason: result.code,
+        userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+      })
+      return c.json({ error: result.message, code: result.code }, result.status as 400)
+    }
+    plog(`[PROXY] Profile creation started for "${result.profileId}" (expires in ${Math.round((result.expiresAt - Date.now()) / 1000)}s)`)
+    return c.json({
+      addId: result.addId,
+      authorizeUrl: result.authorizeUrl,
+      expiresAt: result.expiresAt,
+      profile: result.profileId,
+    })
+  })
+
+  app.post("/profiles/add/complete", async (c) => {
+    let body: { addId?: string; code?: string }
+    try {
+      body = profileAddCompleteBody.parse(await c.req.json())
+    } catch {
+      return c.json({ error: "Invalid JSON in request body" }, 400)
+    }
+    if (!body.addId) {
+      return c.json({ error: "Missing 'addId' in request body", code: "invalid_request" }, 400)
+    }
+    const result = await completeProfileAdd({ addId: body.addId, input: body.code ?? "" })
+    if (!result.ok) {
+      // The paste itself is never logged — it is a one-time credential.
+      claudeLog("profile.add_failed", { reason: result.code })
+      return c.json({
+        error: result.message,
+        code: result.code,
+        ...(result.retryable ? { retryable: true } : {}),
+      }, result.status as 400)
+    }
+    invalidateDiskProfileCache()
+    // A profile that did not exist a moment ago has no cached auth answer, but
+    // the list-wide cache does — drop it so the new card renders authenticated
+    // on the UI's next poll rather than after the 60s TTL.
+    expireAuthStatusCache()
+    claudeLog("profile.add_completed", {
+      profile: result.profileId,
+      userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
+    })
+    plog(`[PROXY] Profile "${result.profileId}" created from the web UI`)
+    return c.json({ success: true, profile: result.profileId })
   })
 
   // --- Plugin management routes ---
@@ -10397,6 +10420,10 @@ export function installProxyProcessErrorHandlers(): void {
 }
 
 export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promise<ProxyInstance> {
+  // OAuth returns to localhost, whose cookies are shared by unrelated local
+  // apps. A real browser's 16 KiB cookie jar exceeded Node's default ingress
+  // limit before /callback could run. Keep a finite 32 KiB header budget.
+  const serverOptions = { maxHeaderSize: 32 * 1024 }
   const selectedConfig = resolveBackendConfig(config)
   if (selectedConfig.backend === "antigravity") {
     const backend = createAntigravityServer(selectedConfig)
@@ -10405,7 +10432,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
       installErrorReporter({ version: selectedConfig.version })
       installProxyProcessErrorHandlers()
     }
-    const server = serve({ fetch: backend.app.fetch, port: selectedConfig.port, hostname: selectedConfig.host, overrideGlobalObjects: false }, info => {
+    const server = serve({ fetch: backend.app.fetch, port: selectedConfig.port, hostname: selectedConfig.host, serverOptions, overrideGlobalObjects: false }, info => {
       if (!selectedConfig.silent) console.log(`Meridian Antigravity backend: http://${selectedConfig.host}:${info.port}`)
     }) as Server
     const tracker = trackServerConnections(server)
@@ -10540,7 +10567,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
   if (fd !== undefined) {
     delete process.env.LISTEN_FDS
     delete process.env.LISTEN_PID
-    server = createAdaptorServer({ fetch: app.fetch, overrideGlobalObjects: false }) as Server
+    server = createAdaptorServer({ fetch: app.fetch, serverOptions, overrideGlobalObjects: false }) as Server
     server.listen({ fd }, () => {
       const addr = server.address()
       onListening(typeof addr === "object" && addr !== null ? addr.port : finalConfig.port)
@@ -10552,6 +10579,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
         fetch: app.fetch,
         port: finalConfig.port,
         hostname: finalConfig.host,
+        serverOptions,
         overrideGlobalObjects: false,
       },
       (info) => onListening(info.port),

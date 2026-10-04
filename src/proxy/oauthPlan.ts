@@ -101,10 +101,7 @@ export function planFieldsMissing(fields: OAuthPlanFields | null | undefined): b
  * fails its caller: a profile whose plan is unknown is strictly better than no
  * profile at all, and every consumer already treats it as optional.
  */
-export async function fetchOAuthPlanFields(
-  accessToken: string,
-  fetchFn: typeof fetch = fetch,
-): Promise<OAuthPlanFields> {
+export async function fetchOAuthPlanFields(accessToken: string, fetchFn: typeof fetch = fetch): Promise<OAuthPlanFields> {
   let response: Response
   try {
     response = await fetchFn(OAUTH_PROFILE_URL, {

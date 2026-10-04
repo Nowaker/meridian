@@ -32,6 +32,7 @@ import {
   saveProfileConfigTo,
 } from "./profileRename"
 import { getSetting, setSetting } from "../settings"
+import { publishProfileConfig, readProfileConfigForUpdate, withProfileConfigLock, withProfileConfigLockSync } from "./profileConfigStore"
 import { createPlatformCredentialStore, type CredentialsFile } from "./tokenRefresh"
 import { noteAuthLogin } from "./authLifecycle"
 
@@ -69,20 +70,11 @@ function ensureProfilesDir(): void {
 }
 
 /**
- * Config directory a browser-login profile gets when it carries no explicit
- * `claudeConfigDir`. Exported so the web login route resolves the same
- * directory this CLI would, instead of rebuilding the path a third time
- * (profiles.ts already builds it for oauth-token isolation).
- */
-export function profileConfigDirFor(id: string): string {
-  return configPath("profiles", id)
-}
-
-/**
- * A profile id becomes a directory name under `profiles/`, so this character
- * set is what stops `../../etc` from becoming one. Exported so the CLI, the
- * web login route and the web add route ask the same question — a second regex
- * elsewhere is a second answer to "what is a legal id", and the two would drift.
+ * Pure: is this ID safe to use as a profile name?
+ *
+ * A profile ID becomes a directory name under PROFILES_DIR, so anything
+ * carrying a path separator or a `..` segment would escape that directory.
+ * Restricting to plain identifiers keeps IDs both safe and shell-friendly.
  */
 export function isValidProfileId(id: string): boolean {
   return Boolean(id) && !/[^a-zA-Z0-9_-]/.test(id)
@@ -91,6 +83,16 @@ export function isValidProfileId(id: string): boolean {
 /** Red text — plain when stdout is piped, where escape codes are noise. */
 function red(text: string): string {
   return process.stdout.isTTY ? `\x1b[31m${text}\x1b[0m` : text
+}
+
+/**
+ * Config directory a browser-login profile gets when it carries no explicit
+ * `claudeConfigDir`. Exported so the web login route resolves the same
+ * directory this CLI would, instead of rebuilding the path a third time
+ * (profiles.ts already builds it for oauth-token isolation).
+ */
+export function profileConfigDirFor(id: string): string {
+  return configPath("profiles", id)
 }
 
 function getProfileDir(id: string): string {
@@ -237,7 +239,7 @@ export function loadProfileIds(): string[] {
 
 function saveProfileConfig(profiles: ProfileConfig[]): void {
   ensureProfilesDir()
-  saveProfileConfigTo(profilesConfigFile(), profiles)
+  publishProfileConfig(profilesConfigFile(), profiles)
 }
 
 function getAuthStatus(configDir: string): { loggedIn: boolean; email?: string; subscriptionType?: string } {
@@ -297,7 +299,6 @@ export function buildLoginCredentials(
   tokenData: CompleteOAuthTokenResponse,
   plan: OAuthPlanFields,
   now: number = Date.now(),
-  fallbackScopes: string[] = OAUTH_SCOPES,
 ): CredentialsFile {
   // The login's own deadline, the same field `claude login` writes. Without it
   // a profile logged in here showed no expiry until its first refresh, hours
@@ -312,7 +313,7 @@ export function buildLoginCredentials(
       refreshToken: tokenData.refresh_token,
       expiresAt: tokenData.expires_at ?? now + (tokenData.expires_in ?? 8 * 60 * 60) * 1000,
       ...(refreshTokenExpiresAt && refreshTokenExpiresAt > now ? { refreshTokenExpiresAt } : {}),
-      scopes: tokenData.scope?.split(" ").filter(Boolean) ?? fallbackScopes,
+      scopes: tokenData.scope?.split(" ").filter(Boolean) ?? OAUTH_SCOPES,
       ...plan,
     },
   }
@@ -398,13 +399,11 @@ export async function exchangeAuthorizationCodeForCredentials(params: OAuthExcha
       signal: AbortSignal.timeout(30_000),
     })
   } catch (err) {
-    claudeLog("auth.token_request_failed", { error: String(err) })
     return { ok: false, reason: "request_failed", detail: err instanceof Error ? err.message : String(err) }
   }
 
   if (!response.ok) {
     const body = await response.text().catch(() => "")
-    claudeLog("auth.token_bad_response", { status: response.status, bodyLength: body.length })
     return { ok: false, reason: "http_error", status: response.status, detail: body.slice(0, 300) || undefined }
   }
 
@@ -412,31 +411,23 @@ export async function exchangeAuthorizationCodeForCredentials(params: OAuthExcha
   try {
     tokenData = await response.json() as OAuthTokenResponse
   } catch (err) {
-    claudeLog("auth.token_parse_failed", { error: String(err) })
     return { ok: false, reason: "invalid_response", detail: err instanceof Error ? err.message : String(err) }
   }
 
-  // Logged before the required-token check, so a response that is missing one
-  // of them still says what it did contain — that case is exactly when the
-  // field list is worth having.
   claudeLog("auth.token_discovered", {
     fields: authFieldPaths(tokenData),
     payload: describeAuthFields(tokenData),
   })
-
   if (!hasRequiredTokens(tokenData)) {
     return { ok: false, reason: "missing_tokens" }
   }
 
-  // Wired in HERE rather than in the CLI's own login, because on this branch
-  // this one function is what the CLI, POST /profiles/login/complete and
-  // POST /profiles/add/complete all go through - a plan fetched in any one of
-  // them alone would leave the other two writing plan-blind credentials.
   const plan = await fetchOAuthPlanFields(tokenData.access_token, fetchFn)
   const store = createPlatformCredentialStore({ claudeConfigDir: params.claudeConfigDir })
-  const credentials = buildLoginCredentials(tokenData, plan, Date.now(), params.scopes)
-  // What ends up on disk, which is not the same question as what arrived: the
-  // two lines together localize a lost field to the response or to this build.
+  const credentials = buildLoginCredentials({
+    ...tokenData,
+    scope: tokenData.scope ?? params.scopes?.join(" "),
+  }, plan)
   claudeLog("auth.credentials_built", {
     fields: authFieldPaths(credentials.claudeAiOauth),
     payload: describeAuthFields(credentials.claudeAiOauth),
@@ -519,10 +510,18 @@ export type CreateProfileSlotResult =
  * CLI's `~/.claude` import. Omitted, the profile gets a fresh directory of its
  * own under `profiles/<id>`.
  */
-export function createProfileSlot(
-  id: string,
-  options: { claudeConfigDir?: string } = {},
-): CreateProfileSlotResult {
+export function createProfileSlot(id: string, options: { claudeConfigDir?: string } = {}): CreateProfileSlotResult {
+  try { return withProfileConfigLockSync(profilesConfigFile(), () => createProfileSlotLocked(id, options)) }
+  catch (error) { return { ok: false, reason: "write_failed", message: error instanceof Error ? error.message : String(error) } }
+}
+
+/** HTTP callers await competing writers without blocking model/health traffic. */
+export async function createProfileSlotAsync(id: string, options: { claudeConfigDir?: string } = {}): Promise<CreateProfileSlotResult> {
+  try { return await withProfileConfigLock(profilesConfigFile(), () => createProfileSlotLocked(id, options)) }
+  catch (error) { return { ok: false, reason: "write_failed", message: error instanceof Error ? error.message : String(error) } }
+}
+
+function createProfileSlotLocked(id: string, options: { claudeConfigDir?: string }): CreateProfileSlotResult {
   if (!isValidProfileId(id)) {
     return {
       ok: false,
@@ -531,7 +530,7 @@ export function createProfileSlot(
     }
   }
 
-  const profiles = loadProfileConfig()
+  const profiles = readProfileConfigForUpdate(profilesConfigFile())
   if (profiles.some(p => p.id === id)) {
     return { ok: false, reason: "already_exists", message: `Profile "${id}" already exists.` }
   }
@@ -541,7 +540,7 @@ export function createProfileSlot(
   try {
     mkdirSync(claudeConfigDir, { recursive: true })
     profiles.push(profile)
-    saveProfileConfig(profiles)
+    saveProfileConfig(reclaimAlias(profiles, id))
   } catch (err) {
     return { ok: false, reason: "write_failed", message: err instanceof Error ? err.message : String(err) }
   }
@@ -568,14 +567,12 @@ export async function profileAdd(id: string, options: AuthLoginOptions = {}): Pr
 
   // Checked here as well as inside createProfileSlot: this one fails before a
   // browser login the user would otherwise complete for nothing.
-  let profiles = loadProfileConfig()
+  const profiles = loadProfileConfig()
   if (profiles.find(p => p.id === id)) {
     console.error(`\x1b[31m✗ Profile "${id}" already exists.\x1b[0m`)
     console.error(`  Run: meridian profile list`)
     process.exit(1)
   }
-  profiles = reclaimAlias(profiles, id)
-
   // Offer to import existing ~/.claude credentials if this is the first profile
   // and the default config dir has valid, active auth
   const defaultClaudeDir = join(homedir(), ".claude")
@@ -695,8 +692,14 @@ export async function profileAddOauthToken(id: string, tokenArg: string | undefi
     process.exit(1)
   }
 
-  profiles.push({ id, type: "oauth-token", oauthToken: token })
-  saveProfileConfig(profiles)
+  profiles = withProfileConfigLockSync(profilesConfigFile(), () => {
+    const current = readProfileConfigForUpdate(profilesConfigFile())
+    if (current.some(p => p.id === id)) throw new Error(`Profile "${id}" was created while the token was being entered`)
+    const next = reclaimAlias(current, id)
+    next.push({ id, type: "oauth-token", oauthToken: token })
+    saveProfileConfig(next)
+    return next
+  })
   console.log(`\x1b[32m✓ Profile "${id}" added (OAuth token).\x1b[0m`)
   printEnvHint(profiles)
 }
@@ -753,7 +756,6 @@ export function profileRemove(id: string): void {
     printEnvHint(result.profiles)
   }
 }
-
 
 export function profileRename(from: string, to: string): void {
   if (envBool("CREDENTIALS_READONLY")) {

@@ -85,11 +85,14 @@ export function canonicalizeOpenCodeMessagesForLineage(
   // Preserve message positions exactly; only block content may be filtered.
   return messages.map((message) => {
     if (message.role !== "user" || !Array.isArray(message.content)) return message
-    // The recovery text is transient only where it trails a tool round; typed
-    // as a user's own message it is durable conversation content.
-    const closesToolRound = message.content.some((block) => isRecord(block) && block.type === "tool_result")
-    const content = message.content.filter((block) =>
-      !isTransientUserPromptHook(block) && !(closesToolRound && isTransientPrefillRecovery(block)))
+    let content = message.content.filter((block) => !isTransientUserPromptHook(block))
+    // Recognize the actual wire shape: completed tool results followed by one
+    // synthetic recovery block. Preserve the wording when it is embedded in
+    // a user's meaningful follow-up or appears before the tool results.
+    if (content.length > 1 && isTransientPrefillRecovery(content.at(-1))
+      && content.slice(0, -1).every((block) => isRecord(block) && block.type === "tool_result")) {
+      content = content.slice(0, -1)
+    }
     // A hook-only message has no durable identity. Retain it rather than
     // collapsing distinct requests to the same empty hash.
     if (content.length === 0 || content.length === message.content.length) return message

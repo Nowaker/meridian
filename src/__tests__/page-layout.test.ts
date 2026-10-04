@@ -122,4 +122,23 @@ describe("layout settings routes", () => {
     expect((await get()).layout).toBe("contained")
     expect(await page("/")).not.toContain("<html data-layout")
   })
+
+  it("keeps both layout routes behind the instance API key", async () => {
+    const previousKey = process.env.MERIDIAN_API_KEY
+    process.env.MERIDIAN_API_KEY = "owned-layout-key"
+    try {
+      expect((await app.fetch(new Request("http://localhost/settings/api/layout"))).status).toBe(401)
+      expect((await put({ layout: "wide" })).status).toBe(401)
+      expect(getSetting("layout")).toBeUndefined()
+      const response = await app.fetch(new Request("http://localhost/settings/api/layout", {
+        method: "PUT", headers: { Authorization: "Bearer owned-layout-key", "Content-Type": "application/json" },
+        body: JSON.stringify({ layout: "wide" }),
+      }))
+      expect(response.status).toBe(200)
+      expect(getSetting("layout")).toBe("wide")
+    } finally {
+      if (previousKey === undefined) delete process.env.MERIDIAN_API_KEY
+      else process.env.MERIDIAN_API_KEY = previousKey
+    }
+  })
 })
