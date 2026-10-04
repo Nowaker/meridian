@@ -97,6 +97,8 @@ export interface ChatGptProfile extends ChatGptPlanFields {
   storeIndex: number | null
   /** When the seat's current access token runs out, epoch ms. */
   accessTokenExpiresAt: number | null
+  /** When the seat signed in to OpenAI, as its access token states, epoch ms. */
+  signedInAt: number | null
 }
 
 /** One window in Claude's `/v1/usage/quota` vocabulary. */
@@ -259,6 +261,7 @@ export function chatGptProfiles(
       aliases,
       storeIndex: seat.storeIndex ?? null,
       accessTokenExpiresAt: seat.expiresAt,
+      signedInAt: seat.signedInAt ?? null,
       ...chatGptPlanFields(options.planTypes?.get(seat.id) ?? seat.planType),
     }
   })

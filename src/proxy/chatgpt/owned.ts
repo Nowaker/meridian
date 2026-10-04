@@ -73,13 +73,15 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
     seats() {
       return reader.readAccounts().map((account, index): ChatGptSeatView => {
         const pending = account.exchangeStartedAt !== null
+        const claims = decodeCodexToken(account.accessToken)
         return {
           id: account.accountUserId,
           email: account.email,
-          planType: decodeCodexToken(account.accessToken)?.planType ?? null,
+          planType: claims?.planType ?? null,
           eligible: !pending,
           ...(pending ? { reason: "requires_reauth" as const } : {}),
           expiresAt: account.expiresAt,
+          signedInAt: claims?.signedInAt ?? null,
           active: index === 0,
           storeIndex: index,
         }

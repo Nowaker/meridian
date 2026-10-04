@@ -32,6 +32,8 @@ export interface ChatGptSeatView {
   reason?: SeatUnavailableReason
   /** The access token's expiry, epoch ms. */
   expiresAt: number | null
+  /** When the seat signed in to OpenAI, as its access token states, epoch ms. */
+  signedInAt?: number | null
   /** The seat the credential owner itself would pick next. */
   active?: boolean
   /** 0-based position in the store; the owner's own account numbers are this plus one. */

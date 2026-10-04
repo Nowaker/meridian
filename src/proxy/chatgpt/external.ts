@@ -23,6 +23,7 @@
  */
 import { readFileSync, statSync } from "node:fs"
 import { codexPoolPath, type CodexPoolAccount, type CodexPoolResult } from "../codex/pool"
+import { decodeCodexToken } from "../codex/token"
 import type {
   ChatGptCredentialSource,
   ChatGptSeatView,
@@ -182,6 +183,7 @@ export function createExternalCredentialSource(options: ExternalSourceOptions = 
           eligible: reason === null,
           ...(reason ? { reason } : {}),
           expiresAt: account.expiresAt,
+          signedInAt: decodeCodexToken(account.accessToken)?.signedInAt ?? null,
           active: account.accountUserId === active,
           storeIndex: account.storeIndex,
         }

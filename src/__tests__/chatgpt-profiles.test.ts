@@ -368,7 +368,7 @@ describe("list entries", () => {
   const seats = [
     seat("user-a__ws-aaaaaa", "a@x.test", { active: true, storeIndex: 0 }),
     seat("user-b__ws-bbbbbb", "b@x.test", { eligible: false, reason: "quota_exhausted", storeIndex: 2 }),
-    seat("user-c__ws-cccccc", "c@x.test", { storeIndex: 3 }),
+    seat("user-c__ws-cccccc", "c@x.test", { storeIndex: 3, signedInAt: NOW - 114 * 86_400_000 }),
   ]
   const entry = (id: string, extra: Partial<CodexUsageEntry>): CodexUsageEntry => ({
     id, type: "codex", identity: id, email: null, plan: null, workspaceName: null, windows: [], resetCredits: null, credits: null, fetchedAt: null, stale: false, error: null, failure: null, ...extra,
@@ -416,13 +416,18 @@ describe("list entries", () => {
   it("reports a seat's login the way a Claude profile reports its own", () => {
     expect(a).toMatchObject({ accessTokenExpiresAt: null, refreshTokenExpiresAt: null, daysUntilRenewal: null, renewalRequiredSoon: false, firstUnauthedAt: null })
   })
+
+  it("dates a seat's sign-in from its token where Meridian recorded none", () => {
+    expect(c).toMatchObject({ authObtainedAt: NOW - 114 * 86_400_000, authObtainedVia: "token" })
+    expect(a).toMatchObject({ authObtainedAt: null, authObtainedVia: null })
+  })
 })
 
 describe("a seat's login lifecycle", () => {
   const SEAT_ID = `user-l__ws-llllll`
   let tokenState: { unavailable: string | null } = { unavailable: null }
   const surface = createChatGptProfileSurface({
-    source: { mode: "follow-external", seats: () => [seat(SEAT_ID, "l@x.test", { expiresAt: NOW + 3_600_000, eligible: tokenState.unavailable === null, reason: (tokenState.unavailable ?? undefined) as ChatGptSeatView["reason"] })] } as unknown as ChatGptCredentialSource,
+    source: { mode: "follow-external", seats: () => [seat(SEAT_ID, "l@x.test", { expiresAt: NOW + 3_600_000, signedInAt: NOW - 30 * 86_400_000, eligible: tokenState.unavailable === null, reason: (tokenState.unavailable ?? undefined) as ChatGptSeatView["reason"] })] } as unknown as ChatGptCredentialSource,
     observed: () => new Map(), usage: () => null, reserved: () => new Set(), names: () => undefined,
     activeSeat: () => undefined, excluded: () => [], spent: () => undefined,
   })
@@ -432,11 +437,14 @@ describe("a seat's login lifecycle", () => {
     const out = surface.listEntries()[0]!
     expect(out.unauthedReason).toBe("credentials_cleared")
     expect(typeof out.firstUnauthedAt).toBe("number")
+    expect(out).toMatchObject({ authObtainedAt: NOW - 30 * 86_400_000, authObtainedVia: "token" })
     // Recorded once, not re-stamped on every poll.
     expect(surface.listEntries()[0]!.firstUnauthedAt).toBe(out.firstUnauthedAt)
     tokenState = { unavailable: null }
     const back = surface.listEntries()[0]!
+    // The sign-in Meridian saw come back outranks the one the token states.
     expect(back).toMatchObject({ firstUnauthedAt: null, unauthedReason: null, authObtainedVia: "observed", accessTokenExpiresAt: NOW + 3_600_000 })
+    expect(back.authObtainedAt).not.toBe(NOW - 30 * 86_400_000)
   })
 
   it("does not call an expired access token a lost sign-in", () => {

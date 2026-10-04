@@ -16,7 +16,7 @@
  * of the exclusions (settings, injected), the usage reading (injected), and
  * any credential - nothing here sees a token.
  */
-import { noteCredentialObserved } from "../authLifecycle"
+import { noteCredentialObserved, type AuthLifecycleRecord } from "../authLifecycle"
 import type { CodexUsageResponse } from "../codex/types"
 import type { LimitDiagnosis } from "../limitDetection"
 import type { SpentRecord } from "../profileHealth"
@@ -100,6 +100,21 @@ function seatLoginPresence(tokenState: ChatGptTokenState): "present" | "absent" 
   if (tokenState === "ok") return "present"
   if (tokenState === "no_token" || tokenState === "requires_reauth") return "absent"
   return "unknown"
+}
+
+/**
+ * When the seat signed in. A login Meridian recorded - performed here, or
+ * noticed after a logout - wins. Otherwise it is the OpenAI sign-in the seat's
+ * access token states: refreshing keeps it, and it can predate the seat's own
+ * authorization when that reused a browser already signed in.
+ */
+function seatSignIn(
+  lifecycle: AuthLifecycleRecord | undefined,
+  profile: ChatGptProfile,
+): { at: number | null; via: "login" | "observed" | "token" | null } {
+  if (lifecycle?.authObtainedAt) return { at: lifecycle.authObtainedAt, via: lifecycle.authObtainedVia ?? null }
+  if (profile.signedInAt !== null) return { at: profile.signedInAt, via: "token" }
+  return { at: null, via: null }
 }
 
 export type ChatGptActivation =
@@ -266,6 +281,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
         const reading = usageById.get(profile.seat)
         const tokenState = chatGptTokenState(profile.unavailable, reading?.error)
         const lifecycle = noteCredentialObserved(chatGptAuthLifecycleKey(profile.seat), { presence: seatLoginPresence(tokenState) })
+        const signIn = seatSignIn(lifecycle, profile)
         const owner = chatGptOwner(deps.source.mode, profile.storeIndex)
         const ahead = profile.id === activeId ? paidAhead(list, profile) : []
         return {
@@ -311,8 +327,8 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           daysUntilRenewal: null,
           renewalRequiredSoon: false,
           accessTokenExpiresAt: profile.accessTokenExpiresAt,
-          authObtainedAt: lifecycle?.authObtainedAt ?? null,
-          authObtainedVia: lifecycle?.authObtainedVia ?? null,
+          authObtainedAt: signIn.at,
+          authObtainedVia: signIn.via,
           lastRefreshAt: lifecycle?.lastRefreshAt ?? null,
           firstUnauthedAt: lifecycle?.firstUnauthedAt ?? null,
           unauthedReason: lifecycle?.unauthedReason ?? null,

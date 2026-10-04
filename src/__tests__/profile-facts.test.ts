@@ -280,6 +280,7 @@ describe("the login's lifetime", () => {
     const now = Date.now()
     expect(fact({ authObtainedAt: now - 6 * DAY, authObtainedVia: "observed" }, "Logged in")!.title).toContain("when Meridian found it")
     expect(fact({ authObtainedAt: now - 6 * DAY, authObtainedVia: "login" }, "Logged in")!.value).toBe("6d 0h ago")
+    expect(fact({ authObtainedAt: now - 114 * DAY, authObtainedVia: "token" }, "Logged in")!.title).toContain("its access token states")
   })
 })
 

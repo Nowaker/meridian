@@ -32,6 +32,12 @@ export interface CodexTokenClaims {
   planType: string | null
   /** `exp`, converted from seconds to epoch milliseconds. */
   expiresAt: number | null
+  /**
+   * `pwd_auth_time`, epoch milliseconds: when the person signed in to OpenAI.
+   * Refreshing reissues the token but keeps this, so it dates the sign-in
+   * every later token descends from.
+   */
+  signedInAt: number | null
 }
 
 export function decodeCodexToken(accessToken: string | null | undefined): CodexTokenClaims | null {
@@ -51,6 +57,7 @@ export function decodeCodexToken(accessToken: string | null | undefined): CodexT
     userId: stringOrNull(auth?.chatgpt_user_id),
     planType: stringOrNull(auth?.chatgpt_plan_type),
     expiresAt: expSeconds === null ? null : expSeconds * 1000,
+    signedInAt: finiteNumberOrNull(payload.pwd_auth_time),
   }
 }
 

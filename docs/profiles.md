@@ -60,11 +60,13 @@ A browser login has a deadline. Anthropic reports it with every token refresh, a
 | `refreshTokenExpiresAt` | The login's deadline (epoch ms), read from the profile's own credential |
 | `daysUntilRenewal`, `renewalRequiredSoon` | As in `/health`; the window is `MERIDIAN_AUTH_RENEWAL_WARN_DAYS` (default 3) |
 | `accessTokenExpiresAt` | When the current access token runs out; past the deadline, when the account stops |
-| `authObtainedAt`, `authObtainedVia` | When the login happened: `login` when Meridian performed it, `observed` when a new login was found on disk |
+| `authObtainedAt`, `authObtainedVia` | When the login happened: `login` when Meridian performed it, `observed` when a new login was found on disk, `token` when it is the sign-in a ChatGPT seat's access token states |
 | `lastRefreshAt` | Last token refresh Meridian performed (one done by a Claude Code process is not seen) |
 | `firstUnauthedAt`, `unauthedReason` | When the account was first found logged out (`refresh_rejected` or `credentials_cleared`); cleared by the next login |
 
 Claude Code wipes `.credentials.json` when a refresh is refused, so Meridian keeps this record in its own `auth-lifecycle.json` beside `settings.json`. Every transition is logged (`[PROXY] Profile "work" logged out: ...`, naming the deadline and how long the login lasted) and stored in the diagnostics log under the `auth` category. The profile card shows it as "Login expires in …", "Logged in … ago" and "Logged out … ago".
+
+A ChatGPT seat reports the same fields. OpenAI states no login deadline, so `refreshTokenExpiresAt` and `daysUntilRenewal` are null and `renewalRequiredSoon` is false. Where Meridian recorded no login for a seat, `authObtainedAt` is the OpenAI sign-in its access token states (`authObtainedVia: "token"`). Refreshing keeps that time, and it can predate the seat's own authorization when that reused a browser that was already signed in.
 
 ### Switching profiles
 

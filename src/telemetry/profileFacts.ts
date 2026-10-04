@@ -58,6 +58,11 @@ function formatResets(resets, now) {
   return count + ' (' + (parts.length === 1 ? 'expires ' : 'expire ') + parts.join(', ') + ')';
 }
 
+var LOGIN_SOURCE = {
+  observed: ' (when Meridian found it)',
+  token: ' (the sign-in its access token states)'
+};
+
 var CHATGPT_TOKEN_STATUS = {
   expired: '\\u2717 Access token expired',
   refused: '\\u2717 Token refused by chatgpt.com',
@@ -123,7 +128,7 @@ function loginFacts(p, now) {
   }
   if (p.authObtainedAt) {
     facts.push({ label: 'Logged in', value: spanText(now - p.authObtainedAt) + ' ago', tone: '',
-      title: new Date(p.authObtainedAt).toLocaleString() + (p.authObtainedVia === 'observed' ? ' (when Meridian found it)' : '') });
+      title: new Date(p.authObtainedAt).toLocaleString() + (LOGIN_SOURCE[p.authObtainedVia] || '') });
   }
   return facts;
 }
