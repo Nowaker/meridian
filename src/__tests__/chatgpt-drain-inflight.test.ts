@@ -161,6 +161,23 @@ describe("GET /inflight counts ChatGPT turns", () => {
     expect((await inflight()).upstreams.chatgpt).toEqual({ streams: 0, requests: 0, queued: 0 })
   })
 
+  it("counts a streamed turn as a stream while it reasons, before the backend's first output", async () => {
+    const { app, inflight } = await server()
+    let answer = (_response: Response) => {}
+    const answered = new Promise<Response>(resolve => { answer = resolve })
+    globalThis.fetch = ((input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      return url === CODEX_URL ? answered : mockFetch(input)
+    }) as typeof fetch
+    const running = Promise.resolve(app.fetch(responses()))
+    await waitFor(async () => (await inflight()).total === 1, "the reasoning turn to be counted")
+    expect((await inflight()).upstreams.chatgpt).toEqual({ streams: 1, requests: 0, queued: 0 })
+    answer(heldResponse())
+    streams[0]!.release()
+    await (await running).text()
+    await waitFor(async () => (await inflight()).total === 0, "the turn to finish")
+  })
+
   it("drops a running ChatGPT stream when the client goes away", async () => {
     const { app, inflight } = await server()
     const client = new AbortController()

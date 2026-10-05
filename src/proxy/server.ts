@@ -8664,12 +8664,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // Read as TEXT rather than JSON: Hono memoizes either, so the Claude handler
   // still parses normally, and only text round-trips byte for byte. A
   // malformed body falls through to the handler's own 400.
-  const peekRequestedModel = async (c: Context): Promise<string | undefined> => {
+  const peekRequest = async (c: Context): Promise<{ model?: string; stream: boolean }> => {
     try {
-      const body = JSON.parse(await c.req.text()) as { model?: unknown } | null
-      return typeof body?.model === "string" ? body.model : undefined
+      const body = JSON.parse(await c.req.text()) as { model?: unknown; stream?: unknown } | null
+      return { model: typeof body?.model === "string" ? body.model : undefined, stream: body?.stream === true }
     } catch {
-      return undefined
+      return { stream: false }
     }
   }
 
@@ -8691,7 +8691,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   }
 
   const dispatchUpstream = async (c: Context, endpoint: UpstreamEndpoint, route: string) => {
-    const model = chatGptBackend ? await peekRequestedModel(c) : undefined
+    const requested = chatGptBackend ? await peekRequest(c) : { stream: false }
+    const model = requested.model
     const provider = chatGptBackend ? providerForModel(model) : "claude"
     try {
       if (provider !== "chatgpt") return await upstream.backendFor(provider).handle({ context: c, endpoint, route })
@@ -8716,7 +8717,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       upstreamSignals.set(c, controller.signal)
       activeRequestAborts.add(controller)
       inFlightRequests++
+      // Bucketed by what the client asked for, as Claude requests are: the
+      // backend answers only after the first output frame, so a streamed turn
+      // still reasoning has no response to judge by yet.
       const inflightEntry = inflight.begin("chatgpt")
+      inflightEntry.setStream(requested.stream)
       // Registered in the session tree like a Claude turn, so
       // /v1/sessions/:key/cancel stops a ChatGPT turn of that session too.
       const session = await chatGptSessionKey(c)
@@ -8736,7 +8741,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       }
       try {
         const response = await upstream.backendFor(provider).handle({ context: c, endpoint, route })
-        inflightEntry.setStream((response.headers.get("content-type") ?? "").includes("text/event-stream"))
         return completeUpstreamResponse(response, controller.signal, complete)
       } catch (error) {
         complete()
