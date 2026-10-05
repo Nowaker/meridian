@@ -1,11 +1,13 @@
 /**
- * A stream the upstream idle guard has already answered leaves no SDK attempt
- * running behind it.
+ * A stream that has been answered or abandoned leaves no SDK attempt running
+ * behind it.
  *
- * The guard answers the client while the attempt behind the stream is still
- * awaiting something: a free SDK slot, admission, or the model's first output.
- * That attempt used to carry on, so once a slot freed it started Claude Code
- * and spent upstream calls on a request whose client already had its 504.
+ * The upstream idle guard answers the client while the SDK query is still
+ * waiting for the model's first output, and a client can leave while its
+ * request still waits for a free SDK slot. Either attempt used to carry on, so
+ * once a slot freed it started Claude Code and spent upstream calls on a
+ * request nobody was waiting for. Waiting for a slot is not upstream silence:
+ * a queued request is never answered as an upstream stall.
  *
  * Runs in its own `bun test` invocation: the idle limit is read once, when the
  * server module loads, and the 90s default would make this file take minutes.
@@ -18,7 +20,8 @@ import { parseSSE } from "./helpers"
 import { getProcessSdkSemaphore } from "../proxy/concurrency"
 
 // Above the time a fresh session's durable admission takes to reach query().
-process.env.MERIDIAN_UPSTREAM_IDLE_MS = "8000"
+const IDLE_MS = 8_000
+process.env.MERIDIAN_UPSTREAM_IDLE_MS = String(IDLE_MS)
 process.env.MERIDIAN_MAX_CONCURRENT = "1"
 
 let controllers: Array<AbortController | undefined> = []
@@ -47,9 +50,10 @@ installMcpToolsMock(() => ({ createOpencodeMcpServer: () => ({ type: "sdk", name
 
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 
-function streamRequest(text: string): Request {
+function streamRequest(text: string, signal?: AbortSignal): Request {
   return new Request("http://localhost/v1/messages", {
     method: "POST",
+    signal,
     headers: { "content-type": "application/json", "x-opencode-session": crypto.randomUUID() },
     body: JSON.stringify({ model: "haiku", max_tokens: 100, stream: true, messages: [{ role: "user", content: text }] }),
   })
@@ -81,12 +85,17 @@ describe("a stream answered by the upstream idle guard", () => {
     delete process.env.MERIDIAN_MAX_CONCURRENT
   })
 
-  it("never starts the attempt that was still queued for an SDK slot", async () => {
+  it("keeps a request queued for an SDK slot waiting, and never starts it once its client leaves", async () => {
     const { app } = createProxyServer({ port: 0, host: "127.0.0.1", silent: true })
     const onlySlot = await getProcessSdkSemaphore().acquire()
+    const client = new AbortController()
     try {
-      const timedOut = await (await app.fetch(streamRequest("hello"))).text()
-      expect(errorType(timedOut)).toBe("upstream_timeout")
+      const body = (await app.fetch(streamRequest("hello", client.signal))).text().catch(() => "")
+      const answered = await Promise.race([body.then(() => true), Bun.sleep(IDLE_MS + 1_000).then(() => false)])
+      expect(answered).toBe(false)
+      expect(getProcessSdkSemaphore().snapshot.queued).toBe(1)
+      client.abort()
+      expect(errorType(await body)).not.toBe("upstream_timeout")
       expect(getProcessSdkSemaphore().snapshot.queued).toBe(0)
     } finally {
       onlySlot.release()
