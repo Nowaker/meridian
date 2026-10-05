@@ -208,6 +208,8 @@ src/
 │   ├── errors.ts              ← Error classification (SDK errors → HTTP responses)
 │   ├── retryAfter.ts          ← Retry-After computation for 429/503/529 (PURE)
 │   ├── models.ts              ← Model mapping, Claude executable resolution
+│   ├── claudeExecutablePreference.ts ← System/bundled/custom executable choice, read from settings.json (leaf)
+│   ├── claudeExecutableSettings.ts ← GET/PUT /settings/api/claude-executable: the choice, what each would run, versions
 │   ├── buildInfo.ts           ← Build provenance: source detection, semver compare (PURE)
 │   ├── localBuildInfo.ts      ← Local build comparisons and public forge links (PURE)
 │   ├── buildRuntime.ts        ← Immutable runtime identity and independent disk status
