@@ -847,9 +847,12 @@ const DEFAULT_DEPS: ResolverDeps = {
   existsSync,
   statSync: (p) => statSync(p),
   exec: (cmd) => exec(cmd, { windowsHide: true, timeout: 2000, maxBuffer: 64 * 1024 }),
+  // `env` is explicit because Bun 1.3's execFileSync otherwise hands the child
+  // the environment the process started with, so the sync resolver could search
+  // a different PATH than the async one.
   execLookupSync: (command, args) => execFileSync(command, args, {
     encoding: "utf8", windowsHide: true, timeout: 2000, maxBuffer: 64 * 1024,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["ignore", "pipe", "pipe"], env: process.env,
   }),
   probeClaude: candidate => probeClaudeVersion(candidate),
   probeClaudeSync: candidate => probeClaudeVersionSync(candidate),
@@ -882,7 +885,7 @@ export function probeClaudeVersionSync(candidate: string, timeoutMs = CLAUDE_PRO
   try {
     const stdout = execFileSync(candidate, ["--version"], {
       encoding: "utf8", windowsHide: true, timeout: timeoutMs, maxBuffer: 16 * 1024,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["ignore", "pipe", "pipe"], env: process.env,
     })
     return judgeVersionOutput(stdout, Date.now() - startedAt)
   } catch (err) {
