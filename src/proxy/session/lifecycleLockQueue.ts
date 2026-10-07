@@ -5,6 +5,7 @@ import {
   SessionLifecycleReentrancyError,
 } from "./lifecycleErrors"
 import { diagnosticLog } from "../../telemetry"
+import { plog } from "../operationalLog"
 
 interface QueueOptions {
   readonly maxPending?: number
@@ -17,7 +18,7 @@ interface QueueOptions {
 }
 
 const logQueueEvent = (message: string): void => {
-  console.error(`[PROXY] ${message}`)
+  plog(`[PROXY] ${message}`)
   diagnosticLog.session(message)
 }
 
@@ -114,13 +115,16 @@ export class LifecycleLockQueue {
     // loop - synchronous store I/O, a CPU-starved host - including the holder's
     // own continuations, which are runnable now. Declaring the holder stalled
     // then rejects every waiter moments before it would have handed off, so a
-    // late deadline starts a fresh window instead. A holder that is stuck while
-    // the loop is healthy still meets its deadline on time.
+    // late deadline gets one fresh window instead. Repeated lag must not grant
+    // an unbounded wait: after that grace, reject waiters even if the second
+    // deadline is late. The holder retains ownership until it actually settles.
+    let graceUsed = false
     const armStallTimer = (): (() => void) => {
       const dueAt = this.now() + this.stallMs
       return this.schedule(() => {
         const lateMs = this.now() - dueAt
-        if (lateMs > this.lagToleranceMs) {
+        if (lateMs > this.lagToleranceMs && !graceUsed) {
+          graceUsed = true
           this.log(`session.lifecycle_stall_deadline_late late_ms=${Math.round(lateMs)} queued=${state.pending.size}; event loop was blocked, extending the holder's deadline`)
           stopTimer = armStallTimer()
           return

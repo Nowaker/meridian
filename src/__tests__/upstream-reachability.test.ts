@@ -363,6 +363,10 @@ describe("resolveReachabilityThresholds", () => {
     expect(resolveReachabilityThresholds(none, noSettings)).toEqual({ unreachableAfterMs: 120_000, holdMs: 300_000, minFailures: 3 })
   })
 
+  it("falls back to the defaults when settings.json holds null", () => {
+    expect(resolveReachabilityThresholds(none, () => null)).toEqual({ unreachableAfterMs: 120_000, holdMs: 300_000, minFailures: 3 })
+  })
+
   it("reads settings.json, and lets the environment win", () => {
     const settings = () => ({ upstreamUnreachableAfterMs: 60_000, upstreamUnreachableHoldMs: 0, upstreamUnreachableMinFailures: 5 })
     expect(resolveReachabilityThresholds(none, settings)).toEqual({ unreachableAfterMs: 60_000, holdMs: 0, minFailures: 5 })

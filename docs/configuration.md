@@ -344,6 +344,34 @@ name as the OS reports it, and the site header shows it beside the status, e.g.
 `Operational · nwkr-desktop`. It is off by default because `/health` answers
 without the API key.
 
+With `"showHostname": true` in `settings.json` (or the switch under **Site
+Header** at `/settings`), `/health` also carries `"hostname"`, the machine's
+name as the OS reports it, and the site header shows it beside the status, e.g.
+`Operational · nwkr-desktop`. It is off by default because `/health` answers
+without the API key.
+
+This applies to Claude and standalone Antigravity health, including unhealthy
+and draining responses; their status codes and other fields stay intact.
+`/livez` and `/readyz` do not disclose the hostname. The header shows the first
+DNS label (or a whole IP address), with the complete name in its tooltip.
+
+`GET /settings/api/header` returns `{ "showHostname": false, "hostname":
+"<OS name>" }` when off. `PUT` accepts a boolean, `null` to remove the saved
+field, or an omitted field to preserve it; invalid values or bodies return
+400. Both routes use the existing `MERIDIAN_API_KEY` gate when configured.
+Health and header settings bypass caches, and disabling takes effect on
+responses assembled after the setting changes, including probes already
+waiting for auth. The UI permits one hostname save at a time and ignores
+older health polls when a newer refresh has started.
+
+Browser writes must originate from this server. HTTPS origins are also
+accepted across an internal HTTP TLS-termination hop with the same preserved
+public Host/port; explicit default 443 is equivalent to omitted HTTPS 443.
+Foreign, opaque, malformed or different-port origins return 403. Forwarding
+headers are not trusted. A reverse proxy that rewrites Host must preserve the
+public Host for this route. CLI writes without an `Origin` header continue to
+work through the API-key gate.
+
 ## Error reporting
 
 Meridian can report its own uncaught exceptions and unhandled promise

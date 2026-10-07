@@ -13,10 +13,11 @@
  * concurrent run.
  */
 
-import { readdirSync, rmSync } from "node:fs"
+import { readdirSync, rmSync, type Dirent } from "node:fs"
 import { join } from "node:path"
 
-const TEST_DIR_PATTERN = /^meridian-test-(?:settings|sessions)-(\d+)$/
+const TEST_DIR_PATTERN = /^meridian-test-(?:settings|sessions)-([1-9]\d*)$/
+const MAX_PID = 0x7fffffff
 
 export function testDirsFor(root: string, pid: number) {
   return {
@@ -25,44 +26,56 @@ export function testDirsFor(root: string, pid: number) {
   }
 }
 
-export function isProcessAlive(pid: number): boolean {
+export function isProcessAlive(
+  pid: number,
+  probe: (pid: number) => unknown = pid => process.kill(pid, 0),
+): boolean {
   try {
-    process.kill(pid, 0)
+    probe(pid)
     return true
   } catch (error) {
-    // EPERM means the pid exists but belongs to someone else.
-    return (error as NodeJS.ErrnoException).code === "EPERM"
+    // Only ESRCH establishes a dead owner. EPERM and unexpected errors must
+    // preserve the directory because the process may still be running.
+    return !(error instanceof Error && "code" in error && error.code === "ESRCH")
   }
 }
 
-/** Remove a scratch directory. Best effort: a failure here must not change the
- *  test run's outcome, and the next run's sweep retries it. */
-export function removeTestDir(dir: string): void {
+/** Remove a scratch directory. Teardown and stale sweeps are best effort and
+ *  retry failures on the next run; startup must check this result to avoid
+ *  inheriting stale state when resetting its own pair fails. */
+export function removeTestDir(dir: string): boolean {
   try {
     rmSync(dir, { recursive: true, force: true })
+    return true
   } catch {
-    // Left for the next run's sweepStaleTestDirs.
+    // Left for the next run's sweepStaleTestDirs; do not report a removal.
+    return false
   }
 }
 
 /** Delete preload scratch directories under `root` whose owning pid is gone.
  *  Returns the directories removed. */
-export function sweepStaleTestDirs(root: string, alive: (pid: number) => boolean = isProcessAlive): string[] {
-  let names: string[]
+export function sweepStaleTestDirs(
+  root: string,
+  alive: (pid: number) => boolean = isProcessAlive,
+  remove: (dir: string) => boolean = removeTestDir,
+): string[] {
+  let entries: Dirent[]
   try {
-    names = readdirSync(root)
+    entries = readdirSync(root, { withFileTypes: true })
   } catch {
     return []
   }
   const removed: string[] = []
-  for (const name of names) {
-    const match = TEST_DIR_PATTERN.exec(name)
+  for (const entry of entries) {
+    // Do not remove unrelated files or symlinks with a matching basename.
+    if (!entry.isDirectory()) continue
+    const match = TEST_DIR_PATTERN.exec(entry.name)
     if (!match) continue
     const pid = Number(match[1])
-    if (pid === process.pid || alive(pid)) continue
-    const dir = join(root, name)
-    removeTestDir(dir)
-    removed.push(dir)
+    if (!Number.isSafeInteger(pid) || pid > MAX_PID || pid === process.pid || alive(pid)) continue
+    const dir = join(root, entry.name)
+    if (remove(dir)) removed.push(dir)
   }
   return removed
 }

@@ -244,9 +244,10 @@ function nonNegativeInt(value: unknown): number | undefined {
  */
 export function resolveReachabilityThresholds(
   readEnv: (suffix: string) => string | undefined = env,
-  readSettings: () => Record<string, unknown> = () => loadSettings() as Record<string, unknown>,
+  readSettings: () => Record<string, unknown> | null = () => loadSettings() as Record<string, unknown> | null,
 ): ReachabilityThresholds {
-  const settings = readSettings()
+  // A settings.json holding `null` parses to null; /health must still answer.
+  const settings = readSettings() ?? {}
   const pick = (envSuffix: string, settingKey: string, fallback: number) =>
     nonNegativeInt(readEnv(envSuffix)) ?? nonNegativeInt(settings[settingKey]) ?? fallback
   return {
