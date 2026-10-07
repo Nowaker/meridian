@@ -344,6 +344,40 @@ describe("resolveClaudeExecutable: legacy SDK cli.js (bun only)", () => {
 })
 
 describe("resolveClaudeExecutable: priority ordering", () => {
+  for (const sync of [false, true]) {
+    it(`shares the lookup/probe budget across Windows candidates (${sync ? "sync" : "async"})`, async () => {
+      let now = 0
+      const calls: Array<{ candidate: string; timeoutMs: number | undefined }> = []
+      const warnings: string[] = []
+      const output = "C:\\First\\claude.exe\nC:\\Second\\claude.exe\nC:\\Third\\claude.exe\n"
+      const lookup = () => { now += 2_000; return output }
+      const probe = (candidate: string, timeoutMs?: number) => {
+        calls.push({ candidate, timeoutMs })
+        now += calls.length === 1 ? 30_000 : (timeoutMs ?? 45_000)
+        return { usable: false as const, reason: "no answer" }
+      }
+      const deps = makeDeps({
+        platform: "win32", existsSync: () => true,
+        statSync: () => ({ size: 200_000_000 }),
+        resolvePackage: () => "/m/cc/package.json",
+        exec: async () => ({ stdout: lookup() }),
+        execLookupSync: lookup,
+        probeClaude: async (candidate, timeoutMs) => probe(candidate, timeoutMs),
+        probeClaudeSync: probe,
+        now: () => now,
+        warn: message => warnings.push(message),
+      })
+      const resolved = sync ? resolveClaudeExecutableSync(deps) : await resolveClaudeExecutableWithSource(deps)
+      expect(resolved?.source).toBe("bundled")
+      expect(calls).toEqual([
+        { candidate: "C:\\First\\claude.exe", timeoutMs: 43_000 },
+        { candidate: "C:\\Second\\claude.exe", timeoutMs: 13_000 },
+      ])
+      expect(now).toBe(45_000)
+      expect(warnings.at(-1)).toContain("45s PATH lookup/probe budget is exhausted")
+    })
+  }
+
   it("keeps the packaged fallback when the PATH entry cannot run Claude, and says why", async () => {
     const bundledPkg = "/m/cc/package.json"
     const warnings: string[] = []

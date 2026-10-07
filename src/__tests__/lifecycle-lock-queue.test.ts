@@ -1,6 +1,7 @@
 import { expect, it, spyOn } from "bun:test"
 import { LifecycleLockQueue } from "../proxy/session/lifecycleLockQueue"
 import { diagnosticLog } from "../telemetry"
+import { setProxyLogSilent } from "../proxy/operationalLog"
 import {
   SessionLifecycleQueueCapacityError,
   SessionLifecycleQueueStalledError,
@@ -123,6 +124,8 @@ it("does not blame the holder for a stall deadline delayed by a blocked event lo
 })
 
 it("reports a late stall deadline on stderr and in the diagnostic log by default", async () => {
+  // Other HTTP tests may have established the process-wide silent host policy.
+  setProxyLogSilent(false)
   diagnosticLog.clear()
   const stderr = spyOn(console, "error").mockImplementation(() => {})
   try {
@@ -158,6 +161,52 @@ it("still declares a stall when the rearmed deadline passes on time", async () =
   expect(logged).toHaveLength(1)
   holder.resolve()
   await active
+})
+
+it("rejects recurrently delayed deadlines after one grace window without releasing the holder", async () => {
+  const clock = controlledClock()
+  const queue = new LifecycleLockQueue({ stallMs: 100, lagToleranceMs: 10, schedule: clock.schedule, now: clock.now, log: () => {} })
+  const holder = Promise.withResolvers<void>()
+  let activeCount = 0
+  let maxActive = 0
+  const active = queue.run("store", undefined, async () => {
+    activeCount++
+    maxActive = Math.max(maxActive, activeCount)
+    await holder.promise
+    activeCount--
+  })
+  let waiterStarted = false
+  let waiterError: unknown
+  const waiting = queue.run("store", undefined, async () => {
+    waiterStarted = true
+    activeCount++
+    maxActive = Math.max(maxActive, activeCount)
+    activeCount--
+  }).catch(error => { waiterError = error })
+  try {
+    clock.advance(111)
+    await Promise.resolve()
+    expect(waiterError).toBeUndefined()
+    expect(waiterStarted).toBe(false)
+    // Every firing is late; lateness alone must not renew the allowance.
+    clock.advance(111)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(waiterError).toBeInstanceOf(SessionLifecycleQueueStalledError)
+    await expect(queue.run("store", undefined, async () => { waiterStarted = true }))
+      .rejects.toBeInstanceOf(SessionLifecycleQueueStalledError)
+    expect(waiterStarted).toBe(false)
+    expect(activeCount).toBe(1)
+  } finally {
+    holder.resolve()
+    await Promise.all([active, waiting])
+  }
+  await queue.run("store", undefined, async () => {
+    activeCount++
+    maxActive = Math.max(maxActive, activeCount)
+    activeCount--
+  })
+  expect(maxActive).toBe(1)
 })
 
 it("does not settle or release an active transaction when its caller aborts", async () => {

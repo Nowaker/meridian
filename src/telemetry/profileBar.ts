@@ -548,8 +548,11 @@ export const profileBarJs = `
     driftChip.textContent = '';
   }
 
+  var healthGeneration = 0;
   function loadHeader() {
-    fetch('/health').then(function(r) { return r.json(); }).then(function(h) {
+    var generation = ++healthGeneration;
+    fetch('/health', { cache: 'no-store' }).then(function(r) { return r.json(); }).then(function(h) {
+      if (generation !== healthGeneration) return;
       renderStatus(statusPillView(h));
       renderHost(h.hostname);
       renderBuild(h.build);
@@ -558,7 +561,9 @@ export const profileBarJs = `
         profileChip.removeAttribute('href');
       }
     }).catch(function() {
+      if (generation !== healthGeneration) return;
       renderStatus(statusPillView(null));
+      renderHost(undefined);
     });
 
     fetch('/profiles/list').then(function(r) { return r.json(); }).then(function(data) {

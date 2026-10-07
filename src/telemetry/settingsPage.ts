@@ -885,26 +885,37 @@ async function putClaudeExecutable(body) {
 async function loadHeaderSettings() {
   const cfg = await (await fetch('/settings/api/header')).json();
   document.getElementById('header-body').innerHTML = telemetryRow('Show hostname',
-    '<input type="checkbox" id="hdr-hostname"' + (cfg.showHostname ? ' checked' : '') + '>',
+    '<input type="checkbox" id="hdr-hostname" aria-label="Show hostname"' + (cfg.showHostname ? ' checked' : '') + '>',
     cfg.showHostname ? 'shown' : 'hidden',
     ' <span style="font-size:12px;color:var(--muted)">This machine: <code>' + telemetryEsc(cfg.hostname || 'unknown') + '</code></span>');
   document.getElementById('hdr-hostname').addEventListener('change', (e) => putHeaderSettings(e.target.checked));
 }
 
 async function putHeaderSettings(showHostname) {
-  const res = await fetch('/settings/api/header', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ showHostname }),
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    alert(err.error || 'Failed to save header settings');
-  } else {
-    showSaved();
-    if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
+  const checkbox = document.getElementById('hdr-hostname');
+  checkbox.disabled = true;
+  try {
+    const res = await fetch('/settings/api/header', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ showHostname }),
+    });
+    if (!res.ok) {
+      checkbox.checked = !showHostname;
+      const err = await res.json().catch(() => ({}));
+      alert(err.error || 'Failed to save header settings');
+    } else {
+      showSaved();
+      if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
+    }
+  } catch {
+    checkbox.checked = !showHostname;
+    alert('Failed to save header settings');
+  } finally {
+    try { await loadHeaderSettings(); }
+    catch { alert('Failed to reload header settings'); }
+    checkbox.disabled = false;
   }
-  await loadHeaderSettings();
 }
 
 async function loadLayout() {

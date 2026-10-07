@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 // Real CLI auth + real HTTP sockets. A fresh proxy whose first auth check is
 // slower than any caller waits: delays the real auth subprocess, never invents
-// an authentication payload. Run on macOS/Linux with Claude logged in.
+// an authentication payload. Retained contributor prototype, not an admitted
+// live gate: task-owned native credential scope and child cleanup need review.
+// Do not run against an owner/default credential store. See the E2E hold.
 import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, readFileSync, chmodSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
