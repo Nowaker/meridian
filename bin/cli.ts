@@ -16,7 +16,7 @@ if (args.includes("--version") || args.includes("-v")) {
   process.exit(0)
 }
 
-if ((args.includes("--help") || args.includes("-h")) && args[0] !== "chatgpt-migrate") {
+if ((args.includes("--help") || args.includes("-h")) && args[0] !== "chatgpt-migrate" && args[0] !== "instance-import") {
   console.log(`meridian v${version}
 
 Local API bridge for Claude and Antigravity subscriptions.
@@ -30,6 +30,7 @@ Commands:
   profile          Manage Claude account profiles and ChatGPT seats (add, list, switch, remove)
   refresh-token    Refresh the Claude Code OAuth token
   chatgpt-migrate  Move ChatGPT accounts from oc-codex-multi-auth into Meridian, or back with --reverse (--help)
+  instance-import  Move one Meridian instance's ChatGPT seats and their history into another (--help)
   test-error-report  Crash with a test error to check error reporting reaches the collector
 
 Setup options:
@@ -218,6 +219,11 @@ if (args[0] === "setup") {
 if (args[0] === "chatgpt-migrate") {
   const { runMigrateCli } = await import("../src/proxy/chatgpt/migrate/cli")
   process.exit(await runMigrateCli(args.slice(1)))
+}
+
+if (args[0] === "instance-import") {
+  const { runInstanceImportCli } = await import("../src/proxy/instanceImport/cli")
+  process.exit(await runInstanceImportCli(args.slice(1)))
 }
 
 if (args[0] === "refresh-token") {

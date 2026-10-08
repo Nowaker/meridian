@@ -84,6 +84,11 @@ locks (`strip.ts`, `files.ts`), duplicate detection and naming on import
 the pure store merge in `handback.ts`) and the owned-store adapter
 (`ownedStore.ts`), which writes only through `chatgpt/credentials.ts` under the
 writer lease. The server never imports it.
+`instanceImport/` implements `meridian instance-import`: the pure plan that names
+every seat the way the destination will (`plan.ts`), the telemetry copy keyed on
+`request_id` and its column-by-column verification (`telemetry.ts`), and the run
+under both stores' writer leases that retires the source by renaming its files
+(`importer.ts`). The server never imports it.
 `telemetry/providerSetup.ts` shares pure command generation and setup presentation
 between the web provider page and desktop. Desktop clipboard requests contain
 choices rather than arbitrary text; the main process validates them against its

@@ -1202,6 +1202,7 @@ ChatGPT's sign-in only accepts the redirect `http://127.0.0.1:1455/auth/callback
 | `meridian profile remove <name>` | Remove a profile and its credentials |
 | `meridian refresh-token` | Manually refresh the Claude OAuth token (exits 0/1) |
 | `meridian chatgpt-migrate [--reverse] [--dry-run] [--step <steps>]` | Move ChatGPT accounts from oc-codex-multi-auth and opencode's OpenAI login into Meridian's store, or with `--reverse` hand them back. See [ChatGPT migration](#chatgpt-migration) |
+| `meridian instance-import --from <dir> --to <dir> [--apply]` | Move one Meridian instance's ChatGPT seats, settings and telemetry into another, then retire the source. See [Moving ChatGPT seats between instances](#moving-chatgpt-seats-between-instances) |
 | `meridian test-error-report` | Crash on purpose so the configured [error-reporting](#error-reporting) collector receives a test issue. Always exits 1; when reporting is off it only prints how to turn it on |
 
 ## ChatGPT migration
@@ -1244,6 +1245,28 @@ Email alone is not identity (one person holds seats in several workspaces), and 
 | `verify` | Checks that no seat is renewed by both, that opencode's global config loads the plugin and its global TUI config the status bar, and that the provider no longer points at Meridian |
 
 The plugin restores opencode's own `openai` login in `auth.json` from its store when it loads; the `backups/` directory the forward `strip` moved aside holds spent tokens and stays aside. Restart opencode afterwards.
+
+## Moving ChatGPT seats between instances
+
+`meridian instance-import` folds one instance's ChatGPT seats into another, for example a separate ChatGPT instance into the one that serves Claude, so a single Meridian serves both. Each instance is named by its config directory (its `MERIDIAN_CONFIG_DIR`); `--from-store`/`--to-store` and `--from-telemetry`/`--to-telemetry` name a store or database the instance keeps elsewhere (`MERIDIAN_CHATGPT_STORE_PATH`, `MERIDIAN_TELEMETRY_DB`).
+
+```bash
+meridian instance-import --from ~/.config/meridian-gpt --to ~/.config/meridian          # what would happen
+meridian instance-import --from ~/.config/meridian-gpt --to ~/.config/meridian --apply  # do it
+```
+
+| Moved | How |
+|---|---|
+| ChatGPT seats | Every account in the source's store, with its credentials unchanged and in its order, written through the destination store's writer lease |
+| Seat names | `chatGptProfileNames`, `chatGptProfileAliases` and `chatGptActiveSeat` (unless the destination has an active seat of its own), so every seat keeps its profile name and former names |
+| ChatGPT features | `chatgpt` and `integrations` keys the destination does not set; a value both set differently is a conflict. Routing order and exclusions that name a seat |
+| Login records | The seats' `auth-lifecycle.json` records |
+| Prices | `model-pricing.json` overrides the destination does not have |
+| Telemetry | Every request and diagnostic log entry, with all its columns, under the same profile ids, so each seat's requests and estimated value on `/` and `/telemetry` are what they were |
+
+Other settings (`layout`, `claudeExecutable`, ...) and Claude profiles stay with their instance; a source with Claude profiles is refused. The plan is computed the way the destination will name its seats: a name the destination already uses for a Claude profile, a former name, or another seat, and requests filed under such a name, are conflicts, and nothing is written. `--rename <old>=<new>` files a seat, or requests filed under `<old>`, under another name.
+
+With `--apply`, neither instance may be serving ChatGPT: stop the source, and the destination unless it has no ChatGPT seats yet (a destination still serving Claude may keep running). Telemetry is copied first, in short transactions beside the running destination, and read back column by column; then the settings and login records; the seats last. Only after the whole destination has been checked again is the source retired: each file it read is renamed to `<name>.imported-<time>`, and nothing is deleted. A run that stops part-way leaves the source in place, and running the command again continues it without copying a request twice. Once it succeeds, restart the destination with `MERIDIAN_CHATGPT_CREDENTIALS=owned` (or unset).
 
 ## SDK Feature Toggles (Experimental)
 
