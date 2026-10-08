@@ -242,17 +242,16 @@ describe("brand colours", () => {
     expect(landingHtml).toContain(".profile-card.switchable:hover { border-color: var(--brand-bright, var(--accent));")
   })
 
-  test("landing: an active account that needs a login keeps its brand border", () => {
-    // The red needs-login border would otherwise replace the one mark saying
-    // which account is active, exactly when somebody comes looking for it.
-    expect(landingHtml).toContain(".profile-card.active.needs-login { border-color: var(--brand, var(--accent)); border-style: solid; }")
-    expect(landingHtml.indexOf(".profile-card.active.needs-login {")).toBeGreaterThan(landingHtml.indexOf(".profile-card.needs-login {"))
-  })
-
-  test("landing: a needs-login border is dashed, so it is never read as an active one", () => {
-    // Beside the Claude brand the red differs in hue alone; to a protanope the
-    // two are the same colour, so the pattern has to tell them apart.
-    expect(landingHtml).toContain(".profile-card.needs-login { border-color: var(--red); border-style: dashed; }")
+  test("landing: a needs-login border is solid red, and an active card keeps its brand ring outside it", () => {
+    // Beside the Claude brand the red differs in hue alone, which a protanope
+    // cannot see; the active card's ring, which this rule leaves alone, is what
+    // still says which account is active.
+    const css = landingHtml.slice(0, landingHtml.indexOf("</style>"))
+    expect(css).toContain(".profile-card.needs-login { border-color: var(--red); }")
+    expect(css).not.toContain(".profile-card.active.needs-login")
+    expect(css).not.toContain("dashed")
+    // Declared after the active rule, so red wins the border and the ring stays.
+    expect(css.indexOf(".profile-card.needs-login {")).toBeGreaterThan(css.indexOf(".profile-card.active {"))
   })
 
   test("landing: a spent active card dims its figures, never its name row", () => {
@@ -335,6 +334,7 @@ function loadPage(html: string, storage: MemoryStorage): Page {
     fetch: () => new Promise(() => {}),
     setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
     requestAnimationFrame: () => 0, cancelAnimationFrame() {},
+    MutationObserver: class { observe() {} disconnect() {} },
     addEventListener() {}, alert() {}, innerHeight: 800, scrollY: 0, scrollTo() {},
   }
   sandbox.window = sandbox
