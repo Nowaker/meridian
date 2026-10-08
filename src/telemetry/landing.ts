@@ -14,7 +14,7 @@ import { profileFindJs } from "./profileFind"
 import { reorderClientJs, reorderCss, reorderLiveRegionHtml } from "./profileOrder"
 import { profileProvidersCss, profileProvidersJs } from "./profileProviders"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "./profileSort"
-import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT } from "./profileSpent"
+import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT, isUnusableJs } from "./profileSpent"
 import { selectionHoldJs } from "./selectionHold"
 
 export const landingHtml = `<!DOCTYPE html>
@@ -90,11 +90,9 @@ export const landingHtml = `<!DOCTYPE html>
     transition: filter 0.2s, opacity 0.2s; }
   .profile-card.spend-fading:hover > *, .profile-card.spend-spent:hover > * { filter: none; opacity: 1; }
   .profile-card.active.spend-fading > .profile-head, .profile-card.active.spend-spent > .profile-head { filter: none; opacity: 1; }
-  /* Dashed, because beside the Claude brand this red differs in hue alone,
-     which a protanope cannot see (ΔE2000 3.5): solid is the active border. */
-  .profile-card.needs-login { border-color: var(--red); border-style: dashed; }
-  /* The pill says it needs a login; the border keeps saying it is active. */
-  .profile-card.active.needs-login { border-color: var(--brand, var(--accent)); border-style: solid; }
+  /* An active card that needs a login keeps its brand ring outside the red
+     border, so it still reads as the active one by more than hue. */
+  .profile-card.needs-login { border-color: var(--red); }
   .profile-card.needs-login .prof-dot { background: var(--red); }
   .spend-pill { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
     color: var(--muted); background: var(--surface2); border: 1px solid var(--border);
@@ -294,7 +292,7 @@ function resetIn(ts){if(ts==null)return '';var d=ts-Date.now();if(d<=0)return 'r
 var GENERAL_WINDOW_TYPES=${JSON.stringify(GENERAL_WINDOW_TYPES)};
 var FADE_FROM=${FADE_FROM};
 var SPENT_AT=${SPENT_AT};
-function isUnusable(p){if(p.loggedIn===false)return true;return p.error==='no_token'}
+${isUnusableJs}
 function generalUtilization(windows,provider){
   var everyWindow=provider==='chatgpt';
   var worst=null;

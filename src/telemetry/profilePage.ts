@@ -8,6 +8,7 @@ import { profileFactsJs } from "./profileFacts"
 import { profileFindJs } from "./profileFind"
 import { reorderClientJs, reorderCss, reorderLiveRegionHtml } from "./profileOrder"
 import { PROVIDERS_NONE_SHOWN_HTML, profileProvidersCss, profileProvidersJs } from "./profileProviders"
+import { isUnusableJs } from "./profileSpent"
 import { WINDOW_LABELS } from "./profileUsage"
 import { selectionHoldJs } from "./selectionHold"
 
@@ -68,6 +69,10 @@ export const profilePageHtml = `<!DOCTYPE html>
      (profileProviders.ts): each provider's active account, and the button
      that switches to one, are in that provider's brand. */
   .profile-card.active { border-color: var(--brand, var(--accent)); box-shadow: 0 0 0 1px var(--brand, var(--accent)); }
+  /* The same mark / gives an account that cannot serve requests. The red
+     border replaces an active card's brand border, and its brand ring stays
+     outside the red, so the two still tell apart. */
+  .profile-card.needs-login { border-color: var(--red); }
   #content .provider-group-head { margin-bottom: 10px; }
   #content .provider-group-head:not([hidden]) ~ .provider-group-head { margin-top: 24px; }
   /* Wide layout: the stack becomes a grid of larger cards, two to four to a
@@ -138,6 +143,7 @@ export const profilePageHtml = `<!DOCTYPE html>
   }
   .badge-active { background: rgba(var(--brand-rgb, 88,166,255),0.15); color: var(--brand-bright, var(--accent)); }
   .badge-type { background: var(--bg); color: var(--muted); border: 1px solid var(--border); }
+  .badge-needs-login { background: rgba(248,81,73,0.12); color: var(--red); border: 1px solid rgba(248,81,73,0.35); }
   .badge-spent { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.35); }
   .spent-note { margin: 10px 0; padding: 10px 14px; border-radius: 8px; font-size: 12px; line-height: 1.5;
     background: rgba(248,81,73,0.08); border: 1px solid rgba(248,81,73,0.3); color: var(--text);
@@ -485,6 +491,9 @@ function formatExtraUsage(eu) {
     status: classifyUtilization(utilization),
   };
 }
+
+// Shared with / (profileSpent.ts), so both pages flag the same accounts.
+${isUnusableJs}
 
 ${reorderClientJs}
 ${selectionHoldJs}
@@ -1080,7 +1089,8 @@ function render(data, quotaData) {
     // Per profile rather than against data.activeProfile: an instance serving
     // both providers has an active Claude account AND an active ChatGPT seat.
     const isActive = !!p.isActive;
-    html += '<div class="profile-card provider-' + esc(slot.provider) + (isActive ? ' active' : '') + '" id="' + esc(profileAnchorElementId(p.id)) + '" data-id="' + esc(p.id) + '" data-index="' + idx + '" data-group="' + esc(slot.provider) + '">';
+    const needsLogin = isUnusable({ loggedIn: p.loggedIn, error: (quotaById[p.id] || {}).error });
+    html += '<div class="profile-card provider-' + esc(slot.provider) + (isActive ? ' active' : '') + (needsLogin ? ' needs-login' : '') + '" id="' + esc(profileAnchorElementId(p.id)) + '" data-id="' + esc(p.id) + '" data-index="' + idx + '" data-group="' + esc(slot.provider) + '">';
     html += '<div class="profile-card-header">';
     if (editingProfile === p.id) {
       html += "<input class=\\"rename-input\\" id=\\"rename-input\\" type=\\"text\\" value=\\"" + esc(p.id) + "\\" " + PROFILE_INPUT_ATTRS
@@ -1098,6 +1108,11 @@ function render(data, quotaData) {
       html += meridianProviders.badgeHtml(slot.provider, "profile-badge");
       // A seat's type is its provider's name, which the badge before it says.
       if ((p.type || "claude-max") !== slot.provider) html += "<span class=\\"profile-badge badge-type\\">" + esc(p.type || "claude-max") + "</span>";
+      // The pill / shows, in the words of whoever holds the login.
+      if (needsLogin) {
+        var access = profileAccessHelp(p);
+        html += '<span class="profile-badge badge-needs-login" title="' + esc(access.summary) + '">' + esc(access.pill) + '</span>';
+      }
       html += renderSpentBadge((quotaById[p.id] || {}).spent);
       if ((quotaById[p.id] || {}).servingOnCredits) html += '<span class="profile-badge badge-credits" title="This seat\u2019s plan usage is spent; its turns are paid with Codex credits">on credits</span>';
       html += "<span class=\\"profile-card-actions\\">";
