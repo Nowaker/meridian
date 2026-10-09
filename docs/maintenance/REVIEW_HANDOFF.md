@@ -20,16 +20,55 @@ human coauthor trailer. Source #1293 was rechecked unchanged at
 a comment. [The committed adversarial review and live before/after proof](evidence/claude-executable-selection-review-20261008.md)
 retain the bounded Linux arm64/OpenCode V1/Haiku acceptance and broader limits.
 
-[Home Manager #1320](https://github.com/rynfar/meridian/pull/1320) is being
-reconciled onto that landed main in its existing isolated feature branch.
-Its original delivery had successful final-head test and native Nix checks;
-the cancelled push-triggered Nix run was superseded by a successful PR-triggered
-run of the same workflow and exact head under its declared concurrency group.
-Only the handoff document conflicted. Module, renderer assertions and lock
-remain unchanged; fresh combined local gates and final-head CI are required
-before its guarded squash. Source #1305 stays open until landing and unchanged
-source verification. [Its native proof and authorship receipt](evidence/home-manager-isolation-1305.md)
-remain valid for the unchanged configuration inputs.
+[Home Manager #1320](https://github.com/rynfar/meridian/pull/1320) merged reviewed
+head `94ab30b11ba78eb1993f95273ac5f87be16e5dfe` as
+`aee79ae3966b8b1d32f8d2a7fde3ec01f7ec2686`, with exact landed tree and Can H.
+Tartanoglu's human coauthor trailer verified. Fresh combined local gates passed
+5,502 tests / 35 skips / zero failures, typecheck and build. Final-head
+[test](https://github.com/rynfar/meridian/actions/runs/37882257433/job/113664326961)
+and [native Nix](https://github.com/rynfar/meridian/actions/runs/37882257435/job/113664342289)
+passed alongside the other relevant checks. The cancelled same-head push Nix
+run was superseded by that successful PR run under declared concurrency.
+Unchanged source #1305 was closed. [Its native proof and authorship receipt](evidence/home-manager-isolation-1305.md)
+retain their scope. The implemented bounded contract #1319 is closed.
+
+The integrations reduced the managed queue from 32 to 28 open PRs. A fresh
+refresh now has 29 PRs and 21 issues: contributor Nowaker opened
+[#1323](https://github.com/rynfar/meridian/pull/1323) at 2026-10-09 05:03:52 UTC.
+No new PR was created by this #769 continuation; #1323 remains in its original
+creation-date position. #650 remains owner-deferred.
+The oldest actionable item is [#769](https://github.com/rynfar/meridian/issues/769).
+Its archived core correction `f09cd586` was applied cleanly to current main as
+`7960fd62`, with Author/AuthorDate preserved. Fresh root adversarial source review
+found no material production blocker; local gates passed 5,552 tests / 35 skips /
+zero failures, typecheck and build. The separately reviewed scrub correction
+remains unlanded. Exact OpenClaw 2026.6.11 client/config/loopback preparation is
+qualified separately in [the current review](evidence/openclaw769-current-main-20261009.md).
+The independently installed native baseline completed a real read/result/reply
+on Linux arm64 / SDK 0.2.141 / Claude Code 2.1.284 / `claude-opus-5-5[1m]`.
+Its fixture failed by requiring the intentionally unchanged headerless tool
+checkpoint mapping to advance; public SDK diagnosis and E54 explain the
+answering branch. That first failure is retained. The committed native escrow
+now qualifies the terminal-verified serving branch separately from durable
+publication and explicitly joins owned Bun socket wrappers. Fresh R4 baseline
+reproduces the ignored edit; candidate consumes it, preserves the real tool pair,
+withholds then restores SDK-prefix proof and resumes normally. Both four-stage
+arms exit zero with original process/query/HTTP custody joined. Read-only
+access input and stopped owned containers are removed after audit. This is
+bounded contract acceptance; no classifier/billing resolution is claimed and
+no new PR was created.
+All four adjacent E41 modes pass with exact chain/parallel batches, immutable
+parents, one real answer per call, previous-fork continuation and full prior
+cache reads. The fresh source-archive package is byte-identical to all 452
+installed/live-tested candidate members. Required final-head CI remains a
+delivery gate. The original historical Kubernetes/native tuple remains separate.
+Keep #769 open: its new classifier trigger is undisclosed and its
+current same-window off/on/off evidence is incomplete.
+[Core delivery #1324](https://github.com/rynfar/meridian/pull/1324) is open for
+the existing plugin-message execution contract, with committed native before/after,
+four-mode E41 and exact package proof. Required final-head CI must pass before
+integration; the broader issue remains open. This is the only new delivery in
+this continuation, created after those acceptance prerequisites completed.
 
 Draft #1322 and the older native/product/client/package holds remain separate.
 No release or community comments are authorized by this checkpoint. The
