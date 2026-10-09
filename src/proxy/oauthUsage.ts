@@ -24,6 +24,7 @@ import { claudeLog } from "../logger"
 import { parseRetryAfterMs } from "./retryAfter"
 import { createPlatformCredentialStore, refreshOAuthToken, type CredentialStore } from "./tokenRefresh"
 import { followedUsageSnapshot } from "./followUsage"
+import { noteApiRejected, noteProviderAccepted } from "./authLifecycle"
 
 const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 const OAUTH_BETA_HEADER = "oauth-2025-04-20"
@@ -469,6 +470,7 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
   const rateLimitBackoffMs = opts?.rateLimitBackoffMs ?? RATE_LIMIT_BACKOFF_MS_DEFAULT
 
   const promise = (async () => {
+    let startedAt = Date.now()
     try {
       const token = await readAccessToken(store)
       if (!token) {
@@ -485,6 +487,7 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
         const refreshed = await refreshOAuthToken(store)
         if (!refreshed) {
           claudeLog("oauth_usage.refresh_failed", { profile: cacheKey })
+          noteApiRejected(store.refreshKey, { startedAt })
           // Not `no_token`: the token is present, and a read-only instance
           // declines to refresh it BY DESIGN (credentialsMode.ts). Reporting
           // a missing login here would tell the operator to re-authenticate
@@ -492,11 +495,13 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
           // from touching credentials.
           return staleOr("refresh_failed", "upstream_error")
         }
+        startedAt = Date.now()
         const newToken = await readAccessToken(store)
         if (!newToken) return staleOr("no_token_after_refresh", "no_token")
         result = await callAnthropic(newToken, fetchImpl)
       }
       if ("__status" in result) {
+        if (result.__status === 401) noteApiRejected(store.refreshKey, { startedAt })
         if (result.__status === 429) {
           // Floor at the backoff, but cap at staleMaxMs: the cooldown suppresses
           // every fetch, so one longer than the stale window would age the
@@ -522,6 +527,7 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
       rateLimitedUntilByProfile.delete(cacheKey)
       failureByProfile.delete(cacheKey)
       const snapshot = buildSnapshot(result)
+      noteProviderAccepted(store.refreshKey, { startedAt })
       cacheByProfile.set(cacheKey, snapshot)
       return { snapshot, error: null }
     } catch (err) {

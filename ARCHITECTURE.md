@@ -246,6 +246,8 @@ src/
 │   ├── sessionStore.ts        ← Shared session store (cross-proxy session resume)
 │   ├── profiles.ts            ← Multi-profile support: resolve, list, switch auth contexts (leaf)
 │   ├── profileCli.ts          ← CLI commands for profile management (leaf, I/O)
+│   ├── authLifecycle.ts       ← Credential-keyed login, renewal, refusal and recovery records (leaf, I/O)
+│   ├── profileLoginState.ts   ← Shared effective login decision and Claude metadata reconciliation (leaf)
 │   ├── profileConfigStore.ts  ← cross-process profile writer lock and atomic snapshots (leaf, I/O)
 │   ├── profileLogin.ts        ← Browser re-authentication state, redirect/paste completion and status
 │   ├── profileAdd.ts          ← Browser profile creation and isolated credential persistence

@@ -41,6 +41,8 @@ const { __setFetchOAuthUsageOverride, resetOAuthUsageCache } = await import("../
 const { getSetting, saveSettings } = await import("../settings")
 const { resetCodexUsageCache } = await import("../proxy/codex/service")
 const { __setChatGptLoginListenOverride } = await import("../proxy/chatgpt/login")
+const { noteRefreshRejected } = await import("../proxy/authLifecycle")
+const { chatGptAuthLifecycleKey } = await import("../proxy/chatgpt/refresh")
 
 const NOW = Date.now()
 const CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -119,6 +121,7 @@ function account(n: number, extra: Record<string, unknown> = {}) {
 }
 
 let dir: string
+const priorConfigDir = process.env.MERIDIAN_CONFIG_DIR
 let poolDir: string
 let poolPath: string
 function writePool(accounts: unknown[]) {
@@ -156,6 +159,7 @@ const LUNA = {
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "chatgpt-gateway-"))
+  process.env.MERIDIAN_CONFIG_DIR = join(dir, "meridian")
   poolDir = join(dir, "opencode")
   mkdirSync(poolDir)
   poolPath = join(poolDir, "oc-codex-multi-auth-accounts.json")
@@ -188,6 +192,8 @@ afterEach(() => {
   delete process.env.MERIDIAN_CODEX_POOL_PATH
   delete process.env.MERIDIAN_CHATGPT_STORE_PATH
   rmSync(dir, { recursive: true, force: true })
+  if (priorConfigDir === undefined) delete process.env.MERIDIAN_CONFIG_DIR
+  else process.env.MERIDIAN_CONFIG_DIR = priorConfigDir
 })
 afterAll(() => {
   rmSync(sessionDir, { recursive: true, force: true })
@@ -540,6 +546,17 @@ describe("offered models follow the backend's catalog", () => {
 })
 
 describe("ChatGPT seats on the profile surface", () => {
+  it("health excludes a recorded dead login that the native seat source still calls eligible", async () => {
+    const rejected = account(0)
+    writePool([rejected, account(1)])
+    noteRefreshRejected(chatGptAuthLifecycleKey(rejected.accountUserId), { detail: "rejected" })
+    const { app } = await server("follow-external")
+
+    const response = await app.fetch(new Request("http://localhost/health"))
+
+    expect(await response.json()).toMatchObject({ chatgpt: { accounts: 2, eligible: 1, ready: 1, unavailable: { requires_reauth: 1 } } })
+  })
+
   type ListBody = { profiles: Array<Record<string, unknown>>; activeProfile: string | null; activeProfiles?: { claude: string | null; chatgpt: string | null } }
   type QuotaBody = { profiles: Array<{ id: string; type: string; isActive: boolean; windows: Array<{ type: string; utilization: number | null; resetsAt: number | null }>; windowsReported: string[] | null; windowSource: string | null; error: string | null; spent: unknown }>; activeProfile: string | null; activeProfiles?: { chatgpt: string | null } }
   type App = { fetch: (r: Request) => Response | Promise<Response> }

@@ -3,7 +3,7 @@
  * `POST /profiles/active` does when this instance does not own its active
  * profile.
  */
-import { describe, test, expect, beforeEach, afterEach } from "bun:test"
+import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 
@@ -26,18 +26,22 @@ installLoggerMock(() => ({
   withClaudeLogContext: (_ctx: unknown, fn: () => unknown) => fn(),
 }))
 
+const models = await import("../proxy/models")
 const { createProxyServer } = await import("../proxy/server")
 const { resetActiveProfile, setActiveProfile } = await import("../proxy/profiles")
 const { resetFollowActive, setFollowStateForTesting } = await import("../proxy/followActive")
 const { clearSessionCache } = await import("../proxy/session/cache")
 
 const FOLLOWED = "http://127.0.0.1:3456"
+let restoreAuth: (() => void) | undefined
 const profiles = [
   { id: "personal", claudeConfigDir: "/home/.claude" },
   { id: "work", claudeConfigDir: "/home/.claude-work" },
 ]
 
 beforeEach(async () => {
+  const auth = spyOn(models, "getClaudeAuthStatusAsync").mockImplementation(async () => ({ loggedIn: true }))
+  restoreAuth = () => auth.mockRestore()
   resetActiveProfile()
   resetFollowActive()
   await clearSessionCache()
@@ -45,6 +49,8 @@ beforeEach(async () => {
 })
 
 afterEach(() => {
+  restoreAuth?.()
+  restoreAuth = undefined
   resetFollowActive()
   resetActiveProfile()
   delete process.env.MERIDIAN_FOLLOW_ACTIVE

@@ -48,13 +48,13 @@ afterAll(() => {
 })
 interface Facts { loggedIn: boolean; rateLimitTier: string | null; allowance: string | null;
   planLabel: string | null; renewalRequiredSoon?: boolean }
-async function facts(profile: ProfileConfig) {
+async function facts(profile: ProfileConfig, expectedLoggedIn = loggedIn) {
   const { app } = createProxyServer({ profiles: [profile], defaultProfile: profile.id, silent: true })
   const health = await app.fetch(new Request("http://localhost/health"))
   const healthBody = await health.json() as { status: string; auth: Facts }
   const listed = await app.fetch(new Request("http://localhost/profiles/list"))
   const listBody = await listed.json() as { profiles: Facts[] }
-  expect(health.status).toBe(loggedIn ? 200 : 503)
+  expect(health.status).toBe(expectedLoggedIn ? 200 : 503)
   expect(listed.status).toBe(200)
   return { health: healthBody.auth, profile: listBody.profiles[0]! }
 }
@@ -88,7 +88,9 @@ describe("profile native-credential metadata isolation", () => {
   })
   test("a successfully read empty stored Claude grant still demotes the profile", async () => {
     credentials = { claudeAiOauth: { accessToken: "", refreshToken: "owned-refresh", expiresAt: 0 } }
-    expect((await facts({ id: "empty-max", claudeConfigDir: join(root, "empty") })).profile.loggedIn).toBe(false)
+    const result = await facts({ id: "empty-max", claudeConfigDir: join(root, "empty") }, false)
+    expect(result.profile.loggedIn).toBe(false)
+    expect(result.health.loggedIn).toBe(false)
   })
   test("unavailable stored credentials remain unknown rather than logged out", async () => {
     throws = true

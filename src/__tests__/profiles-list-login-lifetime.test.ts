@@ -6,15 +6,17 @@
  * selection production does. Skipped on macOS, where credentials live in the
  * Keychain and a file fixture cannot stand in for them.
  */
-import { describe, test, expect, mock, afterAll } from "bun:test"
+import { describe, test, expect, mock, afterAll, setSystemTime, spyOn } from "bun:test"
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 
+let queryError: string | undefined
+
 installSdkMock(() => ({
-  query: () => (async function* () {})(),
+  query: () => (async function* () { if (queryError) throw new Error(queryError) })(),
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: {} }),
   tool: () => ({}),
 }), "profiles-list-login-lifetime.test.ts")
@@ -40,8 +42,10 @@ mock.module("../proxy/models", () => ({
 }))
 
 const { createProxyServer } = await import("../proxy/server")
-const { createPlatformCredentialStore, getAuthRenewalStatus } = await import("../proxy/tokenRefresh")
-const { authLifecycleFor, noteAuthLogin } = await import("../proxy/authLifecycle")
+const tokens = await import("../proxy/tokenRefresh")
+const { createPlatformCredentialStore, getAuthRenewalStatus } = tokens
+const { authLifecycleFor, noteAuthLogin, noteRefreshRejected, noteRefreshSucceeded } = await import("../proxy/authLifecycle")
+const { setActiveProfile, resetActiveProfile } = await import("../proxy/profiles")
 
 const HOUR = 3_600_000
 const root = mkdtempSync(join(tmpdir(), "meridian-login-lifetime-"))
@@ -55,6 +59,95 @@ function profileDir(name: string, oauth: Record<string, unknown>): string {
 }
 
 describe("/profiles/list login lifetime", () => {
+  test.skipIf(process.platform === "darwin")("a healthy configured default is not reconciled against a dead active account", async () => {
+    const now = Date.now()
+    const alive = profileDir("configured-default", { accessToken: "present", expiresAt: now + HOUR })
+    const dead = profileDir("configured-dead", { accessToken: "present", expiresAt: now + HOUR })
+    noteRefreshRejected(createPlatformCredentialStore({ claudeConfigDir: dead }).refreshKey, { at: now, detail: "invalid_grant" })
+    setActiveProfile("active-dead")
+    try {
+      const { app } = createProxyServer({ port: 0, host: "127.0.0.1", profiles: [
+        { id: "default", claudeConfigDir: alive }, { id: "active-dead", claudeConfigDir: dead },
+      ] })
+
+      const listed = await (await app.fetch(new Request("http://localhost/profiles/list"))).json()
+
+      expect(listed).toMatchObject({ profiles: [
+        { id: "default", loggedIn: true }, { id: "active-dead", loggedIn: false },
+      ] })
+    } finally {
+      resetActiveProfile()
+    }
+  })
+
+  for (const stream of [false, true]) {
+    test.skipIf(process.platform === "darwin")(`a terminal ${stream ? "streaming" : "non-streaming"} retry refusal is fenced against the refreshed attempt`, async () => {
+      const at = Date.now()
+      setSystemTime(at)
+      const id = `api-retry-refused-${stream}`
+      const dir = profileDir(id, { accessToken: "present", expiresAt: at + HOUR })
+      const { app } = createProxyServer({ port: 0, host: "127.0.0.1", profiles: [{ id, claudeConfigDir: dir }] })
+      queryError = "401 authentication invalid"
+      const refresh = spyOn(tokens, "refreshOAuthToken").mockImplementation(async store => {
+        setSystemTime(at + 10)
+        noteRefreshSucceeded(store?.refreshKey, { at: at + 10 })
+        return true
+      })
+      try {
+        const response = await app.fetch(new Request("http://localhost/v1/messages", {
+          method: "POST", headers: { "Content-Type": "application/json", "x-meridian-profile": id },
+          body: JSON.stringify({ model: "claude-opus-5-5", stream, max_tokens: 16, messages: [{ role: "user", content: "fixture" }] }),
+        }))
+        await response.text()
+
+        expect(authLifecycleFor(createPlatformCredentialStore({ claudeConfigDir: dir }).refreshKey)?.unauthedReason).toBe("api_rejected")
+        expect(refresh).toHaveBeenCalledTimes(1)
+      } finally {
+        refresh.mockRestore()
+        queryError = undefined
+        setSystemTime()
+      }
+    })
+
+    test.skipIf(process.platform === "darwin")(`a terminal ${stream ? "streaming" : "non-streaming"} OAuth refusal overrides later local checks`, async () => {
+      const now = Date.now()
+      const id = `api-rejected-${stream}`
+      const dir = profileDir(id, { accessToken: "still-present", expiresAt: now + HOUR, refreshTokenExpiresAt: now + HOUR })
+      const { app } = createProxyServer({ port: 0, host: "127.0.0.1", profiles: [{ id, claudeConfigDir: dir }] })
+      queryError = "Failed to authenticate: OAuth session expired"
+      try {
+        const response = await app.fetch(new Request("http://localhost/v1/messages", {
+          method: "POST", headers: { "Content-Type": "application/json", "x-meridian-profile": id },
+          body: JSON.stringify({ model: "claude-opus-4-7", stream, max_tokens: 16, messages: [{ role: "user", content: "fixture" }] }),
+        }))
+        await response.text()
+
+        const listed = await (await app.fetch(new Request("http://localhost/profiles/list"))).json()
+
+        expect(listed).toMatchObject({ profiles: [{ loggedIn: false, unauthedReason: "api_rejected" }] })
+      } finally {
+        queryError = undefined
+      }
+    })
+  }
+
+  test.skipIf(process.platform === "darwin")("a rejected grant outranks a positive local check and blocks switching", async () => {
+    const now = Date.now()
+    const dir = profileDir("rejected", { accessToken: "still-present", refreshToken: "rejected-refresh", expiresAt: now + HOUR, refreshTokenExpiresAt: now - HOUR })
+    const store = createPlatformCredentialStore({ claudeConfigDir: dir })
+    noteRefreshRejected(store.refreshKey, { at: now, detail: "invalid_grant" })
+    const { app } = createProxyServer({ port: 0, host: "127.0.0.1", profiles: [{ id: "rejected", claudeConfigDir: dir }] })
+
+    const listed = await (await app.fetch(new Request("http://localhost/profiles/list"))).json()
+
+    expect(listed).toMatchObject({ profiles: [{ loggedIn: false, firstUnauthedAt: now, unauthedReason: "refresh_rejected" }] })
+    const activation = await app.fetch(new Request("http://localhost/profiles/active", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ profile: "rejected" }),
+    }))
+    expect(activation.status).toBe(409)
+    expect(await activation.json()).toMatchObject({ code: "needs_login" })
+  })
+
   test.skipIf(process.platform === "darwin")("reports the deadline, and a wiped credential as logged out", async () => {
     const now = Date.now()
     const deadline = now + 2 * 24 * HOUR

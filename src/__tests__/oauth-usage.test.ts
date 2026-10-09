@@ -8,9 +8,10 @@
  * token-refresh.test.ts and other tests that swap globalThis.fetch.
  */
 
-import { describe, expect, test, beforeEach } from "bun:test"
+import { describe, expect, test, beforeEach, setSystemTime, spyOn } from "bun:test"
 import { fetchOAuthUsage, fetchOAuthUsageResult, resetOAuthUsageCache, toUsageEntry } from "../proxy/oauthUsage"
 import type { CredentialStore } from "../proxy/tokenRefresh"
+import { authLifecycleFor } from "../proxy/authLifecycle"
 
 const SAMPLE_RESPONSE = {
   five_hour: { utilization: 36.0, resets_at: "2026-04-26T22:30:00.221857+00:00" },
@@ -445,6 +446,60 @@ describe("oauthUsage", () => {
  * an account that had lost its credentials.
  */
 describe("fetchOAuthUsageResult", () => {
+  test("a retry's 401 rejects the newly refreshed token rather than the older attempt", async () => {
+    const key = `usage-new-token-refused:${process.pid}:${crypto.randomUUID()}`
+    const at = Date.now()
+    setSystemTime(at)
+    let accessToken = "synthetic-old"
+    const store: CredentialStore = {
+      refreshKey: key,
+      read: async () => ({ claudeAiOauth: { accessToken, refreshToken: "synthetic-refresh", expiresAt: at + 60_000,
+        subscriptionType: "max", rateLimitTier: "default_claude_max_20x" } }),
+      write: async credentials => { accessToken = credentials.claudeAiOauth.accessToken; return true },
+    }
+    const refresh = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async () => {
+      setSystemTime(at + 10)
+      return Response.json({ access_token: "synthetic-new", refresh_token: "synthetic-rotated", expires_in: 3600 })
+    }, { preconnect: globalThis.fetch.preconnect }))
+    const { fetchImpl, getCalls } = countingFetch(() => new Response("{}", { status: 401 }))
+    try {
+      await fetchOAuthUsageResult({ force: true, store, profileId: key, fetchImpl })
+
+      expect(getCalls()).toBe(2)
+      expect(authLifecycleFor(key)?.unauthedReason).toBe("api_rejected")
+    } finally {
+      refresh.mockRestore()
+      setSystemTime()
+    }
+  })
+
+  test("a terminal usage 401 records auth refusal even while older usage figures remain visible", async () => {
+    const key = `usage-rejected:${process.pid}:${crypto.randomUUID()}`
+    const store: CredentialStore = {
+      refreshKey: key,
+      read: async () => ({ claudeAiOauth: { accessToken: "synthetic", refreshToken: "", expiresAt: Date.now() + 60_000 } }),
+      write: async () => false,
+    }
+    const { fetchImpl } = countingFetch(calls => calls === 1
+      ? Response.json(SAMPLE_RESPONSE)
+      : new Response("{}", { status: 401 }))
+    await fetchOAuthUsageResult({ force: true, store, profileId: key, fetchImpl })
+
+    const refused = await fetchOAuthUsageResult({ force: true, store, profileId: key, fetchImpl })
+
+    expect(refused.snapshot?.stale).toBe(true)
+    expect(authLifecycleFor(key)?.unauthedReason).toBe("api_rejected")
+  })
+
+  test("a usage 429 does not create logout evidence", async () => {
+    const key = `usage-rate-limited:${process.pid}:${crypto.randomUUID()}`
+    const store = { ...makeStore("synthetic"), refreshKey: key }
+
+    await fetchOAuthUsageResult({ force: true, store, profileId: key, fetchImpl: fixedFetch(() => new Response("{}", { status: 429 })) })
+
+    expect(authLifecycleFor(key)?.firstUnauthedAt).toBeUndefined()
+  })
+
   beforeEach(() => {
     resetOAuthUsageCache()
   })

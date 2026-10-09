@@ -16,10 +16,11 @@
  * of the exclusions (settings, injected), the usage reading (injected), and
  * any credential - nothing here sees a token.
  */
-import { noteCredentialObserved, type AuthLifecycleRecord } from "../authLifecycle"
+import { authLifecycleFor, noteApiRejected, noteCredentialObserved, noteProviderAccepted, type AuthLifecycleRecord } from "../authLifecycle"
 import type { CodexUsageResponse } from "../codex/types"
 import type { LimitDiagnosis } from "../limitDetection"
 import type { SpentRecord } from "../profileHealth"
+import { profileLoginState } from "../profileLoginState"
 import {
   CHATGPT_PROFILE_TYPE,
   chatGptOwner,
@@ -119,7 +120,7 @@ function seatSignIn(
 
 export type ChatGptActivation =
   | { ok: true; profile: ChatGptProfile }
-  | { ok: false; status: 400 | 409; error: string }
+  | { ok: false; status: 400 | 409; error: string; code?: "needs_login" }
 
 export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
   const planTypes = (): Map<string, string | null> => new Map(
@@ -133,6 +134,26 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
     aliases: deps.aliases?.(),
   })
 
+  const loginFor = (profile: ChatGptProfile) => {
+    const reading = deps.usage()?.entries.find(entry => entry.id === profile.seat)
+    const key = chatGptAuthLifecycleKey(profile.seat)
+    const prior = authLifecycleFor(key)
+    const failureAt = reading?.failure?.lastFailureAt
+    let error = reading?.error
+    if (error === "unauthorized" && failureAt) {
+      if (Math.max(prior?.authObtainedAt ?? 0, prior?.lastRefreshAt ?? 0, prior?.lastAcceptedAt ?? 0) > failureAt) error = null
+      else noteApiRejected(key, { startedAt: failureAt, at: failureAt })
+    }
+    if (reading?.fetchedAt && !reading.error && !reading.stale && !reading.failure) {
+      noteProviderAccepted(key, { startedAt: reading.fetchedAt })
+    }
+    const tokenState = chatGptTokenState(profile.unavailable, error)
+    const presence = seatLoginPresence(tokenState)
+    const lifecycle = noteCredentialObserved(key, { presence })
+    const state = profileLoginState({ loggedIn: tokenState === "ok" ? true : tokenState === "refused" ? false : undefined, presence, firstUnauthedAt: lifecycle?.firstUnauthedAt })
+    return { tokenState, lifecycle, state }
+  }
+
   /** Seats in the saved order, or undefined while the order names none of them. */
   const savedSeatOrder = (list: readonly ChatGptProfile[]): string[] | undefined => {
     const seats: string[] = []
@@ -145,6 +166,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
 
   const excludedSeats = (list: readonly ChatGptProfile[]): Set<string> => {
     const seats = new Set<string>()
+    for (const profile of list) if (loginFor(profile).state === "needs_login") seats.add(profile.seat)
     for (const id of deps.excluded()) {
       const profile = findChatGptProfile(list, id)
       if (profile) seats.add(profile.seat)
@@ -197,6 +219,10 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
   return {
     profiles,
     resolve: (idOrSeat: string | null | undefined) => findChatGptProfile(profiles(), idOrSeat),
+    loginState(idOrSeat: string) {
+      const profile = findChatGptProfile(profiles(), idOrSeat)
+      return profile ? loginFor(profile).state : "unverified"
+    },
     activeProfileId: (): string | null => active(profiles())?.id ?? null,
 
     /** Validate a switch; the caller persists `profile.seat` and logs it. */
@@ -204,6 +230,9 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
       const list = profiles()
       const profile = findChatGptProfile(list, idOrSeat)
       if (!profile) return { ok: false, status: 400, error: `Unknown profile: ${idOrSeat}` }
+      if (loginFor(profile).state === "needs_login") {
+        return { ok: false, status: 409, code: "needs_login", error: `Profile "${profile.id}" needs a login before it can be activated` }
+      }
       if (excludedSeats(list).has(profile.seat)) {
         return { ok: false, status: 409, error: `Profile "${profile.id}" is excluded from work routing` }
       }
@@ -279,8 +308,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
       const usageById = new Map((usage?.entries ?? []).map(entry => [entry.id, entry]))
       return list.map(profile => {
         const reading = usageById.get(profile.seat)
-        const tokenState = chatGptTokenState(profile.unavailable, reading?.error)
-        const lifecycle = noteCredentialObserved(chatGptAuthLifecycleKey(profile.seat), { presence: seatLoginPresence(tokenState) })
+        const { tokenState, lifecycle, state } = loginFor(profile)
         const signIn = seatSignIn(lifecycle, profile)
         const owner = chatGptOwner(deps.source.mode, profile.storeIndex)
         const ahead = profile.id === activeId ? paidAhead(list, profile) : []
@@ -310,7 +338,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           freeSeatDeferred: ahead.length > 0
             ? { servedFirstBy: ahead.map(other => other.id), freeSeatOrder }
             : null,
-          loggedIn: tokenState === "ok",
+          loggedIn: state === "authenticated",
           tokenState,
           unavailable: profile.unavailable,
           resets: chatGptResetsView(reading?.resetCredits),

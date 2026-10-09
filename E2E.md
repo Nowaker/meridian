@@ -747,6 +747,26 @@ Gemini 3.8 Flash low, macOS arm64, Node 22.22.3).
 Focused tests cover withheld delivery, broken/truncated streams,
 oversize cancellation, caller abort, and HTTP/nonstreaming pass-through.
 
+## Authoritative profile login state
+
+```sh
+bun scripts/e2e-profile-login-state.mjs --real-cli
+E2E_PORT=42147 bun scripts/e2e-profile-login-state.mjs --serve
+```
+
+The headless fixture uses real child processes, credential stores and HTTP
+routes. It verifies that an explicit CLI logout and recorded refresh rejection
+outrank local credential presence, for both Claude and ChatGPT, that activation
+returns `409` with `code: "needs_login"`, and that a new login restores activation.
+`--real-cli` separately verifies the installed Claude CLI's negative answer
+against an owned empty directory. No customer credential or active pointer is
+modified; inference and external HTTP calls are blocked. `--serve` retains the
+negative fixtures for checking `/` and `/profiles` in a browser. Stop with ^C.
+
+The incident investigation found that a quota-read 429 is not a logout signal.
+The fixture measures the local reconciliation read; it does not enable another
+upstream probe or change inactive-profile polling cadence.
+
 ## Quick Start
 
 ```bash

@@ -47,6 +47,7 @@ export type UnauthedReason =
   /** The credential on disk no longer carries an access token — what Claude
    *  Code leaves behind after it is refused. */
   | "credentials_cleared"
+  | "api_rejected"
 
 export type AuthLifecycleEventKind =
   /** Meridian completed an interactive login. */
@@ -80,6 +81,7 @@ export interface AuthLifecycleRecord {
   authObtainedVia?: "login" | "observed"
   /** Last successful token refresh. */
   lastRefreshAt?: number
+  lastAcceptedAt?: number
   /** Last login deadline seen. Kept after Claude Code wipes the credential, so a
    *  drop can be compared with the deadline it fell on. */
   refreshTokenExpiresAt?: number
@@ -103,7 +105,7 @@ function finiteTime(value: unknown): number | undefined {
 }
 
 const EVENT_KINDS: ReadonlySet<string> = new Set(["login", "new_grant", "deadline_moved", "logged_out", "recovered"])
-const REASONS: ReadonlySet<string> = new Set(["refresh_rejected", "credentials_cleared"])
+const REASONS: ReadonlySet<string> = new Set(["refresh_rejected", "credentials_cleared", "api_rejected"])
 
 function readEvent(raw: unknown): AuthLifecycleEvent | null {
   if (typeof raw !== "object" || raw === null) return null
@@ -137,6 +139,8 @@ export function readAuthLifecycles(raw: unknown): Record<string, AuthLifecycleRe
     if (r.authObtainedVia === "login" || r.authObtainedVia === "observed") record.authObtainedVia = r.authObtainedVia
     const refreshed = finiteTime(r.lastRefreshAt)
     if (refreshed) record.lastRefreshAt = refreshed
+    const accepted = finiteTime(r.lastAcceptedAt)
+    if (accepted) record.lastAcceptedAt = accepted
     const deadline = finiteTime(r.refreshTokenExpiresAt)
     if (deadline) record.refreshTokenExpiresAt = deadline
     const unauthed = finiteTime(r.firstUnauthedAt)
@@ -245,15 +249,38 @@ export function applyRefreshRejected(
   input: { at: number; detail?: string },
 ): AuthLifecycleUpdate {
   const base = prev ?? emptyRecord()
-  if (base.firstUnauthedAt) return { record: base, events: [], changed: false }
+  if (base.firstUnauthedAt && base.unauthedReason === "refresh_rejected") return { record: base, events: [], changed: false }
   return markLoggedOut(base, input.at, "refresh_rejected", input.detail)
+}
+
+export function applyApiRejected(
+  prev: AuthLifecycleRecord | undefined,
+  input: { at: number; startedAt: number },
+): AuthLifecycleUpdate {
+  const base = prev ?? emptyRecord()
+  if (base.firstUnauthedAt || Math.max(base.authObtainedAt ?? 0, base.lastRefreshAt ?? 0, base.lastAcceptedAt ?? 0) > input.startedAt) {
+    return { record: base, events: [], changed: false }
+  }
+  return markLoggedOut(base, input.at, "api_rejected")
+}
+
+export function applyProviderAccepted(
+  prev: AuthLifecycleRecord | undefined,
+  input: { at: number; startedAt: number },
+): AuthLifecycleUpdate {
+  const base = prev ?? emptyRecord()
+  if (base.unauthedReason !== "api_rejected" || input.startedAt <= (base.firstUnauthedAt ?? 0)) {
+    return { record: base, events: [], changed: false }
+  }
+  const event: AuthLifecycleEvent = { at: input.at, kind: "recovered" }
+  return { record: withEvents({ ...markLoggedIn(base), lastAcceptedAt: input.startedAt }, [event]), events: [event], changed: true }
 }
 
 function markLoggedOut(record: AuthLifecycleRecord, at: number, reason: UnauthedReason, detail?: string): AuthLifecycleUpdate {
   const event: AuthLifecycleEvent = { at, kind: "logged_out", reason }
   if (record.refreshTokenExpiresAt) event.refreshTokenExpiresAt = record.refreshTokenExpiresAt
   if (detail) event.detail = detail
-  const next = withEvents({ ...record, firstUnauthedAt: at, unauthedReason: reason }, [event])
+  const next = withEvents({ ...record, firstUnauthedAt: record.firstUnauthedAt ?? at, unauthedReason: reason }, [event])
   return { record: next, events: [event], changed: true }
 }
 
@@ -327,6 +354,7 @@ export function describeAuthLifecycleEvent(event: AuthLifecycleEvent, record: Au
     case "logged_out": {
       const why = event.reason === "credentials_cleared"
         ? "the credential was wiped"
+        : event.reason === "api_rejected" ? "upstream refused authentication after recovery"
         : `the refresh was refused${event.detail ? ` (${event.detail})` : ""}`
       const parts = [`logged out: ${why}`]
       parts.push(deadline
@@ -422,6 +450,14 @@ export function noteRefreshSucceeded(key: string | undefined, input: { refreshTo
 
 export function noteRefreshRejected(key: string | undefined, input: { detail?: string; at?: number } = {}): void {
   update(key, prev => applyRefreshRejected(prev, { at: input.at ?? Date.now(), detail: input.detail }))
+}
+
+export function noteApiRejected(key: string | undefined, input: { startedAt: number; at?: number }): void {
+  update(key, prev => applyApiRejected(prev, { at: input.at ?? Date.now(), startedAt: input.startedAt }))
+}
+
+export function noteProviderAccepted(key: string | undefined, input: { startedAt: number; at?: number }): void {
+  update(key, prev => applyProviderAccepted(prev, { at: input.at ?? Date.now(), startedAt: input.startedAt }))
 }
 
 /** Returns the record as it stands after the observation. */

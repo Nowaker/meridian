@@ -16,10 +16,12 @@
  *
  * Every token here is synthetic and every identifier is invented.
  */
-import { describe, test, expect, beforeEach, afterEach } from "bun:test"
+import { describe, test, expect, beforeEach, afterEach, setSystemTime } from "bun:test"
 import { getCodexUsage, resetCodexUsageCache } from "../proxy/codex/service"
 import type { CodexPoolAccount, CodexPoolResult } from "../proxy/codex/pool"
 import type { CodexUsageEntry, CodexUsageResponse } from "../proxy/codex/types"
+import { authLifecycleFor } from "../proxy/authLifecycle"
+import { chatGptAuthLifecycleKey } from "../proxy/chatgpt/refresh"
 
 const NOW = 1_800_000_000_000
 const NOW_SECONDS = Math.floor(NOW / 1000)
@@ -134,6 +136,25 @@ function entryFor(result: CodexUsageResponse, account: CodexPoolAccount): CodexU
 }
 
 describe("codex usage service", () => {
+  test("actual unauthorized usage records refusal before projection and newer acceptance recovers it", async () => {
+    const account = poolAccount(7, { accountId: crypto.randomUUID() })
+    const key = account.accountUserId ? chatGptAuthLifecycleKey(account.accountUserId) : undefined
+    const refused = stubFetch(() => ({ status: 401 }))
+    setSystemTime(NOW)
+    try {
+      await getCodexUsage({ settings: {}, loadPool: pool([account]), fetchImpl: refused.impl, now: NOW })
+
+      expect(authLifecycleFor(key)?.unauthedReason).toBe("api_rejected")
+      resetCodexUsageCache()
+      setSystemTime(NOW + 1000)
+      const accepted = stubFetch(serveAll([account]))
+      await getCodexUsage({ settings: {}, loadPool: pool([account]), fetchImpl: accepted.impl, now: NOW + 1000 })
+      expect(authLifecycleFor(key)?.firstUnauthedAt).toBeUndefined()
+    } finally {
+      setSystemTime()
+    }
+  })
+
   beforeEach(() => resetCodexUsageCache())
   afterEach(() => resetCodexUsageCache())
 

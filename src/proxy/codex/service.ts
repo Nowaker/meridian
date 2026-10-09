@@ -28,6 +28,8 @@ import { codexAccountIdentity, readCodexPool, type CodexPoolAccount, type CodexP
 import { describeCodexPlan } from "./plan"
 import { decodeCodexToken, type CodexTokenClaims } from "./token"
 import { fetchCodexAccountUsage, fetchCodexWorkspaceNames, type CodexAccountUsage, type CodexUsageOutcome } from "./usage"
+import { noteApiRejected, noteProviderAccepted } from "../authLifecycle"
+import { chatGptAuthLifecycleKey } from "../chatgpt/refresh"
 import type { CodexPlan, CodexUsageEntry, CodexUsageError, CodexUsageFailure, CodexUsageResponse } from "./types"
 
 const SUCCESS_TTL_MS = 30_000
@@ -195,6 +197,9 @@ async function obtainUsage(
     },
     { fetchImpl, now },
   )).then((outcome) => {
+    const authKey = account.accountUserId ? chatGptAuthLifecycleKey(account.accountUserId) : undefined
+    if (outcome.error === "unauthorized") noteApiRejected(authKey, { startedAt: now })
+    else if (outcome.usage) noteProviderAccepted(authKey, { startedAt: now })
     if (outcome.error) {
       const cooldown = cooldownFor(outcome.error)
       if (cooldown !== null) heldOffUntil.set(key, { until: now + cooldown, error: outcome.error })

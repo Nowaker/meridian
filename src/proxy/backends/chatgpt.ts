@@ -31,6 +31,8 @@ import { adaptResponsesBody, type BodyAdaptation } from "../chatgpt/body"
 import { buildCodexRequest } from "../chatgpt/request"
 import { isModelRefusal, sniffChatGptFailure, type ChatGptFailureKind } from "../chatgpt/stream"
 import { aggregateResponsesStream, tapResponsesStream, type ChatGptUsage, type TapSummary } from "../chatgpt/tap"
+import { noteApiRejected, noteProviderAccepted } from "../authLifecycle"
+import { chatGptAuthLifecycleKey } from "../chatgpt/refresh"
 import { chatGptCooldownUntil, chatGptCreditsFromHeaders, chatGptRateLimitFromHeaders, creditsCanServe, type ChatGptRateLimit } from "../chatgpt/windows"
 import type { CodexCredits, CodexUsageWindow } from "../codex/types"
 import type { ChatGptCreditsPolicy, ChatGptFreeSeatOrder } from "../chatgpt/features"
@@ -495,6 +497,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
         // read: look once more before giving up on the seat.
         if (!credential.ok && credential.reason === "expired") credential = await source.credentials(seat, { model, reread: true, spendCredits: onCredits })
         if (!credential.ok) { reasons.add(credential.reason); continue }
+        let authAttemptStartedAt = now()
         dispatched.add(seat)
 
         let retriedAuth = false
@@ -537,6 +540,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
           }
 
           if (!sniffed.failure) {
+            noteProviderAccepted(chatGptAuthLifecycleKey(seat), { startedAt: authAttemptStartedAt })
             const until = chatGptCooldownUntil(rateLimit, now())
             if (until !== null) exhaustion.mark(seat, until, "quota_spent")
             if (cacheKey) affinity.set(cacheKey, { profileId: seat, requestId: undefined })
@@ -571,6 +575,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
             if (fresh.ok && fresh.account.accessToken !== credential.account.accessToken) {
               void sniffed.body.cancel().catch(() => {})
               credential = fresh
+              authAttemptStartedAt = now()
               retriedAuth = true
               continue
             }
@@ -580,6 +585,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
             requestId, seat, kind: failureKind, status: upstream.status,
             until: bench(seat, failureKind, rateLimit), rateLimit,
           }
+          if (failureKind === "requires_reauth") noteApiRejected(chatGptAuthLifecycleKey(seat), { startedAt: authAttemptStartedAt })
           refusals.push(refusal)
           if (onCredits) reserveRefusedUntil.set(reserveKey(seat, model), refusal.until)
           hooks?.onSeatRefused?.(refusal)

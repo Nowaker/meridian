@@ -92,7 +92,8 @@ import { detectSupervision } from "./supervision"
 import type { RequestMetric } from "../telemetry"
 import { canRecoverCapturedToolUses, canRecoverUncapturedToolUses, isStreamedToolBlockComplete, unavailableToolResults, type StreamedToolBlockRecord, classifyError, extractSdkTermination, formatSdkTermination, classifyResumeRefusal, isRateLimitError, isExtraUsageRequiredError, isExpiredTokenError, isAccountFailoverError, isQuotaRefusal, isOutputTokenCapExceeded } from "./errors"
 import { refreshOAuthToken, ensureFreshToken, startBackgroundRefresh, stopBackgroundRefresh, createPlatformCredentialStore, getAuthRenewalStatus, getStoredPlanFields, readStoredCredentialSnapshot, renewalStatusFor, resolveRenewalWarnDays, type AuthRenewalStatus, type CredentialStore, type StoredPlanFields } from "./tokenRefresh"
-import { describeAuthLifecycleEvent, noteCredentialObserved, onAuthLifecycleTransition, type AuthLifecycleTransition } from "./authLifecycle"
+import { describeAuthLifecycleEvent, noteCredentialObserved, noteProviderAccepted, onAuthLifecycleTransition, type AuthLifecycleTransition } from "./authLifecycle"
+import { noteClaudeAuthenticationFailure, profileLoginState, reconcileClaudeProfileAuth } from "./profileLoginState"
 import { planAllowance } from "./planAllowance"
 import { isCredentialsReadOnly, logCredentialsModeBanner } from "./credentialsMode"
 import {
@@ -1200,11 +1201,17 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // Read outside the idle guard, never between it and the query: the guard
       // tears its source down without awaiting it, and a generator in between
       // would hold that teardown behind a pull that may never settle.
-      yield* withReachability(
+      for await (const message of withReachability(
         guardUpstreamIdle(sdkQuery, UPSTREAM_IDLE_MS, (sinceLastMs) =>
           claudeLog("upstream.stalled", { mode, sinceLastMs }), undefined, logLateIdleDeadline(mode)),
         claudeReachability,
-      )
+      )) {
+        if (message.type === "result" && !message.is_error && !params.options?.env?.ANTHROPIC_API_KEY && !params.options?.env?.CLAUDE_CODE_OAUTH_TOKEN) {
+          const store = createPlatformCredentialStore({ claudeConfigDir: params.options?.env?.CLAUDE_CONFIG_DIR })
+          noteProviderAccepted(store.refreshKey, { startedAt })
+        }
+        yield message
+      }
     } finally {
       try {
         // Production Query objects expose close(); test doubles and older SDK
@@ -7256,6 +7263,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               } else {
                 streamErr = classifyError(errMsg, model)
               }
+              await noteClaudeAuthenticationFailure(profile, { message: errMsg, startedAt: requestMeta.currentSdkStartedAt ?? requestStartAt })
               claudeLog("proxy.anthropic.error", { error: errMsg, classified: streamErr.type })
 
               // This is where a spent account is actually discovered. The
@@ -8049,6 +8057,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             ? error.verdict
             : classifyError(errMsg)
 
+        if (resolvedProfileId && !requestAbort.controller.signal.aborted) {
+          await noteClaudeAuthenticationFailure(resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, resolvedProfileId), { message: errMsg, startedAt: requestMeta.currentSdkStartedAt ?? requestStartAt })
+        }
+
         // Non-streaming failures still own their headers here, so the hint goes
         // out as a real `Retry-After` (#901). `resolvedProfileId` is undefined
         // when the request died before profile resolution, which just means the
@@ -8765,8 +8777,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // no seat identity and no credential field.
   const chatGptSeatHealth = (source: NonNullable<typeof chatGptSource>) => {
     const seats = source.seats()
+    const loginStates = new Map(seats.map(seat => [seat.id, chatGptProfiles?.loginState(seat.id)]))
+    const eligible = seats.filter(seat => seat.eligible && loginStates.get(seat.id) !== "needs_login")
     const unavailable: Record<string, number> = {}
-    for (const seat of seats) if (seat.reason) unavailable[seat.reason] = (unavailable[seat.reason] ?? 0) + 1
+    for (const seat of seats) {
+      const reason = seat.reason ?? (loginStates.get(seat.id) === "needs_login" ? "requires_reauth" : null)
+      if (reason) unavailable[reason] = (unavailable[reason] ?? 0) + 1
+    }
     const benched = chatGptExhaustion.snapshot()
     const benchedIds = new Set(benched.map(mark => mark.id))
     const planTiers = { paid: 0, free: 0, unknown: 0 }
@@ -8777,8 +8794,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       mode: source.mode,
       serving: source.isServing(),
       accounts: seats.length,
-      eligible: seats.filter(seat => seat.eligible).length,
-      ready: seats.filter(seat => seat.eligible && !benchedIds.has(seat.id)).length,
+      eligible: eligible.length,
+      ready: eligible.filter(seat => !benchedIds.has(seat.id)).length,
       unavailable,
       planTiers,
       activePlanTier: profiles.find(profile => profile.id === activeId)?.planTier ?? null,
@@ -9556,10 +9573,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // Use active profile's auth context for health check
       const healthProfile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile)
       const profileEnvOverrides = Object.keys(healthProfile.env).length > 0 ? healthProfile.env : undefined
-      const auth = await getInstanceAuthStatus(
+      const healthStore = healthProfile.type === "claude-max"
+        ? createPlatformCredentialStore(profileEnvOverrides?.CLAUDE_CONFIG_DIR ? { claudeConfigDir: profileEnvOverrides.CLAUDE_CONFIG_DIR } : undefined)
+        : undefined
+      const auth = await reconcileClaudeProfileAuth(await getInstanceAuthStatus(
           healthProfile.id !== "default" ? healthProfile.id : undefined,
           profileEnvOverrides
-        )
+        ), healthProfile, healthStore)
       if (!servesClaude(auth)) return replyHealth(c, null, 200)
       if (!auth) {
         return replyHealth(c, {
@@ -9597,15 +9617,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // `renewalRequiredSoon`. Best-effort: a credential-store hiccup must not
       // turn a healthy proxy into a degraded one.
       const warnDays = resolveRenewalWarnDays(process.env.MERIDIAN_AUTH_RENEWAL_WARN_DAYS)
-      // Read the *profile's* credential store, not the default one — profiles
-      // are separate auth contexts keyed by CLAUDE_CONFIG_DIR, so the default
-      // store would report an unrelated account's expiry.
-      const renewalConfigDir = profileEnvOverrides?.CLAUDE_CONFIG_DIR
-      // API keys and supplied setup tokens do not authenticate with this
-      // store. Falling back to it would report another account's plan/expiry.
-      const healthStore = healthProfile.type === "claude-max"
-        ? createPlatformCredentialStore(renewalConfigDir ? { claudeConfigDir: renewalConfigDir } : undefined)
-        : undefined
       const renewal = healthStore
         ? await getAuthRenewalStatus(healthStore, warnDays).catch(() => ({ renewalRequiredSoon: false }))
         : { renewalRequiredSoon: false }
@@ -9762,7 +9773,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         planLabel: allowance.label,
         accountType: allowance.accountType,
         planName: allowance.planName,
-        loggedIn: presence === "absent" ? false : (auth?.loggedIn ?? false),
+        loggedIn: profileLoginState({ loggedIn: auth?.loggedIn, presence, firstUnauthedAt: lifecycle?.firstUnauthedAt }) === "authenticated",
         lastCheckedAt: cacheInfo.lastCheckedAt || null,
         lastSuccessAt: cacheInfo.lastSuccessAt || null,
         // Additive: which reading the three fields above came from. A failed
@@ -9878,6 +9889,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       if (typeof requested === "string" && chatGptProfiles.resolve(requested)) {
         const activation = chatGptProfiles.activate(requested)
         if (!activation.ok) {
+          if (activation.code === "needs_login") return c.json({ error: activation.error, code: activation.code }, 409)
           return activation.status === 409
             ? profileExcludedResponse(chatGptProfiles.resolve(requested)!.id)
             : c.json({ error: activation.error }, 400)
@@ -9928,6 +9940,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     }
     if (routingExcludedProfileIds().includes(body.profile)) {
       return profileExcludedResponse(body.profile)
+    }
+    const target = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, body.profile)
+    const auth = await reconcileClaudeProfileAuth(await getInstanceAuthStatus(target.id, target.env), target)
+    if (auth?.loggedIn === false) {
+      return c.json({ error: `Profile "${target.id}" needs a login before it can be activated`, code: "needs_login" }, 409)
     }
     const previousProfile = getActiveProfileId() ?? null
     setActiveProfile(body.profile!)

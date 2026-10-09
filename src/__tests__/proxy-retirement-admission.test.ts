@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
@@ -36,6 +36,7 @@ installSdkMock(() => ({
 installLoggerMock(() => ({ claudeLog: () => {}, withClaudeLogContext: (_ctx, fn) => fn() }))
 installMcpToolsMock(() => ({ createOpencodeMcpServer: () => ({ type: "sdk", name: "opencode", instance: {} }) }))
 
+const models = await import("../proxy/models")
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 const { resetActiveProfile } = await import("../proxy/profiles")
 const { readSessionGcSnapshot } = await import("../proxy/sessionLifecycle")
@@ -44,6 +45,7 @@ const { commitRawSession } = await import("./storeDatabaseHelpers")
 
 let root: string
 let proxy: ReturnType<typeof createProxyServer> | undefined
+let restoreAuth: (() => void) | undefined
 const savedEnv: Record<string, string | undefined> = {}
 const overrides = {
   MERIDIAN_SESSION_GC_MAX_PENDING: "2",
@@ -53,6 +55,8 @@ const overrides = {
 }
 
 beforeEach(async () => {
+  const auth = spyOn(models, "getClaudeAuthStatusAsync").mockImplementation(async () => ({ loggedIn: true }))
+  restoreAuth = () => auth.mockRestore()
   root = realpathSync(mkdtempSync(join(tmpdir(), "meridian-retirement-http-")))
   for (const key of [...Object.keys(overrides), "MERIDIAN_WORKDIR", "MERIDIAN_CONFIG_DIR", "MERIDIAN_SESSION_PROFILE_COPY_PRUNE", "MERIDIAN_SESSION_PROFILE_COPY_GRACE_MS", "CLAUDE_PROXY_SESSION_PROFILE_COPY_PRUNE"]) savedEnv[key] = process.env[key]
   Object.assign(process.env, overrides, { MERIDIAN_WORKDIR: root, MERIDIAN_CONFIG_DIR: join(root, "config") })
@@ -68,6 +72,8 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  restoreAuth?.()
+  restoreAuth = undefined
   await proxy?.sweepSessionGc?.()
   proxy = undefined
   await clearSessionCache()

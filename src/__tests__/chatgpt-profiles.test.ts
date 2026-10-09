@@ -23,6 +23,8 @@ import {
 import { chatGptRefusalDiagnosis, chatGptWarmBody, createChatGptProfileSurface } from "../proxy/chatgpt/profileSurface"
 import type { ChatGptCredentialSource, ChatGptSeatView } from "../proxy/chatgpt/source"
 import type { CodexUsageEntry } from "../proxy/codex/types"
+import { noteRefreshRejected } from "../proxy/authLifecycle"
+import { chatGptAuthLifecycleKey } from "../proxy/chatgpt/refresh"
 
 const NOW = 1_800_000_000_000
 const seat = (id: string, email: string | null, extra: Partial<ChatGptSeatView> = {}): ChatGptSeatView => ({
@@ -152,6 +154,48 @@ describe("profile surface routing", () => {
   const surface = (activeSeat?: string, excluded: string[] = []) => createChatGptProfileSurface({
     source, observed: () => new Map(), usage: () => null, reserved: () => new Set(), names: () => undefined,
     activeSeat: () => activeSeat, excluded: () => excluded, spent: () => undefined,
+  })
+
+  it("keeps a rejected ChatGPT login out of the list and activation candidates", () => {
+    const id = `login-rejected-${process.pid}__ws-aaaaaa`
+    const s = createChatGptProfileSurface({
+      source: { ...source, seats: () => [seat(id, "rejected@example.invalid")] },
+      observed: () => new Map(), usage: () => null, reserved: () => new Set(), names: () => undefined,
+      activeSeat: () => undefined, excluded: () => [], spent: () => undefined,
+    })
+    noteRefreshRejected(chatGptAuthLifecycleKey(id), { at: NOW, detail: "rejected" })
+
+    const entry = s.listEntries()[0]
+
+    expect(entry?.loggedIn).toBe(false)
+    expect(s.activate(id)).toMatchObject({ ok: false, status: 409, code: "needs_login" })
+  })
+
+  it("keeps unauthorized usage out of activation and routing through a later transient failure", () => {
+    const id = `usage-unauthorized-${process.pid}__ws-bbbbbb`
+    const at = Date.now()
+    let reading: CodexUsageEntry = {
+      id, type: "codex", identity: id, email: null, plan: null, workspaceName: null, resetCredits: null, credits: null,
+      windows: [], stale: false, error: "unauthorized", fetchedAt: null,
+      failure: { reason: "unauthorized", consecutiveFailures: 1, lastFailureAt: at },
+    }
+    const s = createChatGptProfileSurface({
+      source: { ...source, seats: () => [seat(id, "refused@example.invalid")] },
+      observed: () => new Map(), usage: () => ({ entries: [reading], error: null, asOf: at }),
+      reserved: () => new Set(), names: () => undefined, activeSeat: () => undefined, excluded: () => [], spent: () => undefined,
+    })
+
+    expect(s.listEntries()[0]?.loggedIn).toBe(false)
+    expect(s.activate(id)).toMatchObject({ ok: false, status: 409, code: "needs_login" })
+    const refusedRoute = s.route(undefined, "work")
+    expect(refusedRoute.kind === "pool" && refusedRoute.excluded.has(id)).toBe(true)
+    reading = { ...reading, error: "rate_limited", failure: { reason: "rate_limited", consecutiveFailures: 2, lastFailureAt: at + 1 } }
+    expect(s.activate(id)).toMatchObject({ ok: false, code: "needs_login" })
+    reading = { ...reading, error: null, failure: null, fetchedAt: at + 2 }
+    expect(s.listEntries()[0]?.loggedIn).toBe(true)
+    expect(s.activate(id).ok).toBe(true)
+    reading = { ...reading, error: "unauthorized", fetchedAt: null, failure: { reason: "unauthorized", consecutiveFailures: 1, lastFailureAt: at } }
+    expect(s.listEntries()[0]?.loggedIn).toBe(true)
   })
 
   it("defaults to the owner's pick and follows the pointer once set", () => {
