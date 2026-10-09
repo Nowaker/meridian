@@ -554,13 +554,14 @@ async function noteRefreshRefused(
 export async function ensureFreshToken(
   store?: CredentialStore,
   bufferMs = 5 * 60 * 1000,
+  recheckPlan = false,
 ): Promise<boolean> {
   const s = store ?? createPlatformCredentialStore()
   const credentials = await s.read()
   const expiresAt = credentials?.claudeAiOauth?.expiresAt
   if (!expiresAt) return false
   if (expiresAt - Date.now() > bufferMs) {
-    if (!isCredentialsReadOnly()) {
+    if (recheckPlan && !isCredentialsReadOnly()) {
       await runCredentialMaintenance(s, { kind: "plan", run: () => recheckStoredPlan(s) })
     }
     return true

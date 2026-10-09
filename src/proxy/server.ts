@@ -457,12 +457,15 @@ function profileIdsForCredentialKey(config: ProxyConfig, key: string): string[] 
 
 async function ensureFreshTokenForProfiles(config: ProxyConfig): Promise<void> {
   const profiles = getEffectiveProfiles(config.profiles)
-  if (profiles.length === 0) return
+  if (profiles.length === 0) {
+    await ensureFreshToken(undefined, undefined, true)
+    return
+  }
 
   for (const profile of profiles) {
     const resolved = resolveProfile(config.profiles, config.defaultProfile, profile.id)
     const store = credentialStoreForProfile(resolved)
-    if (store) await ensureFreshToken(store).catch(() => {})
+    if (store) await ensureFreshToken(store, undefined, true).catch(() => {})
   }
 }
 

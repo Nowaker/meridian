@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
 import type { CredentialStore, CredentialsFile } from "../proxy/tokenRefresh"
-import { ensureFreshToken, getStoredPlanFields, refreshOAuthToken, resetAuthRenewalCache, resetInflightRefresh } from "../proxy/tokenRefresh"
+import { ensureFreshToken as checkToken, getStoredPlanFields, refreshOAuthToken, resetAuthRenewalCache, resetInflightRefresh } from "../proxy/tokenRefresh"
 import { planAllowance } from "../proxy/planAllowance"
 
 const PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
@@ -8,6 +8,10 @@ const SIX_HOURS = 6 * 60 * 60_000
 const originalFetch = globalThis.fetch
 const originalReadonly = process.env.MERIDIAN_CREDENTIALS_READONLY
 let now = 1_800_000_000_000
+
+function ensureFreshToken(store: CredentialStore): Promise<boolean> {
+  return checkToken(store, undefined, true)
+}
 
 function stubFetch(fn: (...args: Parameters<typeof fetch>) => ReturnType<typeof fetch>): void {
   globalThis.fetch = Object.assign(fn, { preconnect: originalFetch.preconnect })
@@ -54,6 +58,14 @@ afterEach(() => {
 })
 
 describe("periodic plan recheck", () => {
+  it("does not put optional plan lookup on the valid-token foreground path", async () => {
+    const f = fixture({ subscriptionType: "max", rateLimitTier: "default_claude_max_5x" })
+    f.source({ organization_type: "claude_max", rate_limit_tier: "default_claude_max_20x" })
+
+    expect(await checkToken(f.store)).toBe(true)
+
+    expect(f.calls()).toBe(0)
+  })
   it("discovers an upgrade on an undated credential without rotating its valid token", async () => {
     const f = fixture({ subscriptionType: "max", rateLimitTier: "default_claude_max_5x" })
     await getStoredPlanFields(f.store)
