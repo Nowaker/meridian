@@ -46,7 +46,7 @@ export interface OAuthPlanFields {
    * rate-limit tier can size neither kind of Team seat: one because it lies
    * and one because it says nothing. Null on every personal account.
    */
-  seatTier?: string
+  seatTier?: string | null
 }
 
 /**
@@ -79,7 +79,7 @@ export function extractPlanFields(profile: OAuthProfileResponse | null | undefin
   return {
     ...(subscriptionType ? { subscriptionType } : {}),
     ...(rateLimitTier ? { rateLimitTier } : {}),
-    ...(seatTier ? { seatTier } : {}),
+    ...(seatTier || seatTier === null ? { seatTier } : {}),
   }
 }
 

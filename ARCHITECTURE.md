@@ -620,6 +620,12 @@ in the in-app history.
 
 ## Auth-status refresh lifetime
 
+`planRecheck.ts` bounds Claude plan observations to six-hour freshness and
+five-minute retry cadence. Plan-only writes and token rotations share per-store
+maintenance admission; a forced rotation waits for a plan write rather than
+joining its result. `tokenRefresh.ts` persists fresh returned plan fields during
+normal credential maintenance and invalidates facts-cache generations after writes.
+
 Auth-status caches remain shared by profile/default context. Each proxy instance
 owns only the refreshes its routes or keepalive requested; closing one owner
 does not cancel a sibling's shared check. The last owner cancels and joins its
