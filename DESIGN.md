@@ -125,8 +125,13 @@ at its provider, so card CSS never names one.
 - **Every card:** a brand stripe on its left edge and a brand badge naming
   the provider.
 - **Active:** brand border + 1px brand ring, brand dot and brand Active pill.
-  There is one per provider.
-- **Switchable on hover:** `-bright` border with a faint brand fill.
+  There is one per provider. On `/` it also carries a 12px brand strip
+  across its top edge reading "ACTIVE".
+- **Switchable on hover:** `-bright` border with a faint brand fill. On `/`
+  the same 12px strip, in `-bright`, reads "CLICK TO ACTIVATE" while the card
+  is hovered or focused.
+- **Strip text:** `--on-brand` (black), which clears 4.5:1 on every brand and
+  its `-bright` tint; white does not on either green.
 - **Spent or failing:** shown by dimming and the existing badges. The active
   border is never recoloured or faded, and the active card's name row, with
   its Active pill and spent badge, never dims. Only its figures do.
@@ -214,7 +219,7 @@ account card on the home page (or the Profiles page). The header chip only
   Active account card: its provider's brand border + 1px brand ring.
   Clickable cards get `cursor: pointer` and a hover border (the brighter
   provider brand on an account card), plus a hover-revealed uppercase hint
-  (e.g. “Click to activate”).
+  (on an account card, the brand strip reading “Click to activate”).
 - **Stats strip:** one flex row of cells separated by 1px `--border`
   dividers inside a single card — label (micro-label), value (20px/700),
   optional muted detail line. Use instead of a grid of chunky cards.

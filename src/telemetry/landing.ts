@@ -90,6 +90,7 @@ export const landingHtml = `<!DOCTYPE html>
     transition: filter 0.2s, opacity 0.2s; }
   .profile-card.spend-fading:hover > *, .profile-card.spend-spent:hover > * { filter: none; opacity: 1; }
   .profile-card.active.spend-fading > .profile-head, .profile-card.active.spend-spent > .profile-head { filter: none; opacity: 1; }
+  .profile-card.active.spend-fading > .card-strip, .profile-card.active.spend-spent > .card-strip { filter: none; opacity: 1; }
   /* An active card that needs a login keeps its brand ring outside the red
      border, so it still reads as the active one by more than hue. */
   .profile-card.needs-login { border-color: var(--red); }
@@ -123,9 +124,22 @@ export const landingHtml = `<!DOCTYPE html>
     border-radius: 10px; padding: 1px 8px; }
   .provider-pill { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
     border-radius: 10px; padding: 1px 8px; }
-  .switch-hint { font-size: 9px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px;
-    color: var(--muted); opacity: 0; transition: opacity 0.15s; }
-  .profile-card.switchable:hover .switch-hint { opacity: 1; }
+  /* A card's activation state is a strip across its top edge in its
+     provider's brand: "Click to activate" while a switchable card is hovered
+     or focused, in the -bright tint its hover border takes, and "Active" for
+     as long as it is the active one, in the brand of its ring. It sits inside
+     the border, so a needs-login card keeps its red frame on all four sides.
+     The hint is hidden by clip-path, not opacity: the spend fade sets the
+     opacity of a card's children, which would show a hidden hint on a dimmed
+     card. --on-brand is the ink that reads on every brand (themeCss). */
+  .card-strip { position: absolute; top: 0; left: 0; right: 0; height: 12px; border-radius: 11px 11px 0 0;
+    background: var(--brand, var(--accent)); color: var(--on-brand); font-size: 9px; font-weight: 600; line-height: 12px;
+    letter-spacing: 0.5px; text-transform: uppercase; text-align: center; white-space: nowrap; overflow: hidden; pointer-events: none; }
+  .card-strip.strip-hint { background: var(--brand-bright, var(--accent)); clip-path: inset(0 0 100% 0); transition: clip-path 0.15s; }
+  .profile-card.switchable:hover > .strip-hint, .profile-card.switchable:focus-visible > .strip-hint { clip-path: inset(0); }
+  @media (max-width: 720px) {
+    .profile-card.active, .profile-card.switchable { padding-top: 18px; }
+  }
   .profile-cost { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text); flex-shrink: 0; margin-left: auto; }
 
   /* Account details on hover. Drawn rather than a title attribute: the native
@@ -564,7 +578,7 @@ function profileSection(q,s,pl,h){
     if(credits)rows+='<div class="usage-row credits-row" title="'+esc(credits.note)+'"><span class="w-label">credits</span>'
       +'<span class="w-credits'+(credits.serving?' serving':'')+'">'+esc(credits.value)+'</span>'
       +'<span class="w-credits-note">'+esc(credits.serving?'serving on credits':credits.policy||credits.note)+'</span></div>'
-      +(credits.pace?'<div class="usage-row credits-row" title="'+esc(credits.pace.title)+'"><span class="w-label">lasts</span>'
+      +(credits.pace?'<div class="usage-row credits-row" title="'+esc(credits.pace.title)+'">'
         +'<span class="w-credits-note credits-pace">'+esc(credits.pace.text)+'</span></div>':'');
     var isPriority=pl&&pl.routing==='priority';
     // active+priority keeps the active profile meaningful - switching it is how
@@ -574,7 +588,9 @@ function profileSection(q,s,pl,h){
     // A ChatGPT seat has an active pointer of its own that neither priority
     // routing nor follow mode takes over, so it is switchable in every mode.
     var switchable=multi&&p.configured&&!p.isActive&&(chat||(!isPriority&&!follow));
-    var badge=isPriority&&!chat?'':p.isActive?'<span class="active-pill">Active</span>':switchable?'<span class="switch-hint">Click to activate</span>':'';
+    var showsActive=p.isActive&&!(isPriority&&!chat);
+    var badge=showsActive?'<span class="active-pill">Active</span>':'';
+    var cardStrip=showsActive?'<div class="card-strip">Active</div>':switchable?'<div class="card-strip strip-hint">Click to activate</div>':'';
     if(follow&&p.isActive&&!chat)badge+=' <span class="pool-chip">'+(follow.activeProfile?'following '+esc(follow.url):'local — '+esc(follow.url)+' unreachable')+(follow.stale?' · stale':'')+'</span>';
     // Sits beside the name because it qualifies the percentages below it: 70%
     // of a 20x account is several times the work left in 70% of a 5x one.
@@ -634,6 +650,7 @@ function profileSection(q,s,pl,h){
       +' data-group="'+esc(slot.provider)+'"'+(providerHidden?' hidden':'')
       +(p.configured?' data-id="'+esc(p.id)+'" data-index="'+pos+'"':'')
       +(switchable?' data-profile="'+esc(p.id)+'" role="button" tabindex="0"':'')+'>'
+      +cardStrip
       +'<div class="profile-head"><span class="profile-name">'+(draggable?meridianReorder.handleHtml(p.id,pos,slot.place,slot.size):'')+'<span class="prof-dot"></span>'+(p.entry?infoIcon(p.entry,p.type):'')+''+esc(p.label||p.id)+' '+meridianProviders.badgeHtml(slot.provider,'provider-pill')+badge+'</span>'
       +'<span class="profile-cost">'+usd(cost?cost.estimatedUsd:0)+'</span></div>'
       +'<div class="profile-sub">'+(cost?cost.requests+' request'+(cost.requests===1?'':'s')+' · est. API value · 24h':'no traffic · 24h')+'</div>'
