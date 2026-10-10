@@ -166,6 +166,8 @@ Claude Code wipes `.credentials.json` when a refresh is refused, so Meridian kee
 
 A ChatGPT seat reports the same fields. OpenAI states no login deadline, so `refreshTokenExpiresAt` and `daysUntilRenewal` are null and `renewalRequiredSoon` is false. Where Meridian recorded no login for a seat, `authObtainedAt` is the OpenAI sign-in its access token states (`authObtainedVia: "token"`). Refreshing keeps that time, and it can predate the seat's own authorization when that reused a browser that was already signed in.
 
+When OpenAI refuses a renewal, the log line, the logged-out event and the `cause` field of `POST /profiles/chatgpt/refresh` name which refusal it was: `refresh token expired`, `refresh token already used` (another program renewed the same login first) or `refresh token revoked`. A failure on OpenAI's side records `HTTP <status>` instead.
+
 ### Switching profiles
 
 ```bash

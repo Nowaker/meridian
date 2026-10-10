@@ -10197,7 +10197,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       chatGptUsageAt = 0
       return c.json({ status: "refreshed", profile: profile.id, expiresAt: outcome.expiresAt })
     }
-    return c.json({ status: outcome.status, profile: profile.id, reason: outcome.reason }, outcome.status === "requires-reauth" ? 401 : 503)
+    return c.json({
+      status: outcome.status,
+      profile: profile.id,
+      reason: outcome.reason,
+      ...(outcome.status === "requires-reauth" && outcome.cause ? { cause: outcome.cause } : {}),
+    }, outcome.status === "requires-reauth" ? 401 : 503)
   })
 
   // PUBLIC - no requireAuth, for the same reason as /callback above: what
