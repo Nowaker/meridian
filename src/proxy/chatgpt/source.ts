@@ -105,6 +105,20 @@ export interface ChatGptCredentialSource {
   removeAccount?(seat: string): boolean
   /** owned only: renew one seat's access token now, through the same single-exchange path a request uses. */
   refreshSeat?(seat: string): Promise<RefreshOutcome>
+  /**
+   * owned only: renew the seat most overdue for renewal (owned.ts
+   * `renewalDueAt`), whether or not any work is sent to it. At most one
+   * exchange per call; a call made while one runs gets that one's result.
+   */
+  renewDue?(): Promise<ChatGptRenewalPass>
+}
+
+/** What one `renewDue` call found and did. */
+export interface ChatGptRenewalPass {
+  /** Every seat due for renewal, most overdue first. */
+  due: string[]
+  /** The exchange made for the first of them, or null when none was made. */
+  outcome: RefreshOutcome | null
 }
 
 /** What an interactive sign-in hands the owned store. */

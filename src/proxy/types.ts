@@ -133,6 +133,8 @@ export interface ChatGptUpstreamControl {
   /** Take refresh authority (owned). Rejects rather than degrading. No-op for follow-external. */
   acquire(): Promise<void>
   release(): void
+  /** Renew the seat most overdue for renewal (owned); true when one was renewed. Always false for follow-external. */
+  renewDue(): Promise<boolean>
 }
 
 export const DEFAULT_PROXY_CONFIG: ProxyConfig = {

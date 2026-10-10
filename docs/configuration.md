@@ -113,6 +113,7 @@ With it set:
 |---|---|
 | Proactive refresh on boot and every 45s | Not scheduled |
 | Auth keepalive every 45s | Not scheduled |
+| Renewing owned ChatGPT seats ahead of expiry, on boot and every 60s | Not scheduled |
 | Auth-status cache (60s TTL) | Also invalidated when the credential file's mtime changes, so a rotation by the other instance is picked up on the next tick |
 | Any credential write | Refused at the credential store, and logged to stderr |
 | Any OAuth refresh request | Not sent — the grant would rotate the token server-side even if the result were never written |

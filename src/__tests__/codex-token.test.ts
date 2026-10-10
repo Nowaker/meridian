@@ -40,6 +40,7 @@ describe("decodeCodexToken", () => {
       userId: "user-ABC",
       planType: "pro",
       expiresAt: 1789494103000,
+      issuedAt: 1788630103000,
       signedInAt: null,
     })
   })
@@ -61,6 +62,7 @@ describe("decodeCodexToken", () => {
       userId: null,
       planType: null,
       expiresAt: 1788905341000,
+      issuedAt: null,
       signedInAt: null,
     })
   })

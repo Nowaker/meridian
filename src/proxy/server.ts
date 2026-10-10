@@ -6,6 +6,7 @@ import { chatGptProvider, CHATGPT_ADAPTER } from './backends/chatgptStatus'
 import { chatGptVerdict, combineBackendVerdicts, type BackendStatus } from './chatgpt/health'
 import { createChatGptBackend, type ChatGptSeatCreditState, type ChatGptSeatRefusal, type ChatGptTurnEvent, type ObservedSeatLimits } from './backends/chatgpt'
 import { resolveChatGptSource } from './chatgpt/config'
+import { startRenewalSchedule } from './chatgpt/owned'
 import { ChatGptTurnLedger, chatGptTokenFields, createChatGptAdmission, createChatGptParityBackend, createUnpricedModelWarning, decorateChatGptTurn, type ChatGptTurnNotes } from './chatgpt/parity'
 import { BURN_SPARSE_WINDOW_MS, creditBurn } from './chatgpt/creditRates'
 import { chatGptFeatureCapabilities, effectiveCreditsPolicy, getChatGptFeatures, resetChatGptFeatures, updateChatGptFeatures, validateChatGptFeatureUpdate } from './chatgpt/features'
@@ -11487,6 +11488,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       isServing: () => chatGptSource.isServing(),
       acquire: () => chatGptSource.acquire(),
       release: () => chatGptSource.release(),
+      renewDue: async () => {
+        const pass = await chatGptSource.renewDue?.()
+        if (pass?.outcome?.status !== "refreshed") return false
+        chatGptUsageAt = 0
+        return true
+      },
     } } : {}),
     transcriptSweep,
   }
@@ -11753,6 +11760,13 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
     if (profileTokenRefreshInterval.unref) profileTokenRefreshInterval.unref()
   }
 
+  // A request renews only the ChatGPT seat it is routed to, so a seat no work
+  // goes to would run out ten days after its last renewal and read as logged
+  // out. This renews each one ahead of expiry instead (chatgpt/owned.ts).
+  const chatGptRenewal = !credentialsReadOnly && chatGpt?.mode === "owned"
+    ? startRenewalSchedule(() => chatGpt.renewDue())
+    : undefined
+
   // Background auth keepalive: periodically refresh auth status for all
   // configured profiles so switching is instant (no stale token delay).
   let authKeepaliveInterval: ReturnType<typeof setInterval> | undefined
@@ -11787,6 +11801,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
         if (authKeepaliveInterval) clearInterval(authKeepaliveInterval)
         if (sessionGcInterval) clearInterval(sessionGcInterval)
         const transcriptSweepStopped = transcriptSweep?.stop()
+        const chatGptRenewalStopped = chatGptRenewal?.stop()
         // Refuse new work before potentially waiting for a deletion child.
         beginDrain?.()
         stopFollowPolling()
@@ -11812,6 +11827,8 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
         } finally {
           connectionTracker.dispose()
           await closeBackend?.()
+          // Not before a renewal still out has recorded its seat's new refresh token.
+          await chatGptRenewalStopped
           chatGpt?.release()
           await transcriptSweepStopped
         }
