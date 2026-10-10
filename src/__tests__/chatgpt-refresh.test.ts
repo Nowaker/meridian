@@ -424,3 +424,54 @@ describe("ChatGPT refresh - the seat's login lifecycle", () => {
     expect(authLifecycleFor(chatGptAuthLifecycleKey("seat-lifecycle-refused"))!.events).toHaveLength(record.events.length)
   })
 })
+
+// Which refusal it was is what tells a login that aged out from one spent by a
+// second process, and nothing kept it: the 2026-10-02 refusals could not be
+// told apart afterwards. The three causes are the ones the Codex CLI itself
+// distinguishes, recorded in this module's words, never the provider's.
+describe("ChatGPT refresh - why a refresh was refused", () => {
+  async function refuseWith(id: string, response: Response) {
+    const store = await seededStore()
+    store.commitAccount(id, () => seat({ accountUserId: id }))
+    const written: string[] = []
+    const original = console.error
+    console.error = (...args: unknown[]) => { written.push(args.join(" ")) }
+    try {
+      const outcome = await createChatGptRefresher({ store, fetchImpl: async () => response }).refreshAccount(id)
+      return { outcome, written: written.join("\n"), event: authLifecycleFor(chatGptAuthLifecycleKey(id))?.events.at(-1) }
+    } finally {
+      console.error = original
+    }
+  }
+
+  const causes: Array<[string, string]> = [
+    ["refresh_token_expired", "refresh token expired"],
+    ["refresh_token_reused", "refresh token already used"],
+    ["refresh_token_invalidated", "refresh token revoked"],
+  ]
+  causes.forEach(([code, cause], index) => {
+    it(`records ${code} as "${cause}", and nothing of the body`, async () => {
+      const message = "the token ending 9f04 can no longer be used"
+      const { outcome, written, event } = await refuseWith(`seat-cause-${index}`, tokenResponse({ error: { code, message } }, 401))
+      expect(outcome).toMatchObject({ status: "requires-reauth", reason: "rejected", cause })
+      expect(event).toMatchObject({ kind: "logged_out", detail: `rejected: ${cause}` })
+      expect(written).toContain(`(rejected: ${cause})`)
+      for (const secret of [STORED_REFRESH, message, code]) {
+        expect(written).not.toContain(secret)
+        expect(JSON.stringify(outcome)).not.toContain(secret)
+      }
+    })
+  })
+
+  it("says only that it was refused when the provider names something else", async () => {
+    const { outcome, event } = await refuseWith("seat-cause-other", tokenResponse({ error: { code: STORED_REFRESH } }, 401))
+    expect(outcome).toEqual({ status: "requires-reauth", accountUserId: "seat-cause-other", reason: "rejected" })
+    expect(event).toMatchObject({ kind: "logged_out", detail: "rejected" })
+  })
+
+  it("records the status of a provider failure, which says nothing about the login", async () => {
+    const { outcome, event } = await refuseWith("seat-cause-503", tokenResponse({ error: "overloaded" }, 503))
+    expect(outcome).toMatchObject({ status: "requires-reauth", reason: "unverifiable", cause: "HTTP 503" })
+    expect(event).toMatchObject({ kind: "logged_out", detail: "unverifiable: HTTP 503" })
+  })
+})

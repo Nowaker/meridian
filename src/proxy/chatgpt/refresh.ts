@@ -56,8 +56,33 @@ export type UnavailableReason =
 
 export type RefreshOutcome =
   | { status: "refreshed"; accountUserId: string; accessToken: string; expiresAt: number }
-  | { status: "requires-reauth"; accountUserId: string; reason: RequiresReauthReason }
+  | {
+    status: "requires-reauth"
+    accountUserId: string
+    reason: RequiresReauthReason
+    /** Which refusal, or which failed status, in this module's words. Absent when the provider named neither. */
+    cause?: string
+  }
   | { status: "unavailable"; accountUserId: string; reason: UnavailableReason }
+
+/**
+ * The refusals the Codex CLI itself tells apart, keyed by the provider's code.
+ * Only the value is ever emitted, so a cause cannot carry the provider's text.
+ */
+const REFUSAL_CAUSES = new Map([
+  ["refresh_token_expired", "refresh token expired"],
+  ["refresh_token_reused", "refresh token already used"],
+  ["refresh_token_invalidated", "refresh token revoked"],
+])
+
+/** The cause a refusal names, read where the Codex CLI reads it: `error.code`, an `error` string, or a top-level `code`. */
+function refusalCause(body: unknown): string | undefined {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return undefined
+  const { error, code } = body as Record<string, unknown>
+  const nested = typeof error === "object" && error !== null ? (error as Record<string, unknown>).code : undefined
+  const named = typeof error === "string" ? error : typeof nested === "string" ? nested : code
+  return typeof named === "string" ? REFUSAL_CAUSES.get(named.toLowerCase()) : undefined
+}
 
 /** Narrower than `typeof fetch` so a test double is an ordinary function. */
 export type TokenExchangeFetch = (url: string, init: RequestInit) => Promise<Response>
@@ -123,14 +148,16 @@ export function createChatGptRefresher(options: ChatGptRefresherOptions): ChatGp
   const reportUnrefreshable = (
     accountUserId: string,
     reason: RequiresReauthReason,
+    cause?: string,
   ): RefreshOutcome => {
     // Said out loud on purpose. An account that can no longer be refreshed is
     // a thing only a person can fix, and an instance that keeps it to itself
     // goes on serving until the access token expires and then falls over. The
     // reason is this module's own vocabulary, never the provider's wording.
-    console.error(`[chatgpt] account ${accountUserId} needs an interactive login (${reason})`)
-    noteRefreshRejected(chatGptAuthLifecycleKey(accountUserId), { at: now(), detail: reason })
-    return { status: "requires-reauth", accountUserId, reason }
+    const detail = cause ? `${reason}: ${cause}` : reason
+    console.error(`[chatgpt] account ${accountUserId} needs an interactive login (${detail})`)
+    noteRefreshRejected(chatGptAuthLifecycleKey(accountUserId), { at: now(), detail })
+    return { status: "requires-reauth", accountUserId, reason, ...(cause ? { cause } : {}) }
   }
 
   const stampExchange = (accountUserId: string, startedAt: number | null): boolean => {
@@ -180,12 +207,11 @@ export function createChatGptRefresher(options: ChatGptRefresherOptions): ChatGp
       // A gateway/status failure does not prove the grant was unconsumed.
       // Keep durable intent so neither this process nor its successor replays it.
       await discardBody(response)
-      return reportUnrefreshable(accountUserId, "unverifiable")
+      return reportUnrefreshable(accountUserId, "unverifiable", `HTTP ${response.status}`)
     }
 
     if (!response.ok) {
-      await discardBody(response)
-      return reportUnrefreshable(accountUserId, "rejected")
+      return reportUnrefreshable(accountUserId, "rejected", refusalCause(await readJson(response)))
     }
 
     const parsed = parseTokenResponse(await readJson(response))
