@@ -14,14 +14,61 @@
  */
 import type { CodexPoolResult } from "../codex/pool"
 import { decodeCodexToken } from "../codex/token"
-import { createChatGptCredentialStore, type ChatGptCredentialStore } from "./credentials"
+import { createChatGptCredentialStore, type ChatGptAccount, type ChatGptCredentialStore } from "./credentials"
 import { acquireWriterLease, type WriterLease } from "./lease"
 import { chatGptLockPath } from "./paths"
 import { createChatGptRefresher, type ChatGptRefresher, type TokenExchangeFetch } from "./refresh"
-import type { ChatGptCredentialSource, ChatGptSeatView } from "./source"
+import type { ChatGptCredentialSource, ChatGptRenewalPass, ChatGptSeatView } from "./source"
 
 /** Renew this far ahead of expiry, matching the Claude path's own margin. */
 const ACCESS_TOKEN_BUFFER_MS = 5 * 60_000
+
+/**
+ * A failed exchange leaves its seat needing a sign-in, so after one the
+ * provider failed, renewing ahead of expiry waits this long before costing
+ * another seat the same way. A seat falls due two days before its token runs
+ * out, which leaves room for several waits.
+ */
+const RENEWAL_PAUSE_MS = 6 * 60 * 60_000
+
+/**
+ * When a seat's access token falls due for renewal: 80% into its life, which
+ * for ChatGPT's ten-day tokens is the eighth day, the age at which the Codex
+ * CLI renews its own. A token that does not say when it was issued falls due
+ * when a request would renew it, five minutes before expiry: a longer fixed
+ * margin would make a short-lived token due again the moment it was renewed.
+ * A seat with no token or no expiry is due now.
+ */
+export function renewalDueAt(account: Pick<ChatGptAccount, "accessToken" | "expiresAt">): number {
+  if (!account.accessToken || account.expiresAt === null) return 0
+  const issuedAt = decodeCodexToken(account.accessToken)?.issuedAt ?? null
+  if (issuedAt === null) return account.expiresAt - ACCESS_TOKEN_BUFFER_MS
+  return Math.round(issuedAt + (account.expiresAt - issuedAt) * 0.8)
+}
+
+/**
+ * Looks for a seat due for renewal at once and then every `intervalMs`, until
+ * stopped. `stop` resolves once a renewal still out has settled: it may have
+ * spent its seat's refresh token, and only the lease still held can record the
+ * token that replaced it.
+ */
+export function startRenewalSchedule(renewDue: () => Promise<unknown>, intervalMs = 60_000): { stop(): Promise<void> } {
+  let settled: Promise<void> = Promise.resolve()
+  const look = () => {
+    settled = renewDue().then(() => undefined, error => {
+      console.error(`[chatgpt] renewing a seat ahead of expiry failed: ${error instanceof Error ? error.message : String(error)}`)
+    })
+  }
+  look()
+  const timer = setInterval(look, intervalMs)
+  timer.unref?.()
+  return {
+    stop() {
+      clearInterval(timer)
+      return settled
+    },
+  }
+}
 
 export interface OwnedSourceOptions {
   storePath: string
@@ -56,6 +103,8 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
   let lease: WriterLease | undefined
   let store: ChatGptCredentialStore | undefined
   let refresher: ChatGptRefresher | undefined
+  let renewal: Promise<ChatGptRenewalPass> | undefined
+  let renewalPausedUntil = 0
 
   const holdsLease = (): boolean => {
     if (!lease) return false
@@ -65,6 +114,28 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
     } catch {
       return false
     }
+  }
+
+  // One exchange per pass, for the seat most overdue, so renewals never go out
+  // as a burst and a provider failure costs one seat its sign-in, not every
+  // seat that happened to be due with it.
+  const renewMostOverdue = async (): Promise<ChatGptRenewalPass> => {
+    const renewer = refresher
+    if (!renewer || !holdsLease() || now() < renewalPausedUntil) return { due: [], outcome: null }
+    const due = reader.readAccounts()
+      .filter(account => account.exchangeStartedAt === null)
+      .map(account => ({ seat: account.accountUserId, at: renewalDueAt(account) }))
+      .filter(candidate => candidate.at <= now())
+      .sort((a, b) => a.at - b.at)
+    const next = due[0]
+    if (!next) return { due: [], outcome: null }
+    console.log(`[chatgpt] renewing account ${next.seat} ahead of expiry (due since ${new Date(next.at).toISOString()}; ${due.length - 1} more due)`)
+    const outcome = await renewer.refreshAccount(next.seat)
+    if (outcome.status === "requires-reauth" && outcome.reason === "unverifiable") {
+      renewalPausedUntil = now() + RENEWAL_PAUSE_MS
+      console.error(`[chatgpt] renewing ahead of expiry paused until ${new Date(renewalPausedUntil).toISOString()}: the provider failed an exchange`)
+    }
+    return { due: due.map(candidate => candidate.seat), outcome }
   }
 
   return {
@@ -189,6 +260,11 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
     async refreshSeat(seat) {
       if (!refresher || !holdsLease()) return { status: "unavailable", accountUserId: seat, reason: "no-write-authority" }
       return refresher.refreshAccount(seat)
+    },
+
+    renewDue() {
+      renewal ??= renewMostOverdue().finally(() => { renewal = undefined })
+      return renewal
     },
   }
 }
