@@ -490,6 +490,24 @@ describe("the landing page marks activation with a strip across a card's top", (
     expect(landingHtml.slice(0, landingHtml.indexOf("</style>"))).not.toContain(".active-pill")
   })
 
+  test("name row badges sit one container gap apart, with no margin of their own to stack on it", () => {
+    // The row's gap alone spaces the name from the first badge and each badge
+    // from the next; a badge margin would add to it between badges only.
+    const rules = (html: string, selector: string) => {
+      const css = html.slice(0, html.indexOf("</style>")) + profileProvidersCss
+      return [...css.matchAll(new RegExp(`(?:^|[\\s,}])${selector.replace(/[.-]/g, "\\$&")}(?:[\\s,][^{]*)?\\{([^}]*)\\}`, "g"))].map(m => m[1]!)
+    }
+    const nameRow = rules(landingHtml, ".profile-name").join("")
+    expect(nameRow).toContain("display: flex;")
+    expect(nameRow).toContain("gap: 8px;")
+    for (const badge of [".provider-pill", ".provider-badge", ".plan-chip", ".pool-chip", ".spend-pill"]) {
+      expect(rules(landingHtml, badge).length).toBeGreaterThan(0)
+      for (const body of rules(landingHtml, badge)) expect(body).not.toMatch(/margin/)
+    }
+    expect(rules(profilePageHtml, ".profile-card-header").join("")).toContain("gap: 8px 12px;")
+    for (const body of rules(profilePageHtml, ".profile-badge")) expect(body).not.toMatch(/margin/)
+  })
+
   test("pure priority routing gives a Claude card no strip, while a seat keeps its own", () => {
     const html = render(null, { profiles: mixed(), routing: "priority", profileOrder: ["c1", "c2", "g1", "g2"] })
     expect(strips(html)).toEqual([

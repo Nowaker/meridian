@@ -195,10 +195,10 @@ export const landingHtml = `<!DOCTYPE html>
   .pace-row .w-bar { overflow: visible; position: relative; }
   .pace-marker { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); opacity: 0.55; border-radius: 1px; }
   .pace-row .w-pct { font-weight: 600; }
-  .pool-chip { font-size: 10px; padding: 2px 8px; border-radius: 10px; background: var(--surface2); color: var(--muted); margin-left: 6px; vertical-align: middle; }
+  .pool-chip { font-size: 10px; padding: 2px 8px; border-radius: 10px; background: var(--surface2); color: var(--muted); }
   .pool-chip.exhausted { color: var(--red); background: rgba(248,81,73,0.12); }
   .plan-chip { font-size: 10px; padding: 2px 8px; border-radius: 10px; background: var(--surface2);
-    color: var(--accent2); margin-left: 6px; vertical-align: middle; font-variant-numeric: tabular-nums; }
+    color: var(--accent2); font-variant-numeric: tabular-nums; }
   .spent-banner { font-size: 12px; line-height: 1.45; color: var(--text); margin-bottom: 10px;
     padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(248,81,73,0.35); background: rgba(248,81,73,0.1); }
   .spent-banner strong { color: var(--red); }

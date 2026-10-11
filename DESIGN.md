@@ -226,7 +226,9 @@ account card on the home page (or the Profiles page). The header chip only
 - **Pills:** radius 10–20px, tinted fill + tinted border of the same hue
   (e.g. the update chip: blue text on `rgba(88,166,255,0.12)` with
   `rgba(88,166,255,0.35)` border; an account's Active pill does the same in
-  its provider's brand). Status badges: green/muted/red variants.
+  its provider's brand). Badges in a row carry no margin: the row's flex
+  gap alone spaces the name from the first badge and each badge from the
+  next. Status badges: green/muted/red variants.
 - **Usage bar:** 6–8px track in `--surface2`, radius 3–4px, fill colored
   by the utilization thresholds; percentage readout matches the fill color.
 - **Buttons:** `--surface2` fill, accent text + accent border; hover =
