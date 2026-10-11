@@ -292,8 +292,8 @@ describe("brand colours", () => {
   })
 
   test("landing: a spent active card dims its figures, never its name row", () => {
-    // The Active pill and the spent badge live in that row, and they are what
-    // say which account is serving and why the rest of the card is dimmed.
+    // The spent badge lives in that row, and with the Active strip it is what
+    // says which account is serving and why the rest of the card is dimmed.
     const spare = ".profile-card.active.spend-fading > .profile-head, .profile-card.active.spend-spent > .profile-head { filter: none; opacity: 1; }"
     expect(landingHtml).toContain(spare)
     expect(landingHtml.indexOf(spare)).toBeGreaterThan(landingHtml.indexOf(".profile-card.spend-fading > *, .profile-card.spend-spent > * {"))
@@ -481,6 +481,13 @@ describe("the landing page marks activation with a strip across a card's top", (
       ["g2", "card-strip", "Active"],
     ])
     expect(html).not.toContain("switch-hint")
+  })
+
+  test("the strip is the active card's only Active label: no pill repeats it in the name row", () => {
+    const html = render(null, { profiles: mixed(), routing: "active" })
+    expect(html.split('<div class="card-strip">Active</div>').length - 1).toBe(2)
+    expect(html).not.toContain("active-pill")
+    expect(landingHtml.slice(0, landingHtml.indexOf("</style>"))).not.toContain(".active-pill")
   })
 
   test("pure priority routing gives a Claude card no strip, while a seat keeps its own", () => {

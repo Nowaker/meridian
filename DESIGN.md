@@ -124,9 +124,9 @@ at its provider, so card CSS never names one.
 
 - **Every card:** a brand stripe on its left edge and a brand badge naming
   the provider.
-- **Active:** brand border + 1px brand ring, brand dot and brand Active pill.
-  There is one per provider. On `/` it also carries a 12px brand strip
-  across its top edge reading "ACTIVE".
+- **Active:** brand border + 1px brand ring and brand dot. There is one per
+  provider. On `/` a 12px brand strip across its top edge reads "ACTIVE" and
+  is its only Active label; `/profiles` has no strip and shows an Active pill.
 - **Switchable on hover:** `-bright` border with a faint brand fill. On `/`
   the same 12px strip, in `-bright`, reads "CLICK TO ACTIVATE" while the card
   is hovered or focused.
@@ -134,7 +134,7 @@ at its provider, so card CSS never names one.
   its `-bright` tint; white does not on either green.
 - **Spent or failing:** shown by dimming and the existing badges. The active
   border is never recoloured or faded, and the active card's name row, with
-  its Active pill and spent badge, never dims. Only its figures do.
+  its Active strip and spent badge, never dims. Only its figures do.
 - **Needs a login:** a dashed red border. Beside the Claude brand the red
   differs in hue alone (ΔE2000 12, and 3.5 to a protanope), so the pattern is
   what keeps it from reading as an active border.

@@ -82,8 +82,8 @@ export const landingHtml = `<!DOCTYPE html>
      passed 95%, which is precisely when somebody comes looking for it. A
      descendant cannot undo an ancestor's filter or opacity, so scoping the
      fade to the children is the only thing that leaves the ring alone. The
-     active card spares its name row as well, so its Active pill and its
-     spent badge stay readable and only its figures recede. */
+     active card spares its Active strip and its name row as well, so they
+     and its spent badge stay readable and only its figures recede. */
   .profile-card.spend-fading > *, .profile-card.spend-spent > * {
     filter: grayscale(var(--spend-fade, 0));
     opacity: calc(1 - 0.55 * var(--spend-fade, 0));
@@ -118,10 +118,6 @@ export const landingHtml = `<!DOCTYPE html>
     flex: 1 1 12em; flex-wrap: wrap; row-gap: 4px; min-width: 0; overflow-wrap: anywhere; }
   .profile-name .prof-dot { width: 8px; height: 8px; flex-shrink: 0; border-radius: 50%; background: var(--border); }
   .profile-card.active .prof-dot { background: var(--brand, var(--accent)); box-shadow: 0 0 6px rgba(var(--brand-rgb, 88,166,255),0.5); }
-  .active-pill { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
-    color: var(--brand-bright, var(--accent)); background: rgba(var(--brand-rgb, 88,166,255),0.12);
-    border: 1px solid rgba(var(--brand-rgb, 88,166,255),0.35);
-    border-radius: 10px; padding: 1px 8px; }
   .provider-pill { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
     border-radius: 10px; padding: 1px 8px; }
   /* A card's activation state is a strip across its top edge in its
@@ -589,7 +585,7 @@ function profileSection(q,s,pl,h){
     // routing nor follow mode takes over, so it is switchable in every mode.
     var switchable=multi&&p.configured&&!p.isActive&&(chat||(!isPriority&&!follow));
     var showsActive=p.isActive&&!(isPriority&&!chat);
-    var badge=showsActive?'<span class="active-pill">Active</span>':'';
+    var badge='';
     var cardStrip=showsActive?'<div class="card-strip">Active</div>':switchable?'<div class="card-strip strip-hint">Click to activate</div>':'';
     if(follow&&p.isActive&&!chat)badge+=' <span class="pool-chip">'+(follow.activeProfile?'following '+esc(follow.url):'local — '+esc(follow.url)+' unreachable')+(follow.stale?' · stale':'')+'</span>';
     // Sits beside the name because it qualifies the percentages below it: 70%
