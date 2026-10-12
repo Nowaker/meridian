@@ -8,6 +8,7 @@ import { profileFactsJs } from "./profileFacts"
 import { profileFindJs } from "./profileFind"
 import { reorderClientJs, reorderCss, reorderLiveRegionHtml } from "./profileOrder"
 import { PROVIDERS_NONE_SHOWN_HTML, profileProvidersCss, profileProvidersJs } from "./profileProviders"
+import { LOGIN_STATES_NONE_SHOWN_HTML, profileLoginStatesCss, profileLoginStatesJs } from "./profileLoginStates"
 import { isUnusableJs } from "./profileSpent"
 import { WINDOW_LABELS } from "./profileUsage"
 import { selectionHoldJs } from "./selectionHold"
@@ -105,6 +106,7 @@ export const profilePageHtml = `<!DOCTYPE html>
   .profile-card-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 12px; }
   ${reorderCss}
   ${profileProvidersCss}
+  ${profileLoginStatesCss}
   .profile-name { font-size: 16px; font-weight: 600; min-width: 0; overflow-wrap: anywhere; color: inherit; text-decoration: none; }
   a.profile-name:hover { color: var(--accent); }
   .profile-card-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
@@ -353,7 +355,7 @@ export const profilePageHtml = `<!DOCTYPE html>
      on every poll: a box inside it would lose its text every ten seconds. -->
 <div class="section" id="profiles-section">
   <h2 class="section-title">Configured Profiles</h2>
-  <div id="profiles-provider-chips"></div>
+  <div class="chip-row"><div id="profiles-provider-chips"></div><div id="profiles-login-chips"></div></div>
   <div class="profile-search" id="profiles-filter-bar" hidden>
     <input type="search" id="profiles-filter" ${PROFILE_INPUT_ATTRS}
       aria-label="Filter profiles" aria-controls="content"
@@ -366,6 +368,7 @@ export const profilePageHtml = `<!DOCTYPE html>
     <button type="button" class="link-btn" onclick="setProfileQuery('')">Clear the search</button>
   </div>
   <div class="provider-none" id="profiles-provider-none" hidden>${PROVIDERS_NONE_SHOWN_HTML}</div>
+  <div class="provider-none login-none" id="profiles-login-none" hidden>${LOGIN_STATES_NONE_SHOWN_HTML}</div>
 </div>
 ${reorderLiveRegionHtml}
 
@@ -498,8 +501,25 @@ ${isUnusableJs}
 ${reorderClientJs}
 ${selectionHoldJs}
 ${profileProvidersJs}
+${profileLoginStatesJs}
 
 var providersPresent = [];
+// Each card's login state by profile id, and how many cards the login-state
+// chips count; below two they are not drawn.
+var loginStateById = Object.create(null);
+var loginTotal = 0;
+var loginChipsKey = null;
+
+function renderLoginChips(states) {
+  var counts = meridianLoginStates.counts(states);
+  var key = states.length + ':' + Object.keys(counts).map(function (k) { return k + '=' + counts[k]; }).join(',');
+  var slot = document.getElementById('profiles-login-chips');
+  if (key !== loginChipsKey) {
+    loginChipsKey = key;
+    slot.innerHTML = meridianLoginStates.chipsHtml(counts, states.length);
+  }
+  meridianLoginStates.syncChips(slot);
+}
 // The chips sit outside #content, so a poll does not replace them; they are
 // redrawn only when the providers or their counts change.
 var providerChipsKey = null;
@@ -1063,6 +1083,15 @@ function render(data, quotaData) {
   const grouped = groups.length > 1;
   providersPresent = groups.map(function (g) { return g.provider; });
   renderProviderChips(groups);
+  loginStateById = Object.create(null);
+  var loginStates = slots.map(function (s) {
+    var p = s.item;
+    var state = meridianLoginStates.stateOf({ loggedIn: p.loggedIn, error: (quotaById[p.id] || {}).error, renewalRequiredSoon: !!p.renewalRequiredSoon });
+    loginStateById[p.id] = state;
+    return state;
+  });
+  loginTotal = loginStates.length;
+  renderLoginChips(loginStates);
 
   if (profiles.length === 0) {
     document.getElementById('content').innerHTML = '<div class="empty-state">'
@@ -1090,7 +1119,7 @@ function render(data, quotaData) {
     // both providers has an active Claude account AND an active ChatGPT seat.
     const isActive = !!p.isActive;
     const needsLogin = isUnusable({ loggedIn: p.loggedIn, error: (quotaById[p.id] || {}).error });
-    html += '<div class="profile-card provider-' + esc(slot.provider) + (isActive ? ' active' : '') + (needsLogin ? ' needs-login' : '') + '" id="' + esc(profileAnchorElementId(p.id)) + '" data-id="' + esc(p.id) + '" data-index="' + idx + '" data-group="' + esc(slot.provider) + '">';
+    html += '<div class="profile-card provider-' + esc(slot.provider) + (isActive ? ' active' : '') + (needsLogin ? ' needs-login' : '') + '" id="' + esc(profileAnchorElementId(p.id)) + '" data-id="' + esc(p.id) + '" data-index="' + idx + '" data-group="' + esc(slot.provider) + '" data-login-state="' + esc(loginStateById[p.id]) + '">';
     html += '<div class="profile-card-header">';
     if (editingProfile === p.id) {
       html += "<input class=\\"rename-input\\" id=\\"rename-input\\" type=\\"text\\" value=\\"" + esc(p.id) + "\\" " + PROFILE_INPUT_ATTRS
@@ -1209,9 +1238,10 @@ function writeProfilesUrl(hashId) {
   if (url.toString() !== location.href) history.replaceState(history.state, '', url.toString());
 }
 
-// A card shows when its provider's chip is on AND it matches the search; a
-// provider's heading shows while any of its cards does. The count and the
-// no-match message count only the providers on screen.
+// A card shows when its provider's chip is on AND its login state's chip is on
+// AND it matches the search; a provider's heading shows while any of its cards
+// does. The count and the no-match message count only the cards the chips
+// leave on screen.
 function applyProfileFilter() {
   var profiles = profilesForFind();
   var byId = Object.create(null);
@@ -1222,16 +1252,19 @@ function applyProfileFilter() {
   var groupShown = Object.create(null);
   for (var c = 0; c < cards.length; c++) {
     var group = cards[c].getAttribute('data-group');
-    var providerOn = meridianProviders.visible(group, providersPresent);
-    var match = providerOn && profileMatchesQuery(byId[cards[c].getAttribute('data-id')], profileQuery);
+    var chipsOn = meridianProviders.visible(group, providersPresent)
+      && meridianLoginStates.visible(cards[c].getAttribute('data-login-state'), loginTotal);
+    var match = chipsOn && profileMatchesQuery(byId[cards[c].getAttribute('data-id')], profileQuery);
     cards[c].hidden = !match;
-    if (providerOn) inView++;
+    if (chipsOn) inView++;
     if (match) { shown++; groupShown[group] = true; }
   }
   var heads = document.querySelectorAll('#content .provider-group-head');
   for (var h = 0; h < heads.length; h++) heads[h].hidden = !groupShown[heads[h].getAttribute('data-group')];
   meridianProviders.syncChips(document.getElementById('profiles-provider-chips'));
+  meridianLoginStates.syncChips(document.getElementById('profiles-login-chips'));
   document.getElementById('profiles-provider-none').hidden = meridianProviders.anyShown(providersPresent);
+  document.getElementById('profiles-login-none').hidden = !(meridianProviders.anyShown(providersPresent) && cards.length > 0 && inView === 0);
   var filtering = profileQueryTerms(profileQuery).length > 0;
   document.getElementById('profiles-section').classList.toggle('filtering', filtering);
   document.getElementById('profiles-filter-bar').hidden = cards.length === 0 && !filtering;
@@ -1288,6 +1321,11 @@ function jumpToProfileAnchor() {
     meridianProviders.setHidden(group, false);
     applyProfileFilter();
   }
+  var loginState = card.getAttribute('data-login-state');
+  if (loginState && !meridianLoginStates.visible(loginState, loginTotal)) {
+    meridianLoginStates.setHidden(loginState, false);
+    applyProfileFilter();
+  }
   if (card.hidden) setProfileQuery('');
   // A former name, or different casing, becomes the name the card shows.
   if (profileIdFromHash(location.hash) !== id) writeProfilesUrl(id);
@@ -1315,10 +1353,12 @@ function jumpToProfileAnchor() {
   // never re-renders and never interrupts a rename, a login or a drag.
   document.getElementById('profiles-section').addEventListener('click', function (e) {
     var id = meridianProviders.onClick(e.target);
+    var chipsSlot = '#profiles-provider-chips';
+    if (!id) { id = meridianLoginStates.onClick(e.target); chipsSlot = '#profiles-login-chips'; }
     if (!id) return;
     applyProfileFilter();
     if (id === '*') {
-      var first = document.querySelector('#profiles-provider-chips .provider-chip');
+      var first = document.querySelector(chipsSlot + ' .provider-chip');
       if (first) first.focus();
     }
   });

@@ -18,6 +18,13 @@ import {
   profileProvidersCss,
   profileProvidersJs,
 } from "../telemetry/profileProviders"
+import {
+  HIDDEN_LOGIN_STATES_KEY,
+  LOGIN_STATES,
+  LOGIN_STATES_NONE_SHOWN_HTML,
+  profileLoginStatesJs,
+} from "../telemetry/profileLoginStates"
+import { isUnusableJs } from "../telemetry/profileSpent"
 
 interface Group { provider: string; items: unknown[] }
 interface Slot { item: unknown; provider: string; place: number; size: number }
@@ -390,7 +397,7 @@ function loadPage(html: string, storage: MemoryStorage): Page {
 function cardsOf(html: string) {
   return [...html.matchAll(/<div class="profile-card ([^"]*)"([^>]*)>/g)].map(m => {
     const attr = (name: string) => m[2]!.match(new RegExp(` ${name}="([^"]*)"`))?.[1] ?? null
-    return { classes: m[1]!.split(" "), id: attr("data-id"), group: attr("data-group"), index: attr("data-index"), hidden: / hidden(\s|$)/.test(m[2]!) }
+    return { classes: m[1]!.split(" "), id: attr("data-id"), group: attr("data-group"), index: attr("data-index"), loginState: attr("data-login-state"), hidden: / hidden(\s|$)/.test(m[2]!) }
   })
 }
 
@@ -449,7 +456,7 @@ describe("the landing page draws one grid, grouped by provider", () => {
     const storage = new MemoryStorage()
     storage.setItem(HIDDEN_PROVIDERS_KEY, '["chatgpt"]')
     const html = section(storage, [seat("a"), seat("b", { isActive: true }), seat("c")])
-    expect(html).not.toContain("provider-chip")
+    expect(html).not.toContain("data-provider-chip")
     expect(headingsOf(html)).toEqual([])
     expect(cardsOf(html).map(c => [c.id, c.classes.includes("provider-chatgpt"), c.classes.includes("active"), c.hidden]))
       .toEqual([["a", true, false, false], ["b", true, true, false], ["c", true, false, false]])
@@ -610,5 +617,212 @@ describe("the profiles page draws the same groups", () => {
     page.run("location.hash = '#g1'; jumpToProfileAnchor()")
     expect(page.run<boolean>("meridianProviders.isHidden('chatgpt')")).toBe(false)
     expect(storage.getItem(HIDDEN_PROVIDERS_KEY)).toBe("[]")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Login-state chips: Authenticated, Expires soon, Needs auth.
+// ---------------------------------------------------------------------------
+
+interface LoginStates {
+  stateOf(p: unknown): string
+  counts(states: string[]): Record<string, number>
+  isHidden(id: string): boolean
+  visible(id: string, total: number): boolean
+  setHidden(id: string, hide: boolean): void
+  showAll(): void
+  chipsHtml(counts: Record<string, number>, total: number): string
+  onClick(target: unknown): string | null
+}
+
+function loadLoginStates(storage?: unknown): LoginStates {
+  return new Function("localStorage", isUnusableJs + "\n" + profileLoginStatesJs + "\nreturn meridianLoginStates;")(storage) as LoginStates
+}
+
+/** Two of each state, split across the providers; the saved order interleaves them. */
+const byState = () => [
+  claude("c-ok", { isActive: true }),
+  seat("g-out", { loggedIn: false }),
+  claude("c-soon", { renewalRequiredSoon: true }),
+  seat("g-ok", { isActive: true }),
+  claude("c-out", { loggedIn: false, renewalRequiredSoon: true }),
+  seat("g-ok2"),
+]
+const STATE_OF: Record<string, string> = {
+  "c-ok": "authenticated", "g-ok": "authenticated", "g-ok2": "authenticated",
+  "c-soon": "expires-soon",
+  "c-out": "needs-auth", "g-out": "needs-auth",
+}
+
+describe("login states", () => {
+  const s = loadLoginStates()
+
+  test("each account is in exactly one state, from the shared needs-login rule and renewalRequiredSoon", () => {
+    expect(s.stateOf({ loggedIn: true })).toBe("authenticated")
+    expect(s.stateOf({ loggedIn: true, renewalRequiredSoon: true })).toBe("expires-soon")
+    expect(s.stateOf({ loggedIn: false })).toBe("needs-auth")
+    // Needs auth outranks an expiring deadline, and a missing token is a needed login.
+    expect(s.stateOf({ loggedIn: false, renewalRequiredSoon: true })).toBe("needs-auth")
+    expect(s.stateOf({ loggedIn: true, error: "no_token", renewalRequiredSoon: true })).toBe("needs-auth")
+    // A seat states no login deadline: logged in is authenticated.
+    expect(s.stateOf({ loggedIn: true, renewalRequiredSoon: false })).toBe("authenticated")
+  })
+
+  test("every chip is on by default, with a count per state", () => {
+    const html = s.chipsHtml(s.counts(["authenticated", "needs-auth", "authenticated"]), 3)
+    expect([...html.matchAll(/data-login-chip="([\w-]+)" aria-pressed="(\w+)"/g)].map(m => [m[1], m[2]]))
+      .toEqual([["authenticated", "true"], ["expires-soon", "true"], ["needs-auth", "true"]])
+    expect([...html.matchAll(/>([^<>]+)<span class="provider-chip-count">(\d+)</g)].map(m => [m[1], m[2]]))
+      .toEqual([["Authenticated", "2"], ["Expires soon", "0"], ["Needs auth", "1"]])
+    expect(html).toContain('class="provider-chip login-needs-auth"')
+  })
+
+  test("one account draws no chips and hides nothing", () => {
+    const storage = new MemoryStorage()
+    storage.setItem(HIDDEN_LOGIN_STATES_KEY, '["authenticated"]')
+    const one = loadLoginStates(storage)
+    expect(one.chipsHtml(one.counts(["authenticated"]), 1)).toBe("")
+    expect(one.visible("authenticated", 1)).toBe(true)
+    expect(one.visible("authenticated", 2)).toBe(false)
+  })
+
+  test("the choice is remembered, and storage holding garbage hides nothing", () => {
+    const storage = new MemoryStorage()
+    const first = loadLoginStates(storage)
+    first.setHidden("needs-auth", true)
+    expect(storage.getItem(HIDDEN_LOGIN_STATES_KEY)).toBe('["needs-auth"]')
+    expect(loadLoginStates(storage).isHidden("needs-auth")).toBe(true)
+    storage.setItem(HIDDEN_LOGIN_STATES_KEY, '["bogus","expires-soon","expires-soon"]')
+    expect(LOGIN_STATES.map(x => loadLoginStates(storage).isHidden(x.id))).toEqual([false, true, false])
+    storage.setItem(HIDDEN_LOGIN_STATES_KEY, "{not json")
+    expect(LOGIN_STATES.some(x => loadLoginStates(storage).isHidden(x.id))).toBe(false)
+  })
+
+  test("a click toggles its chip, and Show all states turns every one back on", () => {
+    const storage = new MemoryStorage()
+    const st = loadLoginStates(storage)
+    const target = (id: string) => ({ closest: () => ({ getAttribute: () => id }) })
+    expect(st.onClick(target("expires-soon"))).toBe("expires-soon")
+    expect(st.isHidden("expires-soon")).toBe(true)
+    st.onClick(target("needs-auth"))
+    expect(st.onClick(target("*"))).toBe("*")
+    expect(storage.getItem(HIDDEN_LOGIN_STATES_KEY)).toBe("[]")
+    expect(st.onClick({ closest: () => null })).toBeNull()
+  })
+
+  for (const [name, html] of [["landing", landingHtml], ["profiles", profilePageHtml]] as const) {
+    test(`${name}: embeds the login-state module and its CSS exactly once`, () => {
+      expect(html.split("var meridianLoginStates = (function () {").length - 1).toBe(1)
+      expect(html.split(".chip-row { display: flex;").length - 1).toBe(1)
+    })
+  }
+})
+
+describe("the landing page filters by login state", () => {
+  const section = (storage: MemoryStorage) =>
+    loadPage(landingHtml, storage).run<{ html: string }>(
+      `profileSection(null, {}, ${JSON.stringify({ profiles: byState(), routing: "active" })}, { auth: { loggedIn: true } })`,
+    ).html
+  const visible = (html: string) => cardsOf(html).filter(c => !c.hidden).map(c => c.id).sort()
+
+  test("every card is tagged with its state, all chips on, every card shown, beside the provider chips", () => {
+    const html = section(new MemoryStorage())
+    expect(Object.fromEntries(cardsOf(html).map(c => [c.id, c.loginState]))).toEqual(STATE_OF)
+    expect(visible(html)).toEqual(Object.keys(STATE_OF).sort())
+    expect(html).toMatch(/<div class="chip-row"><div class="provider-chips" [^>]*>.*<\/div><div class="provider-chips login-chips"/)
+    expect([...html.matchAll(/data-login-chip="([\w-]+)" aria-pressed="(\w+)"[^>]*>.*?<span class="provider-chip-count">(\d+)</g)].map(m => [m[1], m[2], m[3]]))
+      .toEqual([["authenticated", "true", "3"], ["expires-soon", "true", "1"], ["needs-auth", "true", "2"]])
+    expect(html).toContain('<div class="provider-none login-none" hidden>')
+  })
+
+  for (const state of LOGIN_STATES.map(x => x.id)) {
+    test(`turning off ${state} hides exactly its cards`, () => {
+      const storage = new MemoryStorage()
+      storage.setItem(HIDDEN_LOGIN_STATES_KEY, JSON.stringify([state]))
+      const html = section(storage)
+      expect(visible(html)).toEqual(Object.keys(STATE_OF).filter(id => STATE_OF[id] !== state).sort())
+      expect(html).toContain(`data-login-chip="${state}" aria-pressed="false"`)
+    })
+  }
+
+  test("provider and login state combine with AND; a heading hides with its last card", () => {
+    const storage = new MemoryStorage()
+    storage.setItem(HIDDEN_PROVIDERS_KEY, '["chatgpt"]')
+    storage.setItem(HIDDEN_LOGIN_STATES_KEY, '["needs-auth"]')
+    let html = section(storage)
+    expect(visible(html)).toEqual(["c-ok", "c-soon"])
+    storage.setItem(HIDDEN_PROVIDERS_KEY, "[]")
+    storage.setItem(HIDDEN_LOGIN_STATES_KEY, '["authenticated","needs-auth"]')
+    html = section(storage)
+    expect(visible(html)).toEqual(["c-soon"])
+    expect(headingsOf(html)).toEqual([["claude", false], ["chatgpt", true]])
+  })
+
+  test("with every state hidden, the page says so and offers Show all states", () => {
+    const storage = new MemoryStorage()
+    storage.setItem(HIDDEN_LOGIN_STATES_KEY, JSON.stringify(LOGIN_STATES.map(x => x.id)))
+    const html = section(storage)
+    expect(visible(html)).toEqual([])
+    expect(html).toContain(`<div class="provider-none login-none">${LOGIN_STATES_NONE_SHOWN_HTML}</div>`)
+  })
+})
+
+describe("the profiles page filters by login state", () => {
+  const rendered = (storage: MemoryStorage) => {
+    const page = loadPage(profilePageHtml, storage)
+    page.run(`lastProfiles = ${JSON.stringify({ profiles: byState() })}; render(lastProfiles, null)`)
+    return { page, html: page.element("content").innerHTML, chips: page.element("profiles-login-chips").innerHTML }
+  }
+  const stubCards = (page: Page) => {
+    const cards = Object.entries(STATE_OF).map(([id, state]) => {
+      const el = stubElement()
+      el.attrs.set("data-id", id)
+      el.attrs.set("data-group", id.startsWith("c") ? "claude" : "chatgpt")
+      el.attrs.set("data-login-state", state)
+      return el
+    })
+    page.select("#content .profile-card[data-id]", cards)
+    return () => cards.filter(c => !c.hidden).map(c => c.attrs.get("data-id")).sort()
+  }
+
+  test("cards carry their state and the chips sit in their own slot, all on", () => {
+    const { html, chips } = rendered(new MemoryStorage())
+    expect(Object.fromEntries(cardsOf(html).map(c => [c.id, c.loginState]))).toEqual(STATE_OF)
+    expect([...chips.matchAll(/data-login-chip="([\w-]+)" aria-pressed="(\w+)"[^>]*>.*?<span class="provider-chip-count">(\d+)</g)].map(m => [m[1], m[2], m[3]]))
+      .toEqual([["authenticated", "true", "3"], ["expires-soon", "true", "1"], ["needs-auth", "true", "2"]])
+    expect(profilePageHtml).toContain('<div class="chip-row"><div id="profiles-provider-chips"></div><div id="profiles-login-chips"></div></div>')
+  })
+
+  test("each chip hides exactly its state's cards, AND the provider chips, AND the search", () => {
+    const storage = new MemoryStorage()
+    const { page } = rendered(storage)
+    const shown = stubCards(page)
+    page.run("applyProfileFilter()")
+    expect(shown()).toEqual(Object.keys(STATE_OF).sort())
+    for (const state of LOGIN_STATES.map(x => x.id)) {
+      page.run(`meridianLoginStates.showAll(); meridianLoginStates.setHidden('${state}', true); applyProfileFilter()`)
+      expect(shown()).toEqual(Object.keys(STATE_OF).filter(id => STATE_OF[id] !== state).sort())
+    }
+    page.run("meridianLoginStates.showAll(); meridianLoginStates.setHidden('authenticated', true); meridianProviders.setHidden('claude', true); applyProfileFilter()")
+    expect(shown()).toEqual(["g-out"])
+    page.run("setProfileQuery('g-out')")
+    expect(page.element("profiles-filter-count").textContent).toBe("1 of 1")
+    page.run("setProfileQuery(''); meridianLoginStates.setHidden('needs-auth', true); applyProfileFilter()")
+    expect(shown()).toEqual([])
+    expect(page.element("profiles-login-none").hidden).toBe(false)
+    expect(page.element("profiles-provider-none").hidden).toBe(true)
+    expect(storage.getItem(HIDDEN_LOGIN_STATES_KEY)).toBe('["authenticated","needs-auth"]')
+  })
+
+  test("a link to an account in a hidden state shows that state again", () => {
+    const storage = new MemoryStorage()
+    storage.setItem(HIDDEN_LOGIN_STATES_KEY, '["needs-auth"]')
+    const { page } = rendered(storage)
+    const target = stubElement()
+    target.attrs.set("data-group", "claude")
+    target.attrs.set("data-login-state", "needs-auth")
+    page.element("profile-c-out").getAttribute = target.getAttribute
+    page.run("location.hash = '#c-out'; jumpToProfileAnchor()")
+    expect(storage.getItem(HIDDEN_LOGIN_STATES_KEY)).toBe("[]")
   })
 })
