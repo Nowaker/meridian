@@ -93,6 +93,25 @@ describe("Plugin integration — end-to-end via HTTP", () => {
     }))
   }
 
+  it("reads plugins.json from MERIDIAN_CONFIG_DIR when no plugin path is given", async () => {
+    const configDir = mkdtempSync(join(tmpdir(), "plugin-integ-config-"))
+    const pluginPath = join(externalPluginDir, "instance.js")
+    writeFileSync(pluginPath, `export default { name: "instance-plugin", version: "1.0.0", onRequest(ctx) { return ctx } }`)
+    writeFileSync(join(configDir, "plugins.json"), JSON.stringify({ plugins: [{ path: pluginPath, enabled: true }] }))
+    const saved = process.env.MERIDIAN_CONFIG_DIR
+    process.env.MERIDIAN_CONFIG_DIR = configDir
+    try {
+      const { app, initPlugins } = createProxyServer({ port: 0, host: "127.0.0.1" })
+      if (initPlugins) await initPlugins()
+      const list = await (await app.fetch(new Request("http://localhost/plugins/list"))).json() as { plugins: Array<{ name: string; status: string }> }
+      expect(list.plugins.find(p => p.name === "instance-plugin")?.status).toBe("active")
+    } finally {
+      if (saved === undefined) delete process.env.MERIDIAN_CONFIG_DIR
+      else process.env.MERIDIAN_CONFIG_DIR = saved
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
   it("loads an absolute-path plugin and applies its onRequest hook to a live request", async () => {
     // External plugin lives outside ~/.config/meridian/plugins/ — simulates
     // a cloned-repo install (meridian-plugin-pi-scrub and friends).
