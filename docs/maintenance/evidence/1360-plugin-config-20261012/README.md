@@ -16,7 +16,10 @@ per-instance plugin lists and explicit directory/manifest precedence.
 79 assertions and typecheck pass. The baseline loader read existing global
 plugin names; no /v1/messages or live inference was invoked by those assertions.
 
-Remaining: actual source/independently installed CLI isolation, required full
-npm test/typecheck/build, final-head CI and affected client/model/plugin evidence.
+Full local `npm test`, standalone typecheck and build passed on frozen
+584bd172826e192282b20bb1a586a04fc6447da7; see [receipt](full-local-gates.json).
+
+Remaining: actual source/independently installed CLI isolation, final-head CI
+and affected client/model/plugin evidence.
 Current account credentials are unavailable; no refresh or paid-usage workaround.
 Source #1360 stays open until completed incorporation is verified.
