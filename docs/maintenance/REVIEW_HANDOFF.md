@@ -1,3 +1,22 @@
+## Resumed backlog — plugin config CLI proof and Windows ACL correction
+
+#1362 source and independently installed foreground CLIs now pass fenced,
+credentialless config-isolation and override assertions; unchanged main fails
+the same assertion. Four acceptance cases, all processes joined exit0.
+[Receipts and runnable harness](evidence/1360-plugin-config-20261012/README.md).
+5754 local tests/typecheck/build and prior-head CI passed. Account-dependent
+client/model evidence is still deferred; no inference or auth refresh.
+
+#1359 Windows correction f5f7cb5f replaces module-dependent ACL cmdlets with
+Framework attribute/ACL APIs, preserving the existing owner, inheritance,
+principal, full-control and reparse checks. New native control removes module
+discovery and checks create/inspect/file/wrong-kind behavior. Local typecheck
+and portable test pass; Windows-specific cases require native CI. Full local
+validation and real source/installed Windows lifecycle are running/pending.
+Earlier Windows failures remain retained; no success claim or merge yet.
+#1347 local refresh passed5768 tests/typecheck/build, with receipt committed;
+two-account live verification remains deferred at the owner's request.
+
 ## Plugin config isolation #1360 — authored correction under verification
 
 New consequential fix source219160f -> cherry13abefad5 in isolated
