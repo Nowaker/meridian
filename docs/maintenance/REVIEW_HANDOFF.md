@@ -1,3 +1,12 @@
+## Plugin config isolation #1360 — authored correction under verification
+
+New consequential fix source219160f -> cherry13abefad5 in isolated
+meridian-plugin-config-1360-20261012 frome0f9feab. Both config manifest/discovery
+assertions fail unchanged main and pass candidate;34 focused tests/79 assertions
+and typecheck pass. Explicit overrides remain intact; CLI help corrected.
+[Evidence](evidence/1360-plugin-config-20261012/README.md). Full and actual
+source/installed acceptance remain open. No model calls or auth changes.
+
 ## Current Nix runtime integration — #1342 → #1357
 
 Authored current-main incorporation26e2dd4a5/dd4bf666 preserves Connor Grady's
