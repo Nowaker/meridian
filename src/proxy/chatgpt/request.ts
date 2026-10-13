@@ -18,6 +18,16 @@ const CODEX_BASE_PATH = "/backend-api"
 
 export const CODEX_RESPONSES_URL = `${CODEX_ORIGIN}${CODEX_BASE_PATH}/codex/responses`
 
+/**
+ * The image endpoints the Codex CLI calls with a ChatGPT sign-in: plain JSON
+ * in, `{ data: [{ b64_json }] }` out, billed to the seat's plan.
+ * https://github.com/openai/codex/blob/a4ebc509f4cdff88a8e58e175541970a30a2d385/codex-rs/codex-api/src/endpoint/images.rs
+ */
+export const CODEX_IMAGES_URLS = {
+  image_generations: `${CODEX_ORIGIN}${CODEX_BASE_PATH}/codex/images/generations`,
+  image_edits: `${CODEX_ORIGIN}${CODEX_BASE_PATH}/codex/images/edits`,
+} as const
+
 const ORIGINATOR = "codex_cli_rs"
 const RESPONSES_BETA = "responses=experimental"
 const RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
@@ -117,4 +127,18 @@ export function buildCodexRequest(
   }
 
   return { url: CODEX_RESPONSES_URL, headers }
+}
+
+/**
+ * The outbound image request: the seat's credential and the Codex originator,
+ * nothing from the client but the body. No Responses beta, no stream accept:
+ * these endpoints answer one JSON document.
+ */
+export function buildCodexImagesRequest(operation: keyof typeof CODEX_IMAGES_URLS, account: CodexRequestAccount): CodexRequest {
+  const headers = new Headers()
+  headers.set("authorization", `Bearer ${account.accessToken}`)
+  headers.set("chatgpt-account-id", account.accountId)
+  headers.set("originator", ORIGINATOR)
+  headers.set("content-type", "application/json")
+  return { url: CODEX_IMAGES_URLS[operation], headers }
 }

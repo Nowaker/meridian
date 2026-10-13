@@ -46,6 +46,7 @@ const { chatGptAuthLifecycleKey } = await import("../proxy/chatgpt/refresh")
 
 const NOW = Date.now()
 const CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
+const IMAGES_PREFIX = "https://chatgpt.com/backend-api/codex/images/"
 const TOKEN_URL = "https://auth.openai.com/oauth/token"
 
 interface UpstreamCall { url: string; authorization: string | null; accountId: string | null; body: Record<string, unknown> }
@@ -93,7 +94,7 @@ function mockFetch(input: string | URL | Request, init?: RequestInit): Promise<R
     tokenCalls++
     return Promise.resolve(new Response(JSON.stringify({ access_token: "at-refreshed", refresh_token: "rt-rotated", expires_in: 3600 }), { status: 200, headers: { "content-type": "application/json" } }))
   }
-  if (url === CODEX_URL) {
+  if (url === CODEX_URL || url.startsWith(IMAGES_PREFIX)) {
     const headers = new Headers(init?.headers)
     const call = { url, authorization: headers.get("authorization"), accountId: headers.get("chatgpt-account-id"), body: JSON.parse(String(init?.body)) as Record<string, unknown> }
     upstreamCalls.push(call)
@@ -310,6 +311,89 @@ describe("ChatGPT gateway routing", () => {
     const res = await app.fetch(responses({ ...LUNA, stream: false }))
     expect(res.status).toBe(200)
     expect(sdkCalls).toBe(1)
+    expect(upstreamCalls).toHaveLength(0)
+  })
+})
+
+describe("ChatGPT image generation", () => {
+  const PNG_B64 = "iVBORw0KGgo="
+  const image = (extra: Record<string, string> = {}) => new Response(JSON.stringify({ created: 1, data: [{ b64_json: PNG_B64 }] }), {
+    status: 200, headers: { "content-type": "application/json", "set-cookie": "must-not-leak=1", ...extra },
+  })
+  const imagesRequest = (route: string, body: Record<string, unknown>) => new Request(`http://localhost${route}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer any-client-key" },
+    body: JSON.stringify(body),
+  })
+  const GENERATE = { prompt: "a lighthouse at dusk", background: "opaque", model: "gpt-image-2", quality: "auto", size: "auto" }
+
+  it("generates an image on a seat's plan, passing the body and the answer through untouched", async () => {
+    writePool([account(0), account(1)])
+    respond = () => image()
+    const { app } = await server("follow-external")
+    const res = await app.fetch(imagesRequest("/v1/images/generations", GENERATE))
+    expect(res.status).toBe(200)
+    expect(res.headers.get("set-cookie")).toBeNull()
+    expect(await res.json()).toEqual({ created: 1, data: [{ b64_json: PNG_B64 }] })
+
+    expect(upstreamCalls).toHaveLength(1)
+    const [call] = upstreamCalls
+    expect(call!.url).toBe(`${IMAGES_PREFIX}generations`)
+    expect(call!.authorization).toBe("Bearer at-0")
+    expect(call!.accountId).toBe("workspace-0")
+    expect(call!.body).toEqual(GENERATE)
+    expect(sdkCalls).toBe(0)
+
+    const [metric] = telemetryStore.getRecent({ limit: 1 })
+    expect(metric).toMatchObject({ adapter: "chatgpt", requestModel: "gpt-image-2", status: 200, mode: "non-stream" })
+  })
+
+  it("sends reference images to the edits endpoint", async () => {
+    writePool([account(0)])
+    respond = () => image()
+    const { app } = await server("follow-external")
+    const edit = { ...GENERATE, images: [{ image_url: `data:image/png;base64,${PNG_B64}` }] }
+    const res = await app.fetch(imagesRequest("/v1/images/edits", edit))
+    expect(res.status).toBe(200)
+    expect(upstreamCalls.map(call => call.url)).toEqual([`${IMAGES_PREFIX}edits`])
+    expect(upstreamCalls[0]!.body).toEqual(edit)
+  })
+
+  it("moves an image request past a seat whose plan is spent, and benches that seat", async () => {
+    writePool([account(0), account(1)])
+    respond = (_call, index) => index === 0
+      ? new Response(JSON.stringify({ detail: "usage limit reached" }), { status: 429, headers: { "content-type": "application/json" } })
+      : image()
+    const { app } = await server("follow-external")
+    const res = await app.fetch(imagesRequest("/v1/images/generations", GENERATE))
+    expect(res.status).toBe(200)
+    expect(upstreamCalls.map(call => call.accountId)).toEqual(["workspace-0", "workspace-1"])
+
+    upstreamCalls = []
+    respond = () => image()
+    expect((await app.fetch(imagesRequest("/v1/images/generations", GENERATE))).status).toBe(200)
+    expect(upstreamCalls.map(call => call.accountId)).toEqual(["workspace-1"])
+  })
+
+  it("sends an image request with no model to ChatGPT, never to Claude", async () => {
+    writePool([account(0)])
+    respond = () => image()
+    const { app } = await server("follow-external")
+    const { model: _model, ...unnamed } = GENERATE
+    const res = await app.fetch(imagesRequest("/v1/images/generations", unnamed))
+    expect(res.status).toBe(200)
+    expect(sdkCalls).toBe(0)
+    expect(upstreamCalls).toHaveLength(1)
+  })
+
+  it("answers in OpenAI's shape when no ChatGPT source is configured", async () => {
+    const { app } = await server(undefined)
+    const res = await app.fetch(imagesRequest("/v1/images/generations", GENERATE))
+    expect(res.status).toBe(404)
+    const body = await res.json() as { error: { type: string; message: string } }
+    expect(body.error.type).toBe("not_found_error")
+    expect(body.error.message).toContain("/v1/images/generations")
+    expect(sdkCalls).toBe(0)
     expect(upstreamCalls).toHaveLength(0)
   })
 })

@@ -26,9 +26,9 @@
  */
 import { randomUUID } from "node:crypto"
 import { AssignmentStore, type ProfileExhaustion } from "../routing"
-import type { UpstreamBackend, UpstreamRequest } from "../upstream/backend"
+import { isImageEndpoint, type UpstreamBackend, type UpstreamRequest } from "../upstream/backend"
 import { adaptResponsesBody, type BodyAdaptation } from "../chatgpt/body"
-import { buildCodexRequest } from "../chatgpt/request"
+import { buildCodexImagesRequest, buildCodexRequest } from "../chatgpt/request"
 import { isModelRefusal, sniffChatGptFailure, type ChatGptFailureKind } from "../chatgpt/stream"
 import { aggregateResponsesStream, tapResponsesStream, type ChatGptUsage, type TapSummary } from "../chatgpt/tap"
 import { noteApiRejected, noteProviderAccepted } from "../authLifecycle"
@@ -330,9 +330,10 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
     async handle(request: UpstreamRequest<Ctx>) {
       const startedAt = now()
       const requestId = randomUUID()
-      if (request.endpoint !== "responses") {
+      const imageOperation = isImageEndpoint(request.endpoint) ? request.endpoint : undefined
+      if (request.endpoint !== "responses" && !imageOperation) {
         return errorResponse(404, "not_found_error",
-          `This model is served by ChatGPT, which Meridian reaches through the Responses API only. ${request.route} is not available for it.`)
+          `This model is served by ChatGPT, which Meridian reaches through the Responses and Images APIs only. ${request.route} is not available for it.`)
       }
 
       const inbound = await options.inboundRequest(request.context)
@@ -348,7 +349,9 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
       const model = typeof parsed.model === "string" ? parsed.model : undefined
       const requestSource = inbound.headers.get("x-meridian-source")?.slice(0, 64) || undefined
       const turn: ChatGptTurnInfo = { requestId, model, body: parsed, headers: inbound.headers }
-      const adapted = adaptResponsesBody(parsed)
+      // An image request goes as the client wrote it: the Responses
+      // adaptations (forced stream, store=false) mean nothing to that endpoint.
+      const adapted = imageOperation ? { body: parsed, clientWantsStream: parsed.stream === true, applied: [] } : adaptResponsesBody(parsed)
       const attempts: ChatGptAttempt[] = []
 
       const report = (fields: Partial<ChatGptTurnEvent> & { status: number }) => {
@@ -502,7 +505,9 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
 
         let retriedAuth = false
         for (;;) {
-          const { url, headers } = buildCodexRequest(adapted.body, credential.account)
+          const { url, headers } = imageOperation
+            ? buildCodexImagesRequest(imageOperation, credential.account)
+            : buildCodexRequest(adapted.body, credential.account)
           let upstream: Response
           try {
             upstream = await dispatch(url, { method: "POST", headers, body: outbound, redirect: "error", signal: inbound.signal })
@@ -546,6 +551,15 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
             if (cacheKey) affinity.set(cacheKey, { profileId: seat, requestId: undefined })
             lastServedOnCredits.set(seat, onCredits)
             settle(seat)
+            // An image answer is one JSON document with no Responses events
+            // to tap: it passes through as the provider sent it.
+            if (imageOperation) {
+              report({
+                status: upstream.status, seat, ttfbMs: now() - startedAt,
+                ...(onCredits ? { servedOnCredits: true } : {}),
+              })
+              return new Response(sniffed.body, { status: upstream.status, headers: headersOut })
+            }
             const onDone = (summary: TapSummary) => report({
               status: upstream.status, seat, model: summary.model ?? model ?? null, usage: summary.usage,
               ...(onCredits ? { servedOnCredits: true } : {}),

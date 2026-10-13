@@ -30,8 +30,18 @@ export type ProviderId = "claude" | "chatgpt"
  * Distinct from the route string on purpose: `/v1/messages` and `/messages`
  * are two routes onto one surface. A backend cares about the surface; the
  * queue wrapper and telemetry care about the route the client actually called.
+ *
+ * The two image operations of the OpenAI Images API are surfaces of their own
+ * rather than one surface told apart by route: they reach different upstream
+ * endpoints, and only a provider that generates images serves them.
  */
-export type UpstreamEndpoint = "messages" | "responses"
+export type UpstreamEndpoint = "messages" | "responses" | "image_generations" | "image_edits"
+
+export type ImageEndpoint = Extract<UpstreamEndpoint, "image_generations" | "image_edits">
+
+export function isImageEndpoint(endpoint: UpstreamEndpoint): endpoint is ImageEndpoint {
+  return endpoint === "image_generations" || endpoint === "image_edits"
+}
 
 export interface UpstreamRequest<Ctx> {
   /** The inbound HTTP context, owned and shaped by the HTTP layer. */

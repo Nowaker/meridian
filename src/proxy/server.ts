@@ -20,7 +20,7 @@ import { chatGptNameProblem, type ChatGptProfile } from './chatgpt/profiles'
 import { applyChatGptRemoval, applyChatGptRename } from './chatgpt/seatOps'
 import { getCodexUsage } from './codex/service'
 import type { CodexUsageResponse } from './codex/types'
-import { createUpstreamRegistry, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
+import { createUpstreamRegistry, isImageEndpoint, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
 import { createClaudeBackend } from './upstream/claude'
 import { providerForModel } from './upstream/provider'
 import { completeUpstreamResponse } from './upstream/completion'
@@ -8854,10 +8854,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   const dispatchUpstream = async (c: Context, endpoint: UpstreamEndpoint, route: string) => {
     const requested = chatGptBackend ? await peekRequest(c) : { stream: false }
     const model = requested.model
-    const provider = chatGptBackend ? providerForModel(model) : "claude"
+    // Images have one provider whatever model the body names: Claude draws none.
+    const provider = isImageEndpoint(endpoint) ? "chatgpt" : chatGptBackend ? providerForModel(model) : "claude"
+    const shape: ErrorShape = endpoint === "messages" ? "anthropic" : "openai"
     try {
       if (provider !== "chatgpt") return await upstream.backendFor(provider).handle({ context: c, endpoint, route })
-      const shape: ErrorShape = endpoint === "responses" ? "openai" : "anthropic"
       if (draining) return drainingResponse(shape)
       // A restart drain holds a ChatGPT turn at the door exactly like a Claude
       // one; without this a drained /inflight reads 0 while ChatGPT streams
@@ -8909,8 +8910,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       }
     } catch (error) {
       if (!(error instanceof UnknownProviderError)) throw error
-      const message = `Model "${model ?? "unknown"}" is served by the "${provider}" provider, which this Meridian has no configured upstream for.`
-      return endpoint === "responses"
+      const message = isImageEndpoint(endpoint)
+        ? `${route} is served by ChatGPT, which this Meridian has no configured upstream for.`
+        : `Model "${model ?? "unknown"}" is served by the "${provider}" provider, which this Meridian has no configured upstream for.`
+      return shape === "openai"
         ? c.json({ error: { type: "not_found_error", message, code: null } }, 404)
         : c.json({ type: "error", error: { type: "not_found_error", message } }, 404)
     }
@@ -11022,6 +11025,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     })
   }
   app.post("/v1/responses", (c) => dispatchUpstream(c, "responses", "/v1/responses"))
+  app.post("/v1/images/generations", (c) => dispatchUpstream(c, "image_generations", "/v1/images/generations"))
+  app.post("/v1/images/edits", (c) => dispatchUpstream(c, "image_edits", "/v1/images/edits"))
 
   // --- Model Discovery ---
   // Returns available Claude models in OpenAI-compatible format, followed by
