@@ -710,6 +710,13 @@ describe("login states", () => {
     expect(st.onClick({ closest: () => null })).toBeNull()
   })
 
+  test("on a phone, Show all and Show all states are 40px tap targets, as the chips are", () => {
+    const phone = profileProvidersCss.slice(profileProvidersCss.indexOf("@media (max-width: 720px)"))
+    expect(phone).toContain(".provider-chip { min-height: 40px;")
+    expect(phone).toContain(".provider-show-all { display: inline-flex; align-items: center; min-height: 40px; }")
+    expect(LOGIN_STATES_NONE_SHOWN_HTML).toContain('class="provider-show-all"')
+  })
+
   for (const [name, html] of [["landing", landingHtml], ["profiles", profilePageHtml]] as const) {
     test(`${name}: embeds the login-state module and its CSS exactly once`, () => {
       expect(html.split("var meridianLoginStates = (function () {").length - 1).toBe(1)
