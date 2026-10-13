@@ -1,16 +1,19 @@
 # Config-local plugin loading — source #1360
 
-Disposition: accept with corrections; local and source/installed CLI config
-acceptance pass, affected-client/model acceptance remains open.
+Disposition: accept with corrections, merged as the contributor's own PR #1360.
+Local and source/installed CLI config acceptance pass; model inference through a
+relocated plugin was not run.
 Current-main e0f9feab defaults plugin paths to the user's global Meridian tree
 although MERIDIAN_CONFIG_DIR selects a separate instance. The original manifest
 assertion and added discovery-isolation control both fail there; the same
-assertions pass after the actual authored cherry-pick. Explicit plugin directory
+assertions pass with Nowaker's commit applied. Explicit plugin directory
 and manifest settings retain precedence. No exported configuration type, route,
 or lifecycle interface changes.
 
-Source219160f2796422b31a54f2ed52ad101a44137f5a -> cherry-pick13abefad5 preserves
-Nowaker's Author and AuthorDate2026-10-13T00:05:10Z. Maintainer corrections add
+Nowaker's commit is 219160f2796422b31a54f2ed52ad101a44137f5a on their branch.
+The receipts below were recorded on maintainer draft #1362, whose tree is
+identical (cherry-picked copy 13abefad5 plus the same maintainer commits); that
+draft is closed unmerged. Maintainer commits on Nowaker's branch add
 CLI help consistency and controls for distinct configuration roots, retained
 per-instance plugin lists and explicit directory/manifest precedence.
 [Regression receipt](regression.json): baseline2 failures; corrected34 tests /
@@ -36,6 +39,5 @@ explicit options still win. Two simultaneous processes cannot read each other's
 plugin sets in the tested flow. Disabled manifest entries retain precedence over
 discovery. No exported interface, profile entitlement or request hook changes.
 
-Remaining: final-head CI and affected client/model/plugin evidence.
-Current account credentials are unavailable; no refresh or paid-usage workaround.
-Source #1360 stays open until completed incorporation is verified.
+Not run: a model request through a plugin loaded from a relocated config
+directory. The change moves two default paths and touches no request path.

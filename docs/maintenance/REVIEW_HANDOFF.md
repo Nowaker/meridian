@@ -1,30 +1,40 @@
-## Resumed backlog — plugin config CLI proof and Windows ACL correction
+## STOP: contributor attribution — #1363 (2026-10-13)
 
-#1362 source and independently installed foreground CLIs now pass fenced,
-credentialless config-isolation and override assertions; unchanged main fails
-the same assertion. Four acceptance cases, all processes joined exit0.
-[Receipts and runnable harness](evidence/1360-plugin-config-20261012/README.md).
-5754 local tests/typecheck/build and prior-head CI passed. Account-dependent
-client/model evidence is still deferred; no inference or auth refresh.
+Read this before touching any contributor PR. Entries below that record credit
+as "`Co-authored-by` present" or "Author/AuthorDate preserved" describe a
+cherry-pick on a maintainer branch that was then squashed; the commit on `main`
+names the maintainer as Author. Those notes are not evidence of credit. The
+verified record is the [attribution ledger](ATTRIBUTION_LEDGER.md).
 
-#1359 Windows correction f5f7cb5f replaces module-dependent ACL cmdlets with
-Framework attribute/ACL APIs, preserving the existing owner, inheritance,
-principal, full-control and reparse checks. New native control removes module
-discovery and checks create/inspect/file/wrong-kind behavior. Local typecheck
-and portable test pass; Windows-specific cases require native CI. Full local
-validation and real source/installed Windows lifecycle are running/pending.
-Earlier Windows failures remain retained; no success claim or merge yet.
-#1347 local refresh passed5768 tests/typecheck/build, with receipt committed;
-two-account live verification remains deferred at the owner's request.
+The integration-PR procedure is withdrawn. Follow
+[Contributor pull requests](../../.agents/references/contributing.md#contributor-pull-requests):
+merge the contributor's own PR, push fixes to their branch, never close silently.
 
-## Plugin config isolation #1360 — authored correction under verification
+Open maintainer drafts that carry contributor commits. **Do not squash-merge
+them.** The maintainer commits in each belong on the contributor's branch, and
+the contributor's PR is what merges:
 
-New consequential fix source219160f -> cherry13abefad5 in isolated
-meridian-plugin-config-1360-20261012 frome0f9feab. Both config manifest/discovery
-assertions fail unchanged main and pass candidate;34 focused tests/79 assertions
-and typecheck pass. Explicit overrides remain intact; CLI help corrected.
-[Evidence](evidence/1360-plugin-config-20261012/README.md). Full and actual
-source/installed acceptance remain open. No model calls or auth changes.
+| Draft | Carries | Contributor PR to merge instead |
+|---|---|---|
+| #1362 | @Nowaker `13abefad5` | #1360 (signed, `CLEAN`) |
+| #1317 | @Cd1s `80d4b9667` | #1314 (unsigned, `BLOCKED`) |
+| #1322 | @passabilities (10), @justprosh (7), @Nowaker (1) | #1211, #1231, #1292; Nowaker's `52965e113` is from closed #1283 |
+
+Corrections to past PRs (reopening, comment edits, release notes, any rewrite of
+`main`) are the owner's decisions in #1363. Do not start them from this note.
+
+## Plugin config isolation — #1360 (2026-10-13)
+
+Nowaker's own PR #1360 carries the change; maintainer tests, CLI help and
+evidence are separate commits on their branch. This replaces draft #1362, which
+held a cherry-picked copy and is closed unmerged. With `MERIDIAN_CONFIG_DIR`
+set, plugin discovery and `plugins.json` follow that directory; explicit
+`MERIDIAN_PLUGIN_DIR` / `MERIDIAN_PLUGIN_CONFIG` still win. Unchanged main fails
+both isolation assertions and the real CLI probe; the candidate passes them
+through the source CLI and a packed, installed CLI.
+[Receipts and harness](evidence/1360-plugin-config-20261012/README.md).
+Not run: model inference through a plugin loaded from a relocated config
+directory. The change only moves two default paths, so no request path differs.
 
 ## Current Nix runtime integration — #1342 → #1357
 
