@@ -71,8 +71,7 @@ import { detectSupervision } from "./supervision"
 import type { RequestMetric } from "../telemetry"
 import { canRecoverCapturedToolUses, canRecoverUncapturedToolUses, isStreamedToolBlockComplete, unavailableToolResults, type StreamedToolBlockRecord, classifyError, extractSdkTermination, formatSdkTermination, classifyResumeRefusal, isRateLimitError, isExtraUsageRequiredError, isExpiredTokenError, isAccountFailoverError, isQuotaRefusal, isOutputTokenCapExceeded } from "./errors"
 import { createSseRelayStream, relayStreamAttempt } from "./sseFailureSniff"
-import { refreshOAuthToken, ensureFreshToken, startBackgroundRefresh, stopBackgroundRefresh, createPlatformCredentialStore, getAuthRenewalStatus, getStoredPlanFields, readStoredCredentialSnapshot, renewalStatusFor, resolveRenewalWarnDays, type AuthRenewalStatus, type CredentialStore, type StoredPlanFields } from "./tokenRefresh"
-import { describeAuthLifecycleEvent, noteCredentialObserved, onAuthLifecycleTransition, type AuthLifecycleTransition } from "./authLifecycle"
+import { refreshOAuthToken, ensureFreshToken, startBackgroundRefresh, stopBackgroundRefresh, createPlatformCredentialStore, readStoredCredentialSnapshot, getAuthRenewalStatus, getStoredPlanFields, renewalStatusFor, resolveRenewalWarnDays, type CredentialStore, type StoredPlanFields } from "./tokenRefresh"
 import { planAllowance } from "./planAllowance"
 import { isCredentialsReadOnly, logCredentialsModeBanner } from "./credentialsMode"
 import {
@@ -409,15 +408,6 @@ function credentialStoreForProfile(profile: ResolvedProfile): CredentialStore | 
   return createPlatformCredentialStore(
     profile.env.CLAUDE_CONFIG_DIR ? { claudeConfigDir: profile.env.CLAUDE_CONFIG_DIR } : undefined
   )
-}
-
-function profileIdsForCredentialKey(config: ProxyConfig, key: string): string[] {
-  const profiles = getEffectiveProfiles(config.profiles)
-  if (profiles.length === 0) return createPlatformCredentialStore().refreshKey === key ? ["default"] : []
-  return profiles
-    .map(profile => resolveProfile(config.profiles, config.defaultProfile, profile.id))
-    .filter(resolved => credentialStoreForProfile(resolved)?.refreshKey === key)
-    .map(resolved => resolved.id)
 }
 
 async function ensureFreshTokenForProfiles(config: ProxyConfig): Promise<void> {
@@ -8948,6 +8938,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   app.get("/profiles/list", async (c) => {
     const profiles = listProfiles(finalConfig.profiles, finalConfig.defaultProfile)
     const organizations = organizationNames()
+    const expiryObservedAt = Date.now()
     const renewalWarnDays = resolveRenewalWarnDays(process.env.MERIDIAN_AUTH_RENEWAL_WARN_DAYS)
     // Enrich with live auth status
     const enriched = await Promise.all(profiles.map(async (p) => {
@@ -8992,17 +8983,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // outranks a cheerful probe. Only `absent` demotes: see
       // `readStoredCredentialPresence` for why `unknown` must not.
       // A supplied API key/setup token is not the grant in this store; an
-      // empty stored OAuth grant cannot invalidate those credentials. Only an
-      // account with its own OAuth credential has a login lifetime either.
+      // empty stored OAuth grant cannot invalidate those credentials.
       const stored = profileStore ? await readStoredCredentialSnapshot(profileStore) : undefined
       const presence = stored?.presence ?? "unknown"
-      // How long the login has left, and what is on record about it.
-      const renewal: AuthRenewalStatus = stored
-        ? renewalStatusFor(stored.refreshTokenExpiresAt, renewalWarnDays)
-        : { renewalRequiredSoon: false }
-      const lifecycle = profileStore && stored
-        ? noteCredentialObserved(profileStore.refreshKey, { presence, refreshTokenExpiresAt: stored.refreshTokenExpiresAt })
-        : undefined
+      const renewal = renewalStatusFor(stored?.refreshTokenExpiresAt, renewalWarnDays, expiryObservedAt)
       return {
         ...p,
         email: auth?.email || null,
@@ -9026,19 +9010,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // the caller's wait — is a different fact from "cached" and must not
         // render as the same blank, nor as a live "not logged in".
         authProvenance: !auth ? "never" : cacheInfo.isFailure ? "cached" : "live",
-        // Additive: the login's lifetime. `refreshTokenExpiresAt` and the two
-        // renewal fields mean what they mean in /health; past the deadline the
-        // account keeps working until `accessTokenExpiresAt`. The rest is the
-        // record authLifecycle.ts keeps, null until something was observed.
+        // Current stored metadata only: deadlines are advisory and do not
+        // establish authentication, logout or the creation of a new grant.
         refreshTokenExpiresAt: renewal.refreshTokenExpiresAt ?? null,
         daysUntilRenewal: renewal.daysUntilRenewal ?? null,
         renewalRequiredSoon: renewal.renewalRequiredSoon,
         accessTokenExpiresAt: stored?.accessTokenExpiresAt ?? null,
-        authObtainedAt: lifecycle?.authObtainedAt ?? null,
-        authObtainedVia: lifecycle?.authObtainedVia ?? null,
-        lastRefreshAt: lifecycle?.lastRefreshAt ?? null,
-        firstUnauthedAt: lifecycle?.firstUnauthedAt ?? null,
-        unauthedReason: lifecycle?.unauthedReason ?? null,
         // Present for EVERY profile, null included, so a follower can tell an
         // instance too old to answer (field absent) from one saying this
         // profile cannot be shared (field null). Never a secret — see
@@ -10458,18 +10435,6 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
   // Idempotent — re-calling start() on a hot-reload is a no-op.
   startBackgroundRefresh()
 
-  // Logins, logouts and new logins found on disk, in the log and in the
-  // persisted diagnostics, so a logout can be read against the deadline it fell
-  // on long after Claude Code has wiped the credential that held it.
-  const stopAuthLifecycleLog = onAuthLifecycleTransition((transition: AuthLifecycleTransition) => {
-    const ids = profileIdsForCredentialKey(finalConfig, transition.key)
-    const who = ids.length > 0 ? ids.map(id => `"${id}"`).join(", ") : transition.key
-    const message = `Profile ${who} ${describeAuthLifecycleEvent(transition.event, transition.record)}`
-    plog(`[PROXY] ${message}`)
-    diagnosticLog.log({ level: transition.event.kind === "logged_out" ? "warn" : "info", category: "auth", message })
-    claudeLog("auth.lifecycle", { profiles: ids, ...transition.event })
-  })
-
   // Profile-scoped OAuth token refresh: the default scheduler above only
   // watches the default Claude credential store. Multi-profile credentials
   // live under each profile's CLAUDE_CONFIG_DIR, so poll the discovered
@@ -10532,7 +10497,6 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
         beginDrain?.()
         stopFollowPolling()
         stopBackgroundRefresh()
-        stopAuthLifecycleLog()
         stopUpdateCheck()
 
         // Stop admitting new requests, then give whatever is already in flight

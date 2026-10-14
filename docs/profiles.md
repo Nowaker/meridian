@@ -147,22 +147,30 @@ meridian profile add ci --oauth-token sk-ant-oat01-...
 
 OAuth-token profiles store the token in `profiles.json` and feed it to the SDK via `CLAUDE_CODE_OAUTH_TOKEN` — no Keychain entry, no browser handshake. To prevent the SDK's 401-recovery from silently falling back to the host's `~/.claude` credentials, OAuth-token profiles also pin `CLAUDE_CONFIG_DIR` to an isolated per-profile directory under `~/.config/meridian/profiles/<name>/`. That directory holds only SDK state (sessions, settings) — never `.credentials.json`, since the token is delivered through the env.
 
-### Login lifetime
+### Current login expiry
 
-A browser login has a deadline. Anthropic reports it with every token refresh, and refreshing renews the access token (about every 8 hours) but not the deadline. Once the deadline passes, the next refresh is refused and the account stops working when its current access token runs out, at most one access-token lifetime later. Run `meridian profile login <name>` before then.
+Meridian preserves a valid refresh deadline when its OAuth token exchange reports
+one. The Profiles page and home details show this account's current stored
+refresh deadline and access-token expiry, with the exact recorded time on hover
+or keyboard focus. Access expiry may be estimated when the provider omits it.
+Authentication is checked separately: a deadline does not prove logout,
+revocation, a fixed login lifetime or how long an account will serve requests.
 
-`GET /profiles/list` reports this for every browser-login profile:
+`GET /profiles/list` adds four fields, read from one fresh snapshot of each
+stored-Claude profile's own credential:
 
 | Field | Meaning |
-|-------|---------|
-| `refreshTokenExpiresAt` | The login's deadline (epoch ms), read from the profile's own credential |
-| `daysUntilRenewal`, `renewalRequiredSoon` | As in `/health`; the window is `MERIDIAN_AUTH_RENEWAL_WARN_DAYS` (default 3) |
-| `accessTokenExpiresAt` | When the current access token runs out; past the deadline, when the account stops |
-| `authObtainedAt`, `authObtainedVia` | When the login happened: `login` when Meridian performed it, `observed` when a new login was found on disk |
-| `lastRefreshAt` | Last token refresh Meridian performed (one done by a Claude Code process is not seen) |
-| `firstUnauthedAt`, `unauthedReason` | When the account was first found logged out (`refresh_rejected` or `credentials_cleared`); cleared by the next login |
+| --- | --- |
+| `refreshTokenExpiresAt` | Current stored refresh deadline in epoch milliseconds, or `null` when unavailable |
+| `daysUntilRenewal` | `Math.ceil((refreshTokenExpiresAt - now) / 86400000)`, or `null`; zero includes a deadline less than one day past |
+| `renewalRequiredSoon` | Rounded days are at or below `MERIDIAN_AUTH_RENEWAL_WARN_DAYS` (default 3), matching `/health`; false with a null deadline means unknown/not applicable |
+| `accessTokenExpiresAt` | Current stored access-token expiry in epoch milliseconds, or `null`; advisory and possibly estimated |
 
-Claude Code wipes `.credentials.json` when a refresh is refused, so Meridian keeps this record in its own `auth-lifecycle.json` beside `settings.json`. Every transition is logged (`[PROXY] Profile "work" logged out: ...`, naming the deadline and how long the login lasted) and stored in the diagnostics log under the `auth` category. The profile card shows it as "Login expires in …", "Logged in … ago" and "Logged out … ago".
+API-key and supplied setup-token profiles report null timestamps/day count and
+false without consulting the host's stored login. Failed credential reads also
+return unavailable expiry facts and preserve the existing authentication
+provenance. A changed or missing current deadline replaces the displayed value;
+Meridian does not infer a new login or retain a separate login-history file.
 
 ### Switching profiles
 

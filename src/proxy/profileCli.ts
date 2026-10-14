@@ -33,7 +33,6 @@ import {
 import { getSetting, setSetting } from "../settings"
 import { publishProfileConfig, readProfileConfigForUpdate, withProfileConfigLock, withProfileConfigLockSync } from "./profileConfigStore"
 import { createPlatformCredentialStore, type CredentialsFile } from "./tokenRefresh"
-import { noteAuthLogin } from "./authLifecycle"
 
 const OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
 export const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
@@ -302,19 +301,20 @@ export function buildLoginCredentials(
   plan: OAuthPlanFields,
   now: number = Date.now(),
 ): CredentialsFile {
-  // The login's own deadline, the same field `claude login` writes. Without it
-  // a profile logged in here showed no expiry until its first refresh, hours
-  // later. Validated as the refresh path validates it: in the future, or not
-  // at all.
-  const refreshTokenExpiresAt =
-    tokenData.refresh_token_expires_at ??
-    (tokenData.refresh_token_expires_in ? now + tokenData.refresh_token_expires_in * 1000 : undefined)
+  // Preserve the provider's refresh deadline just as the refresh path does.
+  // Missing/malformed metadata is unknown; do not guess its units or lifetime.
+  const refreshDeadline = tokenData.refresh_token_expires_at ??
+    (typeof tokenData.refresh_token_expires_in === "number" && tokenData.refresh_token_expires_in > 0
+      ? now + tokenData.refresh_token_expires_in * 1000 : undefined)
+  const refreshTokenExpiresAt = typeof refreshDeadline === "number"
+    && Number.isFinite(refreshDeadline) && refreshDeadline > now && refreshDeadline <= 8.64e15
+    ? refreshDeadline : undefined
   return {
     claudeAiOauth: {
       accessToken: tokenData.access_token,
       refreshToken: tokenData.refresh_token,
       expiresAt: tokenData.expires_at ?? now + (tokenData.expires_in ?? 8 * 60 * 60) * 1000,
-      ...(refreshTokenExpiresAt && refreshTokenExpiresAt > now ? { refreshTokenExpiresAt } : {}),
+      ...(refreshTokenExpiresAt ? { refreshTokenExpiresAt } : {}),
       scopes: tokenData.scope?.split(" ").filter(Boolean) ?? OAUTH_SCOPES,
       ...plan,
     },
@@ -428,17 +428,7 @@ export async function exchangeAuthorizationCodeForCredentials(params: OAuthExcha
     payload: describeAuthFields(credentials.claudeAiOauth),
   })
   const written = await store.write(credentials)
-  if (written) {
-    noteAuthLogin(store.refreshKey, { refreshTokenExpiresAt: credentials.claudeAiOauth.refreshTokenExpiresAt })
-  }
   return written ? { ok: true } : { ok: false, reason: "write_failed" }
-}
-
-/** A `claude auth login` that just succeeded wrote the credential itself, so it is read back. */
-async function recordCliLogin(configDir: string | undefined): Promise<void> {
-  const store = createPlatformCredentialStore(configDir ? { claudeConfigDir: configDir } : undefined)
-  const credentials = await store.read().catch(() => null)
-  noteAuthLogin(store.refreshKey, { refreshTokenExpiresAt: credentials?.claudeAiOauth?.refreshTokenExpiresAt })
 }
 
 async function completeManualOAuthLogin(configDir: string): Promise<boolean> {
@@ -660,7 +650,6 @@ export async function profileAdd(id: string, options: AuthLoginOptions = {}): Pr
     process.exit(1)
   }
 
-  if (!options.headless) await recordCliLogin(configDir)
   console.log()
   console.log(`\x1b[32m✓ Profile "${id}" created — logged in as ${auth.email} (${auth.subscriptionType || "unknown"})\x1b[0m`)
 
@@ -929,7 +918,6 @@ export async function profileLogin(id: string, options: AuthLoginOptions = {}): 
 
   const auth = getAuthStatus(profile.claudeConfigDir ?? "")
   if (auth.loggedIn) {
-    if (!options.headless) await recordCliLogin(profile.claudeConfigDir)
     console.log(`\x1b[32m✓ Profile "${id}" authenticated as ${auth.email}\x1b[0m`)
   }
 }
