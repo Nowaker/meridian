@@ -3,10 +3,9 @@
  *
  * Separate from the per-adapter SDK features (sdkFeatures.ts) on purpose: those
  * configure the Claude Agent SDK, and the ChatGPT path never runs adapter
- * detection or the SDK, so a per-adapter key would silently not apply. These
- * three are the ChatGPT counterparts of Thinking Passthrough, Max Budget and
- * Fallback Model, stored under `chatgpt` in settings.json and re-read on every
- * request, like routing.
+ * detection or the SDK, so a per-adapter key would silently not apply. They
+ * are stored under `chatgpt` in settings.json and re-read on every request,
+ * like routing.
  *
  * Defaults differ from Claude's where the pass-through contract demands it:
  * reasoning summaries are forwarded unless the operator turns them off, because
@@ -14,11 +13,14 @@
  * a pass-through response.
  */
 import { getSetting, setSetting } from "../../settings"
+import { REASONING_SUMMARY_LEVELS, type ReasoningSummaryLevel } from "./body"
 import { CHATGPT_MODELS, providerForModel } from "../upstream/provider"
 
 export interface ChatGptFeatures {
   /** Forward ChatGPT's reasoning summaries to the client. */
   thinkingPassthrough: boolean
+  /** The reasoning summary level every request asks for; `client` sends what the client asked for. */
+  reasoningSummary: ChatGptReasoningSummary
   /** Per-request cost cap in USD, 0 = off. */
   maxBudgetUsd: number
   /** A ChatGPT model to retry on when the requested one cannot serve, "" = off. */
@@ -29,6 +31,28 @@ export interface ChatGptFeatures {
   seatCreditsPolicy: Record<string, ChatGptCreditsPolicy>
   /** Where a free-plan seat ranks for unpinned work: before any seat spends credits, or after. */
   freeSeatOrder: ChatGptFreeSeatOrder
+}
+
+/**
+ * Which `reasoning.summary` ChatGPT is asked for. `client` leaves the body as
+ * the client sent it, summary or none. Any other value replaces the client's
+ * on every request, and adds a `reasoning` object to one that had none:
+ * clients hardcode a level per model variant (opencode sends `auto`, and
+ * nothing at all for a model it does not recognise as a reasoning one), so
+ * one setting here is the only place an operator can choose it for all of
+ * them. Independent of Thinking Passthrough, which decides whether the
+ * summaries that come back reach the client.
+ */
+export type ChatGptReasoningSummary = "client" | ReasoningSummaryLevel
+export const CHATGPT_REASONING_SUMMARIES: readonly ChatGptReasoningSummary[] = ["client", ...REASONING_SUMMARY_LEVELS]
+
+export function isChatGptReasoningSummary(value: unknown): value is ChatGptReasoningSummary {
+  return typeof value === "string" && (CHATGPT_REASONING_SUMMARIES as readonly string[]).includes(value)
+}
+
+/** The level to force on the outbound body, or undefined to keep the client's. */
+export function forcedReasoningSummary(features: ChatGptFeatures): ReasoningSummaryLevel | undefined {
+  return features.reasoningSummary === "client" ? undefined : features.reasoningSummary
 }
 
 /**
@@ -81,6 +105,7 @@ export function effectiveCreditsPolicy(features: ChatGptFeatures, seat: string):
 
 export const CHATGPT_FEATURE_DEFAULTS: Readonly<ChatGptFeatures> = {
   thinkingPassthrough: true,
+  reasoningSummary: "client",
   maxBudgetUsd: 0,
   fallbackModel: "",
   // A fresh install must not spend money nobody agreed to spend.
@@ -102,6 +127,7 @@ export function getChatGptFeatures(): ChatGptFeatures {
     thinkingPassthrough: typeof saved.thinkingPassthrough === "boolean"
       ? saved.thinkingPassthrough
       : CHATGPT_FEATURE_DEFAULTS.thinkingPassthrough,
+    reasoningSummary: isChatGptReasoningSummary(saved.reasoningSummary) ? saved.reasoningSummary : CHATGPT_FEATURE_DEFAULTS.reasoningSummary,
     maxBudgetUsd: typeof saved.maxBudgetUsd === "number" && Number.isFinite(saved.maxBudgetUsd) && saved.maxBudgetUsd > 0
       ? saved.maxBudgetUsd
       : CHATGPT_FEATURE_DEFAULTS.maxBudgetUsd,
@@ -151,6 +177,9 @@ export function validateChatGptFeatureUpdate(
     if (key === "thinkingPassthrough") {
       if (typeof value !== "boolean") throw new Error("thinkingPassthrough must be a boolean")
       result.thinkingPassthrough = value
+    } else if (key === "reasoningSummary") {
+      if (!isChatGptReasoningSummary(value)) throw new Error(`reasoningSummary must be one of: ${CHATGPT_REASONING_SUMMARIES.join(", ")}`)
+      result.reasoningSummary = value
     } else if (key === "maxBudgetUsd") {
       if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new Error("maxBudgetUsd must be a number >= 0")
       result.maxBudgetUsd = value
@@ -192,6 +221,13 @@ export function chatGptFeatureCapabilities(features: ChatGptFeatures): Array<{ n
       detail: features.thinkingPassthrough
         ? "ChatGPT exposes only short reasoning summaries and encrypted reasoning; both pass through untouched."
         : "Reasoning summaries are removed from responses. Encrypted reasoning still passes through for the next turn.",
+    },
+    {
+      name: "Reasoning Summary",
+      status: features.reasoningSummary,
+      detail: features.reasoningSummary === "client"
+        ? "Each request asks for the reasoning summary level its client chose, or none."
+        : `Every request asks for ${features.reasoningSummary} reasoning summaries, whatever its client chose.`,
     },
     {
       name: "Max Budget",

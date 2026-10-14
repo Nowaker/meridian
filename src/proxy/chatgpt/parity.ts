@@ -3,9 +3,11 @@
  * Max Budget (USD), Fallback Model, and Retry-After.
  *
  * Everything here sits AROUND the pass-through backend rather than inside it.
- * The outbound body is never edited, with one operator-configured exception:
- * a Fallback Model retry resends the client's own body with `model` replaced,
- * and nothing else. Every other feature acts on the response - and only when
+ * The outbound body is never edited here, with one operator-configured
+ * exception: a Fallback Model retry resends the client's own body with
+ * `model` replaced, and nothing else. (The other operator-configured edit,
+ * Reasoning Summary, is a body adaptation in chatgpt/body.ts, so the retry
+ * carries it too.) Every other feature acts on the response - and only when
  * the operator turned it on, so with the defaults the stream reaches the
  * client byte for byte.
  *

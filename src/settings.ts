@@ -149,6 +149,8 @@ export type MeridianHookSettings = {
 /** What the operator saved; absent keys take the defaults in proxy/chatgpt/features.ts. */
 export type ChatGptFeatureSettings = {
   thinkingPassthrough?: boolean
+  /** "client" | "auto" | "concise" | "detailed"; see ChatGptReasoningSummary. */
+  reasoningSummary?: string
   maxBudgetUsd?: number
   fallbackModel?: string
   /** "never" | "reserve" | "immediately"; see ChatGptCreditsPolicy. */

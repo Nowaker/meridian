@@ -390,6 +390,47 @@ describe("sessions", () => {
   })
 })
 
+describe("Reasoning Summary", () => {
+  it("sends the client's reasoning untouched by default, including none at all", async () => {
+    const { app } = makeServer()
+    upstream = () => streamResponse(completedStream("gpt-5.6-sol"))
+    const { reasoning: _omitted, ...withoutReasoning } = codexBody("gpt-5.6-sol")
+    await (await post(app, withoutReasoning)).text()
+    await (await post(app, codexBody("gpt-5.6-sol"))).text()
+    expect(calls).toHaveLength(2)
+    expect(calls[0]!.body).toEqual(withoutReasoning)
+    expect(calls[1]!.body.reasoning).toEqual({ effort: "high", summary: "auto" })
+  })
+
+  it("forces the configured level on every request, keeping the client's effort", async () => {
+    updateChatGptFeatures({ reasoningSummary: "detailed" })
+    const { app } = makeServer()
+    upstream = () => streamResponse(completedStream("gpt-5.6-sol"))
+    const { reasoning: _omitted, ...withoutReasoning } = codexBody("gpt-5.6-sol")
+    await (await post(app, withoutReasoning)).text()
+    await (await post(app, codexBody("gpt-5.6-sol"))).text()
+    expect(calls.map(call => call.body.reasoning)).toEqual([{ summary: "detailed" }, { effort: "high", summary: "detailed" }])
+    const { reasoning: _sent, ...rest } = calls[1]!.body
+    const { reasoning: _client, ...clientRest } = codexBody("gpt-5.6-sol")
+    expect(rest).toEqual(clientRest)
+  })
+
+  it("is carried by a Fallback Model retry", async () => {
+    updateChatGptFeatures({ reasoningSummary: "detailed", fallbackModel: "gpt-5.4" })
+    const { app } = makeServer()
+    upstream = (call) => call.body.model === "gpt-5.4"
+      ? streamResponse(completedStream("gpt-5.4"))
+      : new Response(JSON.stringify({ error: { message: "upstream exploded" } }), { status: 503, headers: { "content-type": "application/json" } })
+    const res = await post(app, codexBody("gpt-5.6-sol"))
+    expect(res.headers.get("x-meridian-fallback-model")).toBe("gpt-5.4")
+    await res.text()
+    expect(calls.map(call => [call.body.model, call.body.reasoning])).toEqual([
+      ["gpt-5.6-sol", { effort: "high", summary: "detailed" }],
+      ["gpt-5.4", { effort: "high", summary: "detailed" }],
+    ])
+  })
+})
+
 describe("status surfaces", () => {
   it("/providers/status shows the ChatGPT seats and the feature settings", async () => {
     updateChatGptFeatures({ maxBudgetUsd: 2, fallbackModel: "gpt-5.4" })
@@ -401,7 +442,7 @@ describe("status surfaces", () => {
     expect(chatgpt.accounts.map(account => account.id)).toEqual(["user-a", "user-b"])
     expect(chatgpt.accounts.map(account => account.label)).toEqual(["a@example.test · id:user-a", "b@example.test · id:user-b"])
     const capabilities = Object.fromEntries((chatgpt.capabilities ?? []).map(row => [row.name, row.status]))
-    expect(capabilities).toMatchObject({ Thinking: "summaries", "Max Budget": "$2", "Fallback Model": "gpt-5.4" })
+    expect(capabilities).toMatchObject({ Thinking: "summaries", "Reasoning Summary": "client", "Max Budget": "$2", "Fallback Model": "gpt-5.4" })
     expect(JSON.stringify(data)).not.toContain("synthetic-token")
   })
 
@@ -414,11 +455,16 @@ describe("status surfaces", () => {
     expect((await patch({ fallbackModel: "gpt-5.4" })).status).toBe(400)
     expect((await patch({ fallbackModel: "gpt-6-luna" })).status).toBe(200)
     expect((await patch({ thinkingPassthrough: false })).status).toBe(200)
-    const read = await (await app.fetch(new Request("http://localhost/settings/api/chatgpt"))).json() as { enabled: boolean; features: { thinkingPassthrough: boolean }; models: string[] }
+    expect((await patch({ reasoningSummary: "verbose" })).status).toBe(400)
+    expect((await patch({ reasoningSummary: true })).status).toBe(400)
+    expect((await patch({ reasoningSummary: "detailed" })).status).toBe(200)
+    const read = await (await app.fetch(new Request("http://localhost/settings/api/chatgpt"))).json() as { enabled: boolean; features: { thinkingPassthrough: boolean; reasoningSummary: string }; models: string[] }
     expect(read.models).toEqual([...CHATGPT_MODELS])
     expect(read.enabled).toBe(true)
     expect(read.features.thinkingPassthrough).toBe(false)
-    const reset = await (await app.fetch(new Request("http://localhost/settings/api/chatgpt", { method: "DELETE" }))).json() as { features: { thinkingPassthrough: boolean } }
+    expect(read.features.reasoningSummary).toBe("detailed")
+    const reset = await (await app.fetch(new Request("http://localhost/settings/api/chatgpt", { method: "DELETE" }))).json() as { features: { thinkingPassthrough: boolean; reasoningSummary: string } }
     expect(reset.features.thinkingPassthrough).toBe(true)
+    expect(reset.features.reasoningSummary).toBe("client")
   })
 })

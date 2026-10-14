@@ -16,6 +16,7 @@ import {
   CHATGPT_FEATURE_DEFAULTS,
   effectiveCreditsPolicy,
   getChatGptFeatures,
+  forcedReasoningSummary,
   resetChatGptFeatures,
   updateChatGptFeatures,
   validateChatGptFeatureUpdate,
@@ -304,15 +305,15 @@ describe("Fallback Model", () => {
 })
 
 describe("ChatGPT feature settings", () => {
-  it("defaults to thinking passthrough on, no budget, no fallback, and never spending credits", () => {
+  it("defaults to thinking passthrough on, the client's reasoning summary, no budget, no fallback, and never spending credits", () => {
     resetChatGptFeatures()
-    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: true, maxBudgetUsd: 0, fallbackModel: "", creditsPolicy: "never", seatCreditsPolicy: {}, freeSeatOrder: "before-credits" })
+    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: true, reasoningSummary: "client", maxBudgetUsd: 0, fallbackModel: "", creditsPolicy: "never", seatCreditsPolicy: {}, freeSeatOrder: "before-credits" })
   })
 
   it("round-trips through settings.json", () => {
     updateChatGptFeatures({ thinkingPassthrough: false, maxBudgetUsd: 0.5 })
     updateChatGptFeatures({ fallbackModel: "gpt-5.4", creditsPolicy: "reserve" })
-    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: false, maxBudgetUsd: 0.5, fallbackModel: "gpt-5.4", creditsPolicy: "reserve", seatCreditsPolicy: {}, freeSeatOrder: "before-credits" })
+    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: false, reasoningSummary: "client", maxBudgetUsd: 0.5, fallbackModel: "gpt-5.4", creditsPolicy: "reserve", seatCreditsPolicy: {}, freeSeatOrder: "before-credits" })
     resetChatGptFeatures()
   })
 
@@ -329,6 +330,20 @@ describe("ChatGPT feature settings", () => {
 
     updateChatGptFeatures(validateChatGptFeatureUpdate({ seatCreditsPolicy: { "pro-abc123": "inherit" } }, [], resolve))
     expect(getChatGptFeatures().seatCreditsPolicy).toEqual({})
+    resetChatGptFeatures()
+  })
+
+  it("accepts the four reasoning summary values, forces all but client, and ignores a saved value it does not know", () => {
+    for (const value of ["client", "auto", "concise", "detailed"] as const) {
+      expect(validateChatGptFeatureUpdate({ reasoningSummary: value })).toEqual({ reasoningSummary: value })
+      updateChatGptFeatures({ reasoningSummary: value })
+      expect(getChatGptFeatures().reasoningSummary).toBe(value)
+      expect(forcedReasoningSummary(getChatGptFeatures())).toBe(value === "client" ? undefined : value)
+    }
+    expect(() => validateChatGptFeatureUpdate({ reasoningSummary: "none" })).toThrow("reasoningSummary must be one of: client, auto, concise, detailed")
+    expect(() => validateChatGptFeatureUpdate({ reasoningSummary: null })).toThrow()
+    updateChatGptFeatures({ reasoningSummary: "verbose" as never })
+    expect(getChatGptFeatures().reasoningSummary).toBe("client")
     resetChatGptFeatures()
   })
 
