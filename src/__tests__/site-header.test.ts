@@ -52,7 +52,7 @@ describe("shared site header", () => {
   // phone width where the plain status shows only its dot.
   test("status pill can render an upstream outage", () => {
     expect(profileBarJs).toContain("statusPillView")
-    expect(profileBarJs).toContain("Can't reach Anthropic")
+    expect(profileBarJs).toContain("Claude connection failed")
     expect(profileBarCss).toContain(".mh-status.outage")
     expect(profileBarCss).toContain(".mh-status.recovering")
     expect(profileBarCss).toMatch(/@media \(max-width: 720px\)[\s\S]*\.mh-status\.outage \.mh-status-text[\s\S]*display: inline/)
@@ -604,6 +604,7 @@ describe("header active-profile chip", () => {
       },
       removeAttribute: () => undefined,
       setAttribute: () => undefined,
+      addEventListener: () => undefined,
       replaceChildren: () => undefined,
       querySelector: () => stubElement(),
     }
@@ -625,7 +626,7 @@ describe("header active-profile chip", () => {
       return found
     }
     runInNewContext(profileBarJs, {
-      document: { getElementById: byId, querySelectorAll: () => [], createElement: escapingDiv },
+      document: { getElementById: byId, querySelectorAll: () => [], createElement: escapingDiv, addEventListener: () => undefined },
       location: { pathname: "/" },
       window: { addEventListener: () => undefined },
       MutationObserver: class { observe() {} },

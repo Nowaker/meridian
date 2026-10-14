@@ -47,3 +47,8 @@ docs/maintenance/evidence/haiku55-nix-installed-20261011/harness-17c45cc7a365b17
 docs/maintenance/evidence/haiku55-nix-installed-20261011/harness-250b62094991939221a6957bd777505cc27ea30debd92b7170321354b3326960.mjs:dreamhost-service-credentials:99
 docs/maintenance/evidence/haiku55-nix-installed-20261011/harness-73bd0dedd306b27ea588c4549182809ea628683aaca6dfeb6ac4f6bb8663d330.mjs:dreamhost-service-credentials:92
 docs/maintenance/evidence/haiku55-nix-installed-20261011/harness-f67367a69d896f5d9ba8c12598672e336de6e50541c1094708691e7e2295d87e.mjs:dreamhost-service-credentials:92
+
+# generic-api-key on upstream's own drain prose (#1224, 09ae9316): the line
+# listing which control operations a drain leaves usable is documentation
+# text, byte-identical to upstream/main; verified at the 74ee9675 merge.
+docs/configuration.md:generic-api-key:782

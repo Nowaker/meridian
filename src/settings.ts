@@ -111,19 +111,6 @@ export interface MeridianSettings {
    *  several instances can be told apart at a glance. Off unless switched on,
    *  because it also publishes the hostname in the unauthenticated /health. */
   showHostname?: boolean
-
-  /**
-   * When `/readyz` concludes Anthropic is unreachable from this host: after at
-   * least `upstreamUnreachableMinFailures` connection failures (default 3)
-   * spanning `upstreamUnreachableAfterMs` (default 120000) with no answer from
-   * Anthropic in between. It then holds for `upstreamUnreachableHoldMs` after
-   * the latest failure (default 300000; 0 never fails readiness) before letting
-   * traffic back in. MERIDIAN_UPSTREAM_UNREACHABLE_AFTER_MS / _HOLD_MS /
-   * _MIN_FAILURES win. Re-read on every evaluation.
-   */
-  upstreamUnreachableAfterMs?: number
-  upstreamUnreachableHoldMs?: number
-  upstreamUnreachableMinFailures?: number
   /** How much of the window the web pages use: "contained" (default) keeps
    *  them in a centered column, "wide" spans the window. Read on every page
    *  load, so a change shows on the next reload. */
@@ -136,6 +123,21 @@ export interface MeridianSettings {
   /** The absolute path custom mode runs. Kept when another mode is chosen, so
    *  switching back does not mean typing it again. */
   claudeExecutablePath?: string
+
+  /**
+   * When `/readyz` declares a connection outage on this instance's configured
+   * Claude egress: after at
+   * least `upstreamUnreachableMinFailures` connection failures (default 3)
+   * spanning `upstreamUnreachableAfterMs` (default 120000) with no qualifying configured-egress transport answer
+   * in between. It then holds for `upstreamUnreachableHoldMs` after
+   * the latest failure (default 300000; 0 never fails readiness) before letting
+   * traffic back in. MERIDIAN_UPSTREAM_UNREACHABLE_AFTER_MS / _HOLD_MS /
+   * _MIN_FAILURES win over CLAUDE_PROXY_* aliases and persisted numeric
+   * fields. Invalid values fall back safely. Re-read on every evaluation.
+   */
+  upstreamUnreachableAfterMs?: number
+  upstreamUnreachableHoldMs?: number
+  upstreamUnreachableMinFailures?: number
 }
 
 /** Webhooks get the event as a JSON POST body, commands as JSON on stdin. Absent `events` = all. */

@@ -1,5 +1,5 @@
 /**
- * Whether Anthropic can be reached from this host at all, learned passively
+ * Observed connection state for this instance's configured Claude egress, learned passively
  * from the traffic Meridian already carries.
  *
  * The failure this exists for: a host whose resolver died while its network
@@ -11,20 +11,17 @@
  *
  * Only CONNECTION-class failures count against reachability: DNS, refused,
  * reset, unroutable, connect timeouts, TLS and proxy tunnel failures. A 429,
- * an auth refusal, a billing cap or a model error never do, and one that
- * proves Anthropic answered - a quota or billing refusal, any API error that
- * carries an HTTP status - counts as reaching it, which is also why one
- * account succeeding keeps the instance reachable however many others fail.
+ * an auth refusal, a billing cap or a model error never do. A native SDK HTTP
+ * retry status or a fresh real response establishes configured-egress transport
+ * reachability. It does not establish the response's origin, account usability
+ * or successful inference. HTTP-looking error text alone is insufficient.
  *
  * Nothing here sends a request of its own. The conclusion is drawn from real
  * requests, and the way back from it is a real request too: after a hold the
  * state turns to `probing`, readiness passes again, and the next request
- * either reaches Anthropic (back to `ok`) or fails the same way (straight back
+ * either observes an egress answer (back to `ok`) or fails the same way (straight back
  * to `unreachable`, without waiting out another detection window).
  */
-
-import { env } from "../env"
-import { loadSettings } from "../settings"
 
 export type ConnectionFailureKind =
   | "dns"
@@ -75,7 +72,6 @@ const CODE_KINDS: Readonly<Record<string, ConnectionFailureKind>> = {
   enetdown: "unroutable",
   ehostunreach: "unroutable",
   ehostdown: "unroutable",
-  etimedout: "timeout",
   und_err_connect_timeout: "timeout",
   err_proxy_tunnel: "proxy",
 }
@@ -83,9 +79,9 @@ const CODE_KINDS: Readonly<Record<string, ConnectionFailureKind>> = {
 /**
  * The CLI's connection errors, in the wording it actually prints.
  *
- * Every terminal API error the CLI reports starts with its own `API Error:`
- * prefix (verified against claude-code 2.1.284, whose formatter emits all the
- * phrases below, and the older wordings the bundled SDK CLI still uses). The
+ * The reported native terminal dialect starts with an `API Error:` prefix.
+ * The public SDK declarations do not establish the target CLI's actual error
+ * envelopes; affected-flow qualification remains required. The
  * prefix is REQUIRED, at the start of a line after the known wrappers, because
  * this classification can take a whole instance out of a load balancer: an MCP
  * server's stderr saying "connection refused" about its own database, or an
@@ -103,10 +99,8 @@ const CONNECTION_PHRASES: ReadonlyArray<{ readonly pattern: RegExp; readonly kin
   { pattern: new RegExp(API_ERROR_LINE + String.raw`no internet route\b` + CODE), kind: "unroutable" },
   { pattern: new RegExp(API_ERROR_LINE + String.raw`couldn't connect through your proxy\b` + CODE), kind: "proxy" },
   { pattern: new RegExp(API_ERROR_LINE + String.raw`unable to connect to api: (?:ssl|self-signed)`), kind: "tls" },
-  { pattern: new RegExp(API_ERROR_LINE + String.raw`request timed out\. check your internet connection`), kind: "timeout" },
   // The code-only fallback, and the older wordings without a code.
   { pattern: new RegExp(API_ERROR_LINE + String.raw`unable to connect to api` + CODE), kind: "connection" },
-  { pattern: new RegExp(API_ERROR_LINE + String.raw`connection error\.?[ \t]*(?:\n|$)`), kind: "connection" },
 ]
 
 /**
@@ -114,9 +108,9 @@ const CONNECTION_PHRASES: ReadonlyArray<{ readonly pattern: RegExp; readonly kin
  * null when it reports anything else.
  *
  * A bare "Request timed out." is deliberately NOT here: the CLI says that when
- * a request got no answer in time, which is a slow upstream rather than an
- * unreachable one. Only its connect-timeout wording, which tells the user to
- * check their connection, counts.
+ * a request got no answer in time, which does not distinguish a slow upstream
+ * from an unreachable one. Internet/proxy advice and ETIMEDOUT do not resolve
+ * that ambiguity. Only an explicit connect-timeout code counts as a timeout.
  */
 export function classifyConnectionFailure(text: string | null | undefined): ConnectionFailureKind | null {
   if (typeof text !== "string" || text.length === 0) return null
@@ -125,34 +119,15 @@ export function classifyConnectionFailure(text: string | null | undefined): Conn
     const match = pattern.exec(lower)
     if (!match) continue
     const code = match[1]
+    if (code === "etimedout") return null
     return (code && CODE_KINDS[code]) || kind
   }
   return null
 }
 
-/** An `API Error:` line that opens with an HTTP status (`API Error: 400 ...`).
- *  Only a response carries one; a connection error never does. */
-const HTTP_STATUS_LINE = new RegExp(API_ERROR_LINE + String.raw`[1-5]\d\d(?!\d)`)
-
-/** Whether an SDK error or API error text reports an HTTP response, which
- *  means the API answered, whatever the answer was. */
-export function answeredOverHttp(text: string | null | undefined): boolean {
-  return typeof text === "string" && HTTP_STATUS_LINE.test(text.toLowerCase())
-}
-
-/**
- * SDK assistant-error tags that only an HTTP response can produce. Seeing one
- * proves Anthropic was reached, whatever it said. `invalid_request`,
- * `authentication_failed` and `unknown` are left out: the CLI also raises
- * those for problems it detects locally, before any request leaves the host.
- * When one of them did come from the API, its text carries the HTTP status,
- * which answeredOverHttp reads instead.
- */
-const HTTP_BACKED_ASSISTANT_ERRORS: ReadonlySet<string> = new Set([
-  "rate_limit",
-  "billing_error",
-  "server_error",
-  "oauth_org_not_allowed",
+const SDK_ASSISTANT_ERRORS: ReadonlySet<string> = new Set([
+  "authentication_failed", "oauth_org_not_allowed", "billing_error", "rate_limit",
+  "invalid_request", "server_error", "unknown", "max_output_tokens",
 ])
 
 /** What one SDK message says about reachability. */
@@ -162,7 +137,56 @@ export type ReachabilityEvidence =
   | null
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+/** Native retry statuses establish an HTTP transport answer on this query's
+ *  configured egress. They do not establish Anthropic origin or inference.
+ *  A null status covers slow/read timeouts too, so supplies no evidence. */
+export function answeredOverHttp(message: unknown): boolean {
+  return isRecord(message) && !isReplayOrSynthetic(message)
+    && message.type === "system" && message.subtype === "api_retry"
+    && typeof message.error === "string" && SDK_ASSISTANT_ERRORS.has(message.error)
+    && typeof message.error_status === "number" && Number.isInteger(message.error_status)
+    && message.error_status >= 100 && message.error_status <= 599
+}
+
+function isReplayOrSynthetic(message: Record<string, unknown>): boolean {
+  return message.isReplay === true || message.isSynthetic === true
+    || message.is_replay === true || message.is_synthetic === true
+}
+
+const MAX_OBSERVATION_ID_LENGTH = 4096
+const MAX_RESPONSE_IDENTITIES = 1024
+
+function observationId(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= MAX_OBSERVATION_ID_LENGTH
+}
+
+function responseIdentity(message: Record<string, unknown>, inner: Record<string, unknown>): string | null {
+  if (!observationId(inner.id)) return null
+  const parent = message.parent_tool_use_id
+  if (parent !== null && !observationId(parent)) return null
+  return JSON.stringify([parent, inner.id])
+}
+
+function isRealResponse(inner: unknown): inner is Record<string, unknown> {
+  return isRecord(inner) && !isReplayOrSynthetic(inner)
+    && inner.type === "message" && inner.role === "assistant" && observationId(inner.id)
+    && typeof inner.model === "string" && inner.model.trim().length > 0
+    && !inner.model.includes("<") && !inner.model.includes(">") && Array.isArray(inner.content)
+}
+
+function isResponseBlock(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  switch (value.type) {
+    case "text": return typeof value.text === "string"
+    case "thinking": return typeof value.thinking === "string" && typeof value.signature === "string"
+    case "redacted_thinking": return typeof value.data === "string"
+    case "tool_use":
+    case "server_tool_use": return observationId(value.id) && observationId(value.name) && isRecord(value.input)
+    default: return false
+  }
 }
 
 function assistantText(message: Record<string, unknown>): string {
@@ -176,46 +200,47 @@ function assistantText(message: Record<string, unknown>): string {
 /**
  * Read one message of the SDK stream for reachability evidence.
  *
- * - `system/api_retry` is the CLI announcing it will retry. With no HTTP status
- *   it is a connection error (the SDK documents `error_status: null` as
- *   exactly that); with one, Anthropic answered. It arrives on the first failed
- *   attempt, so an outage is visible within seconds instead of after the CLI
- *   has spent its whole retry budget on one request.
- * - `stream_event` `message_start` and a real assistant message are Anthropic
- *   answering. A long stream that started before an outage keeps sending
- *   deltas over its open connection, so deltas are not counted - only a
- *   response starting is.
- * - An assistant message carrying `error` is the CLI's terminal report. Its
- *   text says which connection failure it was; otherwise an HTTP status in
- *   the text, or an HTTP-backed tag, proves Anthropic answered.
+ * This inspects native query messages, never client history or tool output.
+ * Null retry statuses, assistant error enums and HTTP-looking strings alone
+ * supply no evidence. Synthetic terminal error text can identify a definite
+ * failure. A later error result or throw does not count it again.
+ * Real starts and nonstream bodies require valid response identities/models.
+ * The observer correlates starts and completed content blocks before counting.
  */
 export function reachabilityEvidence(message: unknown): ReachabilityEvidence {
-  if (!isRecord(message)) return null
+  if (!isRecord(message) || isReplayOrSynthetic(message)) return null
   if (message.type === "system" && message.subtype === "api_retry") {
-    if (typeof message.error_status === "number") return { kind: "reached" }
-    if (message.error_status === null) return { kind: "failure", failure: "connection", terminal: false }
-    return null
+    return answeredOverHttp(message) ? { kind: "reached" } : null
   }
   if (message.type === "stream_event") {
-    return isRecord(message.event) && message.event.type === "message_start" ? { kind: "reached" } : null
+    const event = message.event
+    return isRecord(event) && event.type === "message_start" && isRealResponse(event.message)
+      && responseIdentity(message, event.message) !== null ? { kind: "reached" } : null
   }
   if (message.type !== "assistant") return null
-  if (typeof message.error === "string") {
+  const inner = message.message
+  if (message.error !== undefined) {
+    if (typeof message.error !== "string" || !SDK_ASSISTANT_ERRORS.has(message.error)
+      || !isRecord(inner) || isReplayOrSynthetic(inner) || inner.type !== "message"
+      || inner.role !== "assistant" || inner.model !== "<synthetic>"
+      || !Array.isArray(inner.content) || inner.content.length === 0
+      || !inner.content.every(block => isRecord(block) && block.type === "text" && typeof block.text === "string")
+      || responseIdentity(message, inner) === null) return null
     const text = assistantText(message)
     const failure = classifyConnectionFailure(text)
     if (failure) return { kind: "failure", failure, terminal: true }
-    return answeredOverHttp(text) || HTTP_BACKED_ASSISTANT_ERRORS.has(message.error) ? { kind: "reached" } : null
+    return null
   }
-  const inner = message.message
-  if (!isRecord(inner) || inner.model === "<synthetic>") return null
-  return Array.isArray(inner.content) && inner.content.length > 0 ? { kind: "reached" } : null
+  return isRealResponse(inner) && responseIdentity(message, inner) !== null
+    && Array.isArray(inner.content) && inner.content.length > 0 && inner.content.every(isResponseBlock)
+    ? { kind: "reached" } : null
 }
 
 export interface ReachabilitySnapshot {
   readonly state: ReachabilityState
   /** When the current state began. */
   readonly since: string
-  /** First connection failure since Anthropic last answered; null when it
+  /** First connection failure since this instance last observed an egress answer; null when it
    *  answered most recently. */
   readonly failingSince: string | null
   readonly consecutiveFailures: number
@@ -227,33 +252,51 @@ export interface ReachabilitySnapshot {
   readonly override: { readonly state: "unreachable" | "ok"; readonly until: string } | null
 }
 
+const MAX_DATE_MS = 8_640_000_000_000_000
+
 function iso(ms: number | null): string | null {
   return ms === null ? null : new Date(ms).toISOString()
 }
 
-function nonNegativeInt(value: unknown): number | undefined {
-  const parsed = typeof value === "string" && value.trim() !== "" ? Number(value) : value
-  return typeof parsed === "number" && Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined
+function nonNegativeInt(value: unknown, maximum: number = Number.MAX_SAFE_INTEGER): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= maximum ? value : undefined
+}
+
+function environmentInt(value: string | undefined, maximum: number): number | undefined {
+  return typeof value === "string" && value.trim() !== "" ? nonNegativeInt(Number(value), maximum) : undefined
+}
+
+function normalizeThresholds(value: unknown): ReachabilityThresholds {
+  const record = isRecord(value) ? value : {}
+  return {
+    unreachableAfterMs: nonNegativeInt(record.unreachableAfterMs, MAX_DATE_MS) ?? DEFAULT_REACHABILITY_THRESHOLDS.unreachableAfterMs,
+    holdMs: nonNegativeInt(record.holdMs, MAX_DATE_MS) ?? DEFAULT_REACHABILITY_THRESHOLDS.holdMs,
+    minFailures: Math.max(1, nonNegativeInt(record.minFailures) ?? DEFAULT_REACHABILITY_THRESHOLDS.minFailures),
+  }
+}
+
+/** Date-range saturation also keeps every returned timestamp a safe integer. */
+function addDuration(timestamp: number, duration: number): number {
+  return Math.min(MAX_DATE_MS, timestamp + duration)
 }
 
 /**
- * Thresholds from the environment, then settings.json, then the defaults. Read
- * per evaluation, like routing, so a changed setting applies without a restart.
+ * Normalize captured configuration values without reading their sources.
+ * Environment values take precedence over persisted numeric settings.
  * A value that is not a non-negative integer is ignored rather than guessed at,
  * and a run always needs at least one failure.
  */
-export function resolveReachabilityThresholds(
-  readEnv: (suffix: string) => string | undefined = env,
-  readSettings: () => Record<string, unknown> | null = () => loadSettings() as Record<string, unknown> | null,
+export function reachabilityThresholdsFromConfiguration(
+  environment: { readonly unreachableAfterMs?: string; readonly holdMs?: string; readonly minFailures?: string },
+  settingsValue: unknown,
 ): ReachabilityThresholds {
-  // A settings.json holding `null` parses to null; /health must still answer.
-  const settings = readSettings() ?? {}
-  const pick = (envSuffix: string, settingKey: string, fallback: number) =>
-    nonNegativeInt(readEnv(envSuffix)) ?? nonNegativeInt(settings[settingKey]) ?? fallback
+  const settings = isRecord(settingsValue) ? settingsValue : {}
+  const pick = (environmentValue: string | undefined, settingKey: string, fallback: number, maximum: number) =>
+    environmentInt(environmentValue, maximum) ?? nonNegativeInt(settings[settingKey], maximum) ?? fallback
   return {
-    unreachableAfterMs: pick("UPSTREAM_UNREACHABLE_AFTER_MS", "upstreamUnreachableAfterMs", DEFAULT_REACHABILITY_THRESHOLDS.unreachableAfterMs),
-    holdMs: pick("UPSTREAM_UNREACHABLE_HOLD_MS", "upstreamUnreachableHoldMs", DEFAULT_REACHABILITY_THRESHOLDS.holdMs),
-    minFailures: Math.max(1, pick("UPSTREAM_UNREACHABLE_MIN_FAILURES", "upstreamUnreachableMinFailures", DEFAULT_REACHABILITY_THRESHOLDS.minFailures)),
+    unreachableAfterMs: pick(environment.unreachableAfterMs, "upstreamUnreachableAfterMs", DEFAULT_REACHABILITY_THRESHOLDS.unreachableAfterMs, MAX_DATE_MS),
+    holdMs: pick(environment.holdMs, "upstreamUnreachableHoldMs", DEFAULT_REACHABILITY_THRESHOLDS.holdMs, MAX_DATE_MS),
+    minFailures: Math.max(1, pick(environment.minFailures, "upstreamUnreachableMinFailures", DEFAULT_REACHABILITY_THRESHOLDS.minFailures, Number.MAX_SAFE_INTEGER)),
   }
 }
 
@@ -270,18 +313,48 @@ export class UpstreamReachability {
   /** When the current unreachable episode began; null outside one. */
   private unreachableSince: number | null = null
   private okSince: number
-  private forced: { state: "unreachable" | "ok"; until: number } | null = null
+  private lastClockAt = 0
+  private forced: { state: "unreachable" | "ok"; since: number; until: number } | null = null
+  private resumed: { state: ReachabilityState; since: number; naturalSince: number } | null = null
 
   constructor(
     private clock: () => number = Date.now,
-    private thresholds: () => ReachabilityThresholds = resolveReachabilityThresholds,
+    private thresholds: () => ReachabilityThresholds = () => DEFAULT_REACHABILITY_THRESHOLDS,
   ) {
-    this.okSince = clock()
+    this.okSince = this.now()
   }
 
-  /** Anthropic answered something. Any state returns to `ok` at once. */
+  private now(): number {
+    const value = this.clock()
+    if (Number.isFinite(value) && Math.abs(value) <= MAX_DATE_MS) this.lastClockAt = Math.trunc(value)
+    return this.lastClockAt
+  }
+
+  private naturalState(now: number, holdMs: number): { state: ReachabilityState; since: number; holdUntil: number | null } {
+    if (this.unreachableSince === null || this.lastFailureAt === null) return { state: "ok", since: this.okSince, holdUntil: null }
+    const holdEnds = addDuration(this.lastFailureAt, holdMs)
+    return now >= holdEnds
+      ? { state: "probing", since: Math.max(holdEnds, this.unreachableSince), holdUntil: null }
+      : { state: "unreachable", since: this.unreachableSince, holdUntil: holdEnds }
+  }
+
+  private expireOverride(now: number, holdMs: number): void {
+    const forced = this.forced
+    if (!forced || forced.until > now) return
+    const natural = this.naturalState(now, holdMs)
+    this.resumed = {
+      state: natural.state,
+      since: forced.state === natural.state && natural.since <= forced.until
+        ? forced.since : Math.max(forced.until, natural.since),
+      naturalSince: natural.since,
+    }
+    this.forced = null
+  }
+
+  /** A qualifying configured-egress answer returns any state to `ok` at once. */
   recordReached(): void {
-    const now = this.clock()
+    const now = this.now()
+    this.expireOverride(now, normalizeThresholds(this.thresholds()).holdMs)
     if (this.failingSince !== null) this.okSince = now
     this.lastReachedAt = now
     this.failingSince = null
@@ -290,15 +363,16 @@ export class UpstreamReachability {
   }
 
   recordFailure(kind: ConnectionFailureKind): void {
-    const now = this.clock()
-    const { unreachableAfterMs, holdMs, minFailures } = this.thresholds()
+    const now = this.now()
+    const { unreachableAfterMs, holdMs, minFailures } = normalizeThresholds(this.thresholds())
+    this.expireOverride(now, holdMs)
     const wasProbing = this.unreachableSince !== null
       && this.lastFailureAt !== null
       && now - this.lastFailureAt >= holdMs
     this.lastFailureAt = now
     this.lastErrorKind = kind
     this.failingSince ??= now
-    this.consecutiveFailures += 1
+    this.consecutiveFailures = Math.min(Number.MAX_SAFE_INTEGER, this.consecutiveFailures + 1)
     if (this.unreachableSince !== null) {
       // Still failing after the hold let traffic back in: the probe answered,
       // so the state flips back now rather than after another detection window.
@@ -312,32 +386,32 @@ export class UpstreamReachability {
 
   /** Force a state for testing a load balancer, for at most `ttlMs`. */
   force(state: "unreachable" | "ok", ttlMs: number = DEFAULT_OVERRIDE_TTL_MS): void {
-    this.forced = { state, until: this.clock() + ttlMs }
+    const now = this.now()
+    const ttl = nonNegativeInt(ttlMs, MAX_OVERRIDE_TTL_MS)
+    this.forced = { state, since: now, until: addDuration(now, ttl && ttl > 0 ? ttl : DEFAULT_OVERRIDE_TTL_MS) }
+    this.resumed = null
   }
 
   clearOverride(): void {
+    const now = this.now()
+    const { holdMs } = normalizeThresholds(this.thresholds())
+    this.expireOverride(now, holdMs)
+    if (!this.forced) return
+    const natural = this.naturalState(now, holdMs)
+    this.resumed = { state: natural.state, since: natural.state === this.forced.state ? this.forced.since : now, naturalSince: natural.since }
     this.forced = null
   }
 
   snapshot(): ReachabilitySnapshot {
-    const now = this.clock()
-    if (this.forced && this.forced.until <= now) this.forced = null
-    const { holdMs } = this.thresholds()
-    let state: ReachabilityState = "ok"
-    let since = this.okSince
-    let holdUntil: number | null = null
-    if (this.unreachableSince !== null && this.lastFailureAt !== null) {
-      const holdEnds = this.lastFailureAt + holdMs
-      if (now >= holdEnds) {
-        state = "probing"
-        since = Math.max(holdEnds, this.unreachableSince)
-      } else {
-        state = "unreachable"
-        since = this.unreachableSince
-        holdUntil = holdEnds
-      }
+    const now = this.now()
+    const { holdMs } = normalizeThresholds(this.thresholds())
+    this.expireOverride(now, holdMs)
+    const natural = this.naturalState(now, holdMs)
+    if (this.resumed && (this.resumed.state !== natural.state || this.resumed.naturalSince !== natural.since)) {
+      this.resumed = null
     }
-    if (this.forced) state = this.forced.state
+    const state = this.forced?.state ?? natural.state
+    const since = this.forced?.since ?? this.resumed?.since ?? natural.since
     return {
       state,
       since: iso(since)!,
@@ -346,13 +420,13 @@ export class UpstreamReachability {
       lastReachedAt: iso(this.lastReachedAt),
       lastFailureAt: iso(this.lastFailureAt),
       lastErrorKind: this.lastErrorKind,
-      holdUntil: this.forced ? null : iso(holdUntil),
+      holdUntil: this.forced ? null : iso(natural.holdUntil),
       override: this.forced ? { state: this.forced.state, until: iso(this.forced.until)! } : null,
     }
   }
 
   /** Test seam: a fresh tracker on another clock and thresholds. */
-  resetForTests(clock: () => number = Date.now, thresholds: () => ReachabilityThresholds = resolveReachabilityThresholds): void {
+  resetForTests(clock: () => number = Date.now, thresholds: () => ReachabilityThresholds = () => DEFAULT_REACHABILITY_THRESHOLDS): void {
     this.clock = clock
     this.thresholds = thresholds
     this.lastReachedAt = null
@@ -361,37 +435,67 @@ export class UpstreamReachability {
     this.failingSince = null
     this.consecutiveFailures = 0
     this.unreachableSince = null
-    this.okSince = clock()
+    this.lastClockAt = 0
+    this.okSince = this.now()
     this.forced = null
+    this.resumed = null
   }
 }
 
 /**
- * One SDK attempt's view of the tracker. The CLI reports a terminal connection
+ * One SDK query's view of the tracker. The CLI reports a terminal connection
  * failure twice - as an assistant error message and again as the thrown error
  * that ends the attempt - so the thrown one is counted only when the message
  * never arrived.
  */
-export function observeReachability(tracker: UpstreamReachability) {
+export interface ReachabilityObservationOptions {
+  /** Must match this query's actual SDK option. With partials enabled, an
+   *  unmatched assistant body cannot establish a fresh response start. */
+  readonly includePartialMessages?: boolean
+}
+
+export function observeReachability(tracker: UpstreamReachability, options: ReachabilityObservationOptions = {}) {
   let terminalRecorded = false
+  const responseIds = new Set<string>()
+  const failureIds = new Set<string>()
+  const claim = (identities: Set<string>, identity: string): boolean => {
+    // Do not evict old IDs: a late block/replay must never become fresh proof.
+    if (identities.has(identity) || identities.size >= MAX_RESPONSE_IDENTITIES) return false
+    identities.add(identity)
+    return true
+  }
   return {
     message(message: unknown): void {
       const evidence = reachabilityEvidence(message)
-      if (!evidence) return
+      if (!evidence || !isRecord(message)) return
       if (evidence.kind === "reached") {
+        let identity: string | null = null
+        if (message.type === "system") {
+          identity = observationId(message.uuid) ? `http:${message.uuid}`
+            : `http:${message.error_status}:${nonNegativeInt(message.attempt) ?? "unknown"}`
+        } else if (message.type === "stream_event" && isRecord(message.event) && isRecord(message.event.message)) {
+          identity = responseIdentity(message, message.event.message)
+        } else if (message.type === "assistant" && isRecord(message.message)) {
+          if (options.includePartialMessages) return
+          identity = responseIdentity(message, message.message)
+        }
+        if (identity === null || !claim(responseIds, identity)) return
         tracker.recordReached()
         return
       }
+      if (!isRecord(message.message)) return
+      const identity = responseIdentity(message, message.message)
+      if (identity === null || !claim(failureIds, identity)) return
       if (evidence.terminal) terminalRecorded = true
       tracker.recordFailure(evidence.failure)
     },
     error(error: unknown): void {
-      const text = error instanceof Error ? error.message : String(error)
-      if (answeredOverHttp(text)) {
-        tracker.recordReached()
-        return
-      }
+      // The thrown report has no response/attempt identity. Once a native
+      // terminal envelope arrived, a later throw may be its duplicate even
+      // after recovery. Only a distinct identified terminal can prove a new
+      // failure in this query; otherwise leave the qualifying answer intact.
       if (terminalRecorded) return
+      const text = error instanceof Error ? error.message : typeof error === "string" ? error : null
       const failure = classifyConnectionFailure(text)
       if (failure) tracker.recordFailure(failure)
     },
@@ -399,8 +503,8 @@ export function observeReachability(tracker: UpstreamReachability) {
 }
 
 /** Pass an SDK stream through unchanged while the tracker reads it. */
-export async function* withReachability<T>(source: AsyncIterable<T>, tracker: UpstreamReachability): AsyncGenerator<T> {
-  const observer = observeReachability(tracker)
+export async function* withReachability<T>(source: AsyncIterable<T>, tracker: UpstreamReachability, options: ReachabilityObservationOptions = {}): AsyncGenerator<T> {
+  const observer = observeReachability(tracker, options)
   try {
     for await (const message of source) {
       observer.message(message)
@@ -412,16 +516,10 @@ export async function* withReachability<T>(source: AsyncIterable<T>, tracker: Up
   }
 }
 
-/**
- * The Claude upstream, process-wide: reachability is a property of the host,
- * so every server instance in the process reads and feeds the same one.
- */
-export const claudeReachability = new UpstreamReachability()
-
 /** The readiness line for an unreachable upstream; null when it may serve. */
 export function unreachableDetail(snapshot: ReachabilitySnapshot): string | null {
   if (snapshot.state !== "unreachable") return null
-  if (snapshot.override?.state === "unreachable") return `forced unreachable by override until ${snapshot.override.until}`
+  if (snapshot.override?.state === "unreachable") return `This instance's configured Claude egress forced unreachable by override until ${snapshot.override.until}`
   const failures = `${snapshot.consecutiveFailures} connection failure${snapshot.consecutiveFailures === 1 ? "" : "s"}`
-  return `Anthropic unreachable since ${snapshot.failingSince ?? snapshot.since} (last error: ${snapshot.lastErrorKind ?? "connection"}, ${failures}, last answered ${snapshot.lastReachedAt ?? "never"})`
+  return `This instance's configured Claude egress failed since ${snapshot.failingSince ?? snapshot.since} (last error: ${snapshot.lastErrorKind ?? "connection"}, ${failures}, last answered ${snapshot.lastReachedAt ?? "never"})`
 }
