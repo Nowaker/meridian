@@ -1,15 +1,16 @@
 /**
  * Admission hold for a restart drain (`POST /drain`).
  *
- * A supervisor that restarts Meridian only when `GET /inflight` reads 0 never
- * gets its chance under steady traffic: a new turn always starts before the
- * last one ends. While a drain is active, NEW client requests wait here
- * before they are admitted, and the requests already running finish
- * untouched, so the count can reach 0.
+ * A supervisor that restarts Meridian only when `GET /inflight` reads 0 can
+ * miss an idle opportunity under steady traffic. While a drain is active, new
+ * generation requests wait here before they are admitted, and the requests
+ * already running finish untouched. Time caps and finite waiter capacity make
+ * this best effort: steady long requests can still prevent the count reaching
+ * zero.
  *
  * It only ever delays, never refuses and never cuts anything off:
- * - a held request is admitted when the drain ends (`DELETE /drain`, its own
- *   timeout, or shutdown) or once it has waited `holdMs`, whichever is first;
+ * - a held request proceeds when the drain ends (`DELETE /drain` or its own
+ *   timeout) or once it has waited `holdMs`, whichever is first;
  * - a drain nobody ends ends itself after `timeoutMs`, reopening admission.
  *
  * A held request has not been admitted, so it is not in `/inflight`'s total.
@@ -39,6 +40,17 @@ export interface DrainSnapshot {
 
 export const DEFAULT_DRAIN_OPTIONS: DrainOptions = { holdMs: 60_000, timeoutMs: 10 * 60_000 }
 
+/** Bounds retained hold reservations/timers/listeners, not total HTTP memory. */
+export const MAX_HELD_REQUESTS = 128
+
+export type AdmissionResolution = "released" | "cap" | "aborted" | "shutdown"
+
+export interface AdmissionReservation {
+  readonly ready: Promise<AdmissionResolution>
+  /** Release an abandoned reservation without admitting or counting a cap. */
+  cancel(): void
+}
+
 /** Bounds for options a caller passes; a hold past ~4 min would trip clients' own response-header timeouts. */
 export const DRAIN_LIMITS = {
   holdMs: { min: 1_000, max: 240_000 },
@@ -49,7 +61,7 @@ interface ActiveDrain {
   readonly startedAt: number
   readonly options: DrainOptions
   readonly timer: ReturnType<typeof setTimeout>
-  readonly waiters: Set<() => void>
+  readonly waiters: Set<(reason: AdmissionResolution) => void>
   admittedAtCap: number
 }
 
@@ -81,7 +93,7 @@ export class AdmissionHold {
     this.drain = undefined
     clearTimeout(drain.timer)
     this.lastEnded = { at: new Date(now).toISOString(), reason }
-    for (const release of [...drain.waiters]) release()
+    for (const release of [...drain.waiters]) release(reason === "shutdown" ? "shutdown" : "released")
     this.onEnd?.(reason, final)
     return true
   }
@@ -91,27 +103,38 @@ export class AdmissionHold {
    * otherwise when the drain ends, the request has waited `holdMs`, or the
    * client went away.
    */
-  admit(signal?: AbortSignal): Promise<void> {
+  reserve(signal?: AbortSignal, accept?: (reason: AdmissionResolution) => boolean): AdmissionReservation | undefined {
     const drain = this.drain
-    if (!drain || signal?.aborted) return Promise.resolve()
-    return new Promise<void>((resolve) => {
+    // Overflow fails open before allocating any held timer/listener. A caller
+    // owns ordinary accepted work synchronously, including this fast path.
+    if (!drain || signal?.aborted || drain.waiters.size >= MAX_HELD_REQUESTS) return undefined
+    let cancel = () => {}
+    const ready = new Promise<AdmissionResolution>((resolve) => {
       let settled = false
-      const release = (atCap = false) => {
+      const release = (reason: AdmissionResolution) => {
         if (settled) return
         settled = true
         clearTimeout(cap)
         signal?.removeEventListener("abort", onAbort)
         drain.waiters.delete(waiter)
-        if (atCap) drain.admittedAtCap++
-        resolve()
+        const accepted = accept?.(reason) ?? (reason !== "aborted" && reason !== "shutdown")
+        if (reason === "cap" && accepted) drain.admittedAtCap++
+        resolve(reason)
       }
-      const waiter = () => release()
-      const onAbort = () => release()
-      const cap = setTimeout(() => release(true), drain.options.holdMs)
+      const waiter = (reason: AdmissionResolution) => release(reason)
+      const onAbort = () => release("aborted")
+      const cap = setTimeout(() => release("cap"), drain.options.holdMs)
       cap.unref?.()
       drain.waiters.add(waiter)
       signal?.addEventListener("abort", onAbort, { once: true })
+      cancel = onAbort
     })
+    return { ready, cancel: () => cancel() }
+  }
+
+  /** Compatibility helper for pure callers; HTTP callers reserve synchronously. */
+  async admit(signal?: AbortSignal): Promise<void> {
+    await this.reserve(signal)?.ready
   }
 
   snapshot(): DrainSnapshot {

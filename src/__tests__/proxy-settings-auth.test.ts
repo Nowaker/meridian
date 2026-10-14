@@ -136,16 +136,9 @@ describe("auth audit: every registered prefix is protected when MERIDIAN_API_KEY
   //     Anthropic's own authorization code to the user's own profile — the
   //     PKCE verifier it would be exchanged against is held here, not by them.
   //
-  // The review for `/drain` (POST/DELETE):
-  //
-  //   what it does    delays NEW requests by up to its hold cap each; it never
-  //                   refuses one, never touches a running one, and ends by
-  //                   itself. It emits the same counts as `/inflight`.
-  //   why not gated   the same restart supervisor calls it. It shares
-  //                   `/inflight`'s loopback-peer check and also refuses any
-  //                   request carrying an Origin header, so a web page open on
-  //                   the host cannot start one through cors().
-  const PUBLIC_PREFIXES = new Set(["/", "/health", "/livez", "/readyz", "/inflight", "/callback", "/drain"])
+  // `/drain` mutates admission, so #1282 requires the configured API key in
+  // addition to the actual loopback/no-Origin/no-forwarding checks.
+  const PUBLIC_PREFIXES = new Set(["/", "/health", "/livez", "/readyz", "/inflight", "/callback"])
 
   it("rejects unauthenticated requests to every non-public route prefix", async () => {
     const { app } = createProxyServer({ port: 0, host: "127.0.0.1" })

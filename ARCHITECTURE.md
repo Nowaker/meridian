@@ -187,7 +187,9 @@ src/
 │   ├── sessionTree.ts         ← Live parent→child request registry; subtree cancellation (PURE bookkeeping)
 │   ├── shutdown.ts            ← Bounded HTTP drain and connection tracking
 │   ├── inflight.ts            ← Per-upstream in-flight request counts for GET /inflight (PURE bookkeeping)
-│   ├── admissionHold.ts       ← POST /drain: hold new requests (never refuse) so in-flight can reach 0
+│   ├── admissionHold.ts       ← Bounded per-instance generation reservations for the best-effort POST /drain hold
+│   ├── drainBody.ts           ← Tiny operator body byte/deadline limits and joined reader cancellation
+│   ├── generationAdmission.ts ← Exact combined-provider generation classification and response-reader ownership
 │   ├── adapter.ts             ← AgentAdapter interface (extensibility point for multi-agent support)
 │   ├── adapters/
 │   │   ├── opencode.ts        ← OpenCode adapter (session headers, CWD extraction, tool config)
@@ -454,7 +456,8 @@ Three properties bound it:
   cancel children; a subagent routinely outlives the turn that spawned it. The
   shutdown path already aborts every request directly, and the lease watchdog is
   a proxy-side fence rather than a user intent, so neither cascades.
-- **Live requests only.** An entry exists between "admitted" and "settled". A
+- **Live requests only.** An entry exists between parsed live arrival and
+  settlement, including a bounded pre-admission generation hold (#1282). A
   session that was seen once but has nothing in flight is not a cancellation
   target, so the registry is bounded by concurrency, not by history.
 - **Self-gating.** Propagation can only reach a request that declared a parent,
@@ -463,6 +466,17 @@ Three properties bound it:
 `POST /v1/sessions/:key/cancel` cancels a subtree explicitly, and
 `GET /telemetry/summary` reports the live gauges and cumulative counts under
 `sessionTree`.
+
+The per-instance soft hold is separate from process shutdown. Private body,
+translation and held-request ownership keeps close and idle exit aware of
+pending work while `/inflight.total` reports only admitted client HTTP response
+lifetimes. OpenAI translations transfer one instance-owned reservation and
+abort link to Messages, where existing adapters derive one cancellation
+identity. Held adapter selection stays fixed so a config edit cannot change
+the identity used by the live tree/turn lease at execution. Estimates and
+control routes bypass the hold; combined-provider POST counting remains as
+before. No accepted connection, background job or client-tool process becomes
+restart-transferable through this hold.
 
 ## Testing Strategy
 
