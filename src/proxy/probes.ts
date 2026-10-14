@@ -54,8 +54,8 @@ export interface ReadinessInput {
   readonly profileCount: number
   /** Whether a Claude executable resolves for this instance. */
   readonly claudeExecutableResolved: boolean
-  /** Why Anthropic is concluded unreachable from this host, or null/absent
-   *  while it is not. See ./upstreamReachability.ts. */
+  /** Why this instance's configured Claude egress is declared unreachable,
+   *  or null/absent when no outage is declared. See ./upstreamReachability.ts. */
   readonly claudeUnreachable?: string | null
 }
 
@@ -82,7 +82,8 @@ export interface ReadinessInput {
  *                      own `node_modules`, or its platform package - all
  *                      per-instance, and without one no request can be served
  *                      (#478).
- *   upstream-claude    whether Anthropic answers from THIS host. A dead
+ *   upstream-claude    declared connection outage on this instance's configured
+ *                      Claude egress. A dead
  *                      resolver or a broken route is local to one machine
  *                      while its network still serves HTTP, so a neighbour on
  *                      another host serves fine. It fails only on evidence

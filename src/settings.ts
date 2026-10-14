@@ -92,13 +92,15 @@ export interface MeridianSettings {
   claudeExecutablePath?: string
 
   /**
-   * When `/readyz` concludes Anthropic is unreachable from this host: after at
+   * When `/readyz` declares a connection outage on this instance's configured
+   * Claude egress: after at
    * least `upstreamUnreachableMinFailures` connection failures (default 3)
-   * spanning `upstreamUnreachableAfterMs` (default 120000) with no answer from
-   * Anthropic in between. It then holds for `upstreamUnreachableHoldMs` after
+   * spanning `upstreamUnreachableAfterMs` (default 120000) with no qualifying configured-egress transport answer
+   * in between. It then holds for `upstreamUnreachableHoldMs` after
    * the latest failure (default 300000; 0 never fails readiness) before letting
    * traffic back in. MERIDIAN_UPSTREAM_UNREACHABLE_AFTER_MS / _HOLD_MS /
-   * _MIN_FAILURES win. Re-read on every evaluation.
+   * _MIN_FAILURES win over CLAUDE_PROXY_* aliases and persisted numeric
+   * fields. Invalid values fall back safely. Re-read on every evaluation.
    */
   upstreamUnreachableAfterMs?: number
   upstreamUnreachableHoldMs?: number

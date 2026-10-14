@@ -51,7 +51,7 @@ describe("shared site header", () => {
   // phone width where the plain status shows only its dot.
   test("status pill can render an upstream outage", () => {
     expect(profileBarJs).toContain("statusPillView")
-    expect(profileBarJs).toContain("Can't reach Anthropic")
+    expect(profileBarJs).toContain("Claude connection failed")
     expect(profileBarCss).toContain(".mh-status.outage")
     expect(profileBarCss).toContain(".mh-status.recovering")
     expect(profileBarCss).toMatch(/@media \(max-width: 720px\)[\s\S]*\.mh-status\.outage \.mh-status-text[\s\S]*display: inline/)

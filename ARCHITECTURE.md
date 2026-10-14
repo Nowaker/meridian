@@ -190,7 +190,8 @@ src/
 │   ├── admissionHold.ts       ← Bounded per-instance generation reservations for the best-effort POST /drain hold
 │   ├── drainBody.ts           ← Tiny operator body byte/deadline limits and joined reader cancellation
 │   ├── generationAdmission.ts ← Exact combined-provider generation classification and response-reader ownership
-│   ├── upstreamReachability.ts ← Passive "can Anthropic be reached from here" state for /readyz and /health
+│   ├── upstreamReachability.ts ← Pure instance-local native-Claude transport observations for /readyz and /health
+│   ├── upstreamReachabilityConfig.ts ← Dynamic environment/settings acquisition injected by server orchestration
 │   ├── adapter.ts             ← AgentAdapter interface (extensibility point for multi-agent support)
 │   ├── adapters/
 │   │   ├── opencode.ts        ← OpenCode adapter (session headers, CWD extraction, tool config)
@@ -317,7 +318,17 @@ server.ts (HTTP layer)
    policy for settings that disclose something or choose what runs lives in
    `src/sameOrigin.ts` (standard web types only), used by the header and
    Claude Code executable settings. Backend auth remains at each caller's
-   existing boundary.
+   existing boundary. Shared same-origin browser-write policy is
+   reused by the loopback reachability override; it confers no peer/key authority.
+   `upstreamReachability.ts` has no imports or settings/filesystem I/O; its
+   normalizer, tracker and native-message observer default to pure constants.
+   Each proxy creates its own tracker and injects the per-evaluation callback
+   from `upstreamReachabilityConfig.ts`, the only reachability module that
+   acquires current environment/settings values. Its pass-through observer stays outside the
+   idle guard, preserving direct SDK teardown, and reads only that query's native
+   messages. Bounded response/parent identities prevent old completion/replay
+   from supplying fresh transport evidence. Native event dialect acceptance is
+   separate from direct mocked/pure verification (#1281).
 
 5. **No circular dependencies.** If you need to share types, put them in `types.ts` or the relevant leaf module.
 
