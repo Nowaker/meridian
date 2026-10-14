@@ -75,6 +75,7 @@ export type {
 export { runTransformHook, runObserveHook, buildPipeline, createRequestContext } from "./transform"
 import { claudeLog } from "../logger"
 import { replayBudgetFor, trimReplayHistory } from "./replayBudget"
+import { haikuThinkingCompatibilityError } from "./haikuCompatibility"
 import { PASSTHROUGH_DENY_REASON } from "./passthroughDenial"
 import { exec as execCallback } from "child_process"
 import { promisify } from "util"
@@ -93,6 +94,7 @@ import { telemetryStore, diagnosticLog, createTelemetryRoutes, landingHtml, rend
 import { detectSupervision } from "./supervision"
 import type { RequestMetric } from "../telemetry"
 import { canRecoverCapturedToolUses, canRecoverUncapturedToolUses, isStreamedToolBlockComplete, unavailableToolResults, type StreamedToolBlockRecord, classifyError, extractSdkTermination, formatSdkTermination, classifyResumeRefusal, isRateLimitError, isExtraUsageRequiredError, isExpiredTokenError, isAccountFailoverError, isQuotaRefusal, isOutputTokenCapExceeded } from "./errors"
+import { createSseRelayStream, relayStreamAttempt } from "./sseFailureSniff"
 import { refreshOAuthToken, ensureFreshToken, startBackgroundRefresh, stopBackgroundRefresh, createPlatformCredentialStore, getAuthRenewalStatus, getStoredPlanFields, readStoredCredentialSnapshot, renewalStatusFor, resolveRenewalWarnDays, type AuthRenewalStatus, type CredentialStore, type StoredPlanFields } from "./tokenRefresh"
 import { describeAuthLifecycleEvent, noteCredentialObserved, noteProviderAccepted, onAuthLifecycleTransition, type AuthLifecycleTransition } from "./authLifecycle"
 import { noteClaudeAuthenticationFailure, profileLoginState, reconcileClaudeProfileAuth } from "./profileLoginState"
@@ -140,6 +142,7 @@ import { createTranscriptSweep, DEFAULT_TRANSCRIPT_SWEEP_INTERVAL_MS, listSweepR
 import { normalizeEffort } from "./effort"
 import { parseOutputFormat, structuredOutputText } from "./structuredOutput"
 import { runTransformHook, buildPipeline, createRequestContext } from "./transform"
+import { inspectExecutionHistory } from "./executionHistory"
 import { getAdapterTransforms } from "./transforms/registry"
 import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
@@ -185,6 +188,7 @@ import {
 import { getSetting, setSetting, saveSettings, TELEMETRY_SETTING_LIMITS, type MeridianSettings } from "../settings" 
 import { headerSettingsResponse, healthHostname } from "../headerSettings"
 import { claudeExecutableSettingsResponse } from "./claudeExecutableSettings"
+import { createClaudeProbeOwner } from "./claudeProbeOwnership"
 import { startProfileLogin, completeProfileLogin, completeProfileLoginFromCallback, getProfileLoginStatus } from "./profileLogin"
 import { startProfileAdd, completeProfileAdd } from "./profileAdd"
 import { profileStartBody, profileLoginCompleteBody, profileAddCompleteBody } from "./profileOAuthBody"
@@ -324,11 +328,6 @@ const DENY_HOLD_TIMEOUT_MS = envInt("DENY_HOLD_TIMEOUT_MS", UPSTREAM_IDLE_MS + 3
 // waste at three idle windows instead of an afternoon. 0 disables the ceiling
 // and restores the pre-ceiling behaviour exactly.
 const UPSTREAM_IDLE_MAX_CONSECUTIVE = envInt("UPSTREAM_IDLE_MAX_CONSECUTIVE", 3)
-// How long a stream that has already answered its client waits for the SDK
-// attempt it abandoned to stop before the turn ends and its session is free
-// again. Above the SDK process gate's 7s join budget, which bounds a healthy
-// teardown, so it only decides anything when that teardown is itself stuck.
-const ABANDONED_ATTEMPT_SETTLE_MS = 10_000
 
 // Bounds how long ProxyInstance.close() waits for in-flight /v1/messages
 // requests to finish (after beginDrain() stops admitting new ones) before it
@@ -380,6 +379,12 @@ interface RequestMeta {
    * where in the chain a hop sits, and that it is one at all.
    */
   routeAttempt?: number
+  /**
+   * The adapter declared this a side call sharing the conversation's session
+   * key (`AgentIdentity.isAuxiliaryRequest`). Decided once, before the turn
+   * lease, so skipping the lease and skipping session lookup cannot disagree.
+   */
+  auxiliaryRequest?: boolean
 }
 
 interface PriorityAttemptExposure {
@@ -728,6 +733,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 }
 
 function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner: ReturnType<typeof createAuthStatusOwner>): ProxyServer {
+  const executableProbeOwner = createClaudeProbeOwner()
   if (resolveBackendConfig(config).backend === "antigravity") return createAntigravityServer(resolveBackendConfig(config))
   const getInstanceAuthStatus = (profileId?: string, envOverrides?: Record<string, string>) =>
     authOwner.run(() => getClaudeAuthStatusAsync(profileId, envOverrides))
@@ -980,7 +986,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       root.explicitConfigDir ? { claudeConfigDir: root.configDir } : undefined,
     ).read(),
     runChild: async (root, retentionDays, signal) => {
-      const claudeExecutable = await resolveClaudeExecutableAsync()
+      const claudeExecutable = await executableProbeOwner.run(signal, resolveClaudeExecutableAsync)
       return runIdleSweepChild({ root, retentionDays, claudeExecutable, signal })
     },
     log: plog,
@@ -1496,86 +1502,284 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       })
   }
 
-  /** Inspect an inner response for an account-level failure without destroying
-   *  it. Non-stream: an error body on a non-OK status. Stream: an
-   *  `event: error` frame BEFORE any content frame (mid-content errors pass
-   *  through — never yank a stream a client is already consuming).
-   *
-   *  `isAccountFailoverError` decides which classified types are worth another
-   *  account; anything else is this account's honest answer and belongs to the
-   *  client untouched. The non-stream status gate is `!res.ok` rather than a
-   *  literal 429 because the qualifying types do not share one status — a
-   *  spent quota window is 429, a refused subscription 402. */
+  function isEventStream(res: Response): boolean {
+    return (res.headers.get("content-type") ?? "").includes("text/event-stream")
+  }
+
+  /** Inspect a non-SSE inner response for an account-level failure.
+   *  An account-shaped error on a non-OK status is worth another account;
+   *  anything else is this account's honest answer and belongs to the client
+   *  untouched. SSE bodies are decided in-stream by `streamPriorityDispatch`.
+   *  The status gate is `!res.ok` rather than a literal 429
+   *  because the qualifying types do not share one status — a spent quota
+   *  window is 429, a refused subscription 402. */
   async function sniffAccountFailure(res: Response): Promise<
     | { failed: true; errorPayload: unknown; errorType: string; response: Response }
     | { failed: false; errorPayload: null; errorType: null; response: Response }
   > {
-    const contentType = res.headers.get("content-type") ?? ""
-    if (!contentType.includes("text/event-stream")) {
-      if (!res.ok) {
-        const body = await res.clone().json().catch(() => null) as { error?: { type?: string } } | null
-        const errorType = body?.error?.type
-        if (isAccountFailoverError(errorType)) {
-          return { failed: true, errorPayload: body, errorType, response: res }
-        }
-      }
+    if (isEventStream(res) || res.ok) {
       return { failed: false, errorPayload: null, errorType: null, response: res }
     }
-    const reader = res.body?.getReader()
-    if (!reader) return { failed: false, errorPayload: null, errorType: null, response: res }
-    const decoder = new TextDecoder()
-    const consumed: Uint8Array[] = []
-    let text = ""
-    let failure: { payload: unknown; type: string } | null = null
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      consumed.push(value)
-      text += decoder.decode(value, { stream: true })
-      const frameEnd = text.indexOf("\n\n")
-      if (frameEnd === -1) continue
-      const frame = text.slice(0, frameEnd)
-      if (/^event: error$/m.test(frame)) {
-        const dataLine = frame.split("\n").find(l => l.startsWith("data: "))
-        try {
-          const parsed = dataLine ? JSON.parse(dataLine.slice(6)) as { error?: { type?: string } } : null
-          const parsedType = parsed?.error?.type
-          if (isAccountFailoverError(parsedType)) {
-            failure = { payload: parsed, type: parsedType }
-          }
-        } catch { /* not an account-failure frame — pass through below */ }
-      }
-      break // first complete frame decides
+    const body = await res.clone().json().catch(() => null) as { error?: { type?: string } } | null
+    const errorType = body?.error?.type
+    if (isAccountFailoverError(errorType)) {
+      return { failed: true, errorPayload: body, errorType, response: res }
     }
-    if (failure) {
-      await reader.cancel().catch(() => {})
-      // The original response body is now locked and consumed. Preserve the
-      // exact bytes already read so a no-retry exposure barrier can still
-      // return a usable account-error response to the client.
-      const replay = new ReadableStream<Uint8Array>({
-        start(ctrl) {
-          for (const chunk of consumed) ctrl.enqueue(chunk)
-          ctrl.close()
-        },
-      })
-      const response = new Response(replay, { status: res.status, headers: res.headers })
-      const completion = responseCompletions.get(res)
-      if (completion) responseCompletions.set(response, completion)
-      return { failed: true, errorPayload: failure.payload, errorType: failure.type, response }
-    }
-    const rest = new ReadableStream<Uint8Array>({
-      start(ctrl) { for (const chunk of consumed) ctrl.enqueue(chunk) },
-      async pull(ctrl) {
-        const { done, value } = await reader.read()
-        if (done) ctrl.close()
-        else ctrl.enqueue(value)
-      },
-      cancel(reason) { void reader.cancel(reason).catch(() => {}) },
+    return { failed: false, errorPayload: null, errorType: null, response: res }
+  }
+
+  async function runPriorityAttempt(
+    options: PriorityDispatchOptions,
+    attempt: number,
+    candidate: string,
+    attemptOwnerToken: string | undefined,
+    requestAbortLink = options.requestAbortLink,
+    exposure: PriorityAttemptExposure = { committed: false },
+  ) {
+    const priorityPublication = options.durableRoute && options.publicationTurn
+      ? {
+          routeKey: options.durableRoute.routeKey,
+          profileId: candidate,
+          lastHumanTurnDigest: options.publicationTurn.turnId,
+          lastHumanTurnIssuedAt: options.publicationTurn.issuedAt,
+          attemptOwnerToken: attemptOwnerToken!,
+          expectedAssignmentGeneration: options.durableRoute.expectedGeneration,
+        }
+      : undefined
+    // Fork the hop's telemetry, retaining the request ID for routeChain.
+    const attemptMeta = { ...forkAttemptMeta(options.requestMeta, attempt), routeAttempt: attempt + 1 }
+    const inner = await handleMessages(options.context, attemptMeta, {
+      body: options.body,
+      forcedProfileId: candidate,
+      turnWatchdogSignal: options.turnWatchdogSignal,
+      requestAbortLink,
+      forceFreshPriorityReplay: priorityPublication !== undefined
+        && (options.durableRoute?.forceFreshReplay === true
+          || (options.currentProfileId !== undefined && candidate !== options.currentProfileId)),
+      priorityPublication,
+      priorityAttemptExposure: exposure,
     })
-    const response = new Response(rest, { status: res.status, headers: res.headers })
-    const completion = responseCompletions.get(res)
-    if (completion) responseCompletions.set(response, completion)
-    return { failed: false, errorPayload: null, errorType: null, response }
+    return { inner, exposure }
+  }
+
+  function markPriorityFailure(candidate: string, reason: string): number {
+    const quotaRefusal = isQuotaRefusal(reason)
+    const until = quotaRefusal
+      ? priorityCooldownUntil(candidate, Date.now())
+      : Date.now() + PRIORITY_DEFAULT_COOLDOWN_MS
+    priorityExhaustion.mark(candidate, until, reason)
+    claudeLog("priority.exhausted", { profile: candidate, until, reason })
+    if (quotaRefusal) refinePriorityCooldown(candidate)
+    return until
+  }
+
+  /** Streaming priority dispatch, entered once an account answers with SSE:
+   *  that attempt and every later candidate run INSIDE the client-facing
+   *  stream.
+   *
+   *  The outer SSE Response is returned before the handed attempt's first
+   *  frame, so headers reach the client immediately and keepalives keep the
+   *  connection live while an account is still deciding. An account-failover
+   *  error before any real frame suppresses that account and starts the next
+   *  candidate — never on a cancelled request. The first real frame (content
+   *  or an honest error) relays byte-exact; an exposure-committed attempt's
+   *  error relays instead of suppressing (the no-retry barrier). A pool
+   *  exhausted after headers emits one coherent SSE error frame, because the
+   *  HTTP status can no longer be rewritten.
+   *
+   *  `settleAttempt` settles the durable priority attempt claim exactly as
+   *  the non-stream loop does. */
+  async function streamPriorityDispatch(
+    options: PriorityDispatchOptions,
+    attemptOwnerToken: string | undefined,
+    settleAttempt: (disposition: "release" | "block") => Promise<boolean>,
+    start: {
+      attempt: number
+      inner: Response
+      exposure: PriorityAttemptExposure
+      lastError: unknown
+      previous: string | null
+      previousReason: string
+      earliestPoolReset: number | null
+    },
+  ): Promise<Response> {
+    const encoder = new TextEncoder()
+    const errorFrame = (payload: unknown): Uint8Array =>
+      encoder.encode(`event: error\ndata: ${JSON.stringify(payload)}\n\n`)
+    const unavailableFrame = () => errorFrame({
+      type: "error",
+      error: { type: "overloaded_error", message: "Durable priority attempt state is unavailable", retry_after: OVERLOADED_RETRY_AFTER_SECONDS },
+    })
+
+    // Abort the request-wide link, not just a reader that may not exist yet.
+    const requestAbort = options.requestAbortLink ?? linkRequestAbort(options.context.req.raw.signal)
+
+    let resolveOuterCompletion: () => void = () => {}
+    const outerCompletion = new Promise<void>(resolve => { resolveOuterCompletion = resolve })
+
+    const stream = createSseRelayStream(async sink => {
+        const { enqueue } = sink
+        const isCancelled = () => sink.isCancelled() || requestAbort.controller.signal.aborted
+        let activeExposure: PriorityAttemptExposure | null = null
+        let failedUnexpectedly = false
+        let settled = false
+        const settle = async (disposition: "release" | "block"): Promise<boolean> => {
+          if (settled) return true
+          settled = await settleAttempt(disposition)
+          return settled
+        }
+        let lastInner: Response | null = null
+        try {
+          let { lastError, previous, previousReason, earliestPoolReset } = start
+          for (let attempt = start.attempt; attempt < options.candidateIds.length; attempt++) {
+            const candidate = options.candidateIds[attempt]!
+            const handed = attempt === start.attempt
+            // The handed attempt is always relayed: its reader owns the cancel.
+            if (!handed && isCancelled()) break
+            activeExposure = handed ? start.exposure : { committed: false }
+            const { inner, exposure } = handed
+              ? start
+              : await runPriorityAttempt(options, attempt, candidate, attemptOwnerToken, requestAbort, activeExposure)
+            lastInner = inner
+            const verdict = await relayStreamAttempt(inner, { ...sink, isCancelled })
+            if (verdict.kind === "suppressed") {
+              // Cancel BEFORE joining cleanup, then read the final exposure
+              // state. Cleanup may itself latch a side effect; testing the
+              // barrier before completion could replay an exposed attempt.
+              await verdict.discard()
+              await responseCompletions.get(inner)?.catch(() => {})
+              const reason = verdict.errorType
+              const cooldownUntil = markPriorityFailure(candidate, reason)
+              if (isCancelled()) break
+              earliestPoolReset = Math.min(earliestPoolReset ?? cooldownUntil, cooldownUntil)
+              lastError = verdict.errorPayload
+              previous = candidate
+              previousReason = reason
+              if (exposure.committed) {
+                // The SDK may already have emitted content, structured
+                // output, or a tool side effect. Never replay that attempt on
+                // another account — and the client has not seen the refused
+                // bytes yet, so relay them now instead of failing over.
+                claudeLog("priority.failover_withheld", { profile: candidate, reason: exposure.reason ?? "attempt_exposed" })
+                if (!(await settle("block"))) {
+                  await enqueue(unavailableFrame())
+                  return
+                }
+                sink.onMeaningfulForwarded()
+                for (const chunk of verdict.held) await enqueue(chunk)
+                return
+              }
+              // Suppressible and unexposed: try the next candidate, without
+              // the previous attempt's reader as the cancel target.
+              sink.registerCancel(() => {})
+              continue
+            }
+            if (isCancelled()) break
+            if (options.sessionKey && !options.durableRoute) {
+              // Process memory preserves only legacy/keyless new-conversation
+              // affinity. Trusted attempts publish authority at the atomic
+              // durable terminal barrier and must not poison adoption on
+              // errors or cancel.
+              const previousAssignment = priorityAssignments.get(options.sessionKey)
+              priorityAssignments.set(options.sessionKey, {
+                profileId: candidate,
+                requestId: options.publicationTurn?.turnId ?? previousAssignment?.requestId,
+              })
+            }
+            if (previous) {
+              claudeLog("profile.failover", { from: previous, to: candidate, reason: previousReason, sessionKey: options.sessionKey })
+              plog(`[PROXY] PRIORITY failover ${previous} -> ${candidate} (${previousReason})`)
+              // The client is about to receive a normal answer and will never
+              // learn that an account dropped out. A supervisor watching for
+              // spent accounts has to hear about it from here or not at all.
+              failoverEvents.append({
+                kind: "failover",
+                profile: previous,
+                servedBy: candidate,
+                reason: previousReason,
+                routing: options.routing ?? "priority",
+                sessionKey: options.sessionKey,
+                internalHop: false,
+                until: spentProfiles.get(previous)?.until ?? null,
+                limit: spentProfiles.get(previous)?.diagnosis ?? null,
+              })
+            }
+            return
+          }
+          if (previous && !isCancelled()) {
+            failoverEvents.append({
+              kind: "pool_exhausted",
+              profile: previous,
+              servedBy: null,
+              reason: "rate_limit_error",
+              routing: options.routing ?? "priority",
+              sessionKey: options.sessionKey,
+              internalHop: false,
+              until: spentProfiles.get(previous)?.until ?? null,
+              limit: spentProfiles.get(previous)?.diagnosis ?? null,
+            })
+          }
+          // Every candidate ended before exposure: release the exact durable
+          // claim, then surface the LAST tried profile's error once — headers
+          // are already out, so the terminal verdict travels in the stream.
+          // Quota waits name the pool's earliest opening, just as on JSON.
+          if (!isCancelled() && !(await settle("release"))) {
+            await enqueue(unavailableFrame())
+            return
+          }
+          if (!isCancelled() && lastError !== null) {
+            if (isQuotaRefusal(previousReason) && typeof lastError === "object") {
+              const envelope = (lastError as { error?: unknown }).error
+              if (envelope !== null && typeof envelope === "object") {
+                Object.assign(envelope, retryAfterBodyFields(retryAfterSeconds({ status: 429, resetAtMs: earliestPoolReset })))
+              }
+            }
+            await enqueue(errorFrame(lastError))
+          }
+        } catch (error) {
+          failedUnexpectedly = true
+          // Headers are already sent: classify as the route's own handler
+          // would, but deliver the verdict as a stream error frame.
+          const errMsg = error instanceof Error ? error.message : String(error)
+          claudeLog("error.unhandled", { error: errMsg })
+          if (!isCancelled()) {
+            const classified = classifyError(errMsg)
+            await enqueue(errorFrame({
+              type: "error",
+              error: { type: classified.type, message: classified.message,
+                ...retryAfterBodyFields(retryAfterSeconds({ status: classified.status })) },
+            }))
+          }
+        } finally {
+          if (failedUnexpectedly) requestAbort.abort("priority relay failed")
+          // The outer completion resolves only after the last attempt's own
+          // completion has settled, preserving the route's finishRequest
+          // ordering.
+          void (async () => {
+            try {
+              if (lastInner) await responseCompletions.get(lastInner)?.catch(() => {})
+            } finally {
+              // Settle only after cleanup, when the exposure barrier is final.
+              if (isCancelled() || failedUnexpectedly) await settle(activeExposure?.committed ? "block" : "release")
+              if (!options.requestAbortLink) requestAbort.detach()
+              resolveOuterCompletion()
+            }
+          })()
+        }
+    }, reason => {
+      requestAbort.setCause("stream_cancel")
+      requestAbort.abort(reason)
+      options.requestMeta.cascadeSubtreeCancel?.("stream_cancel")
+    })
+    const response = new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
+    })
+    responseCompletions.set(response, outerCompletion)
+    return response
   }
 
   async function dispatchPriority(options: PriorityDispatchOptions): Promise<Response> {
@@ -1634,34 +1838,15 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // Retry-After names the pool's earliest opening (#901).
     let earliestPoolReset: number | null = null
     for (const [attempt, candidate] of options.candidateIds.entries()) {
-      const exposure: PriorityAttemptExposure = { committed: false }
-      const priorityPublication = options.durableRoute && options.publicationTurn
-        ? {
-            routeKey: options.durableRoute.routeKey,
-            profileId: candidate,
-            lastHumanTurnDigest: options.publicationTurn.turnId,
-            lastHumanTurnIssuedAt: options.publicationTurn.issuedAt,
-            attemptOwnerToken: attemptOwnerToken!,
-            expectedAssignmentGeneration: options.durableRoute.expectedGeneration,
-          }
-        : undefined
-      // Each hop writes its own telemetry row. `routeAttempt` is what marks a
-      // row as a hop and orders it, and the `requestId` forkAttemptMeta keeps
-      // across attempts is what groups them - so the read path can stitch a
-      // failover back into one row with its account chain
-      // (telemetry/routeChain.ts). Nothing is correlated here.
-      const attemptMeta = { ...forkAttemptMeta(options.requestMeta, attempt), routeAttempt: attempt + 1 }
-      const inner = await handleMessages(options.context, attemptMeta, {
-        body: options.body,
-        forcedProfileId: candidate,
-        turnWatchdogSignal: options.turnWatchdogSignal,
-        requestAbortLink: options.requestAbortLink,
-        forceFreshPriorityReplay: priorityPublication !== undefined
-          && (options.durableRoute?.forceFreshReplay === true
-            || (options.currentProfileId !== undefined && candidate !== options.currentProfileId)),
-        priorityPublication,
-        priorityAttemptExposure: exposure,
-      })
+      const { inner, exposure } = await runPriorityAttempt(options, attempt, candidate, attemptOwnerToken)
+      // A non-SSE answer is decided here and keeps its HTTP status. Once an
+      // account streams, headers go out and the remaining candidates are
+      // tried inside the stream.
+      if (options.wantsStream && isEventStream(inner)) {
+        return streamPriorityDispatch(options, attemptOwnerToken, settleAttempt, {
+          attempt, inner, exposure, lastError, previous, previousReason, earliestPoolReset,
+        })
+      }
       const sniffed = await sniffAccountFailure(inner)
       if (!sniffed.failed) {
         if (options.sessionKey && !options.durableRoute) {
@@ -1698,16 +1883,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const reason = sniffed.errorType
       // Only a quota refusal has a reset to look up. Both cooldown tiers read
       // the account's five-hour window, which says nothing about entitlement.
-      const quotaRefusal = isQuotaRefusal(reason)
-      const cooldownUntil = quotaRefusal
-        ? priorityCooldownUntil(candidate, Date.now())
-        : Date.now() + PRIORITY_DEFAULT_COOLDOWN_MS
-      priorityExhaustion.mark(candidate, cooldownUntil, reason)
+      const cooldownUntil = markPriorityFailure(candidate, reason)
       if (earliestPoolReset === null || cooldownUntil < earliestPoolReset) {
         earliestPoolReset = cooldownUntil
       }
-      claudeLog("priority.exhausted", { profile: candidate, until: cooldownUntil, reason })
-      if (quotaRefusal) refinePriorityCooldown(candidate)
       lastError = sniffed.errorPayload
       lastStatus = inner.status
       previous = candidate
@@ -1738,16 +1917,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // before the client can retry; failure stays fail-closed and never advances
     // to another account or returns a retryable account-shaped response.
     if (!(await settleAttempt("release"))) return unavailableAttemptResponse()
-    // Surface the LAST tried profile's error (owner decision). Stream sniff
-    // consumed the inner body, so reconstruct the exact frame for SSE requests.
-    // The SSE frame carries its own `retry_after` field, relayed verbatim from
-    // whichever attempt produced it — headers are unavailable to a stream.
-    if (options.wantsStream) {
-      return new Response(`event: error\ndata: ${JSON.stringify(lastError)}\n\n`, {
-        status: 200,
-        headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" },
-      })
-    }
+    // Surface the LAST tried profile's error (owner decision).
     // The wait belongs to the POOL, not to the last account tried: the caller
     // can proceed as soon as ANY candidate frees up. `earliestPoolReset` is a
     // real observed boundary when a quota refusal supplied one and the
@@ -2534,6 +2704,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
 
         // Overlay profile-specific env vars (e.g. CLAUDE_CONFIG_DIR for multi-account)
         const profileEnv = { ...sdkModelDefaults, ...cleanEnv, ...profile.env }
+        // The Sonnet the SDK will actually serve (query.ts spreads the explicit
+        // pin last). Plain `sonnet` on Sonnet 5+ has a native 1M window, so the
+        // replay budget must not assume 200k from the alias alone (#1212).
+        const resolvedSonnetModel = envOverrides?.ANTHROPIC_DEFAULT_SONNET_MODEL ?? profileEnv.ANTHROPIC_DEFAULT_SONNET_MODEL
+        const resolvedHaikuModel = () => model === "haiku"
+          ? envOverrides?.ANTHROPIC_DEFAULT_HAIKU_MODEL ?? profileEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL
+          : undefined
         const profileCredentialStore = credentialStoreForProfile(profile)
 
         // Drops transport metadata some clients pass through `system`.
@@ -2547,17 +2724,27 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         const adapterBase = adapter.baseName ?? adapter.name
         const adapterTransforms = getAdapterTransforms(adapterBase)
         const pipeline = buildPipeline(adapterTransforms, pluginTransforms)
+        // A plugin's modifiable history must not alias the raw client ancestry.
+        const hookMessages = pluginTransforms.some(transform => transform.onRequest
+          && (!transform.adapters || transform.adapters.includes(adapterBase)))
+          ? structuredClone(body.messages)
+          : body.messages
         const pipelineCtx = runTransformHook(pipeline, "onRequest", createRequestContext({
           adapter: adapterBase,
           body,
           headers: c.req.raw.headers,
           model,
-          messages: body.messages || [],
+          messages: hookMessages,
           systemContext,
           tools: body.tools,
           stream: body.stream ?? false,
           workingDirectory,
         }), adapterBase)
+        const executionHistory = inspectExecutionHistory(body.messages, pipelineCtx.messages)
+        if (!executionHistory.ok) {
+          return c.json({ type: "error", error: { type: "invalid_request_error", message: "messages: Plugin history must contain at least one message with role and content" } }, 400)
+        }
+        const executionMessages = executionHistory.messages
 
         // Allow transform pipeline to override streaming preference (e.g. LiteLLM requires non-streaming)
         const stream = pipelineCtx.prefersStreaming !== undefined ? pipelineCtx.prefersStreaming : (body.stream ?? false)
@@ -2721,6 +2908,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             plog(`[PROXY] ${requestMeta.requestId} thinking disabled (thinking beta stripped by ${getBetaPolicyFromEnv()} policy)`)
           }
         }
+        const thinkingCompatibilityError = haikuThinkingCompatibilityError(resolvedHaikuModel(), thinking)
+        if (thinkingCompatibilityError) {
+          return c.json({ type: "error", error: { type: "invalid_request_error", message: thinkingCompatibilityError } }, 400)
+        }
         const requestedDisplay = thinking && thinking.type !== "disabled" ? thinking.display : undefined
         if (requestedDisplay !== undefined && !isCliThinkingDisplay(requestedDisplay)) {
           plog(`[PROXY] ${requestMeta.requestId} thinking display ${JSON.stringify(requestedDisplay)} dropped (not accepted by the bundled Claude Code CLI)`)
@@ -2872,6 +3063,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // and otherwise text-free bodies) has no stable cache identity either,
         // and runs fresh rather than manufacturing a generation for an empty key.
         //
+        // An adapter-declared auxiliary request is the one keyed request that
+        // is independent anyway: it carries the conversation's key without
+        // being a turn of it (see AgentIdentity.isAuxiliaryRequest).
+        //
         // One decision, one reported cause: deriving the flag from the cause is
         // what keeps the log honest. #820 was a log full of `lineage=new` whose
         // only explanation lived in this file, and a label computed separately
@@ -2883,6 +3078,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           isSubagent: isSubagentRequest,
           clientDrivenLoop: isClientDrivenLoop,
           hasDurableKey: Boolean(durableMappingKey),
+          isAuxiliary: requestMeta.auxiliaryRequest === true,
         })
         const isIndependentSession = independentCause !== undefined
         // Once per process: the operator cannot see this in success metrics.
@@ -2981,12 +3177,16 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         const durableCheckpointIds = durableMappingAtTurn.status === "found"
           ? durableMappingAtTurn.session.passthroughToolCallIds
           : undefined
-        // NOTE: agent-specific (claude-code, pi) — trailing system reminder: claude-cli's
-        // mid-conversation-system feature, and Oh My Pi upgrading developer-origin notes to a
-        // mid-conversation `system` turn after tool results. Fresh replay already delivers the
-        // reminder as user text, so resuming only avoids rewriting the whole history cache.
-        // See allowTrailingSystemReminder.
-        const trailingSystemReminderOptions = adapterBase === "claude-code" || adapterBase === "pi"
+        // NOTE: agent-specific (claude-code, pi, opencode) — trailing system reminder: claude-cli's
+        // mid-conversation-system feature, Oh My Pi upgrading developer-origin notes to a
+        // mid-conversation `system` turn after tool results, and OpenCode 2 sending an instruction
+        // update (a changed AGENTS.md, a date rollover, an MCP or skill catalog change) as a native
+        // `system` update after tool results. Fresh replay already delivers the reminder as user
+        // text, so resuming only avoids rewriting the whole history cache. The opencode adapter is
+        // also the default for unrecognised clients: safety comes from the single echo of the
+        // exact pending tool IDs plus the validated stored history prefix, not from knowing
+        // the client. See allowTrailingSystemReminder.
+        const trailingSystemReminderOptions = adapterBase === "claude-code" || adapterBase === "pi" || adapterBase === "opencode"
           ? { allowTrailingSystemReminder: true }
           : undefined
         const durableCheckpointContinuation = durableCheckpointIds?.length
@@ -3037,6 +3237,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         const lostRaceWhileWaiting = Boolean(
           agentSessionId &&
           profileSessionId &&
+          !isIndependentSession &&
           !advancesDurableCheckpoint &&
           (requestMeta.sessionTurnLease?.advancedWhileWaiting(profileSessionId) || advancedAcrossProcesses) &&
           lineageResult.type !== "continuation" &&
@@ -3229,6 +3430,23 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           undoRollbackUuid = undefined
           resumeSessionId = undefined
         }
+        // Raw lineage still decides ownership and concurrency. Its offsets do
+        // not address a filtered/rewritten execution history, nor an SDK
+        // transcript previously published without complete raw-prefix proof.
+        // Tool inheritance is retained only for a namespace-qualified request
+        // that would otherwise resume this exact SDK session.
+        const executionReplay = executionHistory.changed || Boolean(cachedSession && !cachedSession.lineageHash)
+        const executionReplayToolSessionId = executionReplay && isResume ? resumeSessionId : undefined
+        if (executionReplay) {
+          claudeLog("session.execution_replay", {
+            reason: executionHistory.changed ? "transformed_history" : "unproved_sdk_prefix",
+          })
+          isResume = false
+          isUndo = false
+          sdkUndo = false
+          undoRollbackUuid = undefined
+          resumeSessionId = undefined
+        }
         // Early-stopped sessions resume at the assistant tool-use turn, before synthetic denials.
         let passthroughToolCallAssistantUuid = passthrough && isResume ? cachedSession?.passthroughToolCallAssistantUuid : undefined
         const passthroughToolCallIds = passthrough && isResume ? cachedSession?.passthroughToolCallIds : undefined
@@ -3338,10 +3556,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           }
         } else {
           // Undo without a valid SDK boundary is a fresh structured replay.
-          messagesToConvert = allMessages
+          messagesToConvert = executionMessages
         }
       } else {
-        messagesToConvert = allMessages
+        messagesToConvert = executionMessages
       }
 
       if (passthroughToolCallAssistantUuid) {
@@ -3397,7 +3615,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           isResume = false
           resumeSessionId = undefined
           passthroughToolCallAssistantUuid = undefined
-          messagesToConvert = allMessages
+          messagesToConvert = executionMessages
         }
       }
 
@@ -3406,7 +3624,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const freshReplay = !isResume && !resumeSessionId
       // Client usage describes its resumed context, not the fresh transcript;
       // derive replay capacity from the actual SDK model's window instead.
-      let currentReplayBudget = replayBudgetFor(model)
+      const modelReplayBudget = () => replayBudgetFor(model, model === "sonnet" ? resolvedSonnetModel : resolvedHaikuModel())
+      let currentReplayBudget = modelReplayBudget()
       let replayTrimRetries = 0
       let replayOmittedMessages = 0
       const trimReplay = (attempt: number, reason?: string): boolean => {
@@ -3542,7 +3761,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         }
       }
       const recoveryToolKey = profileSessionId ?? (firstResultId ? anonymousRecoveryKey(firstResultId) : undefined)
-      if (passthrough && recoveryToolKey) {
+      // A side call under the conversation's key must not spend the
+      // conversation's one-shot recovery grant.
+      if (passthrough && recoveryToolKey && independentCause !== "auxiliary-request") {
         const cached = sessionToolCache.get(recoveryToolKey)
         const recovered = cached?.recovery
         if (cached && recovered) {
@@ -3568,7 +3789,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             plog(`[PROXY] ${requestMeta.requestId} tools_restored: recovered tool-result continuation reused ${requestTools.length} declared tools`)
           }
         }
-        if (profileSessionId && isResume && requestTools.length === 0 && cached && cached.sdkSessionId === resumeSessionId && cached.tools.length > 0) {
+        const toolInheritanceSessionId = isResume ? resumeSessionId : executionReplayToolSessionId
+        if (profileSessionId && toolInheritanceSessionId
+          && requestTools.length === 0 && cached && cached.sdkSessionId === toolInheritanceSessionId && cached.tools.length > 0) {
           requestTools = cached.tools
           plog(`[PROXY] ${requestMeta.requestId} tools_restored: client sent 0 tools but continued branch had ${cached.tools.length} — reusing cached tools to preserve prompt cache`)
         }
@@ -3662,7 +3885,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           // Tool-result attribution is indexed from the FULL history so ids
           // resolve even when the originating call sits before a resume-delta
           // boundary (#552).
-          const toolIndex = buildToolUseIndex(allMessages ?? messagesToConvert ?? [])
+          const toolIndex = buildToolUseIndex(executionMessages)
           // NEVER render 'Human:'/'Assistant:' transcript lines — the model
           // imitates that format, emitting 'Human: ...' turns itself and
           // self-approving actions (#496 self-talk). Match the structured
@@ -3692,7 +3915,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         if (!freshReplay) return
         // Stripping [1m] changes capacity, not only billing: the previously
         // valid replay must fit the smaller window before another SDK call.
-        currentReplayBudget = replayBudgetFor(model)
+        currentReplayBudget = modelReplayBudget()
         trimReplay(replayTrimRetries, reason)
         rebuildReplayPrompt()
       }
@@ -3707,7 +3930,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         const shrunkBudget = counts
           ? Math.floor(currentReplayBudget * (Number(counts[2]) / Number(counts[1])) * 0.9)
           : Math.floor(currentReplayBudget * 0.5)
-        currentReplayBudget = Math.min(shrunkBudget, replayBudgetFor(model))
+        currentReplayBudget = Math.min(shrunkBudget, modelReplayBudget())
         // A live tail is indivisible. Reissuing the same kept history only
         // spends another upstream attempt to obtain the identical overflow.
         if (!trimReplay(replayTrimRetries + 1)) return false
@@ -3909,6 +4132,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
 
       // Track tools discovered via ToolSearch (deferred tools that get called)
       const discoveredTools = new Set<string>()
+      // Client tool calls captured for the client, not the dropped repeats. A
+      // lifted turn budget ends the query after the batch holding one
+      // (stopAfterForwardedBatch). A dropped repeat must not end it: when the
+      // CLI refuses a bare tool name, the turn has to reach max_turns, where
+      // the refusal recovery hands the call over and evicts the session.
+      const forwardedToolUseIds = new Set<string>()
+      const isForwardedToolUse = (toolUseId: string) => forwardedToolUseIds.has(toolUseId)
 
       const priorityExposureHook = options.priorityAttemptExposure
         ? {
@@ -4032,11 +4262,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   // Every distinct tool_use for this exchange is captured and the
                   // model is now looping against blocked tools — kill the nested
                   // SDK session immediately instead of letting it generate denied
-                  // retries until the turn budget runs out (#570). Hook-level
-                  // `interrupt: true` / `continue: false` cannot do this: neither
-                  // key exists in the CLI's hook-output schema, so both are
-                  // stripped before the deny is processed (verified against the
-                  // real SDK). Aborting the query's controller SIGTERMs the
+                  // retries until the turn budget runs out (#570). When this
+                  // was verified, the CLI's hook-output schema stripped both
+                  // `interrupt: true` and `continue: false`. Claude Code 2.1.296
+                  // honours `continue: false`, but only once the current batch
+                  // has resolved (stopAfterForwardedBatch), which is later than
+                  // this abort. Aborting the query's controller SIGTERMs the
                   // subprocess; the abort-shaped termination is converted into a
                   // clean stop_reason:"tool_use" response by the recovery paths.
                   requestAbort.setCause("passthrough_single_step")
@@ -4049,6 +4280,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     name: toolName,
                     input: toolInput,
                   })
+                  forwardedToolUseIds.add(input.tool_use_id)
                 }
                 // The reason text is read by the model as the "tool result" of
                 // a denied call. With a vague reason ("Forwarding to client for
@@ -4193,7 +4425,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           }
 
           try {
-            claudeExecutable = await resolveClaudeExecutableAsync()
+            claudeExecutable = await executableProbeOwner.run(requestAbort.controller.signal, resolveClaudeExecutableAsync)
 
             // Wrap SDK call with transparent retry for recoverable errors.
             // Both stale-UUID and rate-limit retries happen inside the generator,
@@ -4254,7 +4486,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   if (resumeSessionId) resumedMappingMayBeAdvanced = true
                   const attemptQuery = buildQueryOptions({
                     prompt: makePrompt(), model, workingDirectory, clientWorkingDirectory: promptClientWorkingDirectory, clientEnvironmentMayDifferFromProxy, systemContext, claudeExecutable,
-                    passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled, liftSingleTurnCap: singleTurnCapLifted,
+                    passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled, isForwardedToolUse, liftSingleTurnCap: singleTurnCapLifted,
                     resumeSessionId, isUndo: sdkUndo, resumeSessionAtUuid: undoRollbackUuid ?? passthroughToolCallAssistantUuid, forkSession: busySessionFork || undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                     effort, thinking, taskBudget, outputFormat, betas, settingSources,
                     codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
@@ -4358,9 +4590,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     sdkUuidMap.length = 0
                     for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
                     yield* runSdkQueryAttempt(buildQueryOptions({
-                      prompt: buildFreshPrompt(allMessages, sanitizeOpts, renderReplayToolName, replayBudgetFor(model), "non_stream_resume_replay"),
+                      prompt: buildFreshPrompt(executionMessages, sanitizeOpts, renderReplayToolName, modelReplayBudget(), "non_stream_resume_replay"),
                       model, workingDirectory, clientWorkingDirectory: promptClientWorkingDirectory, clientEnvironmentMayDifferFromProxy, systemContext, claudeExecutable,
-                      passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
+                      passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled, isForwardedToolUse,
                       resumeSessionId: undefined, isUndo: false, resumeSessionAtUuid: undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                       effort, thinking, taskBudget, outputFormat, betas, settingSources,
                       codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
@@ -4419,9 +4651,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     sdkUuidMap.length = 0
                     for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
                     yield* runSdkQueryAttempt(buildQueryOptions({
-                      prompt: buildFreshPrompt(allMessages, sanitizeOpts, renderReplayToolName, replayBudgetFor(model), "non_stream_model_fallback"),
+                      prompt: buildFreshPrompt(executionMessages, sanitizeOpts, renderReplayToolName, modelReplayBudget(), "non_stream_model_fallback"),
                       model, workingDirectory, clientWorkingDirectory: promptClientWorkingDirectory, clientEnvironmentMayDifferFromProxy, systemContext, claudeExecutable,
-                      passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
+                      passthrough, stream: false, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled, isForwardedToolUse,
                       resumeSessionId: undefined, isUndo: false, resumeSessionAtUuid: undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                       effort, thinking, taskBudget, outputFormat, betas, settingSources,
                       codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
@@ -5009,6 +5241,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             requestSource,
             model,
             requestModel: body.model || undefined,
+            resolvedModel: resolvedHaikuModel(),
             mode: "non-stream",
             isResume,
             isPassthrough: passthrough,
@@ -5105,6 +5338,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     managedForkTarget?.sessionId === currentSessionId ? managedForkSource : undefined,
                     mappingExpectedGeneration,
                     options.priorityPublication,
+                    !executionHistory.changed,
                       )
                         if (stored) {
                           mappingExpectedGeneration = stored
@@ -5534,7 +5768,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               observeStreamFailure(() => telemetryStore.record({
                 requestId: requestMeta.requestId, timestamp: Date.now(), adapter: adapter.name,
                 profileId: profile.id, routeKind, routeGroupId, routeAttempt, requestSource, model,
-                requestModel: body.model || undefined, mode: "stream", isResume,
+                requestModel: body.model || undefined, resolvedModel: resolvedHaikuModel(), mode: "stream", isResume,
                 isPassthrough: passthrough, hasDeferredTools, toolCount, lineageType,
                 messageCount: allMessages.length, sdkSessionId: currentSessionId || resumeSessionId,
                 status: classified.status, queueWaitMs, sessionQueueWaitMs: requestMeta.sessionQueueWaitMs,
@@ -5563,19 +5797,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               closeStream()
             }
 
-            // The attempts behind this stream answer to their own abort, linked
-            // to the request's so every request-wide abort still reaches them.
-            // The catch below answers the client, most often because the idle
-            // guard gave up on `response` while it was mid-await (queued for an
-            // SDK slot, in admission, or backing off), and an async generator
-            // cannot be returned until it next yields. Left alone, that attempt
-            // went on to start Claude Code and spend upstream calls on a request
-            // already answered, while the session's next turn could be running.
-            const attemptAbort = linkRequestAbort(requestAbort.controller.signal)
-            let abandonment: Error | undefined
-            let attempts: AsyncGenerator<unknown, unknown, unknown> | undefined
             try {
-              claudeExecutable = await resolveClaudeExecutableAsync()
+              claudeExecutable = await executableProbeOwner.run(requestAbort.controller.signal, resolveClaudeExecutableAsync)
 
               // Same transparent retry wrapper as the non-streaming path.
               // Rate-limit retry strategy:
@@ -5601,7 +5824,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 let singleTurnCapLifted = false
 
                 while (true) {
-                  if (abandonment) throw abandonment
                   if (managedForkTarget) {
                     if (managedCreationAttemptStarted) {
                       await rotateManagedCreationTarget("stream_retry")
@@ -5625,7 +5847,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     if (resumeSessionId) resumedMappingMayBeAdvanced = true
                     const attemptQuery = buildQueryOptions({
                       prompt: makePrompt(), model, workingDirectory, clientWorkingDirectory: promptClientWorkingDirectory, clientEnvironmentMayDifferFromProxy, systemContext, claudeExecutable,
-                      passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled, liftSingleTurnCap: singleTurnCapLifted,
+                      passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled, isForwardedToolUse, liftSingleTurnCap: singleTurnCapLifted,
                       resumeSessionId, isUndo: sdkUndo, resumeSessionAtUuid: undoRollbackUuid ?? passthroughToolCallAssistantUuid, forkSession: busySessionFork || undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                       effort, thinking, taskBudget, outputFormat, betas, settingSources,
                       codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
@@ -5638,10 +5860,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                         ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                         : undefined,
                       advisorModel,
-                    }, attemptAbort.controller)
+                    }, requestAbort.controller)
                     attemptMaxTurns = attemptQuery.options.maxTurns
                     lastAttemptMaxTurns = attemptMaxTurns
-                    for await (const event of runSdkQueryAttempt(attemptQuery, attemptAbort.controller.signal, requestMeta, "stream", managedSdkAttemptLocators())) {
+                    for await (const event of runSdkQueryAttempt(attemptQuery, requestAbort.controller.signal, requestMeta, "stream", managedSdkAttemptLocators())) {
                       // Same SDK rate-limit capture as the non-stream path.
                       if ((event as any).type === "rate_limit_event") {
                         rateLimitStore.record(profile.id, (event as any).rate_limit_info)
@@ -5653,8 +5875,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     }
                     return
                   } catch (error) {
-                    // Nothing retries for a client that already has its answer.
-                    if (abandonment) throw error
                     const errMsg = error instanceof Error ? error.message : String(error)
 
                     // Tool hooks and structured output are committed exposure
@@ -5711,9 +5931,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                       sdkUuidMap.length = 0
                       for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
                       yield* runSdkQueryAttempt(buildQueryOptions({
-                        prompt: buildFreshPrompt(allMessages, sanitizeOpts, renderReplayToolName, replayBudgetFor(model), "stream_resume_replay"),
+                        prompt: buildFreshPrompt(executionMessages, sanitizeOpts, renderReplayToolName, modelReplayBudget(), "stream_resume_replay"),
                         model, workingDirectory, clientWorkingDirectory: promptClientWorkingDirectory, clientEnvironmentMayDifferFromProxy, systemContext, claudeExecutable,
-                        passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
+                        passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled, isForwardedToolUse,
                         resumeSessionId: undefined, isUndo: false, resumeSessionAtUuid: undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                         effort, thinking, taskBudget, outputFormat, betas, settingSources,
                         codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
@@ -5726,7 +5946,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                           ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                           : undefined,
                         advisorModel,
-                      }, attemptAbort.controller), attemptAbort.controller.signal, requestMeta, "stream_fresh", managedSdkAttemptLocators())
+                      }, requestAbort.controller), requestAbort.controller.signal, requestMeta, "stream_fresh", managedSdkAttemptLocators())
                       return
                     }
 
@@ -5768,9 +5988,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                       sdkUuidMap.length = 0
                       for (let i = 0; i < allMessages.length; i++) sdkUuidMap.push(null)
                       yield* runSdkQueryAttempt(buildQueryOptions({
-                        prompt: buildFreshPrompt(allMessages, sanitizeOpts, renderReplayToolName, replayBudgetFor(model), "stream_model_fallback"),
+                        prompt: buildFreshPrompt(executionMessages, sanitizeOpts, renderReplayToolName, modelReplayBudget(), "stream_model_fallback"),
                         model, workingDirectory, clientWorkingDirectory: promptClientWorkingDirectory, clientEnvironmentMayDifferFromProxy, systemContext, claudeExecutable,
-                        passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
+                        passthrough, stream: true, sdkAgents, passthroughMcp, cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled, isForwardedToolUse,
                         resumeSessionId: undefined, isUndo: false, resumeSessionAtUuid: undefined, forkSessionId: managedForkTarget?.sessionId, sdkHooks, blockedTools: pipelineCtx.blockedTools, incompatibleTools: pipelineCtx.incompatibleTools, mcpServerName: adapter.getMcpServerName(), allowedMcpTools: pipelineCtx.allowedMcpTools, onStderr,
                         effort, thinking, taskBudget, outputFormat, betas, settingSources,
                         codeSystemPrompt: sdkFeatures.codeSystemPrompt, clientSystemPrompt: sdkFeatures.clientSystemPrompt === false ? false : undefined,
@@ -5783,7 +6003,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                           ? sdkFeatures.additionalDirectories.split(",").map(d => d.trim()).filter(Boolean)
                           : undefined,
                         advisorModel,
-                      }, attemptAbort.controller), attemptAbort.controller.signal, requestMeta, "stream_fresh", managedSdkAttemptLocators())
+                      }, requestAbort.controller), requestAbort.controller.signal, requestMeta, "stream_fresh", managedSdkAttemptLocators())
                       return
                     }
 
@@ -5886,7 +6106,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   }
                 }
               })()
-              attempts = response
 
               const heartbeat = setInterval(() => {
                 heartbeatCount += 1
@@ -6502,6 +6721,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     managedForkTarget?.sessionId === currentSessionId ? managedForkSource : undefined,
                     mappingExpectedGeneration,
                     options.priorityPublication,
+                    !executionHistory.changed,
                       )
                       if (stored) {
                         mappingExpectedGeneration = stored
@@ -6680,7 +6900,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     // The nudge asks for prose, but a tool call is an equally
                     // valid answer — so the tool surface has to stay identical.
                     passthrough, stream: true, sdkAgents, passthroughMcp,
-                    cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled,
+                    cleanEnv: profileEnv, envOverrides, hasDeferredTools, earlyStop: earlyStopEnabled, isForwardedToolUse,
                     resumeSessionId: currentSessionId || resumeSessionId,
                     isUndo: false,
                     // Fork rather than extend: the silent turn is now this
@@ -6831,6 +7051,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     recoveryForkSource,
                     mappingExpectedGeneration,
                     options.priorityPublication,
+                    !executionHistory.changed,
                       )
                       if (stored) {
                         mappingExpectedGeneration = stored
@@ -7105,6 +7326,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   routeAttempt,
                   model,
                   requestModel: body.model || undefined,
+                  resolvedModel: resolvedHaikuModel(),
                   mode: "stream",
                   isResume,
                   isPassthrough: passthrough,
@@ -7164,10 +7386,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 }
               }
             } catch (error) {
-              // Every path from here answers the client, so whatever attempt is
-              // still running behind the stream has nobody left to answer.
-              abandonment = new Error("Stream attempt abandoned: its client was already answered")
-              attemptAbort.abort(abandonment)
               // Forced shutdown revokes publication, but cleanup must remain
               // destructive: a client-visible interrupted turn cannot leave its
               // previously published source mapping resumable.
@@ -7387,13 +7605,19 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 if (!messageStartEmitted || streamClosed || (pendingTerminalDelta && !confirmedToolUnavailable)) return false
                 if (durableWritesRevoked) return false
                 if (requestAbort.abortSnapshot().aborted) return false
-                // Every streamed block must be complete AND name a declared
-                // client tool (after alias resolution — records store the
-                // resolved name already).
+                // Every streamed block must be complete. Without the CLI's
+                // rejection there is no proof the call did not run, so it
+                // must also name a declared client tool (after alias
+                // resolution — records store the resolved name already). A
+                // rejected call ran nowhere, so an undeclared name (#1364:
+                // `bash_placeholder`, `mcp:oc__bash`) goes to the client as
+                // the model wrote it, as the API itself would deliver it, and
+                // the client's own invalid-tool result lets the model correct
+                // itself.
                 for (const record of streamedToolBlockRecords.values()) {
                   if (!isStreamedToolBlockComplete(record)) return false
                   const declared = requestTools.some((t: { name: string }) => t.name === record.name)
-                  if (!declared) return false
+                  if (!declared && !confirmedToolUnavailable) return false
                 }
                 // The tracker must cover every streamed id; a divergence
                 // (e.g. a block the buffered path skipped tracking) is a veto.
@@ -7553,6 +7777,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     managedForkTarget?.sessionId === currentSessionId ? managedForkSource : undefined,
                     mappingExpectedGeneration,
                     options.priorityPublication,
+                    !executionHistory.changed,
                       )
                       if (stored) {
                         mappingExpectedGeneration = stored
@@ -7650,6 +7875,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   requestSource,
                   model,
                   requestModel: body.model || undefined,
+                  resolvedModel: resolvedHaikuModel(),
                   mode: "stream",
                   isResume,
                   isPassthrough: passthrough,
@@ -7796,6 +8022,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   requestSource,
                   model,
                   requestModel: body.model || undefined,
+                  resolvedModel: resolvedHaikuModel(),
                   mode: "stream",
                   isResume,
                   isPassthrough: passthrough,
@@ -7870,6 +8097,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 requestSource,
                 model,
                 requestModel: body.model || undefined,
+                resolvedModel: resolvedHaikuModel(),
                 mode: "stream",
                 isResume,
                 isPassthrough: passthrough,
@@ -7961,22 +8189,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 streamClosed = true
               }
             } finally {
-              if (abandonment && attempts) {
-                // The turn ends, and frees its session for the next one, only
-                // once the abandoned attempt has actually stopped. Its return()
-                // settles when the generator finishes, including the SDK
-                // process join in runSdkQueryAttempt's cleanup.
-                let settleTimer: ReturnType<typeof setTimeout> | undefined
-                const settled = await Promise.race([
-                  attempts.return(undefined).then(() => true, () => true),
-                  new Promise<boolean>((resolve) => {
-                    settleTimer = setTimeout(() => resolve(false), ABANDONED_ATTEMPT_SETTLE_MS)
-                  }),
-                ])
-                clearTimeout(settleTimer)
-                if (!settled) claudeLog("stream.abandoned_attempt_unsettled", { waitedMs: ABANDONED_ATTEMPT_SETTLE_MS })
-              }
-              attemptAbort.detach()
               await abandonManagedFork("stream_complete_without_commit")
               // A client cancel during this cleanup queues an eviction that may
               // yet fence the turn or start a rollback retirement. The turn ends,
@@ -8328,6 +8540,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
 
     let body: any
     let sharedSessionRevisionsAtArrival: Record<string, string | null> | undefined
+    let auxiliaryRequest = false
     let routingTurnIdentity: RequestMeta["routingTurnIdentity"]
     try {
       try {
@@ -8356,6 +8569,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         const adapter = detectAdapter(c)
         routingTurnIdentity = adapter.getRoutingTurnIdentity?.(c, body)
         const agentSessionId = adapter.getSessionId(c, body)
+        auxiliaryRequest = agentSessionId !== undefined && adapter.isAuxiliaryRequest?.(c, body) === true
         if (agentSessionId) {
           // Registered BEFORE the turn lease is acquired: a child queued behind
           // its own session's running turn is exactly the request a parent abort
@@ -8382,6 +8596,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             clientSignal.addEventListener("abort", onClientAbort, { once: true })
             detachSubtreeAbortWatch = () => clientSignal.removeEventListener("abort", onClientAbort)
           }
+        }
+        // A side call has no turn: it never reads or publishes the mapping, so
+        // there is nothing to serialize. Queueing it behind the conversation's
+        // running turn only delayed the permission check that turn is waiting
+        // on. It stays registered in the session tree above, so a client abort
+        // still reaches it like any keyed request.
+        if (agentSessionId && !auxiliaryRequest) {
           const arrivalProfileIds = new Set(
             getEffectiveProfiles(finalConfig.profiles).map((profile) => profile.id),
           )
@@ -8489,6 +8710,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         sessionTurnLease,
         sharedSessionRevisionsAtArrival,
         routingTurnIdentity,
+        auxiliaryRequest,
         retainSessionTurnFence: () => { retainSessionTurnFence = true },
         cascadeSubtreeCancel,
         inflight: inflightEntry,
@@ -9323,8 +9545,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
 
   // Each turn resolves its executable as it starts, so a change applies to the
   // next turn without a restart; see claudeExecutableSettings.ts.
-  app.get("/settings/api/claude-executable", (c) => claudeExecutableSettingsResponse(c.req.raw))
-  app.put("/settings/api/claude-executable", (c) => claudeExecutableSettingsResponse(c.req.raw))
+  const executableSettings = (request: Request) => executableProbeOwner.run(request.signal, () => claudeExecutableSettingsResponse(request))
+    .catch((error: unknown) => Response.json({ error: error instanceof Error ? error.message : String(error) },
+      { status: 503, headers: { "Cache-Control": "no-store" } }))
+  app.get("/settings/api/claude-executable", (c) => executableSettings(c.req.raw))
+  app.put("/settings/api/claude-executable", (c) => executableSettings(c.req.raw))
 
   app.get("/settings/api/pricing", (c) => {
     const { BUILTIN_MODEL_PRICING } = require("../telemetry/pricing") as typeof import("../telemetry/pricing")
@@ -9453,7 +9678,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // probes on the HTTP event loop. Startup and concurrent probes share the
     // asynchronous resolver; a miss keeps the existing unready response.
     const executableResolved = getResolvedClaudeExecutableInfo() !== null
-      || await resolveClaudeExecutableAsync().then(() => true, () => false)
+      || await executableProbeOwner.run(c.req.raw.signal, resolveClaudeExecutableAsync).then(() => true, () => false)
     const report = readinessReport({
       profileCount: listProfiles(finalConfig.profiles, finalConfig.defaultProfile).length,
       claudeExecutableResolved: executableResolved,
@@ -11463,7 +11688,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     config: finalConfig,
     initPlugins: initPluginsAsync,
     closeBackend: async () => {
-      const results = await Promise.allSettled([authOwner.close(), antigravity?.closeBackend()])
+      const results = await Promise.allSettled([executableProbeOwner.close(), authOwner.close(), antigravity?.closeBackend()])
       for (const result of results) if (result.status === "rejected") throw result.reason
     },
     beginDrain: () => {

@@ -5,7 +5,9 @@ import { join } from "node:path"
 import {
   commitRawPriorityRecord,
   commitRawSession,
+  committedStoreSeq,
   readCommittedPriorityRecord,
+  readCommittedSession,
 } from "./storeDatabaseHelpers"
 import {
   attachSharedTranscriptLocator,
@@ -926,6 +928,65 @@ describe("durable priority route publication", () => {
     expect(lookupPriorityAssignmentResult("conversation-4")).toEqual(attachedRoute)
     await clearSharedSessions()
     expect(lookupPriorityAssignmentResult("conversation-4").status).toBe("missing")
+  })
+
+  it("does not publish an identical locator, but retains locked identity and generation checks", async () => {
+    const key = "personal:locator-noop"
+    const sdkId = "sdk-locator-noop"
+    expect(await atomicPublish({
+      routeKey: "locator-noop",
+      mappingKey: key,
+      profileId: "personal",
+      sdkSessionId: sdkId,
+      digest: HUMAN_A,
+    })).not.toBe(false)
+    const locator = { sessionId: sdkId, configDir: dir, projectDir: dir, lifecycleGeneration: "fixture-generation" }
+    const attached = await attachSharedTranscriptLocator(key, sdkId, locator)
+    expect(attached).not.toBe(false)
+    if (attached === false) throw new Error("fixture attachment failed")
+    const seq = committedStoreSeq(dir)
+    const row = readCommittedSession(dir, key)
+    const route = lookupPriorityAssignmentResult("locator-noop")
+    for (let index = 0; index < 5; index++) {
+      expect(await attachSharedTranscriptLocator(key, sdkId, { ...locator }, attached)).toBe(attached)
+      expect(await attachSharedTranscriptLocator(key, sdkId, locator)).toBe(attached)
+    }
+    expect(await attachSharedTranscriptLocator(key, sdkId, locator, "stale-generation")).toBe(false)
+    expect(await attachSharedTranscriptLocator(key, "wrong-sdk", { ...locator, sessionId: "wrong-sdk" })).toBe(false)
+    expect(await attachSharedTranscriptLocator("missing", sdkId, locator)).toBe(false)
+    expect(committedStoreSeq(dir)).toBe(seq)
+    expect(readCommittedSession(dir, key)).toEqual(row)
+    expect(lookupPriorityAssignmentResult("locator-noop")).toEqual(route)
+    expect(lookupSharedSessionResult(key)).toMatchObject({ status: "found", generation: attached })
+
+    // Each compared optional field is significant. Real changes still publish
+    // mapping and route generations together; old-generation calls stay fenced.
+    let generation = attached
+    for (const change of [
+      { configDir: join(dir, "changed-config") },
+      { projectDir: join(dir, "changed-project") },
+      { lifecycleGeneration: "changed-generation" },
+      { projectDir: undefined },
+      { lifecycleGeneration: undefined },
+    ]) {
+      const current = lookupSharedSession(key)?.currentTranscript
+      if (!current) throw new Error("current fixture locator is missing")
+      const changed = { ...current, ...change }
+      const prior = generation
+      const priorRoute = lookupPriorityAssignmentResult("locator-noop")
+      const updated = await attachSharedTranscriptLocator(key, sdkId, changed, prior)
+      expect(updated).not.toBe(false)
+      expect(updated).not.toBe(prior)
+      if (updated === false) throw new Error("changed attachment failed")
+      generation = updated
+      expect(lookupPriorityAssignmentResult("locator-noop")).not.toEqual(priorRoute)
+      expect(lookupPriorityAssignmentResult("locator-noop")).toMatchObject({
+        status: "found", assignment: { mappingGeneration: updated },
+      })
+      expect(await attachSharedTranscriptLocator(key, sdkId, changed, prior)).toBe(false)
+      expect(await attachSharedTranscriptLocator(key, sdkId, { ...changed }, updated)).toBe(updated)
+      expect(lookupSharedSessionResult(key)).toMatchObject({ status: "found", generation: updated })
+    }
   })
 
   it("bounds route records separately without deleting their session mappings", async () => {

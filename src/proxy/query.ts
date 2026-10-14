@@ -10,8 +10,10 @@ import { isAbsolute, join, posix, resolve, win32 } from "node:path"
 import type { Options, OutputFormat, SdkBeta, SettingSource, ThinkingConfig } from "@anthropic-ai/claude-agent-sdk"
 import { createOpencodeMcpServer } from "../mcpTools"
 import { createPassthroughMcpServer, PASSTHROUGH_MCP_NAME } from "./passthroughTools"
+import { stopAfterForwardedBatch } from "./passthroughDenial"
 import { env, envInt } from "../env"
 import type { Effort } from "./effort"
+import { haikuThinkingCompatibilityError } from "./haikuCompatibility"
 
 /**
  * Env defaults that quiet the subprocess's own outbound traffic.
@@ -41,7 +43,7 @@ const QUIET_SUBPROCESS_ENV: Record<string, string> = {
  *
  * Without this the API holds every tool-input value back until the model has
  * finished writing it, so a long file write or heredoc arrives in one burst
- * after a silence as long as its generation: 80-86 s of nothing but pings for
+ * after a silence as long as its generation: 78-86 s of nothing but pings for
  * a ~35k-character `write` on Opus. Past MERIDIAN_UPSTREAM_IDLE_MS (90 s by
  * default) that silence looks exactly like a dead stream, and
  * guardUpstreamIdle kills a healthy turn in the middle of the call. With it
@@ -179,6 +181,12 @@ export interface QueryContext {
    * see the retry site in server.ts.
    */
   liftSingleTurnCap?: boolean
+  /**
+   * Whether the passthrough PreToolUse hook captured this tool call for the
+   * client. When the budget allows more than one model turn, it lets the query
+   * stop after the batch it forwarded; see stopAfterForwardedBatch.
+   */
+  isForwardedToolUse?: (toolUseId: string) => boolean
   /** SDK session ID for resume (if continuing a session) */
   resumeSessionId?: string
   /** Whether this is an undo operation */
@@ -311,6 +319,12 @@ export interface BuildQueryResult {
  * + tool_use exhausting the 2-turn budget mid-handoff and returning 500s on
  * fresh (non-resume) requests. Resume adds nothing: rehydration completes
  * inline within turn 1.
+ *
+ * With early stop on, a budget lifted for deferred tools or an advisor no
+ * longer runs the digest either: buildQueryOptions adds a PostToolBatch hook
+ * that ends the query once a batch forwarded to the client has resolved, so
+ * the turns past the tool boundary are headroom rather than spend.
+ * Structured output is the exception; see the hook site.
  */
 function computePassthroughMaxTurns(
   hasDeferredTools: boolean,
@@ -600,12 +614,44 @@ export function buildQueryOptions(ctx: QueryContext, abortController?: AbortCont
     effort, thinking, taskBudget, outputFormat, betas, settingSources, codeSystemPrompt, clientSystemPrompt,
     memory, dreaming, sharedMemory, maxBudgetUsd, maxOutputTokens, fallbackModel, sdkDebug, additionalDirectories,
   } = ctx
+  const resolvedModel = model === "haiku"
+    ? ctx.envOverrides?.ANTHROPIC_DEFAULT_HAIKU_MODEL ?? cleanEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL ?? "claude-haiku-5-5"
+    : model
+  const thinkingError = haikuThinkingCompatibilityError(resolvedModel, thinking)
+  if (thinkingError) throw new Error(thinkingError)
   const cwdNote = buildCwdNote(workingDirectory, clientWorkingDirectory, {
     clientEnvironmentMayDifferFromProxy,
     passthrough,
   })
 
   const allBlockedTools = [...blockedTools, ...incompatibleTools]
+  const maxTurns = passthrough
+    ? computePassthroughMaxTurns(
+        hasDeferredTools,
+        ctx.advisorModel,
+        // Every condition here is one that needs the SDK to keep going
+        // past the tool boundary; see computePassthroughMaxTurns.
+        ctx.earlyStop !== false && !hasDeferredTools && !ctx.advisorModel && !outputFormat,
+        ctx.liftSingleTurnCap === true,
+      )
+    : 200
+  // A lifted budget keeps its turns for what happens before the tool boundary
+  // (ToolSearch discovery, advisor) but must not spend one after it: once a
+  // batch forwarded to the client has resolved, the next model request could
+  // only digest the denial. A budget of 1 already stops there, and its
+  // `error_max_turns` result is what the capped path keys on, so the hook is
+  // added only above it. Structured output keeps the old tail: its answer is
+  // the StructuredOutput call, which can only come after the denial. The
+  // early-stop kill switch keeps it too (#1367).
+  const hooks = passthrough && ctx.earlyStop !== false && maxTurns > 1 && !outputFormat && ctx.isForwardedToolUse
+    ? {
+        ...sdkHooks,
+        PostToolBatch: [
+          ...(sdkHooks?.PostToolBatch ?? []),
+          { matcher: "", hooks: [stopAfterForwardedBatch(ctx.isForwardedToolUse)] },
+        ],
+      }
+    : sdkHooks
 
   return {
     prompt,
@@ -615,16 +661,7 @@ export function buildQueryOptions(ctx: QueryContext, abortController?: AbortCont
       // Hosts like OpenCode embed Bun, so the check fires even when `bun`
       // is not in PATH — causing subprocess spawns to fail.
       executable: "node" as const,
-      maxTurns: passthrough
-        ? computePassthroughMaxTurns(
-            hasDeferredTools,
-            ctx.advisorModel,
-            // Every condition here is one that needs the SDK to keep going
-            // past the tool boundary; see computePassthroughMaxTurns.
-            ctx.earlyStop !== false && !hasDeferredTools && !ctx.advisorModel && !outputFormat,
-            ctx.liftSingleTurnCap === true,
-          )
-        : 200,
+      maxTurns,
       cwd: workingDirectory,
       model,
       pathToClaudeCodeExecutable: claudeExecutable,
@@ -783,7 +820,7 @@ export function buildQueryOptions(ctx: QueryContext, abortController?: AbortCont
       // the same crash-created-orphan window without enabling forkSession.
       ...(forkSessionId ? { sessionId: forkSessionId } : {}),
       ...(resumeSessionAtUuid ? { resumeSessionAt: resumeSessionAtUuid } : {}),
-      ...(sdkHooks ? { hooks: sdkHooks } : {}),
+      ...(hooks ? { hooks } : {}),
       ...(effort ? { effort } : {}),
       ...(thinking ? { thinking: sdkThinking(thinking) } : {}),
       ...(taskBudget ? { taskBudget } : {}),

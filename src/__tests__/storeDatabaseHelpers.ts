@@ -69,6 +69,14 @@ export function committedLifecycleKeys(dir: string): string[] {
   ).map((row) => row.key))
 }
 
+/** The lifecycle journal's resource records by key, as committed. */
+export function committedLifecycleResources(dir: string): Record<string, unknown> {
+  return withStoreDatabase(dir, (database) => Object.fromEntries(
+    (database.prepare("SELECT key, record FROM lifecycle_resources ORDER BY key").all() as Array<{ key: string; record: string }>)
+      .map((row) => [row.key, JSON.parse(row.record) as unknown]),
+  ))
+}
+
 /** Commit lifecycle journal rows verbatim, as another process would, bypassing validation. */
 export function commitRawLifecycleRows(
   dir: string,

@@ -32,3 +32,18 @@ src/__tests__/antigravity-gaps.test.ts:dreamhost-service-credentials:297
 # ANTHROPIC_API_KEY to talk to a local Meridian, which ignores it. File is
 # byte-identical to upstream/main; verified at the f299fe06 merge.
 scripts/e2e-thinking-display-interactive-driver.py:dreamhost-service-credentials:22
+
+# The same placeholder pattern from upstream's Haiku 5.5 (#1337) and Nix
+# runtime-dependency (#1357) harnesses and the copies escrowed with their evidence:
+# each asserts or passes one hyphenated-words placeholder ANTHROPIC_API_KEY
+# for a local Meridian, which ignores it. All eight hits are that one value,
+# and every file is byte-identical to upstream/main; verified at the 8d447ea3
+# merge.
+scripts/e2e-haiku55-native-compat.mjs:dreamhost-service-credentials:70
+scripts/e2e-haiku55-nix-compat.mjs:dreamhost-service-credentials:107
+docs/maintenance/evidence/1342-nix-runtime-20261012/runtime-harness.mjs:dreamhost-service-credentials:107
+docs/maintenance/evidence/haiku55-nix-installed-20261011/harness-11defd43ce328ba318cf52a3377b225725b845c7a1e26909607f0c5a87b20276.mjs:dreamhost-service-credentials:99
+docs/maintenance/evidence/haiku55-nix-installed-20261011/harness-17c45cc7a365b176f49c31ae353722de07e55e19019c282402ec7e8e3e7d95f3.mjs:dreamhost-service-credentials:92
+docs/maintenance/evidence/haiku55-nix-installed-20261011/harness-250b62094991939221a6957bd777505cc27ea30debd92b7170321354b3326960.mjs:dreamhost-service-credentials:99
+docs/maintenance/evidence/haiku55-nix-installed-20261011/harness-73bd0dedd306b27ea588c4549182809ea628683aaca6dfeb6ac4f6bb8663d330.mjs:dreamhost-service-credentials:92
+docs/maintenance/evidence/haiku55-nix-installed-20261011/harness-f67367a69d896f5d9ba8c12598672e336de6e50541c1094708691e7e2295d87e.mjs:dreamhost-service-credentials:92

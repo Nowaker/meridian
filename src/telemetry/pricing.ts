@@ -7,7 +7,8 @@
  * for judging how much value the subscription is delivering.
  *
  * Rates are USD per million tokens, verified against the official pricing
- * docs (platform.claude.com/docs/en/about-claude/pricing, snapshot 2026-07).
+ * docs (platform.claude.com/docs/en/about-claude/pricing, snapshot 2026-07;
+ * Haiku 5.5 model overview, released 2026-10-07).
  * Users can override any rate, or add models missing from this table, via
  * the settings page (persisted by pricingStore.ts; overrides win in
  * resolveModelPricing). Cache rates are derived from the input rate unless
@@ -103,7 +104,12 @@ const SONNET = rates(3, 15) // every Sonnet generation to date, standard rate
 // Sonnet 5 introductory pricing runs through 2026-08-31; standard 3/15 applies
 // from 2026-09-01. Update this entry (or set a settings override) after that.
 const SONNET_5_INTRO = rates(2, 10)
-const HAIKU = rates(1, 5) // Haiku 4.5
+// Haiku 5.5 rates apply to the entire request, based on total prompt tokens
+// (uncached input + cache reads + cache writes), not input + output tokens.
+// Keep the public table/override schema flat; built-in tier selection is internal.
+const HAIKU_55: ModelPricing = { ...rates(0.1, 0.5), cacheReadPerMTok: 0.01 }
+const HAIKU_55_LONG = rates(0.5, 2.5) // strictly more than 100,000 prompt tokens
+const HAIKU = rates(1, 5) // Haiku 4.5 and conservative unknown-family fallback
 const HAIKU_35 = rates(0.8, 4)
 const HAIKU_3 = rates(0.25, 1.25)
 
@@ -114,7 +120,8 @@ const HAIKU_3 = rates(0.25, 1.25)
  * IDs (e.g. claude-haiku-4-5-20251001) fall through to the family rules.
  *
  * Exported for the settings page, which lists these models with their
- * default rates so users can override them.
+ * default rates so users can override them. Haiku 5.5 lists its short-prompt
+ * rates; estimateRequestCostUsd applies its built-in long-prompt tier.
  */
 export const BUILTIN_MODEL_PRICING: Record<string, ModelPricing> = {
   fable: FABLE,
@@ -138,7 +145,8 @@ export const BUILTIN_MODEL_PRICING: Record<string, ModelPricing> = {
   "claude-sonnet-5": SONNET_5_INTRO,
   "claude-sonnet-4-6": SONNET,
   "claude-sonnet-4-5": SONNET,
-  haiku: HAIKU,
+  haiku: HAIKU_55,
+  "claude-haiku-5-5": HAIKU_55,
   "claude-haiku-4-5": HAIKU,
   "claude-3-5-haiku-20241022": HAIKU_35,
   "claude-3-haiku-20240307": HAIKU_3,
@@ -168,7 +176,9 @@ export function resolveModelPricing(
 
   if (overrides) {
     const override = overrides[normalized]
-    if (override) return override
+    // Identity marks the built-in tier policy without adding pricing JSON fields.
+    // Even an override reusing the exported built-in object must stay flat.
+    if (override) return override === HAIKU_55 ? { ...override } : override
   }
 
   const exact = BUILTIN_MODEL_PRICING[normalized]
@@ -181,6 +191,9 @@ export function resolveModelPricing(
 
   if (normalized.includes("fable") || normalized.includes("mythos")) return FABLE
   if (normalized.includes("haiku")) {
+    // The official ID is dateless; accept dated family IDs defensively, but
+    // do not assign 5.5's discount/tier policy to unknown future Haiku versions.
+    if (/^(?:anthropic\.)?claude-haiku-5-5(?:-\d{8})?$/.test(normalized)) return HAIKU_55
     if (normalized.includes("3-5") || normalized.includes("3.5")) return HAIKU_35
     if (/haiku-3\b|3-haiku/.test(normalized)) return HAIKU_3
     return HAIKU
@@ -207,11 +220,24 @@ export function ratesForPrompt(pricing: ModelPricing, promptTokens: number): Fla
   return chosen
 }
 
-/** Estimated USD for a single request's token usage at the given rates. */
-export function estimateRequestCostUsd(
-  metric: Pick<RequestMetric, "inputTokens" | "outputTokens" | "cacheReadInputTokens" | "cacheCreationInputTokens">,
-  pricing: ModelPricing,
-): number {
+type RequestTokens = Pick<RequestMetric, "inputTokens" | "outputTokens" | "cacheReadInputTokens" | "cacheCreationInputTokens">
+
+function pricingForRequest(metric: RequestTokens, pricing: ModelPricing): ModelPricing {
+  // Only resolved built-in Haiku 5.5 pricing carries the tier policy. Custom
+  // flat rates (even equal-valued ones) must not acquire it from the model ID.
+  if (pricing !== HAIKU_55) return pricing
+  const promptTokens = (metric.inputTokens ?? 0) +
+    (metric.cacheReadInputTokens ?? 0) + (metric.cacheCreationInputTokens ?? 0)
+  return promptTokens > 100_000 ? HAIKU_55_LONG : pricing
+}
+
+/**
+ * Estimated USD for a single request's token usage. Resolved built-in Haiku
+ * 5.5 rates include its prompt tier, and a model's long-context tiers apply
+ * past their threshold; overrides and other rates remain flat.
+ */
+export function estimateRequestCostUsd(metric: RequestTokens, pricing: ModelPricing): number {
+  pricing = pricingForRequest(metric, pricing)
   const input = metric.inputTokens ?? 0
   const cacheRead = metric.cacheReadInputTokens ?? 0
   const cacheWrite = metric.cacheCreationInputTokens ?? 0
@@ -246,16 +272,31 @@ function resolveRequestPricing(
   overrides?: Record<string, ModelPricing>,
 ): ModelPricing | null {
   if (isOpenAiModel(metric.model)) return resolveModelPricing(metric.model, overrides)
-  const requested = metric.requestModel || metric.model
-  if (!isOpenAiModel(requested)) return resolveModelPricing(requested, overrides)
-  const key = normalizeModelKey(requested)
-  return overrides?.[key] ?? overrides?.[key.replace(OPENAI_SELECTOR_SUFFIX, "")] ?? null
+  const requestKey = metric.requestModel || metric.model
+  if (isOpenAiModel(requestKey)) {
+    const key = normalizeModelKey(requestKey)
+    return overrides?.[key] ?? overrides?.[key.replace(OPENAI_SELECTOR_SUFFIX, "")] ?? null
+  }
+  // An explicit request-key override remains authoritative, even when a
+  // recorded effective pin would select another model's rates.
+  if (overrides?.[normalizeModelKey(requestKey)]) return resolveModelPricing(requestKey, overrides)
+  if (metric.resolvedModel) {
+    const resolvedPricing = resolveModelPricing(metric.resolvedModel, overrides)
+    if (resolvedPricing !== null) return resolvedPricing
+  }
+  // Legacy records lack pin evidence. Preserve current alias valuation rather
+  // than guessing a historical served model; unknown pins use this fallback too.
+  return resolveModelPricing(requestKey, overrides)
 }
 
 /**
  * Aggregate estimated cost per model across a set of metrics.
  * Grouping key is requestModel || model, matching computeSummary's byModel;
- * resolveRequestPricing decides the rate each request is valued at.
+ * resolveRequestPricing decides the rate each request is valued at. A Claude
+ * request uses a request-key override first, then a known recorded effective
+ * SDK pin (resolvedModel), then the request key. Legacy aliases without a pin
+ * retain current alias valuation, not actual historical served-model costs.
+ * SDK-aggregate prompt tokens select Haiku's tier; this is not exact API billing.
  * Pass overrides (from pricingStore) to apply user-defined rates.
  */
 export function computeCostEstimate(

@@ -56,9 +56,14 @@ export function captureBuildRuntime(input: {
       captured = Object.freeze({ ...snapshot, source, kind: "source", displayVersion: `${snapshot.releaseVersion ?? snapshot.version}+source` })
     } catch (error) {
       unavailable(error)
-      let identity = {}
+      let identity: ReturnType<typeof sourceIdentity> | undefined
       try { identity = sourceIdentity(input.root) } catch (identityError) { unavailable(identityError) }
-      captured = Object.freeze({ ...fallback, ...identity, source, kind: "source" })
+      // Recovered Git facts replace the launcher identity as a unit. An absent
+      // branch (detached HEAD) or dirty flag (failed status) is unknown, not an
+      // invitation to combine a new SHA with stale launcher facts.
+      captured = Object.freeze(identity
+        ? { ...identity, version: fallback.version, source, kind: "source" }
+        : { ...fallback, source, kind: "source" })
     }
   }
   const runtime = captured

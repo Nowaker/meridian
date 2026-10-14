@@ -78,7 +78,7 @@ const BILLING_SIGNALS: readonly RegExp[] = [
   /^\s*(?:(?:error|api error|claude code returned an error result|subprocess stderr):\s*)*your (?:group|organization|org)(?:'|’)s usage limit is set to \$\d/m,
 ]
 
-const EXTRA_USAGE_LINE = /^.*(?:out of|draws? from)(?: your)? extra usage.*$/im
+const EXTRA_USAGE_REFUSAL = /^(?:(?:you(?:'|’)re|you are) out of(?: your)? extra usage\b|third-party apps(?: now)? draws? from(?: your)? extra usage\b)/i
 const ERROR_WRAPPERS = /^\s*(?:(?:error|api error|claude code returned an error result|subprocess stderr):\s*)*(?:\d{3}\s+)?/i
 const MAX_QUOTED_REFUSAL = 300
 
@@ -90,9 +90,11 @@ const MAX_QUOTED_REFUSAL = 300
  *  to and what to do about it. Answered with the generic subscription text,
  *  they read as a lapsed subscription on an account that is in good standing. */
 function extraUsageRefusal(errMsg: string): string | null {
-  const line = EXTRA_USAGE_LINE.exec(errMsg)?.[0]
-  if (!line) return null
-  const sentence = line.replace(ERROR_WRAPPERS, "").trim()
+  // Only the primary recognized refusal supplies client-facing provider text.
+  // A different billing failure can include tool output or diagnostic context
+  // that merely mentions Extra Usage; none of that establishes its cause.
+  const sentence = errMsg.replace(ERROR_WRAPPERS, "").trimStart().split(/\r?\n/, 1)[0]!.trim()
+  if (!EXTRA_USAGE_REFUSAL.test(sentence)) return null
   return sentence.length > MAX_QUOTED_REFUSAL ? `${sentence.slice(0, MAX_QUOTED_REFUSAL)}…` : sentence
 }
 
@@ -394,7 +396,7 @@ export function classifyError(errMsg: string, model?: string): ClassifiedError {
       return {
         status: 402,
         type: "billing_error",
-        message: `Anthropic charged this request to Extra Usage and refused it: "${extraUsage}" This is not a lapsed subscription; the plan's own limits did not cover this request.`
+        message: `Claude returned an Extra Usage refusal: "${extraUsage}"`
       }
     }
     return {
@@ -850,8 +852,10 @@ export function unavailableToolResults(content: unknown): Array<{ id: string; na
  * so drops do not veto a confirmed rejection. The opt-in path has no such
  * proof and stays at the one-turn cap with no drops.
  *
- * Callers must also verify no cancellation, an open envelope, complete
- * blocks, and names declared by the client.
+ * Callers must also verify no cancellation, an open envelope and complete
+ * blocks. The opt-in path additionally requires names the client declared;
+ * a confirmed rejection does not, because the client answers an unknown name
+ * itself and the rejection already proves the call ran nowhere.
  */
 export function canRecoverUncapturedToolUses(input: {
   reason: SdkTermination["reason"]

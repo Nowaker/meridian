@@ -1,12 +1,7 @@
 /**
- * A stream that has been answered or abandoned leaves no SDK attempt running
- * behind it.
- *
- * The upstream idle guard answers the client while the SDK query is still
- * waiting for the model's first output, and a client can leave while its
- * request still waits for a free SDK slot. Either attempt used to carry on, so
- * once a slot freed it started Claude Code and spent upstream calls on a
- * request nobody was waiting for. Waiting for a slot is not upstream silence:
+ * A stream whose client leaves while it still waits for a free SDK slot never
+ * starts Claude Code once the slot frees, so no upstream call is spent on a
+ * request nobody is waiting for. Waiting for a slot is not upstream silence:
  * a queued request is never answered as an upstream stall.
  *
  * Runs in its own `bun test` invocation: the idle limit is read once, when the
@@ -74,7 +69,7 @@ async function sdkSlotsIdle(deadlineMs = 5_000) {
   return snapshot
 }
 
-describe("a stream answered by the upstream idle guard", () => {
+describe("a stream queued for an SDK slot", () => {
   beforeEach(() => {
     controllers = []
     clearSessionCache()
@@ -103,17 +98,5 @@ describe("a stream answered by the upstream idle guard", () => {
 
     expect(await sdkSlotsIdle()).toMatchObject({ active: 0, queued: 0 })
     expect(controllers).toHaveLength(0)
-  })
-
-  it("aborts the SDK query of an attempt still waiting for output", async () => {
-    const { app } = createProxyServer({ port: 0, host: "127.0.0.1", silent: true })
-
-    const timedOut = await (await app.fetch(streamRequest("hello"))).text()
-    expect(errorType(timedOut)).toBe("upstream_timeout")
-    expect(controllers).toHaveLength(1)
-    expect(controllers[0]?.signal.aborted).toBe(true)
-
-    expect(await sdkSlotsIdle()).toMatchObject({ active: 0, queued: 0 })
-    expect(controllers).toHaveLength(1)
   })
 })

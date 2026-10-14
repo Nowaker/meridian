@@ -14,6 +14,7 @@ import { authFieldPaths, describeAuthFields } from "./authDiscovery"
 import { startAuthStatusProcess, startOwnedClaudeProcess, AuthStatusProcessFailure, type AuthStatusProcess } from "./authStatusProcess"
 import { authStatusOwnerContext, type AuthStatusOwnerState, type AuthRefresh } from "./authStatusOwnership"
 import { DEFAULT_CLAUDE_EXECUTABLE_PREFERENCE, savedClaudeExecutablePreference, type ClaudeExecutablePreference } from "./claudeExecutablePreference"
+import { assertClaudeProbeActive, ownClaudeProbe } from "./claudeProbeOwnership"
 
 import { createClaudeResolution, type ClaudeResolutionScope } from "./claudeResolverOwnership"
 
@@ -68,7 +69,7 @@ export type ClaudeModel = "sonnet" | "sonnet[1m]" | "opus" | "opus[1m]" | "haiku
 export const CANONICAL_FABLE_MODEL = "claude-fable-5-1"
 export const CANONICAL_OPUS_MODEL = "claude-opus-5-5"
 export const CANONICAL_SONNET_MODEL = "claude-sonnet-5-5"
-export const CANONICAL_HAIKU_MODEL = "claude-haiku-4-5"
+export const CANONICAL_HAIKU_MODEL = "claude-haiku-5-5"
 
 /**
  * Build the ANTHROPIC_DEFAULT_{TYPE}_MODEL env record to apply before the
@@ -310,10 +311,12 @@ export function mapModelToClaudeModel(model: string, subscriptionType?: string |
     return "opus"
   }
 
-  // Sonnet [1m]: requires Extra Usage on Max plans per Anthropic docs.
-  // Unlike Opus, Sonnet 1M is NOT included with the Max subscription —
-  // it is always billed as Extra Usage. Default to sonnet (200k) to
-  // avoid unexpected charges. Users opt in via MERIDIAN_SONNET_MODEL=sonnet[1m].
+  // Sonnet [1m]: Sonnet 4.x 1M requires Extra Usage on every plan per
+  // Anthropic docs — unlike Opus, it is NOT included with Max. Default to
+  // sonnet (200k) to avoid unexpected charges. Users opt in via
+  // MERIDIAN_SONNET_MODEL=sonnet[1m]. Sonnet 5+ (the canonical pin) serves
+  // its native 1M window on plain `sonnet` with no Extra Usage, so the [1m]
+  // tier is a no-op there; see sonnetHasNative1mContext (#1212).
   const sonnetOverride = process.env.MERIDIAN_SONNET_MODEL ?? process.env.CLAUDE_PROXY_SONNET_MODEL
   if (sonnetOverride === "sonnet[1m]") {
     if (!use1m || isSubagent || isExtendedContextKnownUnavailable(profileId, sessionKey)) return "sonnet"
@@ -504,6 +507,20 @@ export function stripExtendedContext(model: ClaudeModel): ClaudeModel {
  */
 export function hasExtendedContext(model: ClaudeModel): boolean {
   return model.endsWith("[1m]")
+}
+
+/**
+ * Whether the concrete Sonnet id behind the `sonnet` alias runs with a native
+ * 1M window on every plan, with no [1m] variant and no Extra Usage (#1212).
+ * Sonnet 5 and later do, per
+ * https://code.claude.com/docs/en/model-config#extended-context; Sonnet 4.x
+ * keeps the MERIDIAN_SONNET_MODEL=sonnet[1m] opt-in. `sonnetModel` is what
+ * ANTHROPIC_DEFAULT_SONNET_MODEL resolves to, since the alias alone does not
+ * say which generation is served. Any non-Sonnet id returns false.
+ */
+export function sonnetHasNative1mContext(sonnetModel?: string): boolean {
+  const match = /^claude-sonnet-(\d+)(?:[-.[]|$)/.exec(sonnetModel?.trim().toLowerCase() ?? "")
+  return match !== null && Number(match[1]) >= 5
 }
 
 /**
@@ -867,7 +884,9 @@ export interface ClaudeExecutableInfo {
 }
 
 let cachedClaudeInfo: ClaudeExecutableInfo | null = null
-let cachedClaudeResolution: ReturnType<typeof createClaudeResolution> | null = null
+type ClaudeResolution = ReturnType<typeof createClaudeResolution> & { info(): ClaudeExecutableInfo | null }
+let cachedClaudeResolution: ClaudeResolution | null = null
+const activeClaudeResolutions = new Set<ClaudeResolution>()
 // The executable preference each of the two above was resolved under. A turn
 // that finds a different one saved re-resolves, which is what lets the
 // setting take effect without a restart.
@@ -919,7 +938,7 @@ type ClaudeProbeResult =
 const DEFAULT_DEPS: ResolverDeps = {
   existsSync,
   statSync: (p) => statSync(p),
-  exec: async (cmd) => ({ stdout: await startOwnedClaudeProcess({ shell: cmd }, { timeoutMs: 2000, maxBuffer: 64 * 1024 }).result }),
+  exec: async (cmd) => ({ stdout: await sharedClaudeProbe(`lookup:${cmd}:${process.env.PATH ?? ""}`, { shell: cmd }, 2000, 64 * 1024) }),
   // `env` is explicit because Bun 1.3's execFileSync otherwise hands the child
   // the environment the process started with, so the sync resolver could search
   // a different PATH than the async one.
@@ -1156,6 +1175,34 @@ export type ClaudeVersionAnswer = { version: string } | { error: string }
 
 const CLAUDE_VERSION_REMEMBER_MS = 10 * 60_000
 const claudeVersionAnswers = new Map<string, { stamp: string; version: string; at: number }>()
+const sharedClaudeProbes = new Map<string, { resolution: ReturnType<typeof createClaudeResolution>; identity?: string }>()
+
+async function sharedClaudeProbe(key: string, command: { file: string; args: string[] } | { shell: string }, timeoutMs: number, maxBuffer: number, identity?: string): Promise<string> {
+  assertClaudeProbeActive()
+  const existing = sharedClaudeProbes.get(key)
+  if (existing && existing.identity !== identity) {
+    if (existing.resolution.hasUnconfirmedFailure()) throw new AuthStatusProcessFailure("join")
+    throw new Error("executable changed during another version check; retry after it closes")
+  }
+  let resolution = existing?.resolution
+  if (!resolution) {
+    if (sharedClaudeProbes.size >= 16) throw new Error("Claude executable probes are busy; retry after they close")
+    resolution = createClaudeResolution(async scope => {
+      scope.active()
+      return await scope.own(startOwnedClaudeProcess(command, { timeoutMs, maxBuffer })).result
+    })
+    sharedClaudeProbes.set(key, { resolution, identity })
+    const owned = resolution
+    void owned.joined.then(() => { if (sharedClaudeProbes.get(key)?.resolution === owned) sharedClaudeProbes.delete(key) })
+  }
+  const lease = resolution.acquire()
+  ownClaudeProbe(lease)
+  try {
+    const answer = await lease.result
+    assertClaudeProbeActive()
+    return answer
+  } finally { void lease.cancel().catch(() => undefined) }
+}
 
 /**
  * Ask an executable which Claude Code version it is, for Settings to show and
@@ -1166,25 +1213,30 @@ const claudeVersionAnswers = new Map<string, { stamp: string; version: string; a
  * look may find a cold binary warm or a path fixed.
  */
 export async function readClaudeVersion(path: string, timeoutMs = CLAUDE_VERSION_READ_TIMEOUT_MS): Promise<ClaudeVersionAnswer> {
+  assertClaudeProbeActive()
   let stamp: string
   try {
     const stat = statSync(path)
-    stamp = `${stat.size}:${stat.mtimeMs}`
+    stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`
   } catch {
     return { error: "it does not exist" }
   }
   const remembered = claudeVersionAnswers.get(path)
   if (remembered?.stamp === stamp && Date.now() - remembered.at < CLAUDE_VERSION_REMEMBER_MS) return { version: remembered.version }
   try {
-    const stdout = await startOwnedClaudeProcess({ file: path, args: ["--version"] }, { timeoutMs, maxBuffer: 16 * 1024 }).result
+    const stdout = await sharedClaudeProbe(`version:${path}`, { file: path, args: ["--version"] }, timeoutMs, 16 * 1024, stamp)
+    const after = statSync(path)
+    if (`${after.dev}:${after.ino}:${after.size}:${after.mtimeMs}:${after.ctimeMs}` !== stamp) return { error: "executable changed during its version check; retry" }
     const version = CLAUDE_VERSION_OUTPUT.exec(stdout.trim())?.[1]
     if (version) {
       claudeVersionAnswers.set(path, { stamp, version, at: Date.now() })
+      if (claudeVersionAnswers.size > 128) claudeVersionAnswers.delete(claudeVersionAnswers.keys().next().value!)
       return { version }
     }
     const firstLine = stdout.trim().split(/\r?\n/)[0]
     return { error: firstLine ? `\`--version\` printed "${firstLine.slice(0, 80)}", which is not a Claude Code version` : "`--version` printed nothing" }
   } catch (err) {
+    if (err instanceof AuthStatusProcessFailure && err.reason === "join") throw err
     return { error: describeProbeFailure(err, timeoutMs) }
   }
 }
@@ -1200,6 +1252,7 @@ function packagedVersion(binary: string): string | null {
       }
     } catch {
       // No package here; try the parent.
+      continue
     }
   }
   return null
@@ -1230,11 +1283,13 @@ export async function describeClaudeExecutableCandidates(
   let onPath: string[] = []
   try {
     onPath = existingPathCandidates((await deps.exec(deps.platform === "win32" ? "where claude" : "which claude")).stdout, deps)
-  } catch {
+  } catch (error) {
+    if (error instanceof AuthStatusProcessFailure && error.reason === "join") throw error
     // Nothing on PATH; reported below.
   }
   let firstFailure: string | undefined
   for (const candidate of onPath) {
+    assertClaudeProbeActive()
     const answer = await readClaudeVersion(candidate)
     if ("version" in answer) return { system: { path: candidate, source: "path-lookup", version: answer.version }, bundled }
     firstFailure ??= `${candidate}: ${answer.error}`
@@ -1416,49 +1471,70 @@ function preferenceKey(preference: ClaudeExecutablePreference): string {
   return preference.mode === "custom" ? `custom:${preference.customPath}` : preference.mode
 }
 
-function acquireClaudeResolution(): AuthStatusProcess {
+function acquireClaudeResolution(preference = DEFAULT_DEPS.preference?.() ?? DEFAULT_CLAUDE_EXECUTABLE_PREFERENCE): AuthStatusProcess & { info(): ClaudeExecutableInfo | null } {
   // The saved preference is read on every call, so a change applies to the
   // next turn whichever process saved it; the resolution, which may spawn
   // `claude --version`, is cached until the preference changes or the
   // executable it found is gone - an upgrade can remove a versioned path.
-  const preference = DEFAULT_DEPS.preference?.() ?? DEFAULT_CLAUDE_EXECUTABLE_PREFERENCE
-  const key = preferenceKey(preference)
+  assertClaudeProbeActive()
+  if ([...activeClaudeResolutions].some(resolution => resolution.hasUnconfirmedFailure())) throw new AuthStatusProcessFailure("join")
+  const envPath = process.env.MERIDIAN_CLAUDE_PATH
+  const key = JSON.stringify([preferenceKey(preference), envPath ?? null])
   if (cachedClaudeInfo && cachedClaudeInfoPreference === key && existsSync(cachedClaudeInfo.path)) {
-    const path = cachedClaudeInfo.path
+    const info = cachedClaudeInfo, path = info.path
     return { result: Promise.resolve(path), joined: Promise.resolve(),
-      isJoined: () => true, cancel: () => Promise.resolve() }
+      isJoined: () => true, cancel: () => Promise.resolve(), info: () => info }
   }
   if (!cachedClaudeResolution || cachedClaudeResolutionPreference !== key) {
     // A resolution for an older preference keeps its own leases and children;
     // it only stops being the one new callers join, and cannot publish.
-    const resolution = createClaudeResolution(async scope => {
-      const deps = { ...ownedResolverDeps(scope), preference: () => preference }
+    cachedClaudeInfo = null; cachedClaudeInfoPreference = null
+    let info: ClaudeExecutableInfo | null = null
+    const resolution: ClaudeResolution = { ...createClaudeResolution(async scope => {
+      const deps = { ...ownedResolverDeps(scope), preference: () => preference,
+        envGet: (name: string) => name === "MERIDIAN_CLAUDE_PATH" ? envPath : DEFAULT_DEPS.envGet(name) }
       const resolved = await resolveClaudeExecutableWithSource(deps)
       scope.active()
       if (resolved) {
-        if (cachedClaudeResolution === resolution) { cachedClaudeInfo = resolved; cachedClaudeInfoPreference = key }
+        info = resolved
+        const currentKey = JSON.stringify([preferenceKey(savedClaudeExecutablePreference()), process.env.MERIDIAN_CLAUDE_PATH ?? null])
+        if (cachedClaudeResolution === resolution && currentKey === key) { cachedClaudeInfo = resolved; cachedClaudeInfoPreference = key }
         return resolved.path
       }
       throw new Error(
         'Could not find Claude Code executable. Install via: npm install -g @anthropic-ai/claude-code, ' +
         'or set MERIDIAN_CLAUDE_PATH=/path/to/claude to point at an existing binary.',
       )
-    })
+    }), info: () => info }
+    activeClaudeResolutions.add(resolution)
     cachedClaudeResolution = resolution
     cachedClaudeResolutionPreference = key
     void resolution.joined.then(() => {
+      activeClaudeResolutions.delete(resolution)
       if (cachedClaudeResolution === resolution) { cachedClaudeResolution = null; cachedClaudeResolutionPreference = null }
     })
   }
-  return cachedClaudeResolution.acquire()
+  const resolution = cachedClaudeResolution
+  return { ...resolution.acquire(), info: () => resolution.info() }
+}
+
+/** A request-local resolution snapshot; never reads another caller's active cache. */
+export async function resolveClaudeExecutableInfoAsync(preference?: ClaudeExecutablePreference): Promise<ClaudeExecutableInfo> {
+  const lease = acquireClaudeResolution(preference)
+  ownClaudeProbe(lease)
+  try {
+    await lease.result
+    assertClaudeProbeActive()
+    const info = lease.info()
+    if (!info) throw new Error("Claude executable resolution produced no identity")
+    return info
+  } finally { void lease.cancel().catch(() => undefined) }
 }
 
 export async function resolveClaudeExecutableAsync(): Promise<string> {
   // Direct callers hold a lease until shared resolution settles; auth shutdown
   // may release only its own lease and must not cancel their subprocess.
-  const lease = acquireClaudeResolution()
-  try { return await lease.result }
-  finally { void lease.cancel().catch(() => undefined) }
+  return (await resolveClaudeExecutableInfoAsync()).path
 }
 
 /** Reset cached path — for testing only */
@@ -1467,6 +1543,7 @@ export function resetCachedClaudePath(): void {
   cachedClaudeResolution = null
   cachedClaudeInfoPreference = null
   cachedClaudeResolutionPreference = null
+  activeClaudeResolutions.clear()
 }
 
 /** Reset cached auth status — for testing only */
