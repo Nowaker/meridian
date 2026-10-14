@@ -1386,6 +1386,7 @@ curl -s -X PUT -H 'Content-Type: application/json' -d '{"checkForUpdates":false}
 | E67 | [OpenCode V2 interrupted tool turn](#e67-opencode-v2-interrupted-tool-turn) | **Actual OpenCode 2.0.16 client and Meridian V2 plugin, real SDK/model**: `E2E_OPENCODE_BIN=/path/to/opencode E2E_PLUGIN_PATH=/path/to/opencode-scrub/dist/index.js bun scripts/e2e-opencode-checkpoint-fault.mjs`. Inject one partial SSE failure after the real client tool call; require the client's exact retry shape and SDK resume, plus a same-session recovery. **Run before releases touching keyed checkpoint recovery** | 2026-09-26 |
 | E68 | [OpenCode V2 user-invoked skill](#e68-opencode-v2-user-invoked-skill) | **Actual OpenCode V2 server, real SDK/model**: `E2E_OPENCODE_BIN=/path/to/opencode E2E_PLUGIN_PATH=/path/to/opencode-scrub/dist/index.js bun scripts/e2e-opencode-skill-content.mjs`. A skill invoked with no typed text must reach the SDK prompt inside `<skill_content>` and drive the reply. **Run before releases touching user-text sanitization** | 2026-09-27 |
 | E71 | [Claude Code auto-mode classifier isolation](#e71-claude-code-auto-mode-classifier-isolation) | **Automated, needs the `claude` CLI** (skips cleanly without it): `bun scripts/e2e-claude-code-auto-mode.mjs` — real proxy + SDK, the REAL Claude Code CLI in `--permission-mode auto`. Asserts the classifier's side requests are isolated as `independent-request:auxiliary-request` on both the shape and request-class header paths, every later main request continues its session, and nothing collides or is refused. **Run before releases touching the independence guards, the turn lease, or Claude Code detection** | 2026-09-30 |
+| E72 | [Claude Code Agent-tool subagent session isolation](#e72-claude-code-agent-tool-subagent-session-isolation) | **Automated, needs the `claude` CLI** (skips cleanly without it): `bun scripts/e2e-claude-code-subagent-session.mjs` — real proxy + SDK, the REAL Claude Code CLI spawning two parallel Agent-tool subagents. Asserts each subagent resumes its own session, the parent keeps resuming across subagent activity, nothing collides, and no flow waits on another's session lease. **Run before releases touching session keys, the turn lease, account routing, or Claude Code detection** | 2026-10-01 |
 | E73 | [Unknown thinking display values](#e73-unknown-thinking-display-values) | **Automated**: `bun scripts/e2e-thinking-display-interactive.mjs` — actual Claude Code 2.1.287 TUI in a PTY, real proxy/SDK/bundled subprocess. Requires an answer rendered in the client, live-prompt framing, supported-display controls and joined cleanup. The separate HTTP-shaped gate remains a backend smoke test. **Run before releases touching thinking passthrough or the SDK/CLI version** | 2026-10-01 |
 
 | P1 | [Profile: List & Auth Status](#p1-profile-list--auth-status) | `/profiles/list` returns profiles with emails, login status, auth timestamps | - |
@@ -6376,8 +6377,11 @@ the turn is waiting on it.
 The CLI names its request class in `x-claude-code-request-class`, but sends it
 only with `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`, to a first-party base URL, or
 under a remote flag. The adapter therefore uses the header when present and
-otherwise the classifier's shape: session key, no tools, not streamed, and a
-`</block>` or `</severity>` stop sequence.
+otherwise the shape: session key, no tools, not streamed. A request carrying
+the CLI's own `x-claude-code-session-id` needs nothing more, which also covers
+the session-state classifier (one `Current state: …` message, no stop
+sequence); any other request also needs a `</block>` or `</severity>` stop
+sequence.
 
 ```bash
 bun scripts/e2e-claude-code-auto-mode.mjs
@@ -6434,6 +6438,60 @@ installed 1.79.0 at 20:30:29 local; counts below are from the proxy journal,
 The two branch requests that did not resume: the first after the restart
 (`not-found`, because earlier classifier calls had already overwritten the
 mapping), and one `modified-history` from an interrupted turn.
+
+## E72: Claude Code Agent-tool subagent session isolation
+
+**What it proves:** Claude Code's Agent-tool subagents no longer break the
+parent conversation's session resume, and each subagent resumes its own.
+
+A subagent sends its parent's own `metadata.user_id` session id while running
+a multi-turn conversation of its own; background subagents even overlap the
+parent's turns. Under one key, parent and subagents read as
+`unrelated-history` to one another, so none of them resumed, and they queued
+on one session turn lease (3.9–189s observed live). The CLI stamps
+`x-claude-code-agent-id` on every subagent request — stable across that
+subagent's turns, distinct between subagents, sent without
+`CLAUDE_CODE_GATEWAY_HINT_HEADERS` — and the adapter keys a subagent
+`<sid>:agent:<agentId>`. Account routing (sticky and priority assignment)
+still follows the root `<sid>`, so subagents stay on the parent's account.
+
+```bash
+bun scripts/e2e-claude-code-subagent-session.mjs
+```
+
+Direct claude-code adapter, isolated `CLAUDE_CONFIG_DIR`, scrubbed `CLAUDE*`
+environment and a dummy bearer token; the proxy keeps its real Claude Max
+authentication. Main model defaults to `sonnet` (`PROBE_MODEL`). Default
+permission mode with `Bash(echo:*)` and `Agent` pre-allowed, so no auto-mode
+classifier runs (E71 covers it). Turn 1 asks for two parallel foreground
+subagents with two Bash calls each; turn 2 is a `--resume` follow-up. The
+client talks to a recording relay that stamps each request's `x-request-id`
+and records its agent id, because the proxy log never prints headers.
+
+**Pass criteria** (asserted, non-zero exit on any):
+
+- Both invocations exit 0 and answer correctly; every proxy request line maps
+  to a relayed request.
+- At least two distinct agent ids each made two or more requests. A run where
+  the model never spawns subagents fails rather than passing vacuously.
+- Every subagent request after that subagent's first logs
+  `lineage=continuation`.
+- Every main request after the conversation's first logs
+  `lineage=continuation`.
+- No request logs `unrelated-history` or `concurrent-race`; no main or
+  subagent request waits over 1000ms on a session lease; no invocation is
+  refused with a 4xx.
+
+**Before/after (2026-10-01, Linux x86_64, Bun 1.3.11, Agent SDK 0.2.141,
+Claude Code 2.1.287, `sonnet`).** Baseline `55b3110`: FAIL, 4 checks. Two
+subagents ran three requests each (`tools=19`, msgCount 2/5/8); all six
+classified `unrelated-history`, so 0 of 4 later subagent turns resumed, and
+the parent's request after them (msgCount 5) diverged `unrelated-history` too.
+Subagent session-lease waits were 1.7–8.9s. Branch: PASS. Two subagents, three
+requests each: 4 of 4 later subagent turns and 2 of 2 later main requests
+logged `lineage=continuation`, no request collided, and the longest
+session-lease wait across all 9 requests was 1ms. The gate imports `src/`
+directly rather than the built bundle.
 
 ## E73: Unknown thinking display values
 
@@ -6505,6 +6563,95 @@ subprocess had exited on `--thinking-display updates`) and nothing logged a
 drop; `"summarized"` answered. Branch: PASS, 4 of 4: both answered, thinking
 was not forced off, and the drop was logged once. Live, the owner's interactive Claude Code 2.1.287 session failed
 10 of 10 turns through the proxy with this error before the fix.
+
+## E74: Restart drain under overlapping traffic
+
+**What it proves:** `POST /drain` gives a supervisor an idle window while real
+requests overlap, without losing the request that arrives during it (#1224,
+contract #1282).
+
+```bash
+bun scripts/e2e-drain-live.mjs                     # build with the route
+bun scripts/e2e-drain-live.mjs --expect-baseline   # build without it
+```
+
+The script starts the proxy in-process with an API key and isolated config and
+session directories, starts one real streaming request, opens a drain, then
+sends a second real request (`E2E_MODEL`, default `claude-opus-5-5`). Costs a
+few cents of real tokens.
+
+**Pass criteria** (asserted, non-zero exit on any):
+
+- A keyless `POST /drain` is 401; the keyed one starts the drain.
+- The second request is held: `/inflight` shows `drain.held: 1`, it is not in
+  `total`, and no SDK query starts for it.
+- The first stream finishes untouched and `total` reaches 0 while the second is
+  still held.
+- Only the keyed `DELETE /drain` ends the drain; the held request then runs and
+  completes, and nothing is left held or in flight.
+
+With `--expect-baseline`, `POST /drain` must be 404 and the two requests must
+overlap (`total: 2`). The run proves the hold in-process under Bun with a real
+model; it does not drive a real supervisor or restart.
+[Evidence](docs/maintenance/evidence/1224-drain-live-20261013/README.md).
+
+## E75: Readiness follows the instance's real Claude egress
+
+**What it proves:** `/readyz` fails `upstream-claude` after real connection
+failures and recovers on a real answer (#1232, contract #1281).
+
+```bash
+bun scripts/e2e-upstream-reachability-live.mjs
+```
+
+The proxy runs in-process with shortened `MERIDIAN_UPSTREAM_UNREACHABLE_*`
+thresholds. One real request records an answer; the egress is then cut for
+real by pointing the SDK subprocess at a proxy port nothing listens on, with
+retries off. Pass criteria: requests fail; `/health` reports `upstream.claude`
+`unreachable` with the failure kind; `/readyz` fails `upstream-claude` while
+`/livez` stays up; after the hold `/readyz` admits traffic (`probing`) and one
+real answer clears the run. The isolated config has no profiles, so `/readyz`
+also fails its separate `profiles` check; the gate reads only the
+`upstream-claude` line.
+[Evidence](docs/maintenance/evidence/1232-reachability-live-20261014/candidate-report.json).
+
+## E76: Consecutive auxiliary replays reuse their cached history
+
+**What it proves:** a run of Claude Code side calls over a growing history
+reads the shared prefix from the prompt cache instead of rewriting it (#1297).
+
+```bash
+bun scripts/e2e-auxiliary-cache-live.mjs                     # build with the fix
+bun scripts/e2e-auxiliary-cache-live.mjs --expect-baseline   # build without it
+```
+
+Sends three caption-shaped requests (agent id header, streaming, the client's
+tools, the caption prompt appended to the last user message) over one subagent
+history that grows by a tool round each time, with a fresh nonce so no earlier
+run's cache is hit (`E2E_MODEL`, default `claude-sonnet-5-5`). Every caption
+must be handled as an auxiliary request. With the fix, captions 2 and 3 read at
+least 80% of what caption 1 wrote and write under half of it.
+[Evidence](docs/maintenance/evidence/1297-auxiliary-cache-20261014/README.md).
+
+## E77: Progress captions from the interactive client
+
+**What it proves:** a subagent's progress captions leave its working session
+alone with the real interactive Claude Code client (#1288, #1292).
+
+```bash
+bun scripts/e2e-claude-code-captions-interactive.mjs [--expect-baseline]
+```
+
+Print mode never sends captions, so the script drives the interactive TUI in a
+PTY (`scripts/e2e-claude-code-captions-interactive-driver.py`, Python 3 only)
+with two subagents kept busy for two minutes. A recording relay ties each proxy
+log line to its agent id. Pass: at least one caption is handled as an auxiliary
+request and the next request of each captioned subagent resumes
+(`lineage=continuation`). `--expect-baseline` requires no isolated caption and a
+`modified-history` divergence. Both builds also show early divergences in the
+interactive flow (a tool-less streamed request at startup, each subagent's first
+request repeated); those are outside this gate.
+[Evidence](docs/maintenance/evidence/1292-captions-interactive-20261014/README.md).
 
 ## Concurrent transcript publication
 
