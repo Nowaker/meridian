@@ -294,9 +294,12 @@ if (!isScenario(arg)) {
         profile("shared-b", shared.dir),
         profile("default", defaultStore.dir),
       ]
+      // Build the server first: construction reads the clock too, and only the
+      // listing's own reads should see the advancing clock.
+      const app = open(profiles)
       let nowCalls = 0
       clockSpy.mockImplementation(() => (nowCalls++ === 0 ? clock : clock + 10 * DAY))
-      const items = await list(open(profiles), profiles)
+      const items = await list(app, profiles)
       clockSpy.mockReturnValue(clock)
       check(nowCalls > 1, "Multiple-profile listing did not advance the synthetic clock after capturing response time")
       facts(items[0]!, clock + 9 * DAY, clock + HOUR)
