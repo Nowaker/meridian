@@ -9,7 +9,7 @@ import { resolveChatGptSource } from './chatgpt/config'
 import { startRenewalSchedule } from './chatgpt/owned'
 import { ChatGptTurnLedger, chatGptTokenFields, createChatGptAdmission, createChatGptParityBackend, createUnpricedModelWarning, decorateChatGptTurn, type ChatGptTurnNotes } from './chatgpt/parity'
 import { BURN_SPARSE_WINDOW_MS, creditBurn } from './chatgpt/creditRates'
-import { chatGptFeatureCapabilities, effectiveCreditsPolicy, getChatGptFeatures, resetChatGptFeatures, updateChatGptFeatures, validateChatGptFeatureUpdate } from './chatgpt/features'
+import { chatGptFeatureCapabilities, effectiveCreditsPolicy, forcedReasoningSummary, getChatGptFeatures, resetChatGptFeatures, updateChatGptFeatures, validateChatGptFeatureUpdate } from './chatgpt/features'
 import { resolveModelPricing } from '../telemetry/pricing'
 import { getPricingOverrides } from '../telemetry/pricingStore'
 import { computeSummary } from '../telemetry/percentiles'
@@ -8948,6 +8948,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       if (pending) await Promise.race([pending, new Promise(resolve => setTimeout(resolve, CHATGPT_QUOTA_WAIT_MS))])
     },
     creditsPolicy: (seat) => effectiveCreditsPolicy(getChatGptFeatures(), seat).policy,
+    reasoningSummary: () => forcedReasoningSummary(getChatGptFeatures()),
     planWindows: (seat) => {
       const entry = chatGptUsage?.entries.find(candidate => candidate.id === seat)
       return entry && entry.fetchedAt !== null ? { windows: entry.windows, at: entry.fetchedAt } : null

@@ -46,6 +46,44 @@ describe("adaptResponsesBody", () => {
   })
 })
 
+describe("adaptResponsesBody: Reasoning Summary", () => {
+  const satisfied = { model: "gpt-6.1-sol", store: false, stream: true, include: ["reasoning.encrypted_content"], input: [] }
+
+  it("creates `reasoning` with the forced summary when the client sent none", () => {
+    for (const level of ["auto", "concise", "detailed"] as const) {
+      const { body, applied } = adaptResponsesBody(satisfied, { reasoningSummary: level })
+      expect(body.reasoning).toEqual({ summary: level })
+      expect(applied).toEqual([`reasoning.summary=${level}`])
+    }
+    expect("reasoning" in satisfied).toBe(false)
+  })
+
+  it("keeps the client's effort and other reasoning fields", () => {
+    const input = { ...satisfied, reasoning: { effort: "xhigh", generate_summary: null } }
+    const { body, applied } = adaptResponsesBody(input, { reasoningSummary: "detailed" })
+    expect(body.reasoning).toEqual({ effort: "xhigh", generate_summary: null, summary: "detailed" })
+    expect(applied).toEqual(["reasoning.summary=detailed"])
+    expect(input.reasoning).toEqual({ effort: "xhigh", generate_summary: null })
+  })
+
+  it("replaces a different summary the client asked for", () => {
+    const { body, applied } = adaptResponsesBody({ ...satisfied, reasoning: { effort: "high", summary: "auto" } }, { reasoningSummary: "concise" })
+    expect(body.reasoning).toEqual({ effort: "high", summary: "concise" })
+    expect(applied).toEqual(["reasoning.summary=concise"])
+  })
+
+  it("records nothing when the client already asked for the forced level", () => {
+    const input = { ...satisfied, reasoning: { effort: "high", summary: "detailed" } }
+    expect(adaptResponsesBody(input, { reasoningSummary: "detailed" })).toEqual({ body: input, applied: [], clientWantsStream: true })
+  })
+
+  it("leaves `reasoning` exactly as sent, or absent, without an override", () => {
+    const withReasoning = { ...satisfied, reasoning: { effort: "low", summary: "auto" } }
+    expect(JSON.stringify(adaptResponsesBody(withReasoning, {}).body)).toBe(JSON.stringify(withReasoning))
+    expect(JSON.stringify(adaptResponsesBody(satisfied, { reasoningSummary: undefined }).body)).toBe(JSON.stringify(satisfied))
+  })
+})
+
 describe("tapResponsesStream", () => {
   it("forwards bytes unchanged and reports usage, first output and reasoning summaries", async () => {
     const original = await new Response(completedStream()).text()

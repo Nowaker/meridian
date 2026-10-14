@@ -27,7 +27,7 @@
 import { randomUUID } from "node:crypto"
 import { AssignmentStore, type ProfileExhaustion } from "../routing"
 import { isImageEndpoint, type UpstreamBackend, type UpstreamRequest } from "../upstream/backend"
-import { adaptResponsesBody, type BodyAdaptation } from "../chatgpt/body"
+import { adaptResponsesBody, type BodyAdaptation, type ReasoningSummaryLevel } from "../chatgpt/body"
 import { buildCodexImagesRequest, buildCodexRequest } from "../chatgpt/request"
 import { isModelRefusal, sniffChatGptFailure, type ChatGptFailureKind } from "../chatgpt/stream"
 import { aggregateResponsesStream, tapResponsesStream, type ChatGptUsage, type TapSummary } from "../chatgpt/tap"
@@ -162,6 +162,8 @@ export interface ChatGptBackendOptions<Ctx> {
   creditsPolicy?: (seat: string) => ChatGptCreditsPolicy
   /** A seat's plan windows from the last usage read, with when it was taken; null when never read. */
   planWindows?: (seat: string) => { windows: readonly CodexUsageWindow[]; at: number } | null
+  /** The operator's Reasoning Summary level, read per turn; undefined keeps the client's. */
+  reasoningSummary?: () => ReasoningSummaryLevel | undefined
   hooks?: ChatGptHooks
   fetchImpl?: UpstreamFetch
   now?: () => number
@@ -349,7 +351,9 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
       const turn: ChatGptTurnInfo = { requestId, model, body: parsed, headers: inbound.headers }
       // An image request goes as the client wrote it: the Responses
       // adaptations (forced stream, store=false) mean nothing to that endpoint.
-      const adapted = imageOperation ? { body: parsed, clientWantsStream: parsed.stream === true, applied: [] } : adaptResponsesBody(parsed)
+      const adapted = imageOperation
+        ? { body: parsed, clientWantsStream: parsed.stream === true, applied: [] }
+        : adaptResponsesBody(parsed, { reasoningSummary: options.reasoningSummary?.() })
       const attempts: ChatGptAttempt[] = []
 
       const report = (fields: Partial<ChatGptTurnEvent> & { status: number }) => {

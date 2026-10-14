@@ -310,10 +310,17 @@ const FEATURES = [
 // instance serves ChatGPT; descriptions state the provider's own limits.
 const CHATGPT_FEATURES = [
   { key: 'thinkingPassthrough', label: 'Thinking Passthrough', desc: 'Forward ChatGPT reasoning summaries to the client. ChatGPT is secretive about reasoning: it never shows the raw chain of thought, only short reasoning summary headers, and only when the client asks for a summary. Off removes those summaries; the encrypted reasoning the client must send back is always kept', type: 'toggle' },
+  { key: 'reasoningSummary', label: 'Reasoning Summary', desc: 'How much reasoning summary ChatGPT is asked for on every request, whatever the client chose. Clients pick a level per model variant, and some send none at all, so ChatGPT returns no summary. Detailed asks for the fullest summary ChatGPT offers. Summaries still reach the client only while Thinking Passthrough is on', type: 'summary' },
   { key: 'maxBudgetUsd', label: 'Max Budget (USD)', desc: 'Per-request cost cap from OpenAI pricing (0 = disabled). Refused before sending when the input alone is over it, stopped mid-stream when the estimate passes it. Hidden reasoning tokens are only counted when the response ends', type: 'number' },
   { key: 'fallbackModel', label: 'Fallback Model', desc: 'Retry once on this ChatGPT model when the requested one fails before any output was sent: a server error, every account rate limited, or the model refused. Never on a sign-in problem', type: 'select' },
   { key: 'creditsPolicy', label: 'Codex Credits', desc: 'When a seat whose plan usage is used up may keep serving on its purchased Codex credits. Credits may be real money: ChatGPT spends them by itself once a seat\u2019s plan runs out, and an account with automatic reload is charged again every time its balance runs low. Meridian cannot see whether reload is on. Seats with plan usage left are never affected', type: 'policy' },
   { key: 'freeSeatOrder', label: 'Free-Plan Seats', desc: 'Where a seat on ChatGPT\u2019s free plan ranks for work no profile is pinned to. It always comes after every paid seat with plan usage left, because a free seat refuses most Codex models, and it does so even when it is the active seat. A turn pinned to it still goes there', type: 'freeseat' },
+];
+const REASONING_SUMMARY_OPTIONS = [
+  { value: 'client', label: 'As the client asks (unchanged)' },
+  { value: 'auto', label: 'Auto' },
+  { value: 'concise', label: 'Concise' },
+  { value: 'detailed', label: 'Detailed' },
 ];
 const FREE_SEAT_ORDER_OPTIONS = [
   { value: 'before-credits', label: 'Before any seat spends credits (free usage costs nothing)' },
@@ -419,6 +426,8 @@ function renderChatGpt() {
       row.appendChild(input);
     } else if (feat.type === 'policy') {
       row.appendChild(policySelect(CREDITS_POLICY_OPTIONS, features[feat.key], function (value) { saveChatGpt(feat.key, value); }));
+    } else if (feat.type === 'summary') {
+      row.appendChild(policySelect(REASONING_SUMMARY_OPTIONS, features[feat.key], function (value) { saveChatGpt(feat.key, value); }));
     } else if (feat.type === 'freeseat') {
       row.appendChild(policySelect(FREE_SEAT_ORDER_OPTIONS, features[feat.key], function (value) { saveChatGpt(feat.key, value); }));
     } else {
