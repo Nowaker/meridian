@@ -832,21 +832,45 @@ export interface SseTranslatorContext {
  *
  * Anthropic's wire format signals start/end of each content block; OpenAI's
  * does not, so we manufacture an index per stream.
+ *
+ * Argument deltas are routed by their Anthropic block `index`, not by "the
+ * most recently started tool": a block's arguments can arrive after a later
+ * tool block has started, and attributing them to the newer call corrupts
+ * both calls' JSON. An indexed delta whose block never started as a tool is
+ * dropped rather than attached to another call. Events without an `index`
+ * keep the most-recent-tool routing.
  */
 export function createSseTranslator(ctx: SseTranslatorContext): SseTranslator {
   let toolCallIndex = -1 // -1 means "no tools used yet", becomes 0 on first block
+  const toolCallIndexByBlock = new Map<number, number>()
   let lastUsage: AnthropicUsage | undefined
 
   const translate = ((event: AnthropicSseEvent) => {
+    const blockIndex = typeof event.index === "number" ? event.index : undefined
+    let eventToolCallIndex = toolCallIndex
     // Increment must use the same condition the pure translator uses to
     // decide a tool-start chunk gets emitted, otherwise indexes drift if a
     // malformed event is skipped.
-    if (
-      event.type === "content_block_start" &&
-      event.content_block?.type === "tool_use" &&
-      typeof event.content_block.name === "string"
+    if (event.type === "content_block_start") {
+      if (
+        event.content_block?.type === "tool_use" &&
+        typeof event.content_block.name === "string"
+      ) {
+        toolCallIndex++
+        eventToolCallIndex = toolCallIndex
+        if (blockIndex !== undefined) toolCallIndexByBlock.set(blockIndex, toolCallIndex)
+      } else if (blockIndex !== undefined) {
+        // A reused block index no longer belongs to an earlier tool call.
+        toolCallIndexByBlock.delete(blockIndex)
+      }
+    } else if (
+      event.type === "content_block_delta" &&
+      event.delta?.type === "input_json_delta" &&
+      blockIndex !== undefined
     ) {
-      toolCallIndex++
+      const owner = toolCallIndexByBlock.get(blockIndex)
+      if (owner === undefined) return null
+      eventToolCallIndex = owner
     }
 
     if (event.type === "message_start" && event.message?.usage) {
@@ -862,7 +886,7 @@ export function createSseTranslator(ctx: SseTranslatorContext): SseTranslator {
       ctx.completionId,
       ctx.model,
       ctx.created,
-      toolCallIndex,
+      eventToolCallIndex,
       ctx.thinkingPassthrough,
     )
   }) as SseTranslator
