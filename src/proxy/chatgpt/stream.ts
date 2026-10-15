@@ -105,11 +105,45 @@ function frameEventName(frame: string): string | undefined {
   }
 }
 
+const CLIENT_REQUEST_ERROR_CODES: ReadonlySet<string> = new Set([
+  "invalid_request_error",
+  "invalid_prompt",
+  "context_length_exceeded",
+  "string_above_max_length",
+  "content_filter",
+])
+
+function isClientRequestErrorFrame(frame: string): boolean {
+  let data: string | undefined
+  for (const line of frame.split("\n")) {
+    if (line.startsWith("data:") && data === undefined) data = line.slice(5).trim()
+  }
+  if (!data) return false
+  try {
+    const parsed = JSON.parse(data) as {
+      code?: unknown
+      error?: { code?: unknown; type?: unknown }
+      response?: { error?: { code?: unknown; type?: unknown } }
+    }
+    const err = parsed.response?.error ?? parsed.error
+    const code = typeof err?.code === "string"
+      ? err.code
+      : typeof parsed.code === "string"
+        ? parsed.code
+        : typeof err?.type === "string"
+          ? err.type
+          : undefined
+    return code !== undefined && CLIENT_REQUEST_ERROR_CODES.has(code)
+  } catch {
+    return false
+  }
+}
+
 function classifyFrame(frame: string): FrameClass {
   if (isFillerFrame(frame)) return "preamble"
   const name = frameEventName(frame)
   if (name === undefined) return "output"
-  if (FAILURE_EVENTS.has(name)) return "failure"
+  if (FAILURE_EVENTS.has(name)) return isClientRequestErrorFrame(frame) ? "output" : "failure"
   return PREAMBLE_EVENTS.has(name) ? "preamble" : "output"
 }
 
@@ -121,6 +155,7 @@ function failureForStatus(status: number): ChatGptFailure | null {
 }
 
 const MODEL_REFUSAL = /(not supported|unsupported|not available|unavailable|does not exist|not found|unknown|not allowed|no access)/i
+const PARAMETER_REFUSAL = /\b(parameter|argument|temperature|top_p|max_output_tokens|reasoning_effort|truncation|tool_choice|parallel_tool_calls|response_format)\b/i
 
 /**
  * Whether a 400/404 refuses the requested MODEL, rather than another part of
@@ -130,7 +165,10 @@ const MODEL_REFUSAL = /(not supported|unsupported|not available|unavailable|does
  * serves it), so another seat - or another model - may still serve the turn.
  */
 export function isModelRefusal(status: number, text: string): boolean {
-  return (status === 400 || status === 404) && /\bmodel\b/i.test(text) && MODEL_REFUSAL.test(text)
+  return (status === 400 || status === 404)
+    && /\bmodel\b/i.test(text)
+    && MODEL_REFUSAL.test(text)
+    && !PARAMETER_REFUSAL.test(text)
 }
 
 function emptyStream(): ReadableStream<Uint8Array> {

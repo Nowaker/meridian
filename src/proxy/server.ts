@@ -10644,6 +10644,14 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // See src/proxy/openai.ts for the translation logic and design rationale.
   app.post("/v1/chat/completions", (c) => withTranslatedAdmission(c, "anthropic", async (owner, token) => {
     const rawBody = await c.req.json() as Record<string, unknown>
+    if (chatGptBackend && providerForModel(typeof rawBody.model === "string" ? rawBody.model : undefined) === "chatgpt") {
+      return c.json({
+        error: {
+          type: "not_found_error",
+          message: "This model is served by ChatGPT, which Meridian reaches through the Responses and Images APIs only. /v1/chat/completions is not available for it.",
+        },
+      }, 404)
+    }
     const refused = admissionRefusal(owner, "anthropic")
     if (refused) return refused
     const userAgent = c.req.header("user-agent") ?? ""

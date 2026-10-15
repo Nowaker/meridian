@@ -20,7 +20,7 @@
  * passthrough; what Meridian keeps for its logs is a classification.
  */
 import { describe, expect, it } from "bun:test"
-import { sniffChatGptFailure, type ChatGptFailure } from "../proxy/chatgpt/stream"
+import { isModelRefusal, sniffChatGptFailure, type ChatGptFailure } from "../proxy/chatgpt/stream"
 
 const encoder = new TextEncoder()
 
@@ -300,5 +300,26 @@ describe("sniffChatGptFailure - what a failure record is allowed to carry", () =
     const { body } = await sniffChatGptFailure(sseResponse([CREATED, leaky]))
 
     expect((await drain(body)).text).toContain("you are out of credits")
+  })
+})
+
+describe("sniffChatGptFailure & isModelRefusal - client request errors vs seat/model refusals", () => {
+  it("does not treat a client request error in response.failed as a seat failure", async () => {
+    const badRequest = frame("response.failed", {
+      response: {
+        status: "failed",
+        error: { code: "invalid_request_error", message: "Invalid value for input" },
+      },
+    })
+    const { failure, body } = await sniffChatGptFailure(sseResponse([CREATED, badRequest]))
+    expect(failure).toBeNull()
+    expect((await drain(body)).text).toContain("invalid_request_error")
+  })
+
+  it("distinguishes model refusals from parameter validation errors that mention the model", () => {
+    expect(isModelRefusal(400, "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.")).toBe(true)
+    expect(isModelRefusal(404, "The model 'gpt-unknown' does not exist.")).toBe(true)
+    expect(isModelRefusal(400, "Unsupported parameter: 'temperature' is not supported with this model.")).toBe(false)
+    expect(isModelRefusal(400, "Invalid value for 'reasoning_effort': not supported with this model.")).toBe(false)
   })
 })

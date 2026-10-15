@@ -172,10 +172,14 @@ export async function aggregateResponsesStream(body: ReadableStream<Uint8Array>)
     }
   })
   const reader = body.getReader()
-  for (;;) {
-    const chunk = await reader.read()
-    if (chunk.done) break
-    feed(chunk.value)
+  try {
+    for (;;) {
+      const chunk = await reader.read()
+      if (chunk.done) break
+      feed(chunk.value)
+    }
+  } catch {
+    return null
   }
   feed(null)
   const response = terminal.response

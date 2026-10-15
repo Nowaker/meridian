@@ -222,3 +222,14 @@ describe("buildCodexRequest - it cannot forward what it never sees", () => {
       .toBe(`Bearer ${ACCOUNT.accessToken}`)
   })
 })
+
+describe("buildCodexRequest - header-unsafe prompt_cache_key resilience", () => {
+  it("ignores a prompt_cache_key with invalid HTTP header characters instead of throwing", () => {
+    const { headers } = buildCodexRequest({
+      model: "gpt-5-codex",
+      prompt_cache_key: "bad\nkey\u0000value",
+    }, ACCOUNT)
+    expect(headers.get("conversation_id")).toBeNull()
+    expect(headers.get("session_id")).toBeNull()
+  })
+})

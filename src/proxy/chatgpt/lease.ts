@@ -238,8 +238,10 @@ function startLease(lockPath: string, contents: string, heartbeatMs: number): Wr
     try {
       utimesSync(lockPath, now, now)
     } catch {
-      lost = true
-      clearInterval(heartbeat)
+      if (!ownsLock(lockPath, contents)) {
+        lost = true
+        clearInterval(heartbeat)
+      }
     }
   }, heartbeatMs)
   heartbeat.unref?.()
