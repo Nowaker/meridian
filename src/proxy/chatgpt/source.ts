@@ -51,6 +51,8 @@ export type SeatUnavailableReason =
   | "no_authority"
   /** Taken out of work routing by the operator or a supervisor (routing exclusions). */
   | "excluded"
+  /** Held back by its usage reserve while its plan has quota left (usageReserve.ts). */
+  | "reserved"
 
 export interface ChatGptServingAccount {
   accountUserId: string

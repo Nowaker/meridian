@@ -28,7 +28,7 @@ export interface ChatGptSeatCounts {
 }
 
 /** Reasons a seat recovers from on its own, without anybody signing in. */
-const TEMPORARY: ReadonlySet<SeatUnavailableReason> = new Set(["cooling_down", "quota_exhausted", "expired"])
+const TEMPORARY: ReadonlySet<SeatUnavailableReason> = new Set(["cooling_down", "quota_exhausted", "expired", "reserved"])
 
 const REASON_PHRASE: Record<SeatUnavailableReason, string> = {
   unknown: "missing from the credential store",
@@ -40,6 +40,7 @@ const REASON_PHRASE: Record<SeatUnavailableReason, string> = {
   requires_reauth: "needing sign-in",
   no_authority: "not refreshable by this Meridian",
   excluded: "excluded from work routing",
+  reserved: "held back by a usage reserve",
 }
 
 function describeUnavailable(unavailable: Record<string, number>): string {

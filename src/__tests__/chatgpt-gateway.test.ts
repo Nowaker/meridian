@@ -186,7 +186,7 @@ afterEach(() => {
   __setFetchOAuthUsageOverride(null)
   saveSettings({
     chatGptActiveSeat: undefined, chatGptProfileNames: undefined, chatGptProfileAliases: undefined, profileOrder: undefined,
-    routingExcludedProfiles: undefined, routingManagedExcludedProfiles: undefined, chatgpt: undefined,
+    routingExcludedProfiles: undefined, routingManagedExcludedProfiles: undefined, usageReserves: undefined, chatgpt: undefined,
   })
   globalThis.fetch = realFetch
   delete process.env.MERIDIAN_CHATGPT_CREDENTIALS
@@ -962,6 +962,45 @@ describe("ChatGPT seats on the profile surface", () => {
     await res.text()
     // The owner's pick (seat 0) leads; the saved order, not the store's, follows.
     expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-0", "workspace-2"])
+  })
+
+  it("holds a seat back at its usage reserve: work moves on, a pin and the pointer are refused, a warm still reaches it, its card says why", async () => {
+    writePool([account(0), account(1)])
+    respond = call => call.accountId === "workspace-0"
+      ? completed("pong", codexWindows([{ minutes: 10080, used: 96, resetInS: 3 * 86400 }]))
+      : completed()
+    const { app } = await server("follow-external")
+    // Seat 0's own answer states its weekly window at 96%.
+    await (await app.fetch(responses(LUNA, { "x-meridian-profile": "seat0-pace-0" }))).text()
+    const saved = await app.fetch(new Request("http://localhost/settings/api/routing", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ usageReserves: { "seat0-pace-0": { seven_day: { floor: 95, ceiling: 95 } } } }),
+    }))
+    expect(saved.status).toBe(200)
+
+    await (await app.fetch(responses(LUNA))).text()
+    const pinned = await app.fetch(responses(LUNA, { "x-meridian-profile": "seat0-pace-0" }))
+    expect(pinned.status).toBe(429)
+    await pinned.text()
+    expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-0", "workspace-1"])
+
+    const pointed = await post(app, "/profiles/active", { profile: "seat0-pace-0" })
+    expect(pointed.status).toBe(409)
+    expect(await pointed.json()).toMatchObject({ code: "usage_reserve" })
+
+    const warmed = await post(app, "/profiles/seat0-pace-0/warm")
+    expect(warmed.status).toBe(200)
+    await warmed.text()
+    expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-0", "workspace-1", "workspace-0"])
+
+    const quota = await get<{ profiles: Array<{ id: string; reserve?: unknown }> }>(app, "/v1/usage/quota/all")
+    expect(quota.profiles.find(p => p.id === "seat0-pace-0")?.reserve).toMatchObject({
+      held: true,
+      reason: "weekly at 96%, capped at 95%",
+      windows: { seven_day: { floor: 95, ceiling: 95, allowance: 95, held: true } },
+    })
+    expect(quota.profiles.find(p => p.id === "seat1-pace-1")).not.toHaveProperty("reserve")
   })
 })
 

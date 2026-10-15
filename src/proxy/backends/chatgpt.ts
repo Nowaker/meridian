@@ -36,7 +36,17 @@ import { chatGptAuthLifecycleKey } from "../chatgpt/refresh"
 import { chatGptCooldownUntil, chatGptCreditsFromHeaders, chatGptRateLimitFromHeaders, creditsCanServe, type ChatGptRateLimit } from "../chatgpt/windows"
 import type { CodexCredits, CodexUsageWindow } from "../codex/types"
 import type { ChatGptCreditsPolicy, ChatGptFreeSeatOrder } from "../chatgpt/features"
+import { seatWindows } from "../chatgpt/profiles"
 import type { ChatGptCredentialSource, SeatUnavailableReason } from "../chatgpt/source"
+import { retryAfterHeaders, retryAfterSeconds } from "../retryAfter"
+import {
+  describeUsageReserveHold,
+  soonestOpening,
+  usageReserveHold,
+  type ReserveWindowReading,
+  type UsageReserve,
+  type UsageReserveState,
+} from "../usageReserve"
 
 export type UpstreamFetch = (url: string, init: RequestInit) => Promise<Response>
 
@@ -125,6 +135,9 @@ export interface ChatGptHooks {
  * purchased Codex credits (a warm has no business spending them); absent
  * means they may serve once no seat has plan quota left.
  *
+ * `warm` marks a warm, which a usage reserve does not hold back, as an
+ * exclusion does not.
+ *
  * `free` names the seats on ChatGPT's free plan. They serve a pool turn only
  * after every paid seat with plan quota, `preferred` or not, and then either
  * before any seat serves on credits or after all of them (`freeSeatOrder`,
@@ -133,9 +146,9 @@ export interface ChatGptHooks {
 export type ChatGptRoute =
   | {
     kind: "pool"; preferred?: string; excluded: ReadonlySet<string>; order?: readonly string[]; spendCredits?: boolean
-    free?: ReadonlySet<string>; freeSeatOrder?: ChatGptFreeSeatOrder
+    free?: ReadonlySet<string>; freeSeatOrder?: ChatGptFreeSeatOrder; warm?: boolean
   }
-  | { kind: "pinned"; seat: string; spendCredits?: boolean }
+  | { kind: "pinned"; seat: string; spendCredits?: boolean; warm?: boolean }
   | { kind: "refuse"; response: Response; error: string }
 
 export interface ChatGptBackendOptions<Ctx> {
@@ -164,6 +177,13 @@ export interface ChatGptBackendOptions<Ctx> {
   creditsPolicy?: (seat: string) => ChatGptCreditsPolicy
   /** A seat's plan windows from the last usage read, with when it was taken; null when never read. */
   planWindows?: (seat: string) => { windows: readonly CodexUsageWindow[]; at: number } | null
+  /**
+   * The usage reserve on a seat (usageReserve.ts) and the profile id it is
+   * known by; null for a seat without one. A seat its reserve holds back takes
+   * no work while its plan has quota left - not on credits either, because
+   * the plan is billed first and the turn would spend the share kept back.
+   */
+  usageReserve?: (seat: string) => { profile: string; reserve: UsageReserve } | null
   /** The operator's Reasoning Summary level, read per turn; undefined keeps the client's. */
   reasoningSummary?: () => ReasoningSummaryLevel | undefined
   hooks?: ChatGptHooks
@@ -188,6 +208,8 @@ export interface ChatGptBackend<Ctx> extends UpstreamBackend<Ctx> {
   /** Latest `x-codex-*` window headers per seat, from real responses. */
   observedLimits(): ReadonlyMap<string, ObservedSeatLimits>
   seatCreditState(seat: string): ChatGptSeatCreditState
+  /** The window a seat's usage reserve holds it back on, from its newest reading; null when none does. */
+  reserveHold(seat: string): UsageReserveState | null
   /** Drop everything learned about a removed seat: observed windows, credits, refusals, bench. */
   forgetSeat(seat: string): void
 }
@@ -209,10 +231,10 @@ const MAX_CONVERSATIONS = 5_000
 
 const FORWARDED_RESPONSE_HEADERS = ["content-type", "cache-control", "retry-after"] as const
 
-function errorResponse(status: number, type: string, message: string): Response {
+function errorResponse(status: number, type: string, message: string, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify({ error: { type, message, code: null } }), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
   })
 }
 
@@ -289,6 +311,20 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
       && (window.resetsAt === null || window.resetsAt > now()))
   }
 
+  /** The seat's windows by the rule its quota entry is drawn by, so a card and dispatch hold the same seat back. */
+  const newestWindows = (seat: string): ReserveWindowReading[] => {
+    const read = options.planWindows?.(seat) ?? null
+    return seatWindows({
+      usage: read ? { windows: [...read.windows], fetchedAt: read.at, stale: false } : undefined,
+      observed: observed.get(seat),
+    }).windows
+  }
+
+  const reserveHold = (seat: string): UsageReserveState | null => {
+    const declared = options.usageReserve?.(seat)
+    return declared ? usageReserveHold(newestWindows(seat), declared.reserve, now()) : null
+  }
+
   /** `seats` in the owner's rotation for `model`: its active seat first, then store order. */
   const inOwnerOrder = (seats: readonly string[], model: string | undefined): string[] => {
     const views = source.seats(model)
@@ -311,6 +347,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
   return {
     provider: "chatgpt",
     observedLimits: () => observed,
+    reserveHold,
 
     forgetSeat(seat) {
       observed.delete(seat)
@@ -407,15 +444,22 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
       }
 
       // Plan quota first; a spent plan only as the seat's policy allows. A
-      // seat benched for any reason but its plan stays out entirely.
+      // seat benched for any reason but its plan stays out entirely, and so
+      // does one its usage reserve holds back while its plan has quota left.
+      // A seat whose plan is spent outright has nothing left to keep, so its
+      // credits serve as its policy says. A warm is not held back.
       const benched = new Map(exhaustion.snapshot().map(mark => [mark.id, mark.reason]))
       const planTier: string[] = []
       const immediate: string[] = []
       const reserve: string[] = []
+      const reserveHeld = new Map<string, UsageReserveState>()
       for (const seat of routable) {
         const reason = benched.get(seat)
         if (reason !== undefined && reason !== "quota_spent") { reasons.add("quota_exhausted"); continue }
-        if (!stampedSpent.includes(seat) && reason === undefined && !readingSpent(seat)) { planTier.push(seat); continue }
+        const planLeft = !stampedSpent.includes(seat) && reason === undefined && !readingSpent(seat)
+        const hold = planLeft && route.warm !== true ? reserveHold(seat) : null
+        if (hold) { reasons.add("reserved"); reserveHeld.set(seat, hold); continue }
+        if (planLeft) { planTier.push(seat); continue }
         reasons.add("quota_exhausted")
         if ((reserveRefusedUntil.get(reserveKey(seat, model)) ?? 0) > now()) continue
         const policy = policyOf(seat)
@@ -636,7 +680,20 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
       const message = source.describeUnavailable(reasons)
       // No seat at all is a sign-in to do, not an outage to wait out.
       const auth = reasons.has("expired") || reasons.has("requires_reauth") || source.seats().length === 0
-      const quota = !auth && reasons.size > 0 && [...reasons].every(r => r === "quota_exhausted" || r === "cooling_down")
+      const quota = !auth && reasons.size > 0
+        && [...reasons].every(r => r === "quota_exhausted" || r === "cooling_down" || r === "reserved")
+      // Every seat left was held back by its usage reserve: a rate limit,
+      // named, and timed by the soonest a reserve or a bench lets one back in.
+      if (quota && reserveHeld.size > 0) {
+        const named = [...reserveHeld]
+          .map(([seat, hold]) => `${options.usageReserve?.(seat)?.profile ?? seat} (${describeUsageReserveHold(hold)})`)
+          .join("; ")
+        const benchedUntil = exhaustion.snapshot().filter(mark => routable.includes(mark.id)).map(mark => mark.until)
+        const opens = [soonestOpening([...reserveHeld.values()]), ...benchedUntil].filter((at): at is number => at !== null)
+        const seconds = retryAfterSeconds({ status: 429, resetAtMs: opens.length > 0 ? Math.min(...opens) : null, now: now() })
+        const text = `${message} Held back by a usage reserve: ${named}. The rest of each window is kept for use elsewhere, so this request was not sent.`
+        return fail(errorResponse(429, "rate_limit_error", text, retryAfterHeaders(seconds)), "chatgpt_usage_reserve")
+      }
       const response = auth
         ? errorResponse(401, "authentication_error", message)
         : quota ? errorResponse(429, "rate_limit_error", message) : errorResponse(503, "overloaded_error", message)

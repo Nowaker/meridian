@@ -196,6 +196,9 @@ export const landingHtml = `<!DOCTYPE html>
   .pace-row { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 8px; }
   .pace-row .w-bar { overflow: visible; position: relative; }
   .pace-marker { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); opacity: 0.55; border-radius: 1px; }
+  .usage-row .w-bar.reserved { overflow: visible; position: relative; }
+  .reserve-marker { position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px;
+    background: var(--yellow); border-radius: 1px; box-shadow: 0 0 0 1px var(--surface); }
   .pace-row .w-pct { font-weight: 600; }
   .pool-chip { font-size: 10px; padding: 2px 8px; border-radius: 10px; background: var(--surface2); color: var(--muted); }
   .pool-chip.exhausted { color: var(--red); background: rgba(248,81,73,0.12); }
@@ -225,7 +228,7 @@ export const landingHtml = `<!DOCTYPE html>
   .credits-row .w-credits.serving { color: var(--yellow); }
   .credits-row .w-credits-note { color: var(--muted); font-size: 11px; text-align: right; min-width: 0; overflow-wrap: anywhere; }
   .credits-row .w-credits-note.credits-pace { flex: 1; text-align: left; }
-  .pool-chip.on-credits { color: var(--yellow); background: rgba(210,153,34,0.15); }
+  .pool-chip.on-credits, .pool-chip.reserved { color: var(--yellow); background: rgba(210,153,34,0.15); }
 
   /* Traffic strip — one compact surface */
   .strip { display: flex; flex-wrap: wrap; background: var(--surface); border: 1px solid var(--border);
@@ -299,6 +302,10 @@ function paceText(pc){
   return 'on pace';
 }
 function paceColor(pc){return pc.status==='over'?'var(--red)':pc.status==='ahead'?'var(--yellow)':'var(--green)'}
+
+function reservePct(v){return String(Math.round(v*10)/10)}
+function reserveTip(b){return b.floor===b.ceiling?'Usage reserve: capped at '+reservePct(b.ceiling)+'%':'Usage reserve: '+reservePct(b.allowance)+'% allowed now, paced from '+reservePct(b.floor)+'% to '+reservePct(b.ceiling)+'%'}
+function reserveBounds(reserve,type){var b=reserve&&reserve.windows?reserve.windows[type]:null;return b&&typeof b.allowance==='number'?b:null}
 
 function resetIn(ts){if(ts==null)return '';var d=ts-Date.now();if(d<=0)return 'resetting…';var m=Math.ceil(d/60000);if(m<60)return 'in '+m+'m';var h=Math.floor(m/60);if(h<24)return 'in '+h+'h'+(m%60?' '+(m%60)+'m':'');var days=Math.floor(h/24);return 'in '+days+'d'+(h%24?' '+(h%24)+'h':'')}
 
@@ -576,8 +583,10 @@ function profileSection(q,s,pl,h){
     var rows='';
     for(var j=0;j<wins.length;j++){
       var w=wins[j];var pct=Math.round(w.utilization*100);
+      var rb=reserveBounds(quota.reserve,w.type);
       rows+='<div class="usage-row"><span class="w-label">'+esc(winLabel(w.type))+'</span>'
-        +'<div class="w-bar"><div class="w-fill" style="width:'+Math.min(pct,100)+'%;background:'+utilColor(w.utilization)+'"></div></div>'
+        +'<div class="w-bar'+(rb?' reserved" title="'+esc(reserveTip(rb)):'')+'"><div class="w-fill" style="width:'+Math.min(pct,100)+'%;background:'+utilColor(w.utilization)+'"></div>'
+        +(rb?'<div class="reserve-marker" style="left:'+Math.max(0,Math.min(100,rb.allowance)).toFixed(1)+'%"></div>':'')+'</div>'
         +'<span class="w-pct" style="color:'+utilColor(w.utilization)+'">'+pct+'%</span>'
         +'<span class="w-reset">'+resetIn(w.resetsAt)+'</span></div>';
     }
@@ -641,6 +650,8 @@ function profileSection(q,s,pl,h){
       }
     }
     if(credits&&credits.serving)badge+=' <span class="pool-chip on-credits" title="This seat\u2019s plan usage is spent; its turns are paid with Codex credits">on credits</span>';
+    var rsv=quota.reserve;
+    if(rsv&&rsv.held)badge+=' <span class="pool-chip reserved" title="'+esc((rsv.reason||'over its allowance')+(rsv.opensAt!=null&&rsv.opensAt>Date.now()?' · opens '+resetIn(rsv.opensAt):''))+'">held · reserve</span>';
     var sp=spentByProfile[p.id];
     var spentBanner='';
     if(sp){\n      var spBucket=(sp.diagnosis&&sp.diagnosis.bucket)?winLabel(sp.diagnosis.bucket):'its limit';

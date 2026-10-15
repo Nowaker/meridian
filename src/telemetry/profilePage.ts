@@ -151,6 +151,9 @@ export const profilePageHtml = `<!DOCTYPE html>
     background: rgba(248,81,73,0.08); border: 1px solid rgba(248,81,73,0.3); color: var(--text);
     overflow-wrap: anywhere; }
   .spent-note .spent-why { color: var(--muted); }
+  /* A reserve is a choice, not a failure: the spent note's shape in yellow. */
+  .spent-note.reserve-note { background: rgba(210,153,34,0.08); border-color: rgba(210,153,34,0.3); }
+  .reserve-note strong { color: var(--yellow); }
   /* minmax(0, 1fr), not 1fr: a bare fr track is at least as wide as its
      longest unbreakable value, so an email address widened the grid past
      the card instead of wrapping. */
@@ -304,6 +307,11 @@ export const profilePageHtml = `<!DOCTYPE html>
     margin-bottom: 4px;
   }
   .usage-fill { height: 100%; transition: width 0.4s ease; background: var(--green); }
+  /* The reserve cap stands above and below the 4px track, so the track stops clipping. */
+  .usage-bar.reserved { position: relative; overflow: visible; }
+  .usage-bar.reserved .usage-fill { border-radius: 2px; }
+  .reserve-marker { position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px;
+    background: var(--yellow); border-radius: 1px; box-shadow: 0 0 0 1px var(--bg); }
   .usage-card.status-warn .usage-fill,
   .usage-card.status-warn .usage-pct { color: var(--yellow); }
   .usage-card.status-warn .usage-fill { background: var(--yellow); }
@@ -947,6 +955,29 @@ function renderSpentNote(spent, p) {
     + '</div>';
 }
 
+function reservePct(value) { return String(Math.round(value * 10) / 10); }
+
+function reserveTip(bounds) {
+  return bounds.floor === bounds.ceiling
+    ? 'Usage reserve: capped at ' + reservePct(bounds.ceiling) + '%'
+    : 'Usage reserve: ' + reservePct(bounds.allowance) + '% allowed now, paced from '
+      + reservePct(bounds.floor) + '% to ' + reservePct(bounds.ceiling) + '%';
+}
+
+function reserveBounds(reserve, type) {
+  var bounds = reserve && reserve.windows ? reserve.windows[type] : null;
+  return bounds && typeof bounds.allowance === 'number' ? bounds : null;
+}
+
+function renderReserveNote(reserve) {
+  if (!reserve || !reserve.held) return '';
+  var opens = reserve.opensAt != null && reserve.opensAt > Date.now() ? formatResetCountdown(reserve.opensAt) : '';
+  return '<div class="spent-note reserve-note">'
+    + '<strong>Held back by its usage reserve</strong>: ' + esc(reserve.reason || 'over its allowance') + '.'
+    + (opens ? ' Opens ' + esc(opens) + '.' : '')
+    + '</div>';
+}
+
 function renderUsageSection(profileQuota, p) {
   // No quota data for this profile yet (cold start or fetch failed) — hide
   // entirely so we don't render an empty box.
@@ -1017,12 +1048,16 @@ function renderUsageSection(profileQuota, p) {
     var label = labelForWindow(w.type);
     var reset = formatResetCountdown(w.resetsAt);
     var tip = label + ' — ' + pctRound + '%' + (reset ? ' (resets ' + reset + ')' : '');
+    var bounds = reserveBounds(profileQuota.reserve, w.type);
+    if (bounds) tip += ' · ' + reserveTip(bounds);
     return '<div class="usage-card status-' + esc(status) + '" title="' + esc(tip) + '">'
       + '<div class="usage-row">'
       +   '<span class="usage-label">' + esc(label) + '</span>'
       +   '<span class="usage-pct">' + pctRound + '%' + usageTag + '</span>'
       + '</div>'
-      + '<div class="usage-bar"><div class="usage-fill" style="width:' + (pct * 100).toFixed(1) + '%"></div></div>'
+      + '<div class="usage-bar' + (bounds ? ' reserved' : '') + '"><div class="usage-fill" style="width:' + (pct * 100).toFixed(1) + '%"></div>'
+      +   (bounds ? '<div class="reserve-marker" style="left:' + Math.max(0, Math.min(100, bounds.allowance)).toFixed(1) + '%" title="' + attr(reserveTip(bounds)) + '"></div>' : '')
+      + '</div>'
       + (reset ? '<div class="usage-reset">' + esc(reset) + '</div>' : '')
     + '</div>';
   }).join('');
@@ -1059,6 +1094,7 @@ function renderUsageSection(profileQuota, p) {
   return '<div class="usage-section">'
     + '<div class="usage-section-title">Usage' + asOf + '</div>'
     + staleNote
+    + renderReserveNote(profileQuota.reserve)
     + (cards ? '<div class="usage-grid">' + cards + '</div>' : '')
     + extraBlock
     + '</div>';

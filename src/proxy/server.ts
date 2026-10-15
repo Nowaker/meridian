@@ -159,6 +159,21 @@ import { createOAuthCallbackRegistry, normalizePublicUrl, requestPublicOrigin } 
 import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
 import { filterEligibleProfileIds, mergeRoutingExcludedProfiles, parseRoutingExcludedProfiles } from "./routingExclusions"
 import { canonicalRoutingExcludedProfileIds, evaluateRoutingProfileAccess, noEligibleProfilesResponse, profileExcludedResponse, replacementForExcludedActive } from "./routingExclusionRuntime"
+import {
+  allHeldMessage,
+  describeUsageReserveHold,
+  newestClaudeWindows,
+  parseUsageReserves,
+  readUsageReserves,
+  soonestOpening,
+  USAGE_RESERVE_READING_MAX_AGE_MS,
+  usageReserveHold,
+  usageReserveResponse,
+  usageReserveView,
+  type ReserveWindowReading,
+  type UsageReserveMap,
+  type UsageReserveState,
+} from "./usageReserve"
 import { activateProfile } from "./profileActivation"
 import { organizationNames, organizationNeedsRefresh, refreshOrganizationNameSoon } from "./organizationName"
 import {
@@ -1523,6 +1538,37 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return Array.isArray(setting) && setting.length > 0 ? setting : undefined
   }
 
+  /** The usage reserves a supervisor last wrote (usageReserve.ts), re-read per request. */
+  const usageReserves = (): UsageReserveMap => readUsageReserves(getSetting("usageReserves"))
+
+  /** The window a Claude profile's usage reserve holds it back on, from its newest reading; null when none does. */
+  function claudeReserveHold(profileId: string, reserves: UsageReserveMap, now = Date.now()): UsageReserveState | null {
+    const reserve = reserves[profileId]
+    if (!reserve) return null
+    const snapshot = peekOAuthUsage(profileId)
+    if (!snapshot || now - snapshot.fetchedAt > USAGE_RESERVE_READING_MAX_AGE_MS) refreshReserveReading(profileId)
+    return usageReserveHold(newestClaudeWindows(snapshot, rateLimitStore.getAll(profileId)), reserve, now)
+  }
+
+  // Usage pages poll the snapshot a reserve is judged on; an instance nobody
+  // polls would judge an old one, and a reserve that reads an old figure lets
+  // the share it keeps be spent. Work arriving for a reserved profile renews
+  // its reading in the background, for the next request to judge.
+  function refreshReserveReading(profileId: string): void {
+    const target = getEffectiveProfiles(finalConfig.profiles).find(p => p.id === profileId)
+    if ((target?.type ?? "claude-max") !== "claude-max") return
+    void fetchOAuthUsage({ profileId, claudeConfigDir: target?.claudeConfigDir }).catch(err => {
+      claudeLog("usage_reserve.reading_refresh_failed", {
+        profile: profileId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    })
+  }
+
+  /** `Profile "x" is held back by its usage reserve: weekly at 95%, capped at 95%` */
+  const heldMessage = (profileId: string, hold: UsageReserveState): string =>
+    `Profile "${profileId}" is held back by its usage reserve: ${describeUsageReserveHold(hold)}`
+
   /** This profile's usage windows, normalized for the cooldown resolvers. */
   function profileCooldownWindows(profileId: string): CooldownWindow[] {
     return rateLimitStore.getAll(profileId).map(e => ({
@@ -2541,6 +2587,17 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             const unknown = notClaude.filter(id => !chatGptProfiles?.resolve(id))
             if (unknown.length > 0) claudeLog("priority.unknown_order_ids", { unknown })
             const order = filterEligibleProfileIds(fullOrder, routingAccess.excludedProfileIds)
+            // A profile its usage reserve holds back takes no new work. It is
+            // passed over wherever a benched one is, and - unlike a benched one,
+            // whose mark may be stale - never attempted as a last resort: the
+            // share it keeps is not spent to answer a request.
+            const reserves = usageReserves()
+            const reserveHolds = new Map<string, UsageReserveState | null>()
+            const heldBy = (id: string): UsageReserveState | null => {
+              if (!reserveHolds.has(id)) reserveHolds.set(id, claudeReserveHold(id, reserves))
+              return reserveHolds.get(id) ?? null
+            }
+            const unavailable = (id: string) => priorityExhaustion.isExhausted(id) || heldBy(id) !== null
             const assignmentCwd = adapter.extractClientWorkingDirectory?.(body)
               ?? adapter.extractWorkingDirectory(body)
             // The durable route below stays on the request's own key: it is
@@ -2656,8 +2713,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 && routeMappingIsCurrent
                 && assignment.profileId !== preferred
                 && order.includes(assignment.profileId)
-                && !priorityExhaustion.isExhausted(assignment.profileId)
-                && !priorityExhaustion.isExhausted(preferred)
+                && !unavailable(assignment.profileId)
+                && !unavailable(preferred)
                 && shouldPromotePriorityAssignment({
                   policy: failbackPolicy,
                   assignment,
@@ -2667,7 +2724,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               const assignedProfile = assignment?.profileId
               const assignmentIsHealthy = assignedProfile !== undefined
                 && order.includes(assignedProfile)
-                && !priorityExhaustion.isExhausted(assignedProfile)
+                && !unavailable(assignedProfile)
               const retainOnlyProfile = durableRoute && !promotionTurn
                 ? assignedProfile
                 : undefined
@@ -2685,11 +2742,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   : chooseActivePriorityCandidates(
                       activeId,
                       order,
-                      id => priorityExhaustion.isExhausted(id),
+                      unavailable,
                       assignedProfile,
                     )
               } else {
-                const pick = choosePriorityProfile(order, id => priorityExhaustion.isExhausted(id))
+                const pick = choosePriorityProfile(order, unavailable)
                 const first = retainOnlyProfile
                   ?? (shouldPromote
                     ? preferred
@@ -2701,8 +2758,30 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 // that the durable route has no authenticated authority to adopt.
                 candidates = retainOnlyProfile
                   ? [retainOnlyProfile]
-                  : [first, ...order.filter(id => id !== first && !priorityExhaustion.isExhausted(id))]
+                  : [first, ...order.filter(id => id !== first && !unavailable(id))]
               }
+              // With every profile passed over, the pickers above fall back to
+              // one anyway - a bench may be stale. A held one is never that
+              // fallback: the first that is merely benched is tried instead, as
+              // it always was, and with none the request is refused unsent.
+              const unheld = candidates.filter(id => heldBy(id) === null)
+              const lastResort = retainOnlyProfile === undefined ? order.find(id => heldBy(id) === null) : undefined
+              const serving = unheld.length > 0 ? unheld : lastResort !== undefined ? [lastResort] : []
+              if (serving.length === 0) {
+                const holds = new Map(order.flatMap(id => {
+                  const hold = heldBy(id)
+                  return hold ? [[id, hold] as const] : []
+                }))
+                const retainedHold = retainOnlyProfile === undefined ? null : heldBy(retainOnlyProfile)
+                claudeLog("routing.usage_reserve_refused", { held: [...holds.keys()], retained: retainOnlyProfile ?? null })
+                return retainedHold && retainOnlyProfile !== undefined
+                  ? usageReserveResponse(`${heldMessage(retainOnlyProfile, retainedHold)}.`, retainedHold.opensAt, Date.now())
+                  : usageReserveResponse(allHeldMessage(holds), soonestOpening([...holds.values()]), Date.now())
+              }
+              if (serving.length < candidates.length) {
+                claudeLog("routing.usage_reserve", { held: candidates.filter(id => !serving.includes(id)) })
+              }
+              candidates = serving
               return dispatchPriority({
                 context: c,
                 body,
@@ -2745,6 +2824,37 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             routingAccess.profiles[0]!.id,
             stickyOptions
           )
+        }
+        // A profile its usage reserve holds back takes no new work. Work that
+        // named it is refused, as Anthropic would refuse a spent one. Work that
+        // only defaulted to it - the active pointer, a sticky hash, the config
+        // default - goes to the first profile in priority order that is not
+        // held, which is where the supervisor that owns the pointer would move
+        // it next; the pointer itself stays where the supervisor put it. A
+        // warm keeps the exemption it has from exclusions.
+        if (!warmProfileId) {
+          const reserves = usageReserves()
+          const now = Date.now()
+          const hold = claudeReserveHold(profile.id, reserves, now)
+          if (hold && requestedProfileId) {
+            claudeLog("routing.usage_reserve_refused", { held: [profile.id], pinned: true })
+            return usageReserveResponse(`${heldMessage(profile.id, hold)}.`, hold.opensAt, now)
+          }
+          if (hold) {
+            const holds = new Map<string, UsageReserveState>([[profile.id, hold]])
+            const unheld = resolvePriorityOrder([...eligibleProfileIds], priorityProfileOrderSetting()).order.filter(id => {
+              const other = id === profile.id ? hold : claudeReserveHold(id, reserves, now)
+              if (other) holds.set(id, other)
+              return other === null
+            })
+            const next = unheld.find(id => !priorityExhaustion.isExhausted(id)) ?? unheld[0]
+            if (next === undefined) {
+              claudeLog("routing.usage_reserve_refused", { held: [...holds.keys()], pinned: false })
+              return usageReserveResponse(allHeldMessage(holds), soonestOpening([...holds.values()]), now)
+            }
+            claudeLog("routing.usage_reserve", { from: profile.id, to: next })
+            profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, next, stickyOptions)
+          }
         }
         // Also identifies failure telemetry; priority retries resolve each account here.
         resolvedProfileId = profile.id
@@ -9026,6 +9136,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // limits are read lazily.
   let chatGptObserved: () => ReadonlyMap<string, ObservedSeatLimits> = () => new Map()
   let chatGptCreditState: (seat: string) => ChatGptSeatCreditState = () => ({ planSpent: false, servingOnCredits: false })
+  let chatGptReserveHold: (seat: string) => UsageReserveState | null = () => null
   const unpricedCreditModels = new Set<string>()
   const chatGptProfiles = chatGptSource ? createChatGptProfileSurface({
     source: chatGptSource,
@@ -9179,13 +9290,18 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const entry = chatGptUsage?.entries.find(candidate => candidate.id === seat)
       return entry && entry.fetchedAt !== null ? { windows: entry.windows, at: entry.fetchedAt } : null
     },
+    usageReserve: (seat) => {
+      const profile = chatGptProfiles?.profileIdFor(seat)
+      const reserve = profile === undefined ? undefined : usageReserves()[profile]
+      return profile !== undefined && reserve ? { profile, reserve } : null
+    },
     // Only an internal hop carrying this instance's token may claim to be a
     // warm, which is what lets it use a seat excluded from work.
     route: (turn) => {
       const warm = turn.headers.get("x-meridian-internal-hop") === internalHopToken
         && turn.headers.get("x-meridian-routing-purpose") === "warm"
       const route = chatGptProfiles!.route(turn.headers.get("x-meridian-profile") ?? undefined, warm ? "warm" : "work")
-      if (route.kind !== "refuse") return warm ? { ...route, spendCredits: false } : route
+      if (route.kind !== "refuse") return warm ? { ...route, spendCredits: false, warm: true } : route
       return {
         kind: "refuse",
         error: "profile_excluded",
@@ -9204,6 +9320,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   if (chatGptBackend) {
     chatGptObserved = () => chatGptBackend.observedLimits()
     chatGptCreditState = (seat) => chatGptBackend.seatCreditState(seat)
+    chatGptReserveHold = (seat) => chatGptBackend.reserveHold(seat)
     upstream.registerBackend(createChatGptParityBackend<Context>({
       inner: chatGptBackend,
       ledger: chatGptLedger,
@@ -9470,6 +9587,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       profileOrder: resolvePriorityOrder(profileIds, priorityProfileOrderSetting()).order,
       routingExcludedProfiles: parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles")),
       routingManagedExcludedProfiles: parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")),
+      usageReserves: usageReserves(),
       profiles: profileIds,
       envOverride: {
         routing: Boolean(process.env.MERIDIAN_ROUTING),
@@ -9483,6 +9601,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       profileOrder?: unknown
       routingExcludedProfiles?: unknown
       routingManagedExcludedProfiles?: unknown
+      usageReserves?: unknown
     }
     try { body = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
     // One form submits routing, order and exclusions together, so a later
@@ -9514,6 +9633,17 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         return c.json({ error: "routingManagedExcludedProfiles must be an array of profile ids" }, 400)
       }
       updates.routingManagedExcludedProfiles = parseRoutingExcludedProfiles(body.routingManagedExcludedProfiles)
+    }
+    // The whole map at once, as the managed exclusions are written: the
+    // supervisor that owns the policy sends every reserve it means, and a
+    // profile it leaves out has none.
+    if (body.usageReserves !== undefined) {
+      const parsed = parseUsageReserves(body.usageReserves)
+      if (!parsed.ok) return c.json({ error: parsed.error }, 400)
+      const known = new Set(orderableProfileIds())
+      const unknown = Object.keys(parsed.value).filter(id => !known.has(id))
+      if (unknown.length > 0) return c.json({ error: `Unknown profiles: ${unknown.join(", ")}` }, 400)
+      updates.usageReserves = parsed.value
     }
     if (Object.keys(updates).length > 0) saveSettings(updates)
     if (body.routingExcludedProfiles !== undefined || body.routingManagedExcludedProfiles !== undefined) {
@@ -10384,6 +10514,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // parsed body, so the Claude path still reads it.
     if (chatGptProfiles) {
       const requested = await c.req.json().then(body => (body as { profile?: unknown } | null)?.profile, () => undefined)
+      const seat = typeof requested === "string" ? chatGptProfiles.resolve(requested) : undefined
+      const seatHold = seat ? chatGptReserveHold(seat.seat) : null
+      if (seat && seatHold) return c.json({ error: heldMessage(seat.id, seatHold), code: "usage_reserve" }, 409)
       if (typeof requested === "string" && chatGptProfiles.resolve(requested)) {
         const activation = chatGptProfiles.activate(requested)
         if (!activation.ok) {
@@ -10439,6 +10572,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     if (routingExcludedProfileIds().includes(body.profile)) {
       return profileExcludedResponse(body.profile)
     }
+    // The pointer would name a profile no work can reach: refused, so the
+    // switch is seen not to happen. A supervisor lifting a reserve on purpose
+    // writes the reserves without it first.
+    const reserveHold = claudeReserveHold(body.profile, usageReserves())
+    if (reserveHold) return c.json({ error: heldMessage(body.profile, reserveHold), code: "usage_reserve" }, 409)
     const target = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, body.profile)
     const auth = await reconcileClaudeProfileAuth(await getInstanceAuthStatus(target.id, target.env), target)
     if (auth?.loggedIn === false) {
@@ -11693,6 +11831,27 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   app.get("/v1/usage/quota/all", async (c) => {
     const profilesList = getEffectiveProfiles(finalConfig.profiles)
     const activeId = resolveActiveProfileId(profilesList.map(p => p.id)) || finalConfig.defaultProfile || profilesList[0]?.id || null
+    // A profile's usage reserve as its card draws it, judged on the readings
+    // dispatch judges it on: a card must not call a profile available that
+    // work is being kept off. A ChatGPT entry's windows already are the
+    // backend's reading; a Claude profile's add any SDK event newer than the
+    // snapshot, as claudeReserveHold does.
+    const reserves = usageReserves()
+    const now = Date.now()
+    const withReserve = <T extends { id: string; windows: readonly ReserveWindowReading[] }>(
+      entry: T,
+      readings: readonly ReserveWindowReading[],
+    ) => {
+      const view = usageReserveView(readings, reserves[entry.id], now)
+      return view ? { ...entry, reserve: view } : entry
+    }
+    const claudeWithReserve = <T extends { id: string; windows: readonly ReserveWindowReading[]; fetchedAt: number | null }>(entry: T) =>
+      withReserve(entry, newestClaudeWindows(
+        entry.fetchedAt === null ? undefined : { windows: entry.windows, fetchedAt: entry.fetchedAt },
+        rateLimitStore.getAll(entry.id),
+      ))
+    const chatGptWithReserve = <T extends { id: string; windows: readonly ReserveWindowReading[] }>(entry: T) =>
+      withReserve(entry, entry.windows)
     const chatGptEntries = async () => {
       if (!chatGptProfiles) return []
       const pending = refreshChatGptUsage()
@@ -11714,7 +11873,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         spent: spentProfiles.get("default") ?? null,
       }]
       return c.json({
-        profiles: [...claude, ...chatgpt],
+        profiles: [...claude.map(claudeWithReserve), ...chatgpt.map(chatGptWithReserve)],
         ...activeProfileFields(claude.length > 0 ? "default" : null, "default"),
         asOf: Date.now(),
       })
@@ -11754,7 +11913,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     }))
 
     return c.json({
-      profiles: [...results, ...await chatgptPending],
+      profiles: [...results.map(claudeWithReserve), ...(await chatgptPending).map(chatGptWithReserve)],
       ...activeProfileFields(activeId, activeId),
       asOf: Date.now(),
     })

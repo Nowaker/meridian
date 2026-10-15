@@ -19,6 +19,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import { configPath } from "./configDir"
 import type { PriorityFailbackPolicy } from "./proxy/routing"
+import type { UsageReserveMap } from "./proxy/usageReserve"
 import type { ClaudeExecutableMode } from "./proxy/claudeExecutablePreference"
 import type { PageLayout } from "./telemetry/pageLayout"
 
@@ -46,6 +47,12 @@ export interface MeridianSettings {
   priorityFailback?: PriorityFailbackPolicy
   routingExcludedProfiles?: string[]
   routingManagedExcludedProfiles?: string[]
+  /**
+   * Per profile id, how far work may take its 5-hour and weekly windows
+   * (proxy/usageReserve.ts). Written by a supervisor through
+   * `PUT /settings/api/routing`; re-read per request.
+   */
+  usageReserves?: UsageReserveMap
   /** The ChatGPT seat (accountUserId) unpinned ChatGPT turns go to first; POST /profiles/active. */
   chatGptActiveSeat?: string
   /** Operator-chosen profile ids for ChatGPT seats, keyed by seat id (accountUserId). */

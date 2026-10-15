@@ -27,6 +27,7 @@ const REASON_TEXT: Record<SeatUnavailableReason, string> = {
   requires_reauth: 'Needs an interactive login.',
   no_authority: 'This Meridian does not hold refresh authority.',
   excluded: 'Excluded from work routing.',
+  reserved: 'Held back by its usage reserve.',
 }
 
 export const CHATGPT_ADAPTER = 'chatgpt'

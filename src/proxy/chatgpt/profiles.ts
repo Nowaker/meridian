@@ -564,7 +564,10 @@ function toProfileWindows(windows: readonly CodexUsageWindow[], readAt: number):
  * the headers of the seat's latest response. Either one is a complete
  * statement of which windows the seat has.
  */
-export function seatWindows(input: { usage?: CodexUsageEntry; observed?: ObservedRateLimit }): SeatWindowsReading {
+export function seatWindows(input: {
+  usage?: Pick<CodexUsageEntry, "fetchedAt" | "windows" | "stale">
+  observed?: ObservedRateLimit
+}): SeatWindowsReading {
   const usageAt = input.usage && input.usage.fetchedAt !== null && input.usage.windows.length > 0 ? input.usage.fetchedAt : null
   const observedWindows = observedUsageWindows(input.observed)
   const observedAt = observedWindows.length > 0 && input.observed ? input.observed.at : null
