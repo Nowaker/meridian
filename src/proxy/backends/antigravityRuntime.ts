@@ -14,7 +14,7 @@ import { join } from "node:path"
 import { createHash, randomUUID } from "node:crypto"
 import { createInterface } from "node:readline"
 import { z } from "zod"
-import { AgEventQueue, AntigravityError, classifyAgFailure, availableAgTools, parallelAgTool, hasAgImages, renderAgPrompt, contractKey, historyKey, stable, type AgRequest, type AgMessage, type AgCall, type AgResult } from "./antigravityProtocol"
+import { AgEventQueue, AntigravityError, classifyAgFailure, availableAgTools, parallelAgTool, hasAgImages, renderAgPromptWithinLimit, contractKey, historyKey, stable, type AgRequest, type AgMessage, type AgCall, type AgResult } from "./antigravityProtocol"
 
 import { AgSchemaCompiler, agSchemaError, agUpstreamSchema } from "./antigravitySchema"
 import type { ValidateFunction } from "ajv"
@@ -92,7 +92,7 @@ export class AntigravityRun {
   }
   private prompt(request: AgRequest): string {
     const native = agNativeTools(this.runtime.options)
-    return renderAgPrompt(request, native) + (this.runtime.options.allowNativeBrowser ? "\nFor browser work, invoke_subagent with TypeName browser and Workspace inherit. Its chrome_devtools MCP tools are enabled; ordinary self agents may not have that browser tool catalog." : "")
+    return renderAgPromptWithinLimit(request, native, this.runtime.options.allowNativeBrowser ? "\nFor browser work, invoke_subagent with TypeName browser and Workspace inherit. Its chrome_devtools MCP tools are enabled; ordinary self agents may not have that browser tool catalog." : "")
   }
   async start(): Promise<void> {
       this.timer = setTimeout(() => this.abort(new AntigravityError("Antigravity turn timed out", 504, "api_error")), this.runtime.turnTimeoutMs)
@@ -167,7 +167,7 @@ export class AntigravityRun {
               clearTimeout(this.timer)
               this.idle = true
               this.queue.push({ kind: "end" })
-              this.pendingTimer = setTimeout(() => this.abort(new Error("Idle conversation expired"), "retired"), this.runtime.pendingToolTimeoutMs)
+              this.pendingTimer = setTimeout(() => this.abort(new Error("Idle conversation expired"), "retired"), this.runtime.idleConversationMs)
               this.pendingTimer.unref()
             }
           }
@@ -379,6 +379,7 @@ export class AntigravityRuntime {
   readonly executable: string
   readonly turnTimeoutMs: number
   readonly pendingToolTimeoutMs: number
+  readonly idleConversationMs: number
   readonly maxConcurrent: number
   readonly childEnv: NodeJS.ProcessEnv
   // Warm live conversations; expired or restarted processes replay client history.
@@ -466,6 +467,10 @@ export class AntigravityRuntime {
     this.turnTimeoutMs = options.turnTimeoutMs ?? 300_000
     this.pendingToolTimeoutMs = options.pendingToolTimeoutMs ?? 60_000
     for (const value of [this.maxConcurrent, this.turnTimeoutMs, this.pendingToolTimeoutMs]) if (!Number.isSafeInteger(value) || value <= 0) throw new Error("Antigravity limits must be positive integers")
+    this.idleConversationMs = options.idleConversationMs ?? this.pendingToolTimeoutMs
+    // The new option has its own range; leaving it unset retains every
+    // previously accepted tool deadline rather than adding a startup refusal.
+    if (options.idleConversationMs !== undefined && (!Number.isSafeInteger(this.idleConversationMs) || this.idleConversationMs <= 0 || this.idleConversationMs > 86_400_000)) throw new Error("Antigravity idle conversation time must be an integer from 1 to 86400000 ms")
     this.state = options.statePath ? new AgState(options.statePath) : undefined
     try {
     this.nativeSessions = this.state && options.statePath ? new AgNativeSessions(this.state, options.statePath, options) : undefined
