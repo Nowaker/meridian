@@ -475,3 +475,45 @@ describe("ChatGPT refresh - why a refresh was refused", () => {
     expect(event).toMatchObject({ kind: "logged_out", detail: "unverifiable: HTTP 503" })
   })
 })
+
+// A seat's renewal history is the evidence for how renewal frequency affects
+// how long its sign-in lasts: one entry per exchange the provider saw, with
+// what came back. It is kept apart from the login events so a seat renewed
+// daily does not push its sign-in and logout out of the record.
+describe("ChatGPT refresh - the seat's renewal history", () => {
+  const AT = 1_700_000_000_000
+  const DAY_MS = 24 * 3_600_000
+  const part = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url")
+
+  async function refreshOnce(id: string, reply: () => Response) {
+    const store = await seededStore()
+    store.commitAccount(id, () => seat({ accountUserId: id }))
+    const mock = endpoint(reply)
+    const refresher = createChatGptRefresher({ store, fetchImpl: mock.fetchImpl, now: () => AT })
+    const outcome = await refresher.refreshAccount(id)
+    return { refresher, mock, outcome, renewals: () => authLifecycleFor(chatGptAuthLifecycleKey(id))?.renewals }
+  }
+
+  it("records a renewal that rotated the refresh token, with the new token's issue and expiry times", async () => {
+    const accessToken = `${part({ alg: "none" })}.${part({ iat: AT / 1000, exp: (AT + 10 * DAY_MS) / 1000 })}.sig`
+    const { renewals } = await refreshOnce("seat-history-rotated", () => tokenResponse({ access_token: accessToken, refresh_token: "rotated", expires_in: 10 * DAY_MS / 1000 }))
+    expect(renewals()).toEqual([{ at: AT, outcome: "rotated", issuedAt: AT, expiresAt: AT + 10 * DAY_MS }])
+  })
+
+  it("records a renewal that kept the refresh token", async () => {
+    const { renewals } = await refreshOnce("seat-history-kept", () => tokenResponse({ access_token: "opaque", expires_in: 3600 }))
+    expect(renewals()).toEqual([{ at: AT, outcome: "kept", expiresAt: AT + 3_600_000 }])
+  })
+
+  it("records a refusal with its cause, and nothing for the attempts that never reached the provider", async () => {
+    const { refresher, mock, renewals } = await refreshOnce("seat-history-refused", () => tokenResponse({ error: { code: "refresh_token_reused" } }, 401))
+    await refresher.refreshAccount("seat-history-refused")
+    expect(mock.calls).toHaveLength(1)
+    expect(renewals()).toEqual([{ at: AT, outcome: "refused", detail: "rejected: refresh token already used" }])
+  })
+
+  it("records a provider failure as unverified, with its status", async () => {
+    const { renewals } = await refreshOnce("seat-history-503", () => tokenResponse({ error: "overloaded" }, 503))
+    expect(renewals()).toEqual([{ at: AT, outcome: "unverified", detail: "unverifiable: HTTP 503" }])
+  })
+})

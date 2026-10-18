@@ -170,6 +170,10 @@ Meridian renews each seat in its own store on the eighth day of its ten-day acce
 
 When OpenAI refuses a renewal, the log line, the logged-out event and the `cause` field of `POST /profiles/chatgpt/refresh` name which refusal it was: `refresh token expired`, `refresh token already used` (another program renewed the same login first) or `refresh token revoked`. A failure on OpenAI's side records `HTTP <status>` instead.
 
+A seat can be given its own renewal interval in hours, from 1 to 240, with `PATCH /settings/api/chatgpt` and `{"seatRenewalHours": {"<profile>": 24}}`; `null` removes it. That seat is then renewed that long after its access token was issued, and never later than a request would renew it. `GET /settings/api/chatgpt` lists each seat's `renewalHours`, and the log line names the interval. It exists to measure whether renewing more often changes how long a sign-in lasts; every other seat keeps the default.
+
+Each seat's record in `auth-lifecycle.json` keeps its latest 64 renewals under `renewals`, apart from its login events: when, the outcome (`rotated`, `kept`, `refused` or `unverified`), the cause of a refusal, and the new access token's issue and expiry times.
+
 ### Switching profiles
 
 ```bash

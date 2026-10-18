@@ -27,6 +27,7 @@
  */
 
 import { noteRefreshRejected, noteRefreshSucceeded } from "../authLifecycle"
+import { decodeCodexToken } from "../codex/token"
 import { WriterLeaseRequiredError, type ChatGptCredentialStore } from "./credentials"
 import { WriterLeaseLostError } from "./lease"
 
@@ -156,7 +157,10 @@ export function createChatGptRefresher(options: ChatGptRefresherOptions): ChatGp
     // reason is this module's own vocabulary, never the provider's wording.
     const detail = cause ? `${reason}: ${cause}` : reason
     console.error(`[chatgpt] account ${accountUserId} needs an interactive login (${detail})`)
-    noteRefreshRejected(chatGptAuthLifecycleKey(accountUserId), { at: now(), detail })
+    // An interrupted exchange is one this attempt never sent, so it is no
+    // renewal: the history holds only what the provider saw.
+    const renewal = reason === "interrupted" ? undefined : { outcome: reason === "rejected" ? "refused" as const : "unverified" as const, detail }
+    noteRefreshRejected(chatGptAuthLifecycleKey(accountUserId), { at: now(), detail, ...(renewal ? { renewal } : {}) })
     return { status: "requires-reauth", accountUserId, reason, ...(cause ? { cause } : {}) }
   }
 
@@ -233,7 +237,11 @@ export function createChatGptRefresher(options: ChatGptRefresherOptions): ChatGp
     // One line per renewal, so the operator can see a refresh happen. The
     // seat id is an identity, not a credential.
     console.log(`[chatgpt] account ${accountUserId} refreshed${parsed.refreshToken ? " (refresh token rotated)" : ""}; access token valid until ${new Date(expiresAt).toISOString()}`)
-    noteRefreshSucceeded(chatGptAuthLifecycleKey(accountUserId), { at: now() })
+    const issuedAt = decodeCodexToken(accessToken)?.issuedAt ?? null
+    noteRefreshSucceeded(chatGptAuthLifecycleKey(accountUserId), {
+      at: now(),
+      renewal: { outcome: parsed.refreshToken ? "rotated" : "kept", expiresAt, ...(issuedAt !== null ? { issuedAt } : {}) },
+    })
     return { status: "refreshed", accountUserId, accessToken, expiresAt }
   }
 

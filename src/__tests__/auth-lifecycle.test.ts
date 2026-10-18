@@ -10,6 +10,7 @@
 import { describe, test, expect, afterEach } from "bun:test"
 import {
   MAX_AUTH_LIFECYCLE_EVENTS,
+  MAX_AUTH_RENEWALS,
   NEW_GRANT_MIN_JUMP_MS,
   applyLogin,
   applyObservation,
@@ -91,6 +92,35 @@ describe("applyRefreshSucceeded", () => {
     const { record, events } = applyRefreshSucceeded(loggedOut, { at: T0 + HOUR, refreshTokenExpiresAt: T0 + DAY })
     expect(events.map(e => e.kind)).toEqual(["recovered"])
     expect(record.firstUnauthedAt).toBeUndefined()
+  })
+})
+
+describe("the renewal history", () => {
+  test("keeps the latest renewals apart from the events, so a daily renewal never pushes out the login", () => {
+    let record = applyLogin(undefined, { at: T0 }).record
+    for (let day = 1; day <= MAX_AUTH_RENEWALS + 5; day++) {
+      record = applyRefreshSucceeded(record, { at: T0 + day * DAY, renewal: { outcome: "rotated", issuedAt: T0 + day * DAY, expiresAt: T0 + (day + 10) * DAY } }).record
+    }
+    expect(record.renewals).toHaveLength(MAX_AUTH_RENEWALS)
+    expect(record.renewals!.at(-1)).toEqual({ at: T0 + (MAX_AUTH_RENEWALS + 5) * DAY, outcome: "rotated", issuedAt: T0 + (MAX_AUTH_RENEWALS + 5) * DAY, expiresAt: T0 + (MAX_AUTH_RENEWALS + 15) * DAY })
+    expect(record.events.map(e => e.kind)).toEqual(["login"])
+  })
+
+  test("records a refusal even after the logout it caused was already recorded", () => {
+    const loggedOut = applyRefreshRejected(undefined, { at: T0, detail: "rejected" }).record
+    const { record, changed } = applyRefreshRejected(loggedOut, { at: T0 + HOUR, detail: "rejected", renewal: { outcome: "refused", detail: "rejected" } })
+    expect(changed).toBe(true)
+    expect(record.renewals).toEqual([{ at: T0 + HOUR, outcome: "refused", detail: "rejected" }])
+    expect(record.events.map(e => e.kind)).toEqual(["logged_out"])
+  })
+
+  test("survives the file, dropping malformed entries, and is absent from a record that has none", () => {
+    const read = readAuthLifecycles({
+      a: { events: [], renewals: [{ at: T0, outcome: "rotated", issuedAt: T0, expiresAt: T0 + DAY }, { at: T0, outcome: "sideways" }, { outcome: "kept" }, { at: T0, outcome: "refused", detail: "x".repeat(65) }] },
+      b: { events: [] },
+    })
+    expect(read.a!.renewals).toEqual([{ at: T0, outcome: "rotated", issuedAt: T0, expiresAt: T0 + DAY }, { at: T0, outcome: "refused" }])
+    expect(read.b).toEqual({ events: [] })
   })
 })
 

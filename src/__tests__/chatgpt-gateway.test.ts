@@ -1276,7 +1276,7 @@ describe("owned mode signs its own seats in", () => {
       profileOrder: ["dead-one", "two-x", "zero"],
       routingExcludedProfiles: ["s1-kspace-1"],
       chatGptActiveSeat: "user-1__workspace-1",
-      chatgpt: { seatCreditsPolicy: { "user-1__workspace-1": "immediately", "user-0__workspace-0": "reserve" } },
+      chatgpt: { seatCreditsPolicy: { "user-1__workspace-1": "immediately", "user-0__workspace-0": "reserve" }, seatRenewalHours: { "user-1__workspace-1": 24, "user-0__workspace-0": 48 } },
     })
     const proxy = await server("owned")
     await proxy.chatGpt!.acquire()
@@ -1299,6 +1299,7 @@ describe("owned mode signs its own seats in", () => {
       expect(getSetting("routingExcludedProfiles")).toEqual([])
       expect(getSetting("chatGptActiveSeat")).toBe("user-0__workspace-0")
       expect(getSetting("chatgpt")?.seatCreditsPolicy).toEqual({ "user-0__workspace-0": "reserve" })
+      expect(getSetting("chatgpt")?.seatRenewalHours).toEqual({ "user-0__workspace-0": 48 })
       const after = await listed()
       expect(after.profiles.map(p => p.id)).toEqual(["zero", seat2])
       expect(after.activeProfiles?.chatgpt).toBe("zero")
@@ -1309,6 +1310,7 @@ describe("owned mode signs its own seats in", () => {
       expect((await post(proxy.app, "/profiles/remove", { profile: "zero" })).status).toBe(200)
       expect(getSetting("chatGptActiveSeat")).toBe("user-2__workspace-2")
       expect(getSetting("chatgpt")?.seatCreditsPolicy).toEqual({})
+      expect(getSetting("chatgpt")?.seatRenewalHours).toEqual({})
       expect(tokenCalls).toBe(0)
 
       const settings = async () => (await (await proxy.app.fetch(new Request("http://localhost/settings/api/chatgpt"))).json() as { features: { freeSeatOrder: string } }).features

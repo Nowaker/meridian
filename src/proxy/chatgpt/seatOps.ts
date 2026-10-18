@@ -63,5 +63,6 @@ export function applyChatGptRemoval(
     routingManagedExcludedProfiles: getSetting("routingManagedExcludedProfiles"),
   }))
   if (getChatGptFeatures().seatCreditsPolicy[seat.seat]) updateChatGptFeatures({ seatCreditsPolicy: { [seat.seat]: CHATGPT_CREDITS_INHERIT } })
+  if (getChatGptFeatures().seatRenewalHours[seat.seat]) updateChatGptFeatures({ seatRenewalHours: { [seat.seat]: null } })
   if (pointer.moves) setSetting("chatGptActiveSeat", pointer.to)
 }

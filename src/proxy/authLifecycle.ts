@@ -40,6 +40,8 @@ const DEADLINE_TOLERANCE_MS = 5 * 60 * 1000
 
 /** Events kept per credential — years of logins at one a month. */
 export const MAX_AUTH_LIFECYCLE_EVENTS = 24
+/** Renewals kept per credential — two months of renewing daily. */
+export const MAX_AUTH_RENEWALS = 64
 
 export type UnauthedReason =
   /** The token endpoint refused the refresh token. */
@@ -73,6 +75,23 @@ export interface AuthLifecycleEvent {
   detail?: string
 }
 
+/**
+ * One token exchange the provider saw, and what came back. `rotated` and
+ * `kept` say whether a new refresh token was issued; `refused` is the provider
+ * declining the grant, `unverified` an exchange whose result is unknown.
+ */
+export interface AuthRenewal {
+  at: number
+  outcome: AuthRenewalOutcome
+  /** Short and never secret: why it was refused, or the failed status. */
+  detail?: string
+  /** The new access token's issue time and expiry, as far as they are known. */
+  issuedAt?: number
+  expiresAt?: number
+}
+
+export type AuthRenewalOutcome = "rotated" | "kept" | "refused" | "unverified"
+
 export interface AuthLifecycleRecord {
   /** When the login behind the current credential happened. */
   authObtainedAt?: number
@@ -90,6 +109,8 @@ export interface AuthLifecycleRecord {
   firstUnauthedAt?: number
   unauthedReason?: UnauthedReason
   events: AuthLifecycleEvent[]
+  /** The latest exchanges, kept apart from `events` so frequent renewals never push a login out. */
+  renewals?: AuthRenewal[]
 }
 
 export interface AuthLifecycleUpdate {
@@ -106,6 +127,21 @@ function finiteTime(value: unknown): number | undefined {
 
 const EVENT_KINDS: ReadonlySet<string> = new Set(["login", "new_grant", "deadline_moved", "logged_out", "recovered"])
 const REASONS: ReadonlySet<string> = new Set(["refresh_rejected", "credentials_cleared", "api_rejected"])
+const RENEWAL_OUTCOMES: ReadonlySet<string> = new Set(["rotated", "kept", "refused", "unverified"])
+
+function readRenewal(raw: unknown): AuthRenewal | null {
+  if (typeof raw !== "object" || raw === null) return null
+  const r = raw as Record<string, unknown>
+  const at = finiteTime(r.at)
+  if (!at || typeof r.outcome !== "string" || !RENEWAL_OUTCOMES.has(r.outcome)) return null
+  const renewal: AuthRenewal = { at, outcome: r.outcome as AuthRenewalOutcome }
+  if (typeof r.detail === "string" && r.detail.length <= 64) renewal.detail = r.detail
+  const issued = finiteTime(r.issuedAt)
+  if (issued) renewal.issuedAt = issued
+  const expires = finiteTime(r.expiresAt)
+  if (expires) renewal.expiresAt = expires
+  return renewal
+}
 
 function readEvent(raw: unknown): AuthLifecycleEvent | null {
   if (typeof raw !== "object" || raw === null) return null
@@ -155,6 +191,10 @@ export function readAuthLifecycles(raw: unknown): Record<string, AuthLifecycleRe
       }
       record.events = record.events.slice(-MAX_AUTH_LIFECYCLE_EVENTS)
     }
+    if (Array.isArray(r.renewals)) {
+      const renewals = r.renewals.map(readRenewal).filter((renewal): renewal is AuthRenewal => renewal !== null)
+      if (renewals.length > 0) record.renewals = renewals.slice(-MAX_AUTH_RENEWALS)
+    }
     out[key] = record
   }
   return out
@@ -167,6 +207,11 @@ function emptyRecord(): AuthLifecycleRecord {
 function withEvents(record: AuthLifecycleRecord, events: AuthLifecycleEvent[]): AuthLifecycleRecord {
   if (events.length === 0) return record
   return { ...record, events: [...record.events, ...events].slice(-MAX_AUTH_LIFECYCLE_EVENTS) }
+}
+
+function withRenewal(record: AuthLifecycleRecord, at: number, renewal: Omit<AuthRenewal, "at"> | undefined): AuthLifecycleRecord {
+  if (!renewal) return record
+  return { ...record, renewals: [...(record.renewals ?? []), { at, ...renewal }].slice(-MAX_AUTH_RENEWALS) }
 }
 
 function markLoggedIn(record: AuthLifecycleRecord): AuthLifecycleRecord {
@@ -226,9 +271,9 @@ export function applyLogin(
 /** A refresh succeeded; `refreshTokenExpiresAt` is what it reported, if anything. */
 export function applyRefreshSucceeded(
   prev: AuthLifecycleRecord | undefined,
-  input: { at: number; refreshTokenExpiresAt?: number },
+  input: { at: number; refreshTokenExpiresAt?: number; renewal?: Omit<AuthRenewal, "at"> },
 ): AuthLifecycleUpdate {
-  const base = prev ?? emptyRecord()
+  const base = withRenewal(prev ?? emptyRecord(), input.at, input.renewal)
   const deadline = applyDeadline({ ...base, lastRefreshAt: input.at }, input.refreshTokenExpiresAt, input.at)
   let record = deadline.record
   const events = [...deadline.events]
@@ -246,10 +291,10 @@ export function applyRefreshSucceeded(
 /** The token endpoint refused the refresh token. Recorded once per logout. */
 export function applyRefreshRejected(
   prev: AuthLifecycleRecord | undefined,
-  input: { at: number; detail?: string },
+  input: { at: number; detail?: string; renewal?: Omit<AuthRenewal, "at"> },
 ): AuthLifecycleUpdate {
-  const base = prev ?? emptyRecord()
-  if (base.firstUnauthedAt && base.unauthedReason === "refresh_rejected") return { record: base, events: [], changed: false }
+  const base = withRenewal(prev ?? emptyRecord(), input.at, input.renewal)
+  if (base.firstUnauthedAt && base.unauthedReason === "refresh_rejected") return { record: base, events: [], changed: input.renewal !== undefined }
   return markLoggedOut(base, input.at, "refresh_rejected", input.detail)
 }
 
@@ -444,12 +489,15 @@ export function noteAuthLogin(key: string | undefined, input: { refreshTokenExpi
   update(key, prev => applyLogin(prev, { at: input.at ?? Date.now(), refreshTokenExpiresAt: input.refreshTokenExpiresAt }))
 }
 
-export function noteRefreshSucceeded(key: string | undefined, input: { refreshTokenExpiresAt?: number; at?: number } = {}): void {
-  update(key, prev => applyRefreshSucceeded(prev, { at: input.at ?? Date.now(), refreshTokenExpiresAt: input.refreshTokenExpiresAt }))
+export function noteRefreshSucceeded(
+  key: string | undefined,
+  input: { refreshTokenExpiresAt?: number; at?: number; renewal?: Omit<AuthRenewal, "at"> } = {},
+): void {
+  update(key, prev => applyRefreshSucceeded(prev, { at: input.at ?? Date.now(), refreshTokenExpiresAt: input.refreshTokenExpiresAt, renewal: input.renewal }))
 }
 
-export function noteRefreshRejected(key: string | undefined, input: { detail?: string; at?: number } = {}): void {
-  update(key, prev => applyRefreshRejected(prev, { at: input.at ?? Date.now(), detail: input.detail }))
+export function noteRefreshRejected(key: string | undefined, input: { detail?: string; at?: number; renewal?: Omit<AuthRenewal, "at"> } = {}): void {
+  update(key, prev => applyRefreshRejected(prev, { at: input.at ?? Date.now(), detail: input.detail, renewal: input.renewal }))
 }
 
 export function noteApiRejected(key: string | undefined, input: { startedAt: number; at?: number }): void {
