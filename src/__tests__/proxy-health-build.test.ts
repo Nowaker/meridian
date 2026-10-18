@@ -12,6 +12,8 @@
  * cross-file failure with no obvious cause.
  */
 import { describe, expect, it, mock, afterEach } from "bun:test"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 // Spread the real module and override only the auth lookup — replacing
 // ../proxy/models wholesale would drop the dozen other exports server.ts
@@ -221,7 +223,7 @@ describe("/health build provenance", () => {
   it("reports an available update once the check resolves", async () => {
     setSetting("checkForUpdates", true)
     await startUpdateCheck({
-      cachePath: `/tmp/meridian-health-build-${process.pid}.json`,
+      cachePath: join(tmpdir(), `meridian-health-build-${process.pid}.json`),
       fetchLatest: async () => "1.99.0",
     })
 
