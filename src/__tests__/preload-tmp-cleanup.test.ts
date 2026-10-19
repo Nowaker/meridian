@@ -54,7 +54,7 @@ describe("test preload scratch directories", () => {
     expect(testDirsIn(root)).toEqual([])
   }), 20_000)
 
-  it("redirect the run's TMPDIR, so fixtures and spawned children are removed with it", withRoot(root => {
+  it("redirect the run's TMPDIR, so fixtures and children spawned with process.env are removed with it", withRoot(root => {
     const fixture = writeFixture(root, `
       import { spawnSync } from "node:child_process"
       import { mkdtempSync } from "node:fs"
@@ -63,7 +63,7 @@ describe("test preload scratch directories", () => {
       test("tmpdir() is this process's own directory", () => {
         expect(tmpdir()).toBe(join(${JSON.stringify(root)}, \`meridian-test-tmp-\${process.pid}\`))
         mkdtempSync(join(tmpdir(), "leaked-fixture-"))
-        const child = spawnSync(process.execPath, ["-e", 'require("fs").mkdtempSync(require("path").join(require("os").tmpdir(), "leaked-child-"))'])
+        const child = spawnSync(process.execPath, ["-e", 'require("fs").mkdtempSync(require("path").join(require("os").tmpdir(), "leaked-child-"))'], { env: { ...process.env } })
         expect(child.status).toBe(0)
       })
     `)

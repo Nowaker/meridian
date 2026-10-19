@@ -51,8 +51,10 @@ delete process.env.CLAUDE_PROXY_FOLLOW_ACTIVE
 // fixtures with `mkdtemp(join(tmpdir(), ...))` and most never remove them, so
 // each run used to leave hundreds of `meridian-*` directories in the
 // developer's TMPDIR. Pointing TMPDIR at a per-process directory puts all of
-// it, and anything a spawned child writes there, where this teardown removes
-// it in one go.
+// it where this teardown removes it in one go, along with whatever a child
+// spawned with `env: { ...process.env }` writes there. A child spawned with no
+// `env` gets this process's environment as it was at startup on Bun 1.3, so
+// its temp files still land in the outer TMPDIR there.
 //
 // All three directories are removed when this process exits; leftovers of runs
 // that were killed before they could exit are swept here (see

@@ -4,7 +4,7 @@
  * Every `bun test` process gets its own settings, session and temp directory
  * under the system temp dir, keyed by pid. The temp directory becomes the
  * run's TMPDIR, so whatever a test makes with `tmpdir()` - and whatever a
- * process it spawns makes there - lands inside it. `npm test` starts a series
+ * process it spawns with `process.env` makes there - lands inside it. `npm test` starts a series
  * of such processes, so without cleanup each run leaves its directories
  * behind, indefinitely.
  *
