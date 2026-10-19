@@ -6,8 +6,9 @@
  * Each chip group reads one parameter holding a comma-separated list of its
  * chip ids. A parameter that is present names exactly the chips that are on;
  * every other chip of that group is off. Ids the group does not know are
- * dropped, and a parameter with no known id left counts as absent. An absent
- * parameter leaves the group on the choice remembered in localStorage.
+ * dropped, and a nonempty parameter with no known id left counts as absent.
+ * An explicitly empty parameter turns every chip off; an absent parameter
+ * leaves the group on the choice remembered in localStorage.
  *
  * A group the URL names is a view, not a preference: opening the link does
  * not touch the remembered choice, and a click on one of its chips rewrites
@@ -26,13 +27,14 @@ export const profileFilterUrlJs = `(function () {
   function hist() { try { return typeof history !== 'undefined' ? history : null; } catch (_) { return null; } }
 
   // The known ids the parameter names, in the group's own order; null when
-  // the parameter is absent or names none of them.
+  // the parameter is absent or nonempty with no known ids. Empty means none on.
   function read(param, ids) {
     var l = loc();
     if (!l || typeof l.href !== 'string') return null;
     var raw = null;
     try { raw = new URL(l.href).searchParams.get(param); } catch (_) { raw = null; }
     if (raw == null) return null;
+    if (raw === '') return [];
     var named = raw.split(',').map(function (s) { return s.trim(); });
     var on = ids.filter(function (id) { return named.indexOf(id) >= 0; });
     return on.length > 0 ? on : null;

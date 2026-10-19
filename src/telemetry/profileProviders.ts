@@ -200,7 +200,8 @@ var meridianProviders = (function () {
   var fromUrl = false;
   var hidden = [];
 
-  // Takes the chips from the address, or from storage when it names none.
+  // Takes the chips from the address (including an explicitly empty choice),
+  // or from storage when the parameter is absent or contains only unknown ids.
   // Called again on popstate, when the address can change under the page.
   function fromLocation() {
     var on = filterUrl.read(URL_PARAM, IDS);

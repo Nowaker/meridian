@@ -333,17 +333,25 @@ interface Page {
   select(selector: string, elements: unknown[]): void
   /** Runs the page's window listeners for an event, as the browser would. */
   dispatch(type: string): void
+  clickChip(rootId: string, provider: string): void
   at: Address
 }
 
 function loadPage(html: string, storage: MemoryStorage, href = "http://127.0.0.1:3459/"): Page {
   const at = address(href)
   const listeners = new Map<string, Array<() => void>>()
+  const clicks = new Map<string, Array<(event: { target: unknown }) => void>>()
   const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1] ?? "").join("\n")
   const elements = new Map<string, Stub>()
   const selections = new Map<string, unknown[]>()
   const element = (id: string) => {
-    if (!elements.has(id)) elements.set(id, stubElement())
+    if (!elements.has(id)) {
+      const el = stubElement()
+      el.addEventListener = (type: string, fn: (event: { target: unknown }) => void) => {
+        if (type === "click") clicks.set(id, [...(clicks.get(id) ?? []), fn])
+      }
+      elements.set(id, el)
+    }
     return elements.get(id)!
   }
   const document = {
@@ -384,6 +392,10 @@ function loadPage(html: string, storage: MemoryStorage, href = "http://127.0.0.1
     element,
     select: (selector, list) => { selections.set(selector, list) },
     dispatch: type => { for (const fn of listeners.get(type) ?? []) fn() },
+    clickChip: (rootId, provider) => {
+      const target = { closest: () => ({ getAttribute: () => provider }) }
+      for (const fn of clicks.get(rootId) ?? []) fn({ target })
+    },
     at,
   }
 }
@@ -573,9 +585,17 @@ describe("?provider= names the chips that are on", () => {
   test("unknown ids are dropped; with none known left the remembered choice stands", () => {
     expect(shownBy("?provider=claude,antigravity,constructor")).toEqual(["claude"])
     expect(shownBy("?provider=antigravity")).toEqual(["chatgpt"])
-    expect(shownBy("?provider=")).toEqual(["chatgpt"])
+    expect(shownBy("?provider=constructor,toString")).toEqual(["chatgpt"])
+    expect(shownBy("?provider=%20")).toEqual(["chatgpt"])
+    expect(shownBy("?provider=,")).toEqual(["chatgpt"])
     expect(shownBy("?q=work")).toEqual(["chatgpt"])
     expect(shownBy("")).toEqual(["chatgpt"])
+  })
+
+  test("an explicitly empty parameter selects no chips, even with a saved preference", () => {
+    expect(shownBy("?provider=")).toEqual([])
+    expect(shownBy("?provider")).toEqual([])
+    expect(shownBy("?provider=", remembering([]))).toEqual([])
   })
 
   test("opening a link never writes the remembered choice", () => {
@@ -695,3 +715,52 @@ describe("?provider= on the profiles page", () => {
     expect(storage.writes).toBe(0)
   })
 })
+
+for (const [name, html, path, rootId, selector, apply] of [
+  ["landing", landingHtml, "/", "content", "[data-group]", "applyProviderFilter()"],
+  ["profiles", profilePageHtml, "/profiles", "profiles-section", "#content .profile-card[data-id]", "applyProfileFilter()"],
+] as const) {
+  test(`${name}: last chip off survives reload, history and Show all without saving a preference`, () => {
+    const storage = remembering(["claude"])
+    const base = `http://127.0.0.1:3459${path}?fixture=roundtrip`
+    const open = (href: string) => {
+      const page = loadPage(html, storage, href)
+      if (name === "profiles") page.run(`lastProfiles = ${JSON.stringify({ profiles: mixed() })}; render(lastProfiles, null)`)
+      else page.run(`profileSection(null, {}, ${JSON.stringify({ profiles: mixed() })}, { auth: { loggedIn: true } })`)
+      const cards = [["c1", "claude"], ["g1", "chatgpt"]].map(([id, group]) => {
+        const el = stubElement()
+        el.attrs.set("data-id", id!)
+        el.attrs.set("data-group", group!)
+        return el
+      })
+      if (name === "landing") page.element("content").querySelectorAll = (s: string) => s === selector ? cards : []
+      else page.select(selector, cards)
+      page.run(apply)
+      return { page, shown: () => cards.filter(c => !c.hidden).map(c => c.attrs.get("data-id")) }
+    }
+    const first = open(`${base}&provider=chatgpt`)
+    expect(first.shown()).toEqual(["g1"])
+    first.page.clickChip(rootId, "chatgpt")
+    expect(first.shown()).toEqual([])
+    const emptyUrl = `${base}&provider=`
+    expect(first.page.at.location.href).toBe(emptyUrl)
+
+    const reloaded = open(emptyUrl)
+    expect(reloaded.shown()).toEqual([])
+    if (name === "profiles") expect(reloaded.page.element("profiles-provider-none").hidden).toBe(false)
+    reloaded.page.clickChip(rootId, "*")
+    expect(reloaded.shown()).toEqual(["c1", "g1"])
+    expect(reloaded.page.at.location.href).toBe(`${base}&provider=claude,chatgpt`)
+
+    // Back to an earlier all-hidden entry, then forward to a plain visit.
+    // Dispatch only popstate: the page listener must apply the new filter.
+    for (const [href, shown] of [[emptyUrl, []], [base, ["g1"]], [emptyUrl, []]] as const) {
+      reloaded.page.at.location.href = href
+      reloaded.page.dispatch("popstate")
+      expect(reloaded.shown()).toEqual([...shown])
+    }
+    expect(storage.writes).toBe(0)
+    expect(storage.getItem(HIDDEN_PROVIDERS_KEY)).toBe('["claude"]')
+    expect(open(base).shown()).toEqual(["g1"])
+  })
+}
