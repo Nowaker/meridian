@@ -324,8 +324,8 @@ describe("/v1/responses keeps a spawned Codex thread out of its parent's session
 })
 
 describe("/v1/responses cost estimate for GPT model ids", () => {
-  beforeEach(() => {
-    clearSessionCache()
+  beforeEach(async () => {
+    await clearSessionCache()
     telemetryStore.clear()
   })
 

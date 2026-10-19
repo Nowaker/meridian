@@ -2691,7 +2691,7 @@ describe("re-authenticated profile unbenching (#1385)", () => {
     resetProcessSdkSemaphoreForTests()
     capturedEnvs = []
     failingDirs = new Set()
-    clearSessionCache()
+    await clearSessionCache()
     resetActiveProfile()
     rateLimitStore.clear()
     savedEnv.MERIDIAN_ROUTING = process.env.MERIDIAN_ROUTING

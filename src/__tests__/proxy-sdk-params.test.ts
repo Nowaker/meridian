@@ -85,10 +85,10 @@ const BASE_BODY = {
 }
 
 describe("Claude Code live prompt with trailing system metadata", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     capturedPrompt = undefined
     mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
-    clearSessionCache()
+    await clearSessionCache()
   })
 
   it("keeps the first real user request outside a history envelope", async () => {
