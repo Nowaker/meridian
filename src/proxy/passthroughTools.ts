@@ -382,7 +382,9 @@ export function sharedPassthroughMcpServer(
     serverName,
     autoDefer,
     autoDefer && coreToolNames ? coreToolNames.map(name => name.toLowerCase()) : null,
-    tools.map(tool => [tool.name, tool.description || "", tool.defer_loading ?? null, stableStringify(tool.input_schema ?? null)]),
+    // Schema property order survives SDK tools/list rendering, so it is part
+    // of the built catalog's identity even when JSON Schema semantics match.
+    tools.map(tool => [tool.name, tool.description || "", tool.defer_loading ?? null, JSON.stringify(tool.input_schema ?? null)]),
   ])).digest("hex")
   const shared = sharedPassthroughServers.get(digest)?.deref()
   if (shared) return shared
