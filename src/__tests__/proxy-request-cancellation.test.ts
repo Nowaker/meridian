@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { readFileSync, rmSync } from "node:fs"
 import { open, type FileHandle } from "node:fs/promises"
+import * as files from "node:fs/promises"
 import { join } from "node:path"
 import * as lifecycle from "../proxy/sessionLifecycle"
 import { lifecycleLockQueue } from "../proxy/session/lifecycleLockQueue"
@@ -290,6 +291,34 @@ describe("request cancellation propagation", () => {
     expect(sessionStore.lookupSharedSession(sessionId)).toBeDefined()
   })
 
+  it.each(["request", "shutdown"] as const)("never publishes a mapping revoked by %s while its fsync waits", async (cause) => {
+    const controller = new AbortController()
+    const server = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const disk = await holdStoreFileSync(getSessionStoreDir())
+    const rename = files.rename
+    let publications = 0
+    const renames = spyOn(files, "rename").mockImplementation(async (...args) => {
+      if (String(args[1]) === join(getSessionStoreDir(), "sessions.json")) publications++
+      return rename(...args)
+    })
+    try {
+      const response = server.app.fetch(makeRequest(false, controller.signal, "cancel-during-store-fsync"))
+      await disk.entered
+      if (cause === "request") controller.abort("cancel during durable write")
+      else server.forceAbortInFlight?.()
+      disk.release()
+      expect((await response).status).toBe(499)
+      expect(sessionStore.lookupSharedSession("cancel-during-store-fsync")).toBeUndefined()
+      // Another proxy must never be able to resume the canceled target, even
+      // briefly between a late publication and its compensating eviction.
+      expect(publications).toBe(0)
+    } finally {
+      disk.release()
+      disk.restore()
+      renames.mockRestore()
+    }
+  })
+
   it("aborts a streaming SDK query when the response body is cancelled", async () => {
     mode = "wait-for-abort"
     const started = queryStarted()
@@ -319,13 +348,14 @@ describe("request cancellation propagation", () => {
   })
 })
 
-async function holdStoreFileSync(dir: string): Promise<{ release: () => void; restore: () => void }> {
+async function holdStoreFileSync(dir: string): Promise<{ entered: Promise<void>; release: () => void; restore: () => void }> {
   const probe = await open(join(dir, "sync-probe"), "w")
   const prototype = Object.getPrototypeOf(probe) as FileHandle
   await probe.close()
   rmSync(join(dir, "sync-probe"), { force: true })
   const { writeFile, sync } = prototype
   const storeFiles = new WeakSet<FileHandle>()
+  const entered = Promise.withResolvers<void>()
   let release!: () => void
   const released = new Promise<void>((resolve) => { release = resolve })
   prototype.writeFile = function (this: FileHandle, ...args: Parameters<FileHandle["writeFile"]>) {
@@ -335,10 +365,14 @@ async function holdStoreFileSync(dir: string): Promise<{ release: () => void; re
     return writeFile.apply(this, args)
   }
   prototype.sync = async function (this: FileHandle) {
-    if (storeFiles.has(this)) await released
+    if (storeFiles.has(this)) {
+      entered.resolve()
+      await released
+    }
     return sync.call(this)
   }
   return {
+    entered: entered.promise,
     release,
     restore: () => {
       prototype.writeFile = writeFile

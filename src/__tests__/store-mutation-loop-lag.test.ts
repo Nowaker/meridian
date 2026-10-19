@@ -200,6 +200,29 @@ describe("copy-on-write store mutations", () => {
     expect((parsed.a as { messageCount: number }).messageCount).toBe(3)
   })
 
+  it("owns caller history before an asynchronous mutation yields", async () => {
+    const hashes = ["original"]
+    const blocks = [["original-block"]]
+    const locator = { sessionId: "claude-captured", configDir: "/tmp/original" }
+    const write = storeSharedSession("captured", "claude-captured", 1, "h", hashes,
+      undefined, undefined, blocks, undefined, undefined, locator)
+    hashes[0] = "changed"
+    blocks[0]![0] = "changed-block"
+    locator.configDir = "invalid-relative-path"
+    await write
+    expect(lookupSharedSession("captured")).toMatchObject({
+      messageHashes: ["original"], messageBlockHashes: [["original-block"]],
+      currentTranscript: { configDir: "/tmp/original" },
+    })
+
+    const attached = { sessionId: "claude-attached", configDir: "/tmp/attached" }
+    await storeSharedSession("attached", attached.sessionId)
+    const attachment = attachSharedTranscriptLocator("attached", attached.sessionId, attached)
+    attached.configDir = "invalid-relative-path"
+    await attachment
+    expect(lookupSharedSession("attached")?.currentTranscript?.configDir).toBe("/tmp/attached")
+  })
+
   it("owns nested caller data before memoizing serialized entries", async () => {
     const hashes = ["m1"]
     const blockHashes = [["b1"]]
