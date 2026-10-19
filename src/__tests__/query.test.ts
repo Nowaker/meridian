@@ -2,6 +2,12 @@
  * Tests for the SDK query options builder.
  */
 import { describe, it, expect } from "bun:test"
+import { installSdkMock } from "./sdkMock"
+installSdkMock(() => ({
+  query: () => { throw new Error("Options builder must not query a model") },
+  createSdkMcpServer: () => ({ type: "sdk", name: "passthrough", instance: {} }),
+  tool: () => ({}),
+}), "query.test.ts")
 import { buildQueryOptions, GIT_STATUS_PROVENANCE_NOTE, REPLAY_PROVENANCE_NOTE, SCRATCHPAD_COUNTER_INSTRUCTION, resolveQueryConfigDir, singleTurnCapLiftRaisesBudget, type QueryContext } from "../proxy/query"
 import { BLOCKED_BUILTIN_TOOLS, CLAUDE_CODE_ONLY_TOOLS, MCP_SERVER_NAME, ALLOWED_MCP_TOOLS } from "../proxy/tools"
 import { CHERRY_BLOCKED_BUILTIN_TOOLS, CHERRY_INCOMPATIBLE_TOOLS, CHERRY_WEB_TOOLS } from "../proxy/adapters/cherry"
@@ -611,10 +617,51 @@ describe("buildQueryOptions", () => {
     expect((result.options as any).hooks).toEqual(hooks)
   })
 
-  it("sets ENABLE_TOOL_SEARCH=true when hasDeferredTools is true", () => {
-    const result = buildQueryOptions(makeContext({ passthrough: true, hasDeferredTools: true }))
+  it("sets ENABLE_TOOL_SEARCH=true and keeps ToolSearch in tools when hasDeferredTools is true (#1368)", () => {
+    const passthroughMcp = createPassthroughMcpServer(
+      [
+        { name: "read" },
+        { name: "deferred_alpha", defer_loading: true },
+        { name: "deferred_beta", defer_loading: true },
+      ],
+      undefined,
+      "passthrough",
+    )
+    expect(passthroughMcp.deferredToolNames).toEqual([
+      "mcp__passthrough__deferred_alpha",
+      "mcp__passthrough__deferred_beta",
+    ])
+    const result = buildQueryOptions(makeContext({
+      passthrough: true,
+      hasDeferredTools: true,
+      passthroughMcp,
+    }))
     const env = (result.options as any).env
     expect(env.ENABLE_TOOL_SEARCH).toBe("true")
+    expect((result.options as any).tools).toEqual(["ToolSearch"])
+    const sp = (result.options as any).systemPrompt
+    const promptText = typeof sp === "string" ? sp : sp.append
+    expect(promptText).toContain("The following deferred tools are available via ToolSearch")
+    expect(promptText).toContain("mcp__passthrough__deferred_alpha")
+    expect(promptText).toContain("mcp__passthrough__deferred_beta")
+    expect(promptText).not.toContain("mcp__passthrough__read")
+  })
+
+  it("omits the deferred-tools note when CLAUDE_CODE_DISABLE_ATTACHMENTS is explicitly disabled (#1368)", () => {
+    const passthroughMcp = createPassthroughMcpServer(
+      [{ name: "deferred_alpha", defer_loading: true }],
+      undefined,
+      "passthrough",
+    )
+    const result = buildQueryOptions(makeContext({
+      passthrough: true,
+      hasDeferredTools: true,
+      passthroughMcp,
+      envOverrides: { CLAUDE_CODE_DISABLE_ATTACHMENTS: "0" },
+    }))
+    const sp = (result.options as any).systemPrompt
+    const promptText = typeof sp === "string" ? sp : sp.append
+    expect(promptText).not.toContain("The following deferred tools are available via ToolSearch")
   })
 
   it("sets ENABLE_TOOL_SEARCH=false when hasDeferredTools is false", () => {

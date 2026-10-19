@@ -23,6 +23,73 @@ the contributor's PR is what merges:
 Corrections to past PRs (reopening, comment edits, release notes, any rewrite of
 `main`) are the owner's decisions in #1363. Do not start them from this note.
 
+## Backlog review and corrections (2026-10-18 MDT / 2026-10-19 UTC)
+
+Refreshed `origin/main` `095b4869b` and the paginated live queues: 29 Meridian
+PRs plus two scrub release PRs across six managed repositories. All five scrub
+repos have zero open issues/contributor PRs. The original dirty desktop checkout
+was preserved. [Detailed queue, exact heads and review findings](evidence/backlog-20261018/README.md).
+
+- Signed corrections pushed on existing contributor PRs: #1411 `bd08c43d`
+  all-hidden provider URL reload, #1410 `423477f1` schema-order-sensitive shared
+  tool definitions, and #1396 `db52bfd0`/`a40be179` durable system-instruction
+  lineage safety plus a discriminating client gate. No maintainer integration PRs.
+  #1410 full local 6,948 pass and #1396 full local 6,961 pass; both final-head
+  CI rollups are green. Their actual-client/model/heap gates remain.
+  #1411 passes 50 focused/browser/type/build checks and corrected-head CI,
+  but full local has 90 unresolved failures and must not merge.
+- #1409's cleanup change passes independent safety review, 21 focused tests,
+  typecheck/build and a discriminating unchanged-main/candidate leak probe.
+  Full local suite exits red on Bun 1.3.14 (4 failures) and pinned 1.3.11
+  (1 failure); unchanged main is red too (1 failure). Isolated passing controls
+  are not treated as a repaired full gate.
+- #1398 warning passes actual Bun/Node startup/transport controls; its full
+  local suite has four unresolved failures. Eight forwarded PRs #1394–#1401
+  carry another verified contributor's source commits. The owner requires true
+  Author credit. The owner explicitly approved the commit-preserving route for
+  #1394–#1401 on 2026-10-18 MDT / 2026-10-19 UTC, with all normal tests, live,
+  CI and signature gates retained. The independently reviewed workflow change
+  [#1413](https://github.com/rynfar/meridian/pull/1413) passed final-head CI at
+  `15f35f17` and merged as signed `f81d9d8db`; its landed tree exactly matches
+  the reviewed tree. [Merge proof](evidence/backlog-20261018/policy-merge.json).
+  The bounded route is adopted. Refresh the per-commit manifest before each
+  product merge; approval does not waive acceptance gates. No forwarded product
+  PR has merged.
+- Isolated live follow-ups completed; [sanitized proof and open gates](evidence/backlog-20261018/live-verification.md).
+  #1410's bounded 230-tool/12-owner heap falls 262.37→44.58 MiB and catalogs
+  match; actual plugin-qualified OpenCode 2.0.21 read/continuation passes.
+  Its E41 model qualification failed on mixed 5.5/4.8 SDK annotations; remaining
+  E41/extended V2 gates were not run. #1396 witnesses actual native reminder
+  disappearances and preserved continuations versus baseline replay, but mixed
+  Fable/4.8 identities, failed cache floors and missing controls retain acceptance.
+  No further inference was used to explain these failures or obtain green runs.
+  #1399's active-sweep correction is pushed as signed `4644524c`/`1372390c`.
+  Red/green regressions, focused/adjacent/type/build and final CI pass; local
+  main stage remains 6,396 pass/36 skip/89 fail on Bun 1.3.11. The supplementary
+  464 passes used host Bun 1.3.14 and do not repair that gate. Native macOS load
+  acceptance is open. [Current shutdown/credit/resolver follow-up](evidence/backlog-20261018/shutdown-and-resolver-followup.md).
+  Independent credit audit now records 60 introduced commits, all original 58
+  intact plus two correctly authored/signed corrections. Refresh before merge.
+- Evidence #1412 merged signed `da8187ab4`; combined tree and all 123 selected
+  artifact hashes match. No product PR merged. A synthetic no-model investigation
+  localizes the common resolver quarantine cascade across #1399/#1411 while
+  retaining the unknown initiating witness. Separate tasks are fixing the
+  mocked-SDK test boundary; no live gate waived. #1400 now has signed `cf399a7d`
+  on its original branch, preserving all seven earlier commits. Effective wait,
+  retained-scope and expiry controls pass 418 focused cases on Bun 1.3.11;
+  type/build and all eight final-head target CI checks pass. Full local/live
+  gates remain pending.
+  [Retry-After correction record](evidence/backlog-20261018/retry-after-correction.md).
+  Fresh credit audit now records 61 introduced objects, retaining all earlier
+  60 unchanged. Commit-object rollup SUCCESS can be fork-only; it is not proof
+  of required target PR CI. Refresh actual contexts/test before any merge.
+- #1407/#1403 source review is favorable but actual affected-client/model proof
+  remains open. #1406 needs truthful settings documentation and resumed-session
+  isolation proof. #1399/#1400 corrections retain their local/live gates. Older
+  storage/lifecycle/draft/owner/no-review holds are preserved.
+- No release or external comment is authorized. Release-only OpenCode scrub #20
+  and Pi scrub #15 also have no exact-head checks. No queue-clear claim.
+
 ## Contributor merges under the new process (2026-10-13)
 
 Each landed as the contributor's own PR. Author is the output of
@@ -37,7 +104,41 @@ Each landed as the contributor's own PR. Author is the output of
 | #1211 | `eb1f46211` | passabilities.eth (@passabilities) | merge of `main` only | direct, explicit `--body`, no maintainer trailer |
 | #1231 | `84e161b9c` | passabilities.eth (@passabilities) | merge of `main` after #1211 (conflicts resolved to the PR's side) | direct, explicit `--body`, no maintainer trailer |
 | #1224 | `09ae9316f` | Damian Nowak (@Nowaker) | contract corrections for #1282 (`948336443`), two merges of `main` | direct, explicit `--body` with a maintainer `Co-authored-by` (the fix changed) |
+| #1292 | `cbed8faaa` | Aleksey Proshutinskiy (@justprosh) | merge of `main`, one test and comment update for #1349 (`7bc3f87fe`) | `--admin` (unsigned), explicit `--body`, no maintainer trailer |
+| #1232 | `0559c554d` | Damian Nowak (@Nowaker) | contract corrections for #1281 (`4539ece6b`) | direct, explicit `--body` with a maintainer `Co-authored-by` (the fix changed) |
+| #1297 | `74ee96752` | Aleksey Proshutinskiy (@justprosh) | merge of `main` only | `--admin` (unsigned), explicit `--body`, no maintainer trailer |
 
+- #1382 (@Cd1s, Antigravity prompt byte budget): merged `72dd81384` as the
+  contributor's own PR (`Cd1s <135119404+Cd1s@users.noreply.github.com>` is
+  Author on `main`). [Evidence](evidence/1382-1376-1374-1380-20261015/README.md).
+  89/89 focused tests, full suite, build, final-head CI, live Pi 1.2.0 + official
+  agy 1.2.7 (`gemini-3.8-flash-low`) before/after: `main` (`626a17516`) sent
+  249,381 B and lost the newest turn (`NEWEST_TURN_LOST`); `#1382` (`6b372b342`)
+  sent 169,853 B and delivered newest tail, oldest head, and nonce (`NEWEST_TURN_DELIVERED`).
+- #1376 (@TristanSpeakEasy, route streamed OpenAI tool arguments by content block):
+  merged `7c935a407` as the contributor's own PR (`Tristan Cartledge` is Author
+  on `main`). [Evidence](evidence/1382-1376-1374-1380-20261015/README.md).
+  174/174 focused tests, full suite, build, final-head CI, and live
+  `/v1/chat/completions` parallel tool-call streaming verification.
+- #1374 (@mradwankhalil, default thinking display to `summarized` under Thinking
+  Passthrough): merged `769f6b9c9` as the contributor's own PR (`Mohamed R. Khalil`
+  is Author on `main`). [Evidence](evidence/1382-1376-1374-1380-20261015/README.md).
+  50/50 focused tests, full suite, build, final-head CI, and live `claude-opus-4-7`
+  passthrough before/after (0 thinking chars on `main` vs 137 thinking chars on
+  `#1374`, with `display: "omitted"` negative control staying at 0).
+- `meridian-plugin-opencode-scrub` #22 (@mradwankhalil, `cf047f8`) and #23
+  (@sergiomarquezdev, `c59fa18`): merged as the contributors' own PRs with
+  verified Git authorship on `main`, closing issue #21 and superseding draft #24
+  (closed unmerged). Package/parser boundary E2E (`scripts/e2e-cwd-package.mjs`,
+  48/48 cases PASS) landed in maintainer PR #25 (`456c471`).
+- #1380 (reported by @Flagg0096, session-turn watchdog timer leak on cancelled
+  lease waiter): fixed in `releaseSessionTurn` (`src/proxy/server.ts`) with
+  deterministic regression coverage in `src/__tests__/proxy-concurrency-coordination.test.ts`.
+- #1377 (@Nowaker, ChatGPT subscription backend, 146 files / +30,840 lines):
+  reviewed at `10c7b6cee` and held for explicit owner product and API-contract
+  approval (modifies `ProxyConfig`, `/profiles/list`, `/health`, `/readyz`,
+  `/inflight`, `/v1/models`, and adds `/v1/images/*` without an approved
+  contract issue).
 - #1213: [evidence](evidence/1213-sonnet-native-context-20261013/README.md).
   5,773 local tests, build, final-head CI, live OpenCode 2.0.16 / Sonnet 5.5
   before/after on macOS arm64. Not carried from the earlier draft: the exact-id
@@ -66,6 +167,22 @@ Each landed as the contributor's own PR. Author is the output of
   `npm test` and build, final-head CI, live E74 before/after with Opus 5.5.
   Known limitation: under Bun a held client that disconnects is not released
   until the hold ends.
+- #1292: [evidence](evidence/1292-captions-interactive-20261014/README.md).
+  Live interactive Claude Code 2.1.299: on `main` each subagent's turn after a
+  caption replays (`modified-history`); with the fix captions are auxiliary and
+  the next turn resumes. Escrowed as E77. Fixes #1288.
+- #1232: [evidence](evidence/1232-reachability-live-20261014/README.md). Nine
+  contract gaps corrected on the branch; live E75 outage and recovery on real
+  egress. Closes #1281.
+- #1297: [evidence](evidence/1297-auxiliary-cache-20261014/README.md). Live E76
+  with Sonnet 5.5: later captions write 4.8k cache tokens instead of 11–13k.
+- #1260 (@Nowaker, login expiry): reviewed against contract #1270. Most of the
+  PR (the `auth-lifecycle.json` history, five extra `/profiles/list` fields,
+  login/logout UI rows) is outside the approved contract. A maintainer commit
+  narrowing it to #1270 is prepared locally on `pr-1260` (`8e86d8144`; full
+  suite and build pass) but not pushed: it deletes about 600 lines of the
+  contributor's work, so pushing it versus asking the contributor to narrow the
+  PR is the owner's decision.
 - #1373 (maintainer fix for #1364, reported and isolated by @imarshallwidjaja):
   merged `8d447ea35`. A CLI-rejected tool call with an undeclared name now
   reaches the client as `tool_use` in streaming passthrough. Fixture stand with

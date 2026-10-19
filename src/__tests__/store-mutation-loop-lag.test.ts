@@ -73,9 +73,11 @@ function buildFixture(dir: string, entries: number, messagesPerEntry: number): {
   return { keys, text: publishForeign(dir, document) }
 }
 
-/** Longest event-loop stall while `work` runs: the widest gap between ticks of a 1 ms interval. */
-async function loopLagOf(work: () => unknown): Promise<number> {
-  let last = performance.now()
+/** Longest event-loop gap during a synchronous or awaited asynchronous mutation. */
+async function loopLagOf(label: string, work: () => unknown): Promise<number> {
+  const cpuBefore = process.cpuUsage()
+  const started = performance.now()
+  let last = started
   let worst = 0
   const tick = setInterval(() => {
     const now = performance.now()
@@ -87,7 +89,13 @@ async function loopLagOf(work: () => unknown): Promise<number> {
   } finally {
     clearInterval(tick)
   }
-  return Math.max(worst, performance.now() - last)
+  const lag = Math.max(worst, performance.now() - last)
+  const cpu = process.cpuUsage(cpuBefore)
+  console.log(`[loop-lag-sample] ${JSON.stringify({
+    label, lagMs: lag, workMs: performance.now() - started,
+    processCpuMs: (cpu.user + cpu.system) / 1_000,
+  })}`)
+  return lag
 }
 
 function median(values: number[]): number {
@@ -115,7 +123,7 @@ describe("session store mutation cost on a large store", () => {
     // What every mutation used to do on the loop: parse, serialize, write, fsync.
     const baselines: number[] = []
     for (let run = 0; run < 3; run++) {
-      baselines.push(await loopLagOf(() => {
+      baselines.push(await loopLagOf(`baseline-${run}`, () => {
         const parsed = JSON.parse(readFileSync(join(dir, "sessions.json"), "utf8"))
         const fd = openSync(join(dir, `baseline-${run}`), "w", 0o600)
         writeFileSync(fd, JSON.stringify(parsed))
@@ -128,12 +136,12 @@ describe("session store mutation cost on a large store", () => {
     await storeSharedSession(keys[0]!, randomUUID(), 3, hash(), [hash(), hash(), hash()])
     const lags: number[] = []
     for (let index = 1; index <= 5; index++) {
-      lags.push(await loopLagOf(() => (
+      lags.push(await loopLagOf(`warm-${index}`, () => (
         storeSharedSession(keys[index]!, randomUUID(), 3, hash(), [hash(), hash(), hash()])
       )))
     }
     const entry = lookupSharedSession(keys[6]!)!
-    lags.push(await loopLagOf(() => (
+    lags.push(await loopLagOf("warm-locator", () => (
       attachSharedTranscriptLocator(keys[6]!, entry.claudeSessionId, {
         sessionId: entry.claudeSessionId,
         configDir: "/home/user/.claude",
