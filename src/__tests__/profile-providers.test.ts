@@ -668,14 +668,15 @@ interface LoginStates {
   counts(states: string[]): Record<string, number>
   isHidden(id: string): boolean
   visible(id: string, total: number): boolean
+  fromLocation(): void
   setHidden(id: string, hide: boolean): void
   showAll(): void
   chipsHtml(counts: Record<string, number>, total: number): string
   onClick(target: unknown): string | null
 }
 
-function loadLoginStates(storage?: unknown): LoginStates {
-  return new Function("localStorage", isUnusableJs + "\n" + profileLoginStatesJs + "\nreturn meridianLoginStates;")(storage) as LoginStates
+function loadLoginStates(storage?: unknown, at?: Address): LoginStates {
+  return new Function("localStorage", "location", "history", isUnusableJs + "\n" + profileLoginStatesJs + "\nreturn meridianLoginStates;")(storage, at?.location, at?.history) as LoginStates
 }
 
 /** Two of each state, split across the providers; the saved order interleaves them. */
@@ -1025,6 +1026,150 @@ describe("?provider= on the profiles page", () => {
     page.dispatch("popstate")
     expect(shown()).toEqual(["c1", "c2"])
     expect(page.run<boolean>("meridianProviders.isHidden('chatgpt')")).toBe(true)
+    expect(storage.writes).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ?login= in the address, alone and with ?provider= (profileFilterUrl.ts).
+// ---------------------------------------------------------------------------
+
+const rememberingStates = (hidden: string[]) => {
+  const storage = new WatchedStorage()
+  storage.setItem(HIDDEN_LOGIN_STATES_KEY, JSON.stringify(hidden))
+  storage.writes = 0
+  return storage
+}
+
+describe("?login= names the login-state chips that are on", () => {
+  const shownBy = (search: string, storage = rememberingStates(["needs-auth"])) => {
+    const s = loadLoginStates(storage, address(`http://127.0.0.1:3459/profiles${search}`))
+    return LOGIN_STATES.map(x => x.id).filter(id => !s.isHidden(id))
+  }
+
+  test("one id, a list, and unknown ids", () => {
+    expect(shownBy("?login=needs-auth")).toEqual(["needs-auth"])
+    expect(shownBy("?login=needs-auth,authenticated")).toEqual(["authenticated", "needs-auth"])
+    expect(shownBy("?login=needs-auth,spent,constructor")).toEqual(["needs-auth"])
+    expect(shownBy("?login=spent")).toEqual(["authenticated", "expires-soon"])
+    expect(shownBy("?login=")).toEqual(["authenticated", "expires-soon"])
+    expect(shownBy("?provider=claude")).toEqual(["authenticated", "expires-soon"])
+  })
+
+  test("Needs auth is the needs-login rule only: a spent or unreachable account is not in it", () => {
+    const s = loadLoginStates()
+    expect(s.stateOf({ loggedIn: true, error: "rate_limited" })).toBe("authenticated")
+    expect(s.stateOf({ loggedIn: true, error: "unreachable" })).toBe("authenticated")
+    expect(s.stateOf({ loggedIn: true, error: "no_token" })).toBe("needs-auth")
+    expect(s.stateOf({ loggedIn: false })).toBe("needs-auth")
+  })
+
+  test("opening a link writes nothing; a click rewrites ?login= and keeps ?provider= and the anchor", () => {
+    const storage = rememberingStates(["needs-auth"])
+    const at = address("http://127.0.0.1:3459/profiles?login=needs-auth&provider=claude#d-dh-c2")
+    const s = loadLoginStates(storage, at)
+    expect(storage.writes).toBe(0)
+    s.setHidden("expires-soon", false)
+    expect(at.location.href).toBe("http://127.0.0.1:3459/profiles?login=expires-soon,needs-auth&provider=claude#d-dh-c2")
+    s.showAll()
+    expect(at.location.href).toBe("http://127.0.0.1:3459/profiles?login=authenticated,expires-soon,needs-auth&provider=claude#d-dh-c2")
+    expect(storage.writes).toBe(0)
+    expect(storage.getItem(HIDDEN_LOGIN_STATES_KEY)).toBe('["needs-auth"]')
+  })
+
+  test("without ?login= a click saves as before, even when ?provider= is in the address", () => {
+    const storage = rememberingStates([])
+    const at = address("http://127.0.0.1:3459/profiles?provider=claude")
+    loadLoginStates(storage, at).setHidden("authenticated", true)
+    expect(storage.getItem(HIDDEN_LOGIN_STATES_KEY)).toBe('["authenticated"]')
+    expect(at.replaced).toEqual([])
+  })
+})
+
+/** The three links Portal's auth warnings open, and the accounts each must show. */
+const AUTH_LINKS: Array<[string, string[]]> = [
+  ["?login=needs-auth", ["c-out", "g-out"]],
+  ["?login=needs-auth&provider=claude", ["c-out"]],
+  ["?login=needs-auth&provider=chatgpt", ["g-out"]],
+]
+
+describe("needs-auth links on the landing page", () => {
+  const landingAt = (search: string, storage: MemoryStorage) =>
+    loadPage(landingHtml, storage, `http://127.0.0.1:3459/${search}`).run<{ html: string }>(
+      `profileSection(null, {}, ${JSON.stringify({ profiles: byState(), routing: "active" })}, { auth: { loggedIn: true } })`,
+    ).html
+
+  test("without ?provider= the provider chips stay as remembered: a hidden provider stays hidden", () => {
+    const storage = rememberingStates([])
+    storage.setItem(HIDDEN_PROVIDERS_KEY, '["claude"]')
+    storage.writes = 0
+    expect(cardsOf(landingAt("?login=needs-auth", storage)).filter(c => !c.hidden).map(c => c.id)).toEqual(["g-out"])
+    expect(cardsOf(landingAt("?login=needs-auth&provider=claude,chatgpt", storage)).filter(c => !c.hidden).map(c => c.id).sort()).toEqual(["c-out", "g-out"])
+    expect(storage.writes).toBe(0)
+  })
+
+  for (const [search, expected] of AUTH_LINKS) {
+    test(`${search} shows exactly ${expected.join(", ")} and saves nothing`, () => {
+      const storage = rememberingStates(["needs-auth"])
+      const html = landingAt(search, storage)
+      expect(cardsOf(html).filter(c => !c.hidden).map(c => c.id).sort()).toEqual(expected)
+      expect(html).toContain('data-login-chip="needs-auth" aria-pressed="true"')
+      expect(html).toContain('data-login-chip="authenticated" aria-pressed="false"')
+      expect(storage.writes).toBe(0)
+    })
+  }
+})
+
+describe("needs-auth links on the profiles page", () => {
+  const open = (href: string, storage: MemoryStorage) => {
+    const page = loadPage(profilePageHtml, storage, href)
+    page.run(`lastProfiles = ${JSON.stringify({ profiles: byState() })}; render(lastProfiles, null)`)
+    const cards = Object.entries(STATE_OF).map(([id, state]) => {
+      const el = stubElement()
+      el.attrs.set("data-id", id)
+      el.attrs.set("data-group", id.startsWith("c") ? "claude" : "chatgpt")
+      el.attrs.set("data-login-state", state)
+      return el
+    })
+    page.select("#content .profile-card[data-id]", cards)
+    const shown = () => { page.run("applyProfileFilter()"); return cards.filter(c => !c.hidden).map(c => c.attrs.get("data-id")).sort() }
+    return { page, shown }
+  }
+
+  for (const [search, expected] of AUTH_LINKS) {
+    test(`${search} shows exactly ${expected.join(", ")} and saves nothing`, () => {
+      const storage = rememberingStates(["needs-auth"])
+      const { page, shown } = open(`http://127.0.0.1:3459/profiles${search}`, storage)
+      expect(shown()).toEqual(expected)
+      expect(page.element("profiles-login-chips").innerHTML).toContain('data-login-chip="needs-auth" aria-pressed="true"')
+      expect(storage.writes).toBe(0)
+    })
+  }
+
+  test("an anchor to an account the link hides turns its chip on in the address, not in storage", () => {
+    const storage = rememberingStates([])
+    const { page, shown } = open("http://127.0.0.1:3459/profiles?login=needs-auth&provider=claude#c-ok", storage)
+    expect(shown()).toEqual(["c-out"])
+    const target = stubElement()
+    target.attrs.set("data-group", "claude")
+    target.attrs.set("data-login-state", "authenticated")
+    page.element("profile-c-ok").getAttribute = target.getAttribute
+    page.run("jumpToProfileAnchor()")
+    expect(shown()).toEqual(["c-ok", "c-out"])
+    expect(page.at.location.href).toBe("http://127.0.0.1:3459/profiles?login=authenticated,needs-auth&provider=claude#c-ok")
+    expect(storage.writes).toBe(0)
+  })
+
+  test("back and forward re-read both parameters", () => {
+    const storage = rememberingStates([])
+    const { page, shown } = open("http://127.0.0.1:3459/profiles?login=needs-auth&provider=chatgpt", storage)
+    expect(shown()).toEqual(["g-out"])
+    page.at.location.href = "http://127.0.0.1:3459/profiles?login=needs-auth"
+    page.dispatch("popstate")
+    expect(shown()).toEqual(["c-out", "g-out"])
+    page.at.location.href = "http://127.0.0.1:3459/profiles"
+    page.dispatch("popstate")
+    expect(shown()).toEqual(Object.keys(STATE_OF).sort())
     expect(storage.writes).toBe(0)
   })
 })

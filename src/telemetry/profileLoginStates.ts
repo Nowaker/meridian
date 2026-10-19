@@ -6,9 +6,10 @@
  * second group: Authenticated, Expires soon, Needs auth. A card shows when its
  * provider's chip is on AND its state's chip is on. Every chip is on until
  * someone turns it off; what is hidden is remembered in localStorage, shared
- * by both pages, as the provider chips are. The group exists only while two
- * or more accounts are listed, because with one account a chip could do
- * nothing but empty the page.
+ * by both pages, as the provider chips are; a link can name the chips that are
+ * on instead, as `?login=needs-auth`, without touching what is remembered
+ * (profileFilterUrl.ts). The group exists only while two or more accounts are
+ * listed, because with one account a chip could do nothing but empty the page.
  *
  * Each account is in exactly one state, decided by rules the pages already
  * apply rather than a second copy of them:
@@ -27,6 +28,8 @@
  * phone sizing; `.login-<id>` points `--brand` at the state's semantic colour.
  */
 
+import { profileFilterUrlJs } from "./profileFilterUrl"
+
 export interface LoginState {
   readonly id: string
   readonly label: string
@@ -41,6 +44,9 @@ export const LOGIN_STATES: readonly LoginState[] = [
 
 /** localStorage key: a JSON array of the login states whose chip is off. */
 export const HIDDEN_LOGIN_STATES_KEY = "meridian.hiddenLoginStates"
+
+/** Query parameter naming the login-state chips that are on (profileFilterUrl.ts). */
+export const LOGIN_STATE_URL_PARAM = "login"
 
 /** Shown in place of the grid when the login-state chips hide every card on screen. */
 export const LOGIN_STATES_NONE_SHOWN_HTML = 'No account is in a login state shown. '
@@ -72,6 +78,7 @@ export const profileLoginStatesJs = `
 var meridianLoginStates = (function () {
   var STATES = ${JSON.stringify(LOGIN_STATES)};
   var STORAGE_KEY = ${JSON.stringify(HIDDEN_LOGIN_STATES_KEY)};
+  var URL_PARAM = ${JSON.stringify(LOGIN_STATE_URL_PARAM)};
   var NONE_SHOWN_HTML = ${JSON.stringify(LOGIN_STATES_NONE_SHOWN_HTML)};
   var byId = Object.create(null);
   for (var i = 0; i < STATES.length; i++) byId[STATES[i].id] = STATES[i];
@@ -116,7 +123,24 @@ var meridianLoginStates = (function () {
 
   var storage = null;
   try { storage = localStorage; } catch (_) { storage = null; }
-  var hidden = readHidden(storage);
+  var filterUrl = ${profileFilterUrlJs};
+  var IDS = STATES.map(function (s) { return s.id; });
+  // Whether ?login= decides the chips, rather than the remembered choice.
+  var fromUrl = false;
+  var hidden = [];
+
+  // Called again on popstate, when the address can change under the page.
+  function fromLocation() {
+    var on = filterUrl.read(URL_PARAM, IDS);
+    fromUrl = on !== null;
+    hidden = fromUrl ? IDS.filter(function (id) { return on.indexOf(id) < 0; }) : readHidden(storage);
+  }
+  fromLocation();
+
+  function save() {
+    if (fromUrl) filterUrl.write(URL_PARAM, IDS.filter(function (id) { return hidden.indexOf(id) < 0; }));
+    else writeHidden(storage, hidden);
+  }
 
   function isHidden(id) { return hidden.indexOf(id) >= 0; }
 
@@ -126,12 +150,12 @@ var meridianLoginStates = (function () {
   function setHidden(id, hide) {
     if (!byId[id] || isHidden(id) === !!hide) return;
     hidden = hide ? hidden.concat([id]) : hidden.filter(function (h) { return h !== id; });
-    writeHidden(storage, hidden);
+    save();
   }
 
   function showAll() {
     hidden = [];
-    writeHidden(storage, hidden);
+    save();
   }
 
   function title(id, on) { return (on ? 'Hide' : 'Show') + ' accounts: ' + byId[id].label.toLowerCase(); }
@@ -182,6 +206,7 @@ var meridianLoginStates = (function () {
     readHidden: readHidden,
     isHidden: isHidden,
     visible: visible,
+    fromLocation: fromLocation,
     setHidden: setHidden,
     showAll: showAll,
     chipsHtml: chipsHtml,

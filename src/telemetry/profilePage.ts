@@ -1386,9 +1386,10 @@ function jumpToProfileAnchor() {
     if (lastProfiles) afterRender();
   });
   // A chip click rewrites only the current history entry, so going back to
-  // an earlier one can bring a different ?provider= with it.
+  // an earlier one can bring a different ?provider= or ?login= with it.
   window.addEventListener('popstate', function () {
     meridianProviders.fromLocation();
+    meridianLoginStates.fromLocation();
     applyProfileFilter();
   });
   // The chips and "Show all" act on cards that are already drawn, so a toggle

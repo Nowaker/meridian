@@ -772,8 +772,8 @@ function switchProfile(id){
 // this every grab of the handle would also change the active account.
 function onHandle(e){return !!(e.target.closest&&e.target.closest('.drag-handle'))}
 // A chip click rewrites only the current history entry, so going back to an
-// earlier one can bring a different ?provider= with it.
-window.addEventListener('popstate',function(){meridianProviders.fromLocation();applyProviderFilter()});
+// earlier one can bring a different ?provider= or ?login= with it.
+window.addEventListener('popstate',function(){meridianProviders.fromLocation();meridianLoginStates.fromLocation();applyProviderFilter()});
 document.getElementById('content').addEventListener('click',function(e){
   // Before the selection check: pressing a button leaves a selection standing,
   // and a chip that does nothing while some text is selected looks broken.
