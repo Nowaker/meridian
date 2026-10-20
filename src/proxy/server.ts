@@ -85,6 +85,7 @@ import { withClaudeLogContext } from "../logger"
 import { parseToolInputObject } from "./toolInputJson"
 import { createPassthroughMcpServer, sharedPassthroughMcpServer, createPassthroughReplayToolNameRenderer, resolveClientToolName, normalizeToolInput, hasRepairableToolInput, computeToolSetKey, toolUseSignature, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX, passthroughMcpPrefix, autoDeferDecision, getAutoDeferThreshold } from "./passthroughTools"
 import { describeLocalBootIdentity } from "./session/processIncarnation"
+import { openCodePrimaryAgentContextHash, requiresOpenCodeAgentReplay } from "./adapters/opencodeAgentContext"
 import { detectServerTools, serverToolErrorMessage } from "./tools"
 import { clientAbortDisposition, coalesceCompleteToolResultContinuation, createEarlyStopTracker, isClientForwardedToolUse, noteAssistantMessage, noteUserContent, settledToolCallAssistantUuid, settlesCheckpointThenContinues, shouldEarlyStop, trackerCoversStreamedCalls } from "./passthroughEarlyStop"
 import { checkEmptyToolInputs, checkUndeliveredToolUses, type EnvelopeViolation } from "./envelopeIntegrity"
@@ -100,6 +101,7 @@ import { createSseRelayStream, relayStreamAttempt } from "./sseFailureSniff"
 import { refreshOAuthToken, ensureFreshToken, startBackgroundRefresh, stopBackgroundRefresh, createPlatformCredentialStore, readStoredCredentialSnapshot, getAuthRenewalStatus, getStoredPlanFields, renewalStatusFor, resolveRenewalWarnDays, type CredentialStore, type StoredPlanFields } from "./tokenRefresh"
 import { planAllowance } from "./planAllowance"
 import { isCredentialsReadOnly, logCredentialsModeBanner } from "./credentialsMode"
+import { runtimeCancelWarning } from "./runtimeCancelWarning"
 import {
   createFileDesignTokenStore,
   createDesignLogin,
@@ -120,7 +122,7 @@ import { livenessReport, readinessReport, renderProbe } from "./probes"
 import { UpstreamReachability, DEFAULT_OVERRIDE_TTL_MS, MAX_OVERRIDE_TTL_MS, unreachableDetail, withReachability } from "./upstreamReachability"
 import { resolveReachabilityThresholds } from "./upstreamReachabilityConfig"
 import type { AnthropicSseEvent } from "./openai"
-import { translateOpenAiToAnthropic, translateAnthropicToOpenAi, buildModelList, createSseTranslator } from "./openai"
+import { translateOpenAiToAnthropic, translateAnthropicToOpenAi, buildModelList, createSseTranslator, translateAnthropicSseError } from "./openai"
 import { normalizeJcodeSessionId } from "./adapters/jcode"
 import { extractLettaConversationId, LETTA_CONVERSATION_HEADER } from "./adapters/letta"
 import { isClaudeCodeClient } from "./adapters/claudecode"
@@ -3431,11 +3433,22 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // transcript previously published without complete raw-prefix proof.
         // Tool inheritance is retained only for a namespace-qualified request
         // that would otherwise resume this exact SDK session.
+        const resumeContextHash = adapterBase === "opencode" ? openCodePrimaryAgentContextHash(
+          c.req.header("x-opencode-agent-mode"),
+          c.req.header("x-opencode-agent-name"),
+          sdkFeatures.clientSystemPrompt !== false,
+        ) : undefined
+        const agentContextReplay = Boolean(cachedSession && requiresOpenCodeAgentReplay(
+          cachedSession.resumeContextHash,
+          resumeContextHash,
+        ))
         const executionReplay = executionHistory.changed || Boolean(cachedSession && !cachedSession.lineageHash)
+          || agentContextReplay
         const executionReplayToolSessionId = executionReplay && isResume ? resumeSessionId : undefined
         if (executionReplay) {
           claudeLog("session.execution_replay", {
-            reason: executionHistory.changed ? "transformed_history" : "unproved_sdk_prefix",
+            reason: executionHistory.changed ? "transformed_history"
+              : agentContextReplay ? "changed_or_unproved_primary_agent" : "unproved_sdk_prefix",
           })
           isResume = false
           isUndo = false
@@ -5361,6 +5374,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     mappingExpectedGeneration,
                     options.priorityPublication,
                     !executionHistory.changed,
+                    resumeContextHash,
                       )
                         if (stored) {
                           mappingExpectedGeneration = stored
@@ -6752,6 +6766,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     mappingExpectedGeneration,
                     options.priorityPublication,
                     !executionHistory.changed,
+                    resumeContextHash,
                       )
                       if (stored) {
                         mappingExpectedGeneration = stored
@@ -7088,6 +7103,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     mappingExpectedGeneration,
                     options.priorityPublication,
                     !executionHistory.changed,
+                    resumeContextHash,
                       )
                       if (stored) {
                         mappingExpectedGeneration = stored
@@ -7820,6 +7836,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                     mappingExpectedGeneration,
                     options.priorityPublication,
                     !executionHistory.changed,
+                    resumeContextHash,
                       )
                       if (stored) {
                         mappingExpectedGeneration = stored
@@ -10895,6 +10912,15 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               catch { continue }
               if (typeof event.type !== "string") continue
 
+              // Forward failures as OpenAI in-band errors; the translator
+              // below has no error shape and would drop them, leaving only the
+              // preceding max_tokens finish chunk.
+              const errorChunk = translateAnthropicSseError(event)
+              if (errorChunk) {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(errorChunk)}\n\n`))
+                continue
+              }
+
               const chunk = translate(event as unknown as AnthropicSseEvent)
               if (chunk) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
             }
@@ -11683,6 +11709,8 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
       // at startup, rather than letting the version string imply otherwise.
       const buildDrift = describeBuildDrift(buildRuntime.info(finalConfig.version ?? "unknown", getLatestVersion()))
       if (buildDrift) console.log(`Build: ${buildDrift}`)
+      const cancelWarning = runtimeCancelWarning()
+      if (cancelWarning) console.warn(cancelWarning)
       console.log(`\nPoint any Anthropic-compatible tool at this endpoint:`)
       console.log(`  ANTHROPIC_API_KEY=x ANTHROPIC_BASE_URL=http://${finalConfig.host}:${port}`)
     }

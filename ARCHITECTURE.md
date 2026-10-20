@@ -198,6 +198,7 @@ src/
 │   ├── server.ts              ← HTTP layer: routes, SSE streaming, concurrency, request orchestration
 │   ├── concurrency.ts         ← Abortable SDK query semaphore and concurrency config parsing
 │   ├── requestAbort.ts        ← HTTP request abort → SDK query abort bridge
+│   ├── runtimeCancelWarning.ts ← Startup warning under Bun, whose HTTP server misses a client gone before the first byte (leaf)
 │   ├── sessionTree.ts         ← Live parent→child request registry; subtree cancellation (PURE bookkeeping)
 │   ├── shutdown.ts            ← Bounded HTTP drain and connection tracking
 │   ├── inflight.ts            ← Per-upstream in-flight request counts for GET /inflight (PURE bookkeeping)
@@ -439,6 +440,19 @@ forces client-owned passthrough unconditionally: instance
 that base, because the protocol's tool loop lives entirely in the client.
 
 Both are LRU with coordinated eviction — evicting from one removes the corresponding entry in the other.
+
+The SDK mapping can also record an adapter-owned stable context digest.
+`adapters/opencodeAgentContext.ts` fingerprints an explicitly declared primary
+agent when client prompts are enabled. The native CLI restores its original
+system prompt on ordinary resume and on forks, so switching primary agents
+requires complete client-history replay into a fresh SDK session. A legacy
+mapping replays once when the plugin first supplies primary-agent identity.
+The cache and shared store publish the digest with the mapping; `server.ts`
+uses the existing execution-history replay boundary. Dynamic file-tree and
+diagnostic context within the same agent retains ordinary resume, as do
+clients without this explicit identity. Editing instructions without changing
+the primary agent remains subject to the native resume limitation. Prompt text
+is never added to the store.
 
 ### Lineage Verification
 
