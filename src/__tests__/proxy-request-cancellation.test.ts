@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
-import { readFileSync, rmSync } from "node:fs"
-import { open, type FileHandle } from "node:fs/promises"
+import AsyncDatabase from "libsql/promise"
+import { closeStoreDatabase } from "../proxy/session/storeDatabase"
 import { join } from "node:path"
 import * as lifecycle from "../proxy/sessionLifecycle"
 import { lifecycleLockQueue } from "../proxy/session/lifecycleLockQueue"
@@ -267,18 +267,21 @@ describe("request cancellation propagation", () => {
     await first.text()
     expect(sessionStore.lookupSharedSession(sessionId)).toBeDefined()
 
-    const disk = await holdStoreFileSync(getSessionStoreDir())
+    const disk = await holdStoreStatement(/^DELETE FROM sessions /)
     let next: Promise<Response> | undefined
     try {
       // What a cancelled stream's body leaves behind once its turn has ended:
       // an eviction nobody waits for.
       const eviction = sessionStore.evictSharedSession(sessionId)
+      await disk.entered
+      capturedController = undefined
       next = Promise.resolve(server.app.fetch(makeRequest(false, undefined, sessionId, [
         { role: "user", content: "hello" },
         { role: "assistant", content: "ok" },
         { role: "user", content: "continue" },
       ])))
       await Bun.sleep(100)
+      expect(capturedController).toBeUndefined()
       disk.release()
       expect(await eviction).toBe(true)
     } finally {
@@ -288,6 +291,32 @@ describe("request cancellation propagation", () => {
     const response = await next!
     expect(response.status).toBe(200)
     expect(sessionStore.lookupSharedSession(sessionId)).toBeDefined()
+  })
+
+  it.each(["request", "shutdown"] as const)("never commits a mapping revoked by %s during SQLite statement preparation", async (cause) => {
+    const controller = new AbortController()
+    const server = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const disk = await holdStoreStatement(/^INSERT INTO sessions /)
+    let response: ReturnType<typeof server.app.fetch> | undefined
+    try {
+      response = server.app.fetch(makeRequest(false, controller.signal, "cancel-during-store-prepare"))
+      await disk.entered
+      // Admission and the SDK result precede this real SQLite preparation.
+      // Revocation must roll the draft back before COMMIT is dispatched.
+      expect(capturedController).toBeDefined()
+      if (cause === "request") controller.abort("cancel during durable write")
+      else server.forceAbortInFlight?.()
+      disk.release()
+      expect((await response).status).toBe(499)
+      expect(sessionStore.lookupSharedSession("cancel-during-store-prepare")).toBeUndefined()
+      // Compensating eviction after COMMIT is insufficient: another proxy
+      // must never see a canceled target, even briefly.
+      expect(disk.commits()).toBe(0)
+    } finally {
+      disk.release()
+      if (response) await response
+      disk.restore()
+    }
   })
 
   it("aborts a streaming SDK query when the response body is cancelled", async () => {
@@ -319,30 +348,41 @@ describe("request cancellation propagation", () => {
   })
 })
 
-async function holdStoreFileSync(dir: string): Promise<{ release: () => void; restore: () => void }> {
-  const probe = await open(join(dir, "sync-probe"), "w")
-  const prototype = Object.getPrototypeOf(probe) as FileHandle
-  await probe.close()
-  rmSync(join(dir, "sync-probe"), { force: true })
-  const { writeFile, sync } = prototype
-  const storeFiles = new WeakSet<FileHandle>()
-  let release!: () => void
-  const released = new Promise<void>((resolve) => { release = resolve })
-  prototype.writeFile = function (this: FileHandle, ...args: Parameters<FileHandle["writeFile"]>) {
-    const [data] = args
-    const head = typeof data === "string" ? data.slice(0, 64) : Buffer.isBuffer(data) ? data.subarray(0, 64).toString("utf8") : ""
-    if (head.includes("meridian-session-store")) storeFiles.add(this)
-    return writeFile.apply(this, args)
-  }
-  prototype.sync = async function (this: FileHandle) {
-    if (storeFiles.has(this)) await released
-    return sync.call(this)
-  }
+/** Hold a real native statement's completed preparation, before publication.
+ * Closing the idle connection ensures this statement has not been cached by a
+ * preceding case. The transaction and its eventual COMMIT/ROLLBACK remain real. */
+async function holdStoreStatement(sqlPattern: RegExp) {
+  await closeStoreDatabase(getSessionStoreDir())
+  const { prepare, exec } = AsyncDatabase.prototype
+  const entered = Promise.withResolvers<void>()
+  const released = Promise.withResolvers<void>()
+  const pending = new WeakSet<AsyncDatabase>()
+  let held = false
+  let commits = 0
+  const preparation = spyOn(AsyncDatabase.prototype, "prepare").mockImplementation(async function (this: AsyncDatabase, sql: string) {
+    const statement = await prepare.call(this, sql)
+    if (!held && sqlPattern.test(sql)) {
+      held = true
+      pending.add(this)
+      entered.resolve()
+      await released.promise
+    }
+    return statement
+  })
+  const execution = spyOn(AsyncDatabase.prototype, "exec").mockImplementation(function (this: AsyncDatabase, sql: string) {
+    if (pending.has(this) && (sql === "COMMIT" || sql === "ROLLBACK")) {
+      if (sql === "COMMIT") commits++
+      pending.delete(this)
+    }
+    return exec.call(this, sql)
+  })
   return {
-    release,
+    entered: entered.promise,
+    release: () => released.resolve(),
+    commits: () => commits,
     restore: () => {
-      prototype.writeFile = writeFile
-      prototype.sync = sync
+      preparation.mockRestore()
+      execution.mockRestore()
     },
   }
 }

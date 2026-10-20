@@ -392,6 +392,58 @@ an actual loaded-Linux-host timeout reproduction**. Stock Node controls also
 cover the aggregate Git budget, TERM resistance, detached/stale launcher facts
 and failed status. [Source mappings, sanitized proof and limits](docs/maintenance/evidence/1330-source-build-identity.md).
 
+## Startup warning under Bun (E87)
+
+**What it proves:** a proxy started under Bun says at startup that it cannot
+stop a request whose client goes away before the first byte of the response,
+and how to run it so it can. A proxy under Node says nothing.
+
+Under Bun, the `node:http` server that @hono/node-server serves with is never
+told of a client that goes away before the response's first byte: neither the
+socket nor the response emits `close` or turns `destroyed`, a 0-byte socket
+write succeeds, and headers flushed early only surface the loss at the next
+write. The request's abort signal never fires, so a request cancelled while the
+model is still thinking (Esc in Claude Code, an orchestrator stopping subagents
+still starting) runs on to the end of its turn, on the account's allowance.
+Under Node it stops. Serving with `Bun.serve` instead would change the `server`
+that `startProxyServer` hands to its callers, so this change only warns:
+`runtimeCancelWarning.ts` prints one `console.warn` line after the startup
+banner when `process.versions.bun` is set. The line names the running Bun, the
+Bun releases the behaviour was checked on (1.2.20, 1.3.11, 1.3.14), and the way
+out for both installs: `npm run build && npm run start` from a source checkout,
+or `meridian` started with Node (not `bunx --bun`) from an npm install. It
+prints on any Bun, including the documented `npm run proxy:direct` dev start,
+and never when the proxy is started silently. The supervisor already runs the
+build under Node and uses the source under Bun only when there is no build.
+
+**Unit coverage:** `runtime-cancel-warning.test.ts` (the warning names the
+running Bun, the probed releases, the cost and both remedies; it is absent
+under Node).
+
+**Offline checks (this build, Linux x64, no credentials, no requests):**
+
+- Startup with an empty `HOME` and `CLAUDE_CONFIG_DIR` on loopback, stopped
+  with SIGINT after 25 s: `bun run ./bin/cli.ts` under Bun 1.3.14 prints the
+  warning right after the `Build:` line; `node dist/cli.js` (what the
+  `meridian` bin runs) under Node 22.13.0 prints none.
+- A bare `node:http` server with a raw TCP client that sends a request and
+  drops the socket after 300 ms without a response: under Bun 1.2.20, 1.3.11
+  and 1.3.14 no `req`, `res` or socket `close` fires within 2 s; under Node
+  22.13.0 all three fire at about 310 ms. This checks the premise at the
+  `node:http` level only, not through the proxy.
+
+**Source evidence (not re-run against this build):** the contributor probed
+the missed disconnect through the proxy on 2026-10-06 on macOS with Bun 1.3.14
+and Claude CLI 2.1.284–2.1.294, through a client-cancel gate that is not part
+of this change: under Bun no routing mode stopped the SDK child when the client
+went before the first byte, while the built proxy under Node with manual
+routing closed the SDK child's API request about 1.5 s after the client went.
+
+**Not covered:** the underlying cancellation under Bun is not fixed; the
+warning only reports it. Live evidence owed: a run through the proxy with a
+real client cancel on the current Bun (and any Bun 1.4.x in use, where the
+claim is unchecked), on Linux and on Windows. No model calls were made here.
+
 ## Antigravity subscription CLI backend
 
 ```sh
@@ -1092,6 +1144,39 @@ bun scripts/e2e-capped-turns.mjs --case=client-refusal --stream --undeclared=bas
 On unchanged `431ec201` all three end in an SSE `Reached maximum number of
 turns` error. A built-in name such as `Bash` still does: Claude Code 2.1.296
 appends an explanation to that refusal, which is not recognized as a rejection.
+
+The unparseable-arguments control covers a Pi failure seen with fine-grained
+tool streaming on: an edit call ended in `Reached maximum number of turns (1)`.
+The fixture streams a registered-name call whose arguments hold a raw TAB
+inside a JSON string. The real CLI rejects it before PreToolUse with
+`InputValidationError: … could not be parsed as JSON`. Meridian must deliver
+the complete call as strict JSON with `stop_reason: tool_use`. It must evict
+the rejected SDK session and replay the client's result into a fresh one:
+
+```bash
+bun scripts/e2e-capped-turns.mjs --case=unparsed-input --stream
+bun scripts/e2e-capped-turns.mjs --case=unparsed-input --stream --headerless
+bun scripts/e2e-capped-turns.mjs --case=unparsed-input --stream --deferred
+```
+
+The actual-client control runs real Pi against the same kind of fixture. Pi
+must apply the rejected edit to a TAB-indented file and finish the follow-up
+turn. `--expect-baseline` asserts the unfixed failure: no edit, and Pi exits
+on `Reached maximum number of turns (1)`:
+
+```bash
+bun scripts/e2e-pi-unparsed-tool-input.mjs
+bun scripts/e2e-pi-unparsed-tool-input.mjs --expect-baseline   # without the fix
+```
+
+**Verified 2026-10-12:** macOS arm64, Bun 1.3.14, Agent SDK 0.2.141, Claude
+Code 2.1.296, Pi 1.1.0. With the fix, all four commands pass. Without it
+(base b68710f), the three capped-turn commands end in an SSE `api_error`
+frame (`(4)` with `--deferred`), and only `--expect-baseline` passes. The 17
+other capped-turn and client-refusal commands above still pass. In three live
+Pi runs with Claude Opus 5.5, the model did not emit a raw TAB. The fixture is
+the only reproduction.
+
 
 For the affected model and Pi adapter on Linux, also run the live
 multi-turn control (real Claude Team account, not the fixture upstream):
@@ -6591,6 +6676,64 @@ overlap (`total: 2`). The run proves the hold in-process under Bun with a real
 model; it does not drive a real supervisor or restart.
 [Evidence](docs/maintenance/evidence/1224-drain-live-20261013/README.md).
 
+## E75: Readiness follows the instance's real Claude egress
+
+**What it proves:** `/readyz` fails `upstream-claude` after real connection
+failures and recovers on a real answer (#1232, contract #1281).
+
+```bash
+bun scripts/e2e-upstream-reachability-live.mjs
+```
+
+The proxy runs in-process with shortened `MERIDIAN_UPSTREAM_UNREACHABLE_*`
+thresholds. One real request records an answer; the egress is then cut for
+real by pointing the SDK subprocess at a proxy port nothing listens on, with
+retries off. Pass criteria: requests fail; `/health` reports `upstream.claude`
+`unreachable` with the failure kind; `/readyz` fails `upstream-claude` while
+`/livez` stays up; after the hold `/readyz` admits traffic (`probing`) and one
+real answer clears the run. The isolated config has no profiles, so `/readyz`
+also fails its separate `profiles` check; the gate reads only the
+`upstream-claude` line.
+[Evidence](docs/maintenance/evidence/1232-reachability-live-20261014/candidate-report.json).
+
+## E76: Consecutive auxiliary replays reuse their cached history
+
+**What it proves:** a run of Claude Code side calls over a growing history
+reads the shared prefix from the prompt cache instead of rewriting it (#1297).
+
+```bash
+bun scripts/e2e-auxiliary-cache-live.mjs                     # build with the fix
+bun scripts/e2e-auxiliary-cache-live.mjs --expect-baseline   # build without it
+```
+
+Sends three caption-shaped requests (agent id header, streaming, the client's
+tools, the caption prompt appended to the last user message) over one subagent
+history that grows by a tool round each time, with a fresh nonce so no earlier
+run's cache is hit (`E2E_MODEL`, default `claude-sonnet-5-5`). Every caption
+must be handled as an auxiliary request. With the fix, captions 2 and 3 read at
+least 80% of what caption 1 wrote and write under half of it.
+[Evidence](docs/maintenance/evidence/1297-auxiliary-cache-20261014/README.md).
+
+## E77: Progress captions from the interactive client
+
+**What it proves:** a subagent's progress captions leave its working session
+alone with the real interactive Claude Code client (#1288, #1292).
+
+```bash
+bun scripts/e2e-claude-code-captions-interactive.mjs [--expect-baseline]
+```
+
+Print mode never sends captions, so the script drives the interactive TUI in a
+PTY (`scripts/e2e-claude-code-captions-interactive-driver.py`, Python 3 only)
+with two subagents kept busy for two minutes. A recording relay ties each proxy
+log line to its agent id. Pass: at least one caption is handled as an auxiliary
+request and the next request of each captioned subagent resumes
+(`lineage=continuation`). `--expect-baseline` requires no isolated caption and a
+`modified-history` divergence. Both builds also show early divergences in the
+interactive flow (a tool-less streamed request at startup, each subagent's first
+request repeated); those are outside this gate.
+[Evidence](docs/maintenance/evidence/1292-captions-interactive-20261014/README.md).
+
 ## Concurrent transcript publication
 
 Run `bun scripts/e2e-publication-lifetime.mjs` and again with `--stream` after lifecycle or publication changes. This gate uses real Claude Max queries and two concurrent HTTP conversations, each with a fresh and resumed turn. A timing hook pauses each request after its real SDK writer lease is released, promotes its request pin as the owning proxy would, and runs a separate collector process before publication. The collector uses zero grace periods and the supported SDK deleter, exercising the destructive race in an isolated session store and disposable project.
@@ -7585,6 +7728,26 @@ This validates macOS text and client tool use, not Windows/Linux runtime behavio
 Model ID, capability and pricing source:
 https://platform.claude.com/docs/en/models/sonnet-5-5/overview .
 
+## OpenAI pricing and Claude-answered GPT ids
+
+Start an isolated proxy (`MERIDIAN_CONFIG_DIR`, `MERIDIAN_SESSION_DIR` in a
+scratch directory, `MERIDIAN_CREDENTIALS_READONLY=1`) and point Codex CLI at
+it with a throwaway `CODEX_HOME` whose `config.toml` sets `model = "gpt-5.5"`
+and the Meridian provider from [docs/agents.md](docs/agents.md). Run
+`codex exec --skip-git-repo-check "Reply with exactly the word: pong"`, then:
+
+- The proxy log shows `adapter=codex model=sonnet`: Claude answered the GPT id.
+- `/telemetry/summary` `costEstimate.byModel["gpt-5.5"].estimatedUsd` is `null`
+  and `unpricedRequestCount` is 1; the request is not valued at GPT rates.
+- `/settings/api/pricing` lists the generated `gpt-*` built-ins.
+- After `PUT /settings/api/pricing/gpt-5.5` the same request is priced at the
+  override.
+
+Verified 2026-09-27 on Linux x64, Codex CLI 0.151.0, Agent SDK 0.2.141: all
+four checks passed (override `3/15` valued the turn at $0.052142, dominated by
+13,887 cache-write tokens). Requests actually served by an OpenAI model need
+the ChatGPT gateway, which is not part of this flow.
+
 ## Scrub plugin headless acceptance
 
 These opt-in harnesses preserve the actual client paths used for the 2026-09-24
@@ -8197,3 +8360,18 @@ tool result holding a fresh nonce: the follow-up must resume the same SDK
 session at its checkpoint and return the nonce. `--expect-digest` inverts the
 deferred count for a build without the fix. Unchanged `main` before #1370 made
 three model requests per deferred hand-off. Costs a few cents of real tokens.
+
+## Antigravity prompt byte budget (#1382)
+
+`node scripts/e2e-antigravity-prompt-limit.mjs <dist/server.js> <pi cli.js> <official agy> <report.json> <label>`
+runs actual Pi in RPC mode against a built Meridian and official `agy`
+(`gemini-3.8-flash-low`). Turn 1 reads six 40 KB files with Pi's `read` tool
+so the conversation exceeds `agy`'s ~192,000-byte single-step input cap. After
+the live `agy` process expires (`idleConversationMs: 3000`), Turn 2 asks
+without tools for the code at the end of the newest file, the code at the top of
+the oldest file, and a nonce from the question.
+
+Run once against an unbudgeted baseline (which sends ~249 KB in the replayed step
+and reports `NEWEST_TURN_LOST`) and once against the candidate (which shrinks
+the oldest tool results first to ~170 KB and reports `NEWEST_TURN_DELIVERED`
+with `newestTail: true`, `oldestHead: true`, `nonce: true`, and `toolCalls: 0`).

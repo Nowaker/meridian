@@ -149,6 +149,9 @@ export interface WriteTransaction<T> {
   /** Consulted when COMMIT reports an error: whether it landed anyway, which
    *  SQLite allows when the checkpoint that follows a commit fails. */
   landedDespiteError?: () => boolean
+  /** Recheck request/shutdown authority after all disk/lock/prepare yields,
+   * immediately before dispatching COMMIT. A refusal rolls back the draft. */
+  beforeCommit?: () => void
 }
 
 export interface WriteOutcome<T> {
@@ -313,6 +316,14 @@ export class StoreDatabase {
       throw error
     }
 
+    try {
+      transaction.beforeCommit?.()
+    } catch (error) {
+      await this.rollbackQuietly()
+      throw error
+    }
+    // No yield separates the authority check from COMMIT dispatch. Once that
+    // filesystem operation is dispatched, cancellation cannot recall it.
     try {
       await this.writer.exec("COMMIT")
     } catch (error) {

@@ -102,10 +102,13 @@ function createFingerprintCache(maxSize: number) {
 let activeMaxSessions = getMaxSessionsLimit()
 let sessionCache = createSessionCache(activeMaxSessions)
 let fingerprintCache = createFingerprintCache(activeMaxSessions)
+let sessionCacheEpoch = 0
 
 /** Clear all session caches (used in tests).
  *  Re-reads MERIDIAN_MAX_SESSIONS / CLAUDE_PROXY_MAX_SESSIONS so tests can override the limit. */
 export async function clearSessionCache(): Promise<void> {
+  // Earlier queued publications must not repopulate cleared local fallback.
+  sessionCacheEpoch++
   const configuredLimit = getMaxSessionsLimit()
   if (configuredLimit !== activeMaxSessions) {
     activeMaxSessions = configuredLimit
@@ -185,6 +188,7 @@ function stateFromSharedSession(
 /** Drop rollback authority only after the response terminal is irrevocable. */
 export async function finalizePrioritySessionPublication(
   publication: PrioritySessionPublication,
+  beforePublish?: () => void,
 ): Promise<boolean> {
   const rollback = publication.rollback
   if (!rollback) return true
@@ -197,7 +201,7 @@ export async function finalizePrioritySessionPublication(
       ? undefined
       : rollback.previousAssignment?.mappingKey,
     attemptOwnerToken: publication.attemptOwnerToken,
-  })
+  }, beforePublish)
   if (!finalized) return false
   publication.rollback = undefined
   return true
@@ -212,6 +216,7 @@ export async function rollbackPrioritySessionPublication(
 ): Promise<StoredSessionGeneration | false> {
   const rollback = publication.rollback
   if (!rollback) return false
+  const cacheEpoch = sessionCacheEpoch
   const restored = await rollbackSharedSessionAndPriorityAssignment({
     key: rollback.key,
     routeKey: publication.routeKey,
@@ -225,6 +230,7 @@ export async function rollbackPrioritySessionPublication(
 
   publication.expectedAssignmentGeneration = restored.assignmentGeneration
   publication.rollback = undefined
+  if (cacheEpoch !== sessionCacheEpoch) return restored.mappingGeneration
   if (sessionId) {
     if (restored.restoredMapping) sessionCache.set(sessionId, stateFromSharedSession(restored.restoredMapping))
     else sessionCache.delete(sessionId)
@@ -452,8 +458,17 @@ export async function storeSession(
   expectedGeneration?: StoredSessionGeneration | null,
   priorityPublication?: PrioritySessionPublication,
   sdkPrefixMatchesClient = true,
+  beforePublish?: () => void,
 ): Promise<StoredSessionGeneration | false> {
   if (!claudeSessionId) return false
+  const cacheEpoch = sessionCacheEpoch
+  // Durable mutations own their inputs. The local read-error fallback must
+  // publish the same snapshot rather than retain caller-owned references.
+  sdkMessageUuids = sdkMessageUuids?.slice()
+  contextUsage = contextUsage === undefined ? undefined : structuredClone(contextUsage)
+  passthroughToolCallIds = passthroughToolCallIds?.slice() ?? passthroughToolCallIds
+  currentTranscript = currentTranscript === undefined ? undefined : { ...currentTranscript }
+  sourceTranscript = sourceTranscript === undefined ? undefined : { ...sourceTranscript }
   const rawLineageHash = computeLineageHash(messages)
   const lineageHash = sdkPrefixMatchesClient ? rawLineageHash : ""
   const clientLineageHash = sdkPrefixMatchesClient ? undefined : rawLineageHash
@@ -513,7 +528,7 @@ export async function storeSession(
         lastHumanTurnIssuedAt: priorityPublication.lastHumanTurnIssuedAt,
         expectedAssignmentGeneration: priorityPublication.expectedAssignmentGeneration,
       },
-    })
+    }, beforePublish)
     if (!published) return false
     priorityPublication.rollback = {
       key,
@@ -541,11 +556,13 @@ export async function storeSession(
       sourceTranscript,
       expectedGeneration,
       clientLineageHash ?? null,
+      beforePublish,
     )
   }
   if (!storedGeneration) return false
 
-  // Publish to memory only after the durable CAS succeeds.
+  // Publish to memory only after durable CAS, unless cleanup superseded it.
+  if (cacheEpoch !== sessionCacheEpoch) return storedGeneration
   if (sessionId) sessionCache.set(sessionId, state)
   if (fp && !sessionId) fingerprintCache.set(fp, state)
   return storedGeneration
