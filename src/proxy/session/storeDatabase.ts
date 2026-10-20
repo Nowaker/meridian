@@ -34,11 +34,12 @@
 
 import { createHash } from "node:crypto"
 import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, statSync } from "node:fs"
-import { readFile, rename } from "node:fs/promises"
-import { dirname, join } from "node:path"
+import { lstat, readFile, rename } from "node:fs/promises"
+import { basename, dirname, join } from "node:path"
 import SyncDatabase from "libsql"
 import AsyncDatabase from "libsql/promise"
 import { syncDirectoryDurably } from "./durableFileSystem"
+import { withLegacySessionStoreLock } from "./legacySessionStoreLock"
 
 export const STORE_DATABASE_NAME = "sessions.db"
 const STORE_DATABASE_FORMAT = 1
@@ -463,6 +464,22 @@ export function fileDigest(data: Buffer): string {
  * the contents that were imported.
  */
 export async function retireImportedFile(path: string, digest: string): Promise<string | undefined> {
+  // The database writer lock does not fence an older process publishing JSON.
+  // Keep its exact legacy lock from the digest read through the real rename.
+  // Lifecycle journal callers already hold their separate sidecar lock.
+  if (basename(path) === "sessions.json") {
+    // A queued retirement may outlive its directory. Preserve the original
+    // missing-file contract without creating a lock staging file there.
+    try { await lstat(path) } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
+      throw error
+    }
+    return withLegacySessionStoreLock(path, () => retireImportedFileUnderWriterLock(path, digest))
+  }
+  return retireImportedFileUnderWriterLock(path, digest)
+}
+
+async function retireImportedFileUnderWriterLock(path: string, digest: string): Promise<string | undefined> {
   let current: Buffer
   try {
     current = await readFile(path)

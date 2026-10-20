@@ -230,6 +230,7 @@ src/
 │   │   ├── turnCoordinator.ts ← Process-wide serialization for reliable session IDs
 │   │   ├── crossProcessTurnCoordinator.ts ← Durable coordination across proxy processes
 │   │   ├── processIncarnation.ts ← Process/host identity for lock ownership
+│   │   ├── legacySessionStoreLock.ts ← Existing JSON writer fence during SQLite import retirement
 │   │   ├── storeDatabase.ts   ← SQLite database behind the session store and lifecycle journal (WAL, off-loop commits)
 │   │   └── durableFileSystem.ts ← Durable file operations
 │   ├── sessionStore.ts        ← Shared session store (cross-proxy session resume)
@@ -595,6 +596,8 @@ Cleanup never receives the canceled admission signal. Publication callbacks
 remain synchronous; same-context recursive acquisition is rejected explicitly.
 
 ## Session store write cost
+
+Retiring an imported `sessions.json` holds the older JSON writer's canonical lock across digest verification and rename. Its initialized owner, incarnation and recovery-claim protocol lives in `session/legacySessionStoreLock.ts`; a SQLite transaction alone cannot fence an older JSON writer. A replaced file remains active for the next import. Lifecycle imports retain their existing sidecar lock.
 
 `sessionStore.ts` keeps the store in `sessions.db` (`session/storeDatabase.ts`), and a mutation writes only the rows it changes; the database waits for locks and the disk off the event loop, while building the change runs on it, so that CPU is lag for every request. Each process caches the store as of the last commit it read: while nothing changed a read costs one row lookup, and after another process commits only the rows it wrote are parsed again. Mutators receive a copy-on-write draft and replace entries rather than editing them. New entries own a deep copy of caller data before serialization. Cached entries are frozen; privately parsed nested arrays are frozen before a lookup or snapshot exposes them, avoiding a full nested walk for a single cold lookup. Unchanged entries keep their identity and are never serialized again.
 
