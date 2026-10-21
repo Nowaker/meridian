@@ -3812,8 +3812,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // crash before target publication could leave the still-current source
         // unpinned and eligible for deletion.
         const attachedGeneration = lifecycleMappingKey
-          ? await inDurableOrder(() => attachPinnedTranscript(managedForkSource!,
-() => {
+          ? await inDurableOrder(() => attachPinnedTranscript(
+            managedForkSource!,
+            () => {
               assertDurableWritesAllowed()
               return attachSharedTranscriptLocator(
                 lifecycleMappingKey,
@@ -3823,7 +3824,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 assertDurableWritesAllowed,
               )
             },
-admissionLifecycleOptions))
+            admissionLifecycleOptions,
+          ))
           : false
         if (!attachedGeneration) {
           throw new Error("Session mapping changed before managed fork preparation; retry the turn")
@@ -6918,7 +6920,7 @@ admissionLifecycleOptions))
                         }
                         return stored
                       })
-                      },
+                    },
                     admissionLifecycleOptions,
                   ).catch(deferStreamPublication)
                   if (mappingStored) {
@@ -7061,8 +7063,9 @@ admissionLifecycleOptions))
                     ? { ...storedRecoverySource }
                     : transcriptLocator(recoverySourceId)
                   const recoveryAttachedGeneration = recoveryForkSource.sessionId === recoverySourceId
-                    ? await inDurableOrder(() => attachPinnedTranscript(recoveryForkSource!,
-() => {
+                    ? await inDurableOrder(() => attachPinnedTranscript(
+                      recoveryForkSource!,
+                      () => {
                         assertDurableWritesAllowed()
                         return attachSharedTranscriptLocator(
                           lifecycleMappingKey,
@@ -7072,7 +7075,8 @@ admissionLifecycleOptions))
                           assertDurableWritesAllowed,
                         )
                       },
-admissionLifecycleOptions))
+            admissionLifecycleOptions,
+          ))
                     : false
                   if (!recoveryAttachedGeneration) {
                     throw new Error("Session mapping changed before silent recovery fork preparation")
@@ -7262,7 +7266,7 @@ admissionLifecycleOptions))
                         }
                         return stored
                       })
-                      },
+                    },
                     admissionLifecycleOptions,
                   )
                   if (recoveryMappingStored) {
@@ -8003,7 +8007,7 @@ admissionLifecycleOptions))
                         }
                         return stored
                       })
-                      },
+                    },
                     admissionLifecycleOptions,
                   )
                   if (mappingStored) {
