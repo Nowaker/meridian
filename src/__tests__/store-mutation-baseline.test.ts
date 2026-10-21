@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, expect, it, spyOn } from "bun:test"
 import * as fs from "node:fs"
+import * as asyncFs from "node:fs/promises"
+import type { FileHandle } from "node:fs/promises"
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -17,7 +19,7 @@ beforeEach(() => {
 })
 afterEach(() => { setSessionStoreDir(null); rmSync(directory, { recursive: true, force: true }) })
 
-function trace(operation: () => void): string[] {
+async function trace(operation: () => void | Promise<void>): Promise<string[]> {
   const events: string[] = []
   const paths = new Map<number, string>()
   const kind = (path: string) => path === directory ? "directory"
@@ -25,6 +27,14 @@ function trace(operation: () => void): string[] {
     : path.endsWith("sessions.json.lock") ? "lock"
     : path.includes("sessions.json.tmp-") ? "data-temp" : "data"
   const open = fs.openSync, sync = fs.fsyncSync, link = fs.linkSync, rename = fs.renameSync, unlink = fs.unlinkSync
+  const openAsync = asyncFs.open, linkAsync = asyncFs.link, renameAsync = asyncFs.rename, unlinkAsync = asyncFs.unlink
+  const probePath = join(directory, "trace-handle-prototype")
+  const probe = await openAsync(probePath, "w", 0o600)
+  const prototype = Object.getPrototypeOf(probe) as Pick<FileHandle, "sync">
+  const syncAsync = prototype.sync
+  if (typeof syncAsync !== "function") throw new Error("FileHandle.sync unavailable")
+  await probe.close()
+  await unlinkAsync(probePath)
   const spies = [
     spyOn(fs, "openSync").mockImplementation((...args: Parameters<typeof fs.openSync>) => {
       const fd = open(...args); paths.set(fd, String(args[0])); return fd
@@ -37,19 +47,40 @@ function trace(operation: () => void): string[] {
       events.push(`rename:${kind(String(from))}->${kind(String(to))}`); rename(from, to)
     }),
     spyOn(fs, "unlinkSync").mockImplementation(path => { events.push(`unlink:${kind(String(path))}`); unlink(path) }),
+    spyOn(asyncFs, "open").mockImplementation(async (...args: Parameters<typeof asyncFs.open>) => {
+      const handle = await openAsync(...args)
+      paths.set(handle.fd, String(args[0]))
+      return handle
+    }),
+    spyOn(prototype, "sync").mockImplementation(async function (this: FileHandle) {
+      events.push(`sync:${kind(paths.get(this.fd)!)}`)
+      await syncAsync.call(this)
+    }),
+    spyOn(asyncFs, "link").mockImplementation(async (from, to) => {
+      events.push(`link:${kind(String(from))}->${kind(String(to))}`)
+      await linkAsync(from, to)
+    }),
+    spyOn(asyncFs, "rename").mockImplementation(async (from, to) => {
+      events.push(`rename:${kind(String(from))}->${kind(String(to))}`)
+      await renameAsync(from, to)
+    }),
+    spyOn(asyncFs, "unlink").mockImplementation(async path => {
+      events.push(`unlink:${kind(String(path))}`)
+      await unlinkAsync(path)
+    }),
   ]
-  try { operation() } finally { spies.reverse().forEach(spy => spy.mockRestore()) }
+  try { await operation() } finally { spies.reverse().forEach(spy => spy.mockRestore()) }
   return events
 }
 
 it("matches actual legacy mutation durability/order, rather than the one-sync comparison", async () => {
-  const before = trace(() => {
+  const before = await trace(() => {
     const parsed = JSON.parse(readFileSync(join(directory, "sessions.json"), "utf8"))
     const fd = fs.openSync(join(directory, "old-comparison"), "w", 0o600)
     fs.writeFileSync(fd, JSON.stringify(parsed)); fs.fsyncSync(fd); fs.closeSync(fd)
   })
   expect(before.filter(event => event.startsWith("sync:"))).toHaveLength(1)
-  const baseline = trace(() => rewriteFullStore(directory))
+  const baseline = await trace(() => rewriteFullStore(directory))
   expect(baseline).toEqual([
     "sync:lock-temp", "link:lock-temp->lock", "unlink:lock-temp", "sync:data-temp",
     "rename:data-temp->data", "sync:directory", "unlink:lock",
@@ -57,7 +88,7 @@ it("matches actual legacy mutation durability/order, rather than the one-sync co
   expect(readFileSync(join(directory, "sessions.json"), "utf8")).toBe(original)
   expect(fs.statSync(join(directory, "sessions.json")).mode & 0o777).toBe(0o600)
   await storeSharedSession("warm", "seed", 0)
-  const warm = trace(async () => { await storeSharedSession("warm", "replacement", 0) })
+  const warm = await trace(async () => { await storeSharedSession("warm", "replacement", 0) })
   expect(warm).toEqual(baseline)
   expect(baseline.filter(event => event.startsWith("sync:"))).toHaveLength(3)
 })
