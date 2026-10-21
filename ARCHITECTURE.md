@@ -472,20 +472,30 @@ retains the guard and requires process restart before maintenance. Offline WAL
 TRUNCATE requires an exclusive maintenance connection and one local handle.
 A sole runtime handle still holds shared ownership and may only use PASSIVE.
 
-Standalone cache/store operations remain synchronous except the owner-approved
-`clearSessionCache(): Promise<void>`. Clear resets both LRUs immediately and
-fences older cache commit hooks. SQL cleanup joins bounded FIFO admission; a
-second reset runs at its durable COMMIT before later publications, rather than
-in an await continuation that could erase them. Internal synchronous scopes
-join the existing transaction. Cleanup keeps its best-effort error policy;
-callers await it before relying on completed durable work. JSON cleanup still
-runs synchronously before returning its completion promise. Server
-mutation roots enter asynchronous admission around the complete operation;
-nested store writes join the same transaction. Lifecycle publication promotes
-the resource and publishes its mapping/pins/priority state in one COMMIT. Its
-callback is synchronous and performs no SDK, filesystem or process probes.
-Cache and priority-memory changes are commit hooks; server publication flags
-are set only after the awaited durable publication returns. Unknown COMMIT
+JSON durable mutations return promises and serialize per store path in call order.
+They await lock publication/retries, writes, fsync, close, rename and directory
+flush; reads and parsing remain synchronous. Cache snapshots own caller data
+before the first yield, and cancellation is rechecked immediately before rename.
+Request-local publication ordering keeps cancellation behind an earlier admitted
+write. Offline migration retains its separate synchronous, bounded legacy lock.
+
+SQLite cache/store operations remain synchronous inside their admitted scope.
+`storeMutationResult.ts` runs a continuation immediately for a native result or
+after the JSON mutation promise settles; it never adds an await inside a SQL
+transaction. Server mutation roots enter asynchronous admission around the whole
+operation, and nested SQL writes join the same transaction. Lifecycle publication
+promotes the resource and publishes its mapping/pins/priority state in one COMMIT;
+its SQL callback performs no SDK, filesystem or process probes. JSON lifecycle
+publication may await the durable mapping mutation while retaining its sidecar lock.
+
+The owner-approved `clearSessionCache(): Promise<void>` resets both LRUs
+immediately and fences older cache commit hooks. SQL cleanup joins bounded FIFO
+admission; a second reset runs at its durable COMMIT before later publications.
+Internal synchronous scopes join the existing SQL transaction. JSON cleanup joins
+its ordered writer queue. Both paths keep the best-effort error policy, and
+callers await completion before relying on durable cleanup. Cache hooks are fenced
+by the epoch captured at invocation; priority publication metadata still follows
+its store commit even when cleanup superseded the cache hook. Unknown SQL COMMIT
 outcomes retain the turn fence and never authorize abandonment of that fork.
 
 Native SQLite `busy_timeout=0` prevents synchronous lock waits. A bounded local

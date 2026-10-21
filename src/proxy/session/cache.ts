@@ -289,6 +289,7 @@ export function rollbackPrioritySessionPublication(
   const epoch = cacheEpoch
   const rollback = publication.rollback
   if (!rollback) return false
+  const fingerprint = !sessionId ? getConversationFingerprint(messages, workingDirectory) : null
   return mapStoreMutation(rollbackSharedSessionAndPriorityAssignment({
     key: rollback.key,
     routeKey: publication.routeKey,
@@ -298,7 +299,6 @@ export function rollbackPrioritySessionPublication(
     previousAssignment: rollback.previousAssignment,
     attemptOwnerToken: publication.attemptOwnerToken,
   }), restored => {
-  const fingerprint = !sessionId ? getConversationFingerprint(messages, workingDirectory) : null
     if (!restored) return false
 
     afterSessionStoreCommit(() => {

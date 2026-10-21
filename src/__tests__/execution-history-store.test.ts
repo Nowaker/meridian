@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
+import { hostname, tmpdir } from "node:os"
+import { randomUUID } from "node:crypto"
+import { captureProcessIncarnation } from "../proxy/session/processIncarnation"
+import { getConversationFingerprint } from "../proxy/session/fingerprint"
 import { join } from "node:path"
 import { lookupSession, rollbackPrioritySessionPublication, storeSession, type PrioritySessionPublication } from "../proxy/session/cache"
 import { computeLineageHash } from "../proxy/session/lineage"
@@ -121,5 +124,49 @@ describe("durable raw proof and execution reuse proof", () => {
     const errors = spyOn(console, "error").mockImplementation(() => {})
     try { expect(lookupSharedSessionResult("malformed-system").status).toBe("error") }
     finally { errors.mockRestore() }
+  })
+
+  it("captures the headerless rollback key before an ordered JSON write yields", async () => {
+    const history = [{ role: "user", content: "headerless rollback original objective" }]
+    const originalHistory = structuredClone(history)
+    const cwd = "/fixture/headerless-rollback"
+    const key = getConversationFingerprint(history, cwd)
+    await storeSession(undefined, history, "sdk-before", cwd)
+    const before = lookupSharedSessionResult(key)
+    if (before.status !== "found") throw new Error("fixture mapping missing")
+    const publication = await priorityPublication("headerless-rollback")
+    expect(await storeSession(undefined, history, "sdk-published", cwd, undefined, undefined,
+      undefined, undefined, undefined, undefined, before.generation, publication)).not.toBe(false)
+
+    const incarnation = captureProcessIncarnation()
+    if (!incarnation) throw new Error("fixture lock owner unavailable")
+    const path = join(directory, "sessions.json")
+    const lockPath = path + ".lock"
+    const token = JSON.stringify({ pid: process.pid, hostname: hostname(), token: randomUUID(), incarnation })
+    writeFileSync(lockPath, token, { flag: "wx", mode: 0o600 })
+    const pending = rollbackPrioritySessionPublication(undefined, history, cwd, publication)
+    try {
+      expect(pending).toBeInstanceOf(Promise)
+      history[0]!.content = "caller changed its input while rollback waited"
+      expect(lookupSharedSession(key)?.claudeSessionId).toBe("sdk-published")
+    } finally {
+      if (readFileSync(lockPath, "utf8") === token) unlinkSync(lockPath)
+      await pending
+    }
+    expect(lookupSharedSession(key)?.claudeSessionId).toBe("sdk-before")
+    // Force the genuine store-error fallback so disk reads cannot hide a stale LRU.
+    const stored = readFileSync(path, "utf8")
+    writeFileSync(path, "controlled read failure")
+    const errors = spyOn(console, "error").mockImplementation(() => {})
+    try {
+      const result = lookupSession(undefined, [...originalHistory,
+        { role: "assistant", content: "answer" }, { role: "user", content: "next" }], cwd)
+      expect(result.type).toBe("continuation")
+      if (result.type !== "continuation") throw new Error("Expected restored fallback")
+      expect(result.session.claudeSessionId).toBe("sdk-before")
+    } finally {
+      errors.mockRestore()
+      writeFileSync(path, stored)
+    }
   })
 })
