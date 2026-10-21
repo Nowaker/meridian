@@ -9643,15 +9643,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // still reasoning has no response to judge by yet.
       const inflightEntry = inflight.begin("chatgpt")
       inflightEntry.setStream(requested.stream)
-      // Registered in the session tree like a Claude turn, so
-      // /v1/sessions/:key/cancel stops a ChatGPT turn of that session too.
-      const session = await chatGptSessionKey(c)
-      const treeEntry = session ? processSessionTree.register({
-        requestId: `chatgpt-${randomUUID()}`,
-        sessionKey: session.key,
-        parentKey: session.parent,
-        abort: (reason) => controller.abort(reason),
-      }) : undefined
+      let treeEntry: SessionTreeRegistration | undefined
       const complete = () => {
         c.req.raw.signal.removeEventListener("abort", abort)
         upstreamSignals.delete(c)
@@ -9660,7 +9652,18 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         inflightEntry.end()
         uncount()
       }
+      // Everything after the registration above runs under this try, so a
+      // failure before the backend answers still releases what it registered.
       try {
+        // Registered in the session tree like a Claude turn, so
+        // /v1/sessions/:key/cancel stops a ChatGPT turn of that session too.
+        const session = await chatGptSessionKey(c)
+        treeEntry = session ? processSessionTree.register({
+          requestId: `chatgpt-${randomUUID()}`,
+          sessionKey: session.key,
+          parentKey: session.parent,
+          abort: (reason) => controller.abort(reason),
+        }) : undefined
         const response = await backend.handle({ context: c, endpoint, route })
         return completeUpstreamResponse(response, controller.signal, complete)
       } catch (error) {
@@ -11566,8 +11569,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     const isLetta = lettaConversationId !== undefined
     const adapterName = isJcode ? "jcode" : isLetta ? "letta" : "openai"
     // A generic client that carries a session key the adapter recognizes
-    // (x-opencode-session / x-session-affinity) keeps its real messages and
-    // resumes, like Jcode — packing re-sends the whole conversation as fresh
+    // (x-opencode-session / x-session-affinity / x-session-id) keeps its real
+    // messages and resumes, like Jcode — packing re-sends the whole conversation as fresh
     // system text every turn, so the prompt cache never sees a continuation.
     // The key is forwarded on the internal hop below so the inner handler
     // resolves the same session. The forwarded headers are gated on a resolved
@@ -11652,7 +11655,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       internalHeaders[LETTA_CONVERSATION_HEADER] = lettaConversationId
     } else if (openAiSessionId !== undefined) {
       // A keyed generic request: forward exactly the headers the inner hop
-      // needs to resolve the same session (openCodeAdapter.getSessionId reads
+      // needs to resolve the same session (openAiAdapter.getSessionId reads
       // the session and agent headers) and the caller's user-agent, which the
       // pluginless-OpenCode degradation reads (#1024). On the inner path the
       // agent headers do more than scope the key — they select the subagent
@@ -11662,6 +11665,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       for (const name of [
         "x-opencode-session",
         "x-session-affinity",
+        "x-session-id",
         "x-opencode-agent-mode",
         "x-opencode-agent-name",
         "user-agent",

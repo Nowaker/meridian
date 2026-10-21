@@ -12,6 +12,7 @@ External plugins depend on these interfaces. **Changes require project owner app
 | `clearSessionCache(): Promise<void>` | `session/cache.ts`, exported by `server.ts` | Owner-approved #1244/#1277 cleanup: reset memory immediately; await ordered durable cleanup, retaining its best-effort error policy |
 | `ProxyConfig` type | `types.ts` | Plugin configuration |
 | `x-opencode-session` header | `adapters/opencode.ts` | Session tracking from agent plugins |
+| Generic OpenAI `x-session-id` on `/v1/chat/completions` | `adapters/openai.ts`, `server.ts` | Owner-approved #1441: distinct conversation identity after the existing OpenCode/session-affinity keys and agent scoping; blank values keep the headerless path |
 | `x-meridian-profile` header | `server.ts`, `profiles.ts` | Per-request profile selection |
 | `GET /health` response shape | `server.ts` | Plugin health checks |
 | `/health` `backend` field | `server.ts` / `backends/antigravity.ts` | Desktop provider compatibility check (#1073) |
@@ -34,6 +35,14 @@ External plugins depend on these interfaces. **Changes require project owner app
 If you need to modify any of these, open an issue first — breaking changes affect downstream plugin authors.
 
 Usage reserves were requested explicitly by the owner on 2026-10-14. A supervisor writes `usageReserves` as one whole map from profile id (Claude or ChatGPT) to `{ five_hour?, seven_day? }`, each `{ floor, ceiling }` in percent with `0 < floor <= ceiling <= 100`; a write with any entry that cannot be drawn, or naming an unknown profile, is refused whole with 400 and nothing from it is saved. At elapsed fraction t of a window the allowance is `clamp(100t, floor, ceiling)`, and a profile at or above its allowance in either window is held back from new work. Work that only defaulted to a held profile goes to the first unheld profile in priority order and the active pointer stays where it was; work that named a held profile, and work every eligible profile of which is held, is answered 429 `rate_limit_error` without being sent, with `Retry-After` at the soonest opening, clamped to 24 hours. Warm hops are exempt, as they are from routing exclusions. A ChatGPT seat held while its plan has quota is not served on credits either; a seat whose plan is spent keeps its credits policy. `POST /profiles/active` naming a held profile answers 409 `{ error, code: "usage_reserve" }` and leaves the pointer. Entries of `GET /v1/usage/quota/all` for a reserved profile carry `reserve: { held, reason, opensAt, windows }`, judged on the readings dispatch judges.
+
+The owner approved the generic OpenAI conversation-header contract in #1441
+on 2026-10-21. `x-opencode-session` and `x-session-affinity` retain precedence
+over `x-session-id`, including their existing agent scoping. A nonblank
+`x-session-id` must be distinct per conversation and follows the same serialized,
+append-only history, fork and retry behavior as the other explicit keys.
+Other adapters retain their identity rules; request-body and CORS policy are
+unchanged. Actual affected-flow evidence and final-head checks remain required.
 
 The owner approved executable selection in #1319 on 2026-10-08. System remains
 the default; `MERIDIAN_CLAUDE_PATH` has highest priority. The authenticated
