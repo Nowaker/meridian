@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setupStoreBackend, teardownStoreBackend } from "./fixtures/bookkeeping-store-backend"
 import { clearSessionCache, evictSession, getSessionByClaudeId, lookupSession, storeSession } from "../proxy/session/cache"
 import { getConversationFingerprint } from "../proxy/session/fingerprint"
 import { evictSharedSession, lookupSharedSession, lookupSharedSessionResult, setSessionStoreDir, storeSharedSession } from "../proxy/sessionStore"
@@ -12,11 +13,13 @@ describe("cross-process session cache coherence", () => {
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), "meridian-cache-coherence-"))
     setSessionStoreDir(dir, { skipLocking: false })
+    setupStoreBackend(dir)
     await clearSessionCache()
   })
 
   afterEach(async () => {
     await clearSessionCache()
+    teardownStoreBackend()
     setSessionStoreDir(null)
     rmSync(dir, { recursive: true, force: true })
   })
@@ -27,8 +30,8 @@ describe("cross-process session cache coherence", () => {
     const sessionId = keyed ? "owned-cache-session" : undefined
     const uuids = ["original-uuid"]
     const locator = { sessionId: "owned-sdk", configDir: "/tmp/owned-config" }
-    const pending = storeSession(sessionId, messages, "owned-sdk", cwd, uuids,
-      undefined, undefined, undefined, locator)
+    const pending = (await storeSession(sessionId, messages, "owned-sdk", cwd, uuids,
+      undefined, undefined, undefined, locator))
     uuids[0] = "changed-uuid"
     locator.configDir = "invalid-relative-path"
     await pending
@@ -49,7 +52,7 @@ describe("cross-process session cache coherence", () => {
     const cwd = "/tmp/cleanup-ordering"
     const sessionId = keyed ? "client-session" : undefined
     const key = sessionId ?? getConversationFingerprint(messages, cwd)
-    const pending = storeSession(sessionId, messages, "before-cleanup", cwd)
+    const pending = (await storeSession(sessionId, messages, "before-cleanup", cwd))
     const cleanup = clearSessionCache()
     await Promise.all([pending, cleanup])
     expect(lookupSharedSession(key)).toBeUndefined()
@@ -65,9 +68,9 @@ describe("cross-process session cache coherence", () => {
     const cwd = "/tmp/cleanup-ordering"
     const sessionId = keyed ? "client-session" : undefined
     const key = sessionId ?? getConversationFingerprint(messages, cwd)
-    const old = storeSession(sessionId, messages, "before-cleanup", cwd)
+    const old = (await storeSession(sessionId, messages, "before-cleanup", cwd))
     const cleanup = clearSessionCache()
-    const later = storeSession(sessionId, messages, "after-cleanup", cwd)
+    const later = (await storeSession(sessionId, messages, "after-cleanup", cwd))
     await Promise.all([old, cleanup, later])
     expect(lookupSharedSession(key)?.claudeSessionId).toBe("after-cleanup")
     writeFileSync(join(dir, "sessions.json"), "corrupt fixture")

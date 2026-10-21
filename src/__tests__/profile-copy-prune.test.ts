@@ -77,7 +77,7 @@ function storedKeys(): string[] {
   return Object.keys(readSessionStoreSnapshot()).sort()
 }
 
-function prune(overrides: Partial<Parameters<typeof pruneSupersededProfileCopies>[0]> = {}): Promise<number> {
+async function prune(overrides: Partial<Parameters<typeof pruneSupersededProfileCopies>[0]> = {}): Promise<number> {
   return pruneSupersededProfileCopies({
     profileIds: PROFILES,
     graceMs: GRACE,

@@ -286,7 +286,7 @@ describe("Integration: passthrough early stop", () => {
   })
 
   afterEach(async () => {
-    for (const key of usedSessionKeys) await evictSharedSession(key)
+    for (const key of usedSessionKeys) evictSharedSession(key)
     usedSessionKeys.clear()
     await clearSessionCache()
     if (savedPassthrough !== undefined) process.env.MERIDIAN_PASSTHROUGH = savedPassthrough

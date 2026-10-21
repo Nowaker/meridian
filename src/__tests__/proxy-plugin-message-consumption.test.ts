@@ -45,7 +45,7 @@ beforeEach(async () => {
   calls = []
   failures = []
   await clearSessionCache()
-  await clearSharedSessions()
+  clearSharedSessions()
   overrides = [
     spyOn(models, "getClaudeAuthStatusAsync").mockResolvedValue({ loggedIn: true, subscriptionType: "max" }),
     spyOn(models, "resolveClaudeExecutableAsync").mockResolvedValue("fixture-claude-not-executed"),
