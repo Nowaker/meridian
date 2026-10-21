@@ -118,8 +118,13 @@ export function buildCodexRequest(
   // be given a fresh one, which would land it on a cold cache every turn.
   const cacheKey = body?.prompt_cache_key
   if (typeof cacheKey === "string" && cacheKey.length > 0) {
-    headers.set("conversation_id", cacheKey)
-    headers.set("session_id", cacheKey)
+    try {
+      headers.set("conversation_id", cacheKey)
+      headers.set("session_id", cacheKey)
+    } catch {
+      headers.delete("conversation_id")
+      headers.delete("session_id")
+    }
   }
 
   if (options?.sendOrganizationHeader && options.organizationId) {

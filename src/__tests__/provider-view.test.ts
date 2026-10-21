@@ -21,6 +21,16 @@ describe('provider presentation and contract', () => {
     expect(html).not.toContain('data-provider-card="claude"')
     expect(html).not.toContain('Manage Claude accounts')
   })
+  it('offers a ChatGPT tab only where ChatGPT is served', () => {
+    const tabs = (html: string) => [...html.matchAll(/data-provider="([a-z]+)"/g)].map(match => match[1])
+    expect(tabs(providerOverview(sample))).toEqual(['all', 'claude', 'antigravity'])
+    const claudeOnly = providerOverview(sample, 'chatgpt')
+    expect(claudeOnly).toContain('data-provider="all" aria-pressed="true"')
+    expect(claudeOnly).toContain('data-provider-card="claude"')
+    const served = { ...sample, providers: [...sample.providers, { ...disabledProvider('chatgpt'), enabled: true, status: 'healthy', accounts: [] }] }
+    expect(tabs(providerOverview(served))).toEqual(['all', 'claude', 'antigravity', 'chatgpt'])
+    expect(providerOverview(served, 'chatgpt')).not.toContain('data-provider-card="claude"')
+  })
   it('rejects malformed desktop provider data rather than rendering invented numbers', () => {
     expect(parseProviderSnapshot(sample)).toEqual(sample)
     expect(() => parseProviderSnapshot({ ...sample, providers: [{ id: 'antigravity' }] })).toThrow()

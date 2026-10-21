@@ -47,11 +47,14 @@ export function providerOverview(data: ProviderSnapshot, filter: ProviderFilter 
   const label = { claude: 'Claude', antigravity: 'Antigravity', chatgpt: 'ChatGPT' } as const
   const eyebrow = { claude: 'Anthropic subscription', antigravity: 'Google subscription', chatgpt: 'OpenAI subscription' } as const
   const num = (value: number) => value.toLocaleString()
+  // ChatGPT gets a tab only where the instance serves it.
+  const tabs = PROVIDER_IDS.filter(id => id !== 'chatgpt' || data.providers.some(p => p.id === id))
+  if (filter !== 'all' && !tabs.includes(filter)) filter = 'all'
   const providers = data.providers.filter(p => filter === 'all' || p.id === filter)
   const active = providers.filter(p => p.enabled)
   const measured = active.filter(p => p.activity)
   const total = measured.reduce((sum, p) => ({ requests: sum.requests + p.activity!.requests, tokens: sum.tokens + p.activity!.inputTokens + p.activity!.outputTokens, errors: sum.errors + p.activity!.errors }), { requests: 0, tokens: 0, errors: 0 })
-  return `<div class="provider-tabs" role="group" aria-label="Provider filter">${(['all', ...PROVIDER_IDS] as const).map(id => `<button data-provider="${id}" aria-pressed="${filter === id}">${id === 'all' ? 'All providers' : label[id]}</button>`).join('')}</div>
+  return `<div class="provider-tabs" role="group" aria-label="Provider filter">${(['all', ...tabs] as const).map(id => `<button data-provider="${id}" aria-pressed="${filter === id}">${id === 'all' ? 'All providers' : label[id]}</button>`).join('')}</div>
     <div class="provider-totals" aria-label="Observed activity"><div><span>Requests</span><strong>${measured.length ? num(total.requests) : '—'}</strong></div><div><span>Input + output tokens</span><strong>${measured.length ? num(total.tokens) : '—'}</strong></div><div><span>Errors</span><strong>${measured.length ? num(total.errors) : '—'}</strong></div></div>
     <p class="provider-caption">Observed activity over the past hour. Subscription allowances stay separate.${measured.length < active.length ? ' Some activity is unavailable; totals are partial.' : ''}</p>
     <div class="provider-grid">${providers.map(p => `<article class="provider-card" data-provider-card="${p.id}"><header><div><span class="provider-eyebrow">${eyebrow[p.id]}</span><h2>${esc(p.name)}</h2></div><span class="provider-state ${p.status === 'healthy' ? 'good' : ''}">${esc(p.enabled ? p.status : 'Not enabled')}</span></header>

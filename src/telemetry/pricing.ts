@@ -207,6 +207,41 @@ export function resolveModelPricing(
   return null
 }
 
+function isOpenAiModel(model: string): boolean {
+  return normalizeModelKey(model).startsWith("gpt-")
+}
+
+/**
+ * Pricing for one recorded request. Claude requests are priced by the
+ * client's id, which names an exact version where `model` is only the SDK
+ * tier alias. OpenAI rates follow the model that did the work instead: a
+ * request an OpenAI model served is priced as that model, and a GPT id that
+ * Claude answered (the OpenAI-compatible endpoints accept them and record the
+ * Claude tier as `model`) gets no built-in OpenAI rate, only a user override
+ * or its recorded SDK pin.
+ */
+function resolveRequestPricing(
+  metric: RequestMetric,
+  overrides?: Record<string, ModelPricing>,
+): ModelPricing | null {
+  if (isOpenAiModel(metric.model)) return resolveModelPricing(metric.model, overrides)
+  const requestKey = metric.requestModel || metric.model
+  const normalizedKey = normalizeModelKey(requestKey)
+  // An explicit request-key override remains authoritative, even when a
+  // recorded effective pin would select another model's rates.
+  if (overrides?.[normalizedKey]) return resolveModelPricing(requestKey, overrides)
+  const openAiOverride = isOpenAiModel(requestKey) ? overrides?.[normalizedKey.replace(OPENAI_SELECTOR_SUFFIX, "")] : undefined
+  if (openAiOverride) return openAiOverride
+  if (metric.resolvedModel) {
+    const resolvedPricing = resolveModelPricing(metric.resolvedModel, overrides)
+    if (resolvedPricing !== null) return resolvedPricing
+  }
+  if (isOpenAiModel(requestKey)) return null
+  // Legacy records lack pin evidence. Preserve current alias valuation rather
+  // than guessing a historical served model; unknown pins use this fallback too.
+  return resolveModelPricing(requestKey, overrides)
+}
+
 /** The rates a request with this many prompt tokens bills at; see ContextTierPricing. */
 export function ratesForPrompt(pricing: ModelPricing, promptTokens: number): FlatModelPricing {
   let chosen: FlatModelPricing = pricing
@@ -233,8 +268,8 @@ function pricingForRequest(metric: RequestTokens, pricing: ModelPricing): ModelP
 
 /**
  * Estimated USD for a single request's token usage. Resolved built-in Haiku
- * 5.5 rates include its prompt tier, and a model's long-context tiers apply
- * past their threshold; overrides and other rates remain flat.
+ * 5.5 rates include its prompt tier, and OpenAI rates their long-context
+ * tier (contextTiers); overrides and other rates remain flat.
  */
 export function estimateRequestCostUsd(metric: RequestTokens, pricing: ModelPricing): number {
   pricing = pricingForRequest(metric, pricing)
@@ -255,48 +290,15 @@ function roundUsd(value: number): number {
   return Math.round(value * 1e6) / 1e6
 }
 
-function isOpenAiModel(model: string): boolean {
-  return normalizeModelKey(model).startsWith("gpt-")
-}
-
-/**
- * Pricing for one recorded request. Claude requests are priced by the
- * client's id, which names an exact version where `model` is only the SDK
- * tier alias. OpenAI rates follow the model that did the work instead: a
- * request an OpenAI model served is priced as that model, and a GPT id that
- * Claude answered (the OpenAI-compatible endpoints accept them and record the
- * Claude tier as `model`) gets no built-in OpenAI rate, only a user override.
- */
-function resolveRequestPricing(
-  metric: RequestMetric,
-  overrides?: Record<string, ModelPricing>,
-): ModelPricing | null {
-  if (isOpenAiModel(metric.model)) return resolveModelPricing(metric.model, overrides)
-  const requestKey = metric.requestModel || metric.model
-  if (isOpenAiModel(requestKey)) {
-    const key = normalizeModelKey(requestKey)
-    return overrides?.[key] ?? overrides?.[key.replace(OPENAI_SELECTOR_SUFFIX, "")] ?? null
-  }
-  // An explicit request-key override remains authoritative, even when a
-  // recorded effective pin would select another model's rates.
-  if (overrides?.[normalizeModelKey(requestKey)]) return resolveModelPricing(requestKey, overrides)
-  if (metric.resolvedModel) {
-    const resolvedPricing = resolveModelPricing(metric.resolvedModel, overrides)
-    if (resolvedPricing !== null) return resolvedPricing
-  }
-  // Legacy records lack pin evidence. Preserve current alias valuation rather
-  // than guessing a historical served model; unknown pins use this fallback too.
-  return resolveModelPricing(requestKey, overrides)
-}
-
 /**
  * Aggregate estimated cost per model across a set of metrics.
- * Grouping key is requestModel || model, matching computeSummary's byModel;
- * resolveRequestPricing decides the rate each request is valued at. A Claude
- * request uses a request-key override first, then a known recorded effective
- * SDK pin (resolvedModel), then the request key. Legacy aliases without a pin
- * retain current alias valuation, not actual historical served-model costs.
- * SDK-aggregate prompt tokens select Haiku's tier; this is not exact API billing.
+ * Grouping key is requestModel || model, matching computeSummary's byModel.
+ * resolveRequestPricing decides the rate each request is valued at: a GPT row
+ * at the OpenAI model that served it; otherwise a request-key override first,
+ * then a known recorded effective SDK pin (resolvedModel), then the request
+ * key. Legacy aliases without a pin retain current alias valuation, not actual
+ * historical served-model costs. SDK-aggregate prompt tokens select Haiku's
+ * tier; this is not exact API billing.
  * Pass overrides (from pricingStore) to apply user-defined rates.
  */
 export function computeCostEstimate(

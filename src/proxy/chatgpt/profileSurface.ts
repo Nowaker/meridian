@@ -10,9 +10,9 @@
  * only `type: "chatgpt"` tells them apart.
  *
  * What this owns: the ChatGPT active pointer's meaning, how a turn is routed
- * across seats (active first, exclusions honoured, a pin obeyed), the entries
- * each route returns, and a refusal translated into the limit vocabulary the
- * events ring already speaks. What it does not own: storage of the pointer and
+ * across seats (active first, a pin obeyed, exclusions honoured when the host
+ * supplies them), the entries each route returns, and a refusal translated
+ * into the limit vocabulary the events ring already speaks. What it does not own: storage of the pointer and
  * of the exclusions (settings, injected), the usage reading (injected), and
  * any credential - nothing here sees a token.
  */
@@ -83,8 +83,8 @@ export interface ChatGptProfileSurfaceDeps {
   aliases?: () => Readonly<Record<string, unknown>> | undefined
   /** The persisted pointer, a seat id. */
   activeSeat: () => string | undefined
-  /** Routing exclusions as configured: profile ids, seat ids, or Claude ids (ignored here). */
-  excluded: () => readonly string[]
+  /** Seats kept out of work: profile ids, seat ids, or Claude ids (ignored here). None when absent. */
+  excluded?: () => readonly string[]
   /** The saved profile order (`profileOrder`), Claude ids included; ChatGPT failover follows it after the active seat. */
   order?: () => readonly string[] | undefined
   spent: (profileId: string) => SpentRecord | undefined
@@ -167,7 +167,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
   const excludedSeats = (list: readonly ChatGptProfile[]): Set<string> => {
     const seats = new Set<string>()
     for (const profile of list) if (loginFor(profile).state === "needs_login") seats.add(profile.seat)
-    for (const id of deps.excluded()) {
+    for (const id of deps.excluded?.() ?? []) {
       const profile = findChatGptProfile(list, id)
       if (profile) seats.add(profile.seat)
     }

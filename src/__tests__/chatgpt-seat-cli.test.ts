@@ -189,9 +189,9 @@ describe("ChatGPT seats from the CLI, while a running Meridian holds the store",
   it("asks that instance to remove the seat, and writes nothing itself", async () => {
     const lease = await acquireWriterLease({ lockPath: `${storePath}.lock`, waitMs: 0 })
     try {
-      const h = harness({ instance: { "/profiles/remove": [{ status: 200, body: { success: true, profile: "p-pppppp", provider: "chatgpt", activeProfile: "f-ffffff" } }] } })
+      const h = harness({ instance: { "/profiles/chatgpt/remove": [{ status: 200, body: { success: true, profile: "p-pppppp", provider: "chatgpt", activeProfile: "f-ffffff" } }] } })
       expect(await removeChatGptSeat("p-pppppp", h.ctx)).toBe(true)
-      expect(h.calls).toEqual([{ path: "/profiles/remove", body: { profile: "p-pppppp" } }])
+      expect(h.calls).toEqual([{ path: "/profiles/chatgpt/remove", body: { profile: "p-pppppp" } }])
       expect(accounts()).toHaveLength(2)
     } finally {
       lease.release()

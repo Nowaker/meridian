@@ -139,7 +139,12 @@ export interface ChatGptLogin {
   complete(connectId: string, pasted: string): Promise<ChatGptLoginCompletion>
   /** Abandon a sign-in now: stop polling, and close the redirect listener if nothing else needs it. */
   cancel(connectId: string): boolean
-  close(): void
+  /**
+   * Stop every sign-in and close the redirect listener. Resolves once a code
+   * exchange already under way has saved its seat or failed, so shutdown can
+   * keep the writer lease until then.
+   */
+  close(): Promise<void>
 }
 
 interface PendingLogin {
@@ -309,7 +314,16 @@ export function createChatGptLogin(options: ChatGptLoginOptions): ChatGptLogin {
     armSweep()
   }
 
-  const exchange = async (login: PendingLogin, code: string, grant: { redirectUri: string; verifier: string }): Promise<ChatGptLoginCompletion> => {
+  const exchanges = new Set<Promise<ChatGptLoginCompletion>>()
+  const exchange = (login: PendingLogin, code: string, grant: { redirectUri: string; verifier: string }): Promise<ChatGptLoginCompletion> => {
+    const running = exchangeCode(login, code, grant)
+    exchanges.add(running)
+    const done = () => { exchanges.delete(running) }
+    running.then(done, done)
+    return running
+  }
+
+  const exchangeCode = async (login: PendingLogin, code: string, grant: { redirectUri: string; verifier: string }): Promise<ChatGptLoginCompletion> => {
     login.outcome = { status: "exchanging", expiresAt: login.expiresAt }
     const fail = (status: number, codeName: string, message: string): ChatGptLoginCompletion => {
       settle(login, { status: "failed", message })
@@ -603,6 +617,7 @@ export function createChatGptLogin(options: ChatGptLoginOptions): ChatGptLogin {
       void closing?.then(open => open?.close())
       callback?.close("shutdown")
       callback = undefined
+      return Promise.allSettled([...exchanges]).then(() => undefined)
     },
   }
 }

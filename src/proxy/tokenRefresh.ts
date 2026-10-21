@@ -122,7 +122,9 @@ function guardCredentialWrites(store: CredentialStore): CredentialStore {
       if (isCredentialsReadOnly()) {
         return refuseCredentialWrite("credential-store", store.refreshKey ?? "unknown-store")
       }
-      return store.write(credentials)
+      const written = await store.write(credentials)
+      if (written) invalidateCredentialFacts(store.refreshKey)
+      return written
     },
   }
 }
@@ -263,14 +265,22 @@ const fileStore: CredentialStore = buildFileStore(CREDENTIALS_FILE)
  * (Linux). Default behaviour (no opts) is unchanged — reads from the
  * standard `~/.claude` location.
  */
+let credentialStorePlatformOverrideForTests: NodeJS.Platform | null = null
+
+/** Test-only override so file-backed credential routes can run on macOS without touching the login Keychain. */
+export function setCredentialStorePlatformForTests(override: NodeJS.Platform | null): void {
+  credentialStorePlatformOverrideForTests = override
+}
+
 export function createPlatformCredentialStore(opts?: { claudeConfigDir?: string }): CredentialStore {
+  const currentPlatform = credentialStorePlatformOverrideForTests ?? platform()
   if (opts?.claudeConfigDir) {
-    if (platform() === "darwin") {
+    if (currentPlatform === "darwin") {
       return buildMacosStore(configDirToKeychainService(opts.claudeConfigDir))
     }
     return buildFileStore(configDirToCredentialsFile(opts.claudeConfigDir))
   }
-  return platform() === "darwin" ? macosStore : fileStore
+  return currentPlatform === "darwin" ? macosStore : fileStore
 }
 
 /** Look up the appropriate file path for a profile (Linux convention even on macOS for inspection). */
@@ -290,16 +300,16 @@ export function credentialsFilePathForProfile(claudeConfigDir?: string): string 
  */
 export type StoredCredentialPresence = "present" | "absent" | "unknown"
 
-/**
- * One uncached read of the login as stored: whether it can authenticate, and
- * when the login and its current access token end. Uncached because a login
- * replaces both deadlines at once, and a cached read would pair the new
- * login's record with the old one's deadline.
- */
+/** Current, uncached facts about this store; deadlines do not establish auth. */
 export interface StoredCredentialSnapshot {
   presence: StoredCredentialPresence
   refreshTokenExpiresAt?: number
   accessTokenExpiresAt?: number
+}
+
+function validStoredExpiry(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 8.64e15
+    ? value : undefined
 }
 
 export async function readStoredCredentialSnapshot(store: CredentialStore): Promise<StoredCredentialSnapshot> {
@@ -314,14 +324,12 @@ export async function readStoredCredentialSnapshot(store: CredentialStore): Prom
   const accessToken = oauth?.accessToken
   return {
     presence: typeof accessToken === "string" && accessToken.length > 0 ? "present" : "absent",
-    ...(typeof oauth?.refreshTokenExpiresAt === "number" ? { refreshTokenExpiresAt: oauth.refreshTokenExpiresAt } : {}),
-    ...(typeof oauth?.expiresAt === "number" ? { accessTokenExpiresAt: oauth.expiresAt } : {}),
+    refreshTokenExpiresAt: validStoredExpiry(oauth?.refreshTokenExpiresAt),
+    accessTokenExpiresAt: validStoredExpiry(oauth?.expiresAt),
   }
 }
 
-export async function readStoredCredentialPresence(
-  store: CredentialStore,
-): Promise<StoredCredentialPresence> {
+export async function readStoredCredentialPresence(store: CredentialStore): Promise<StoredCredentialPresence> {
   return (await readStoredCredentialSnapshot(store)).presence
 }
 
@@ -757,6 +765,7 @@ export async function getAuthRenewalStatus(
   return renewalStatusFor(refreshTokenExpiresAt, warnDays)
 }
 
+/** The existing /health rounded-day warning rule, reused for profile expiry. */
 export function renewalStatusFor(
   refreshTokenExpiresAt: number | undefined,
   warnDays = DEFAULT_RENEWAL_WARN_DAYS,

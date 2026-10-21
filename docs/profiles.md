@@ -147,22 +147,39 @@ meridian profile add ci --oauth-token sk-ant-oat01-...
 
 OAuth-token profiles store the token in `profiles.json` and feed it to the SDK via `CLAUDE_CODE_OAUTH_TOKEN` — no Keychain entry, no browser handshake. To prevent the SDK's 401-recovery from silently falling back to the host's `~/.claude` credentials, OAuth-token profiles also pin `CLAUDE_CONFIG_DIR` to an isolated per-profile directory under `~/.config/meridian/profiles/<name>/`. That directory holds only SDK state (sessions, settings) — never `.credentials.json`, since the token is delivered through the env.
 
-### Login lifetime
+### Current login expiry
 
-A browser login has a deadline. Anthropic reports it with every token refresh, and refreshing renews the access token (about every 8 hours) but not the deadline. Once the deadline passes, the next refresh is refused and the account stops working when its current access token runs out, at most one access-token lifetime later. Run `meridian profile login <name>` before then.
+Meridian preserves a valid refresh deadline when its OAuth token exchange reports
+one. The Profiles page and home details show this account's current stored
+refresh deadline and access-token expiry, with the exact recorded time on hover
+or keyboard focus. Access expiry may be estimated when the provider omits it.
+Authentication is checked separately: a deadline does not prove logout,
+revocation, a fixed login lifetime or how long an account will serve requests.
 
-`GET /profiles/list` reports this for every browser-login profile:
+`GET /profiles/list` adds these fields, read from one fresh snapshot of each
+stored-Claude profile's own credential and from what Meridian recorded about
+its login:
 
 | Field | Meaning |
-|-------|---------|
-| `refreshTokenExpiresAt` | The login's deadline (epoch ms), read from the profile's own credential |
-| `daysUntilRenewal`, `renewalRequiredSoon` | As in `/health`; the window is `MERIDIAN_AUTH_RENEWAL_WARN_DAYS` (default 3) |
-| `accessTokenExpiresAt` | When the current access token runs out; past the deadline, when the account stops |
+| --- | --- |
+| `refreshTokenExpiresAt` | Current stored refresh deadline in epoch milliseconds, or `null` when unavailable |
+| `daysUntilRenewal` | `Math.ceil((refreshTokenExpiresAt - now) / 86400000)`, or `null`; zero includes a deadline less than one day past |
+| `renewalRequiredSoon` | Rounded days are at or below `MERIDIAN_AUTH_RENEWAL_WARN_DAYS` (default 3), matching `/health`; false with a null deadline means unknown/not applicable |
+| `accessTokenExpiresAt` | Current stored access-token expiry in epoch milliseconds, or `null`; advisory and possibly estimated |
 | `authObtainedAt`, `authObtainedVia` | When the login happened: `login` when Meridian performed it, `observed` when a new login was found on disk, `token` when it is the sign-in a ChatGPT seat's access token states |
 | `lastRefreshAt` | Last token refresh Meridian performed (one done by a Claude Code process is not seen) |
 | `firstUnauthedAt`, `unauthedReason` | When the account was first found logged out (`refresh_rejected` or `credentials_cleared`); cleared by the next login |
 
-Claude Code wipes `.credentials.json` when a refresh is refused, so Meridian keeps this record in its own `auth-lifecycle.json` beside `settings.json`. Every transition is logged (`[PROXY] Profile "work" logged out: ...`, naming the deadline and how long the login lasted) and stored in the diagnostics log under the `auth` category. The profile card shows it as "Login expires in …", "Logged in … ago" and "Logged out … ago".
+API-key and supplied setup-token profiles report null timestamps/day count and
+false without consulting the host's stored login. Failed credential reads also
+return unavailable expiry facts and preserve the existing authentication
+provenance. A changed or missing current deadline replaces the displayed value.
+The login history fields come from `auth-lifecycle.json` in the config
+directory, which records each account's logins, refreshes and logouts.
+
+### ChatGPT seats
+
+An instance serving [ChatGPT subscriptions](configuration.md#chatgpt-subscriptions) lists each seat as a profile of `type: "chatgpt"` beside the Claude ones, and the same commands and routes act on it. Each provider keeps its own active account, so switching a seat never moves the Claude pointer.
 
 A ChatGPT seat reports the same fields. OpenAI states no login deadline, so `refreshTokenExpiresAt` and `daysUntilRenewal` are null and `renewalRequiredSoon` is false. Where Meridian recorded no login for a seat, `authObtainedAt` is the OpenAI sign-in its access token states (`authObtainedVia: "token"`). Refreshing keeps that time, and it can predate the seat's own authorization when that reused a browser that was already signed in.
 
@@ -243,6 +260,8 @@ Each profile stores its credentials in its configured `CLAUDE_CONFIG_DIR`. CLI-c
 3. First configured profile
 
 Session state is scoped per profile — switching accounts won't cross-contaminate conversation history.
+
+A conversation that comes back to a profile after turns on another is not resumed from the copy it left there. That copy ends where the conversation was when it left, and a resume would send it the turns taken elsewhere without the replies given there. When another profile's copy holds more of the history the client sends, the history is replayed into a fresh session instead (`diverged=moved-on-elsewhere` in the request log). The profile's own copy is still resumed when nothing elsewhere holds more, for example after a rewind to a point it holds.
 
 ### Environment variable configuration
 

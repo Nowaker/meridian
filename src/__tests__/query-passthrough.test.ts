@@ -2,7 +2,7 @@
  * Tests for SDK parameter passthrough fields in buildQueryOptions.
  */
 import { describe, it, expect, beforeEach, afterEach } from "bun:test"
-import { buildQueryOptions, promptCachingDisabled, SCRATCHPAD_COUNTER_INSTRUCTION, type QueryContext } from "../proxy/query"
+import { buildQueryOptions, promptCachingDisabled, passthroughThinking, SCRATCHPAD_COUNTER_INSTRUCTION, type QueryContext } from "../proxy/query"
 import { BLOCKED_BUILTIN_TOOLS, CLAUDE_CODE_ONLY_TOOLS, MCP_SERVER_NAME, ALLOWED_MCP_TOOLS } from "../proxy/tools"
 
 function makeContext(overrides: Partial<QueryContext> = {}): QueryContext {
@@ -28,6 +28,31 @@ function makeContext(overrides: Partial<QueryContext> = {}): QueryContext {
 }
 
 describe("buildQueryOptions — SDK parameter passthrough", () => {
+  it("isolates client-owned tools from proxy-host settings, hooks and MCP discovery", () => {
+    const sdkHooks = { PreToolUse: [{ hooks: [async () => ({})] }] }
+    const result = buildQueryOptions(makeContext({
+      passthrough: true,
+      settingSources: ["user", "project", "local"],
+      systemContext: "CLIENT_CONTEXT_MUST_REMAIN",
+      memory: true,
+      codeSystemPrompt: false,
+      sdkHooks,
+    }))
+    expect(result.options.settingSources).toEqual([])
+    expect(result.options.strictMcpConfig).toBe(true)
+    expect(result.options.systemPrompt).toContain("CLIENT_CONTEXT_MUST_REMAIN")
+    expect(result.options.settings).toMatchObject({ autoMemoryEnabled: true })
+    expect(result.options.tools).toEqual([])
+    expect(result.options.hooks).toBe(sdkHooks)
+  })
+
+  it("retains selected filesystem sources for SDK-owned tool execution", () => {
+    const sources = ["user", "project"] as const
+    const result = buildQueryOptions(makeContext({ passthrough: false, settingSources: [...sources] }))
+    expect(result.options.settingSources).toEqual([...sources])
+    expect(result.options.strictMcpConfig).toBeUndefined()
+  })
+
   it("passes effort to SDK options when provided", () => {
     const result = buildQueryOptions(makeContext({ effort: "high" }))
     expect(result.options.effort).toBe("high")
@@ -110,6 +135,21 @@ describe("buildQueryOptions — SDK parameter passthrough", () => {
     expect(buildQueryOptions(makeContext({ thinking: nonString })).options.thinking).toEqual({ type: "adaptive" })
     const unknownType = { type: "future", display: "updates" } as unknown as QueryContext["thinking"]
     expect(buildQueryOptions(makeContext({ thinking: unknownType })).options.thinking as unknown).toEqual({ type: "future" })
+  })
+
+  it("asks for summarized thinking when the blocks are forwarded and no display is named", () => {
+    expect(passthroughThinking({ type: "adaptive" }, true)).toEqual({ type: "adaptive", display: "summarized" })
+    expect(passthroughThinking({ type: "enabled", budgetTokens: 2048 }, true))
+      .toEqual({ type: "enabled", budgetTokens: 2048, display: "summarized" })
+  })
+
+  it("leaves thinking alone when the blocks are not forwarded, off, or already carry a display", () => {
+    expect(passthroughThinking({ type: "adaptive" }, false)).toEqual({ type: "adaptive" })
+    expect(passthroughThinking(undefined, true)).toBeUndefined()
+    expect(passthroughThinking({ type: "disabled" }, true)).toEqual({ type: "disabled" })
+    expect(passthroughThinking({ type: "adaptive", display: "omitted" }, true)).toEqual({ type: "adaptive", display: "omitted" })
+    // A value the bundled CLI rejects is still the client's choice: it is dropped later, not replaced.
+    expect(passthroughThinking({ type: "adaptive", display: "updates" }, true)).toEqual({ type: "adaptive", display: "updates" })
   })
 
   it("leaves disabled thinking untouched", () => {

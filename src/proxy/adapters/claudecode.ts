@@ -5,9 +5,10 @@
  *   1. It typically runs on a different machine than the proxy (pointing at
  *      ANTHROPIC_BASE_URL over the network), so its CWD doesn't exist on the
  *      proxy host.
- *   2. Its system prompt embeds working-directory info using the
- *      `Primary working directory: <path>` format inside a `# Environment`
- *      block — different from OpenCode's `<env>Working directory: <path></env>`.
+ *   2. It states its working directory as `Primary working directory: <path>`
+ *      inside a `# Environment` block — different from OpenCode's
+ *      `<env>Working directory: <path></env>` — which older clients put in the
+ *      system prompt and 2.1.290 sends among the messages.
  *
  * Consequently this adapter:
  *   - Returns `undefined` from extractWorkingDirectory so the SDK subprocess
@@ -26,30 +27,92 @@ import { resolvePassthrough } from "../../env"
 import { isClaudeCodeProgressSummary } from "./claudecodeProgress"
 
 /**
- * Extract Claude Code's client-local working directory from the request's
- * system prompt. Claude Code injects a block like:
+ * Extract Claude Code's client-local working directory from the request.
+ * Claude Code states it in a block like:
  *
  *   # Environment
  *   You have been invoked in the following environment:
  *    - Primary working directory: /Users/alice/projects/myapp
  *    - ...
  *
+ * NOTE: agent-specific (claude-code). Where the block is has moved. Older
+ * clients put it in the system prompt. 2.1.290 sends it as a `system` message
+ * after the first user message for a model that takes system turns, and as a
+ * `<system-reminder>` block opening the first user message for one that does
+ * not (Haiku 4.5). Read from the system prompt alone, no request of that
+ * client had a directory: the SDK subprocess ran in the proxy's own, and the
+ * prompt told the model the client's was unknown, so the model composed paths
+ * against the proxy's tree.
+ *
+ * The first block of the conversation is the one. The SDK session is filed
+ * under the directory it was created in, so a conversation whose directory
+ * changed part-way could not be resumed. Among the messages only the client's
+ * own framing is read: `system` turns, and the run of reminder blocks that
+ * opens the first user message. Nothing the user typed, the assistant said or
+ * a tool returned is read.
+ *
  * Returns the path if found, or undefined to fall back to the SDK CWD.
  */
 function extractClaudeCodeClientCwd(body: any): string | undefined {
   let systemText = ""
-  if (typeof body.system === "string") {
+  if (typeof body?.system === "string") {
     systemText = body.system
-  } else if (Array.isArray(body.system)) {
+  } else if (Array.isArray(body?.system)) {
     systemText = body.system
       .filter((b: any) => b.type === "text" && b.text)
       .map((b: any) => b.text)
       .join("\n")
   }
-  if (!systemText) return undefined
+  const fromSystemPrompt = systemText.match(/Primary working directory:\s*([^\n<]+)/i)?.[1]?.trim()
+  if (fromSystemPrompt) return fromSystemPrompt
 
-  const match = systemText.match(/Primary working directory:\s*([^\n<]+)/i)
-  return match?.[1]?.trim() || undefined
+  if (!Array.isArray(body?.messages)) return undefined
+  let firstUserMessageSeen = false
+  for (const message of body.messages) {
+    let texts: string[] = []
+    if (message?.role === "system") {
+      texts = textBlocksOf(message.content)
+    } else if (message?.role === "user" && !firstUserMessageSeen) {
+      firstUserMessageSeen = true
+      texts = Array.isArray(message.content) ? leadingReminderTexts(message.content) : []
+    }
+    for (const text of texts) {
+      const found = text.match(ENVIRONMENT_BLOCK_CWD)?.[1]?.trim()
+      if (found) return found
+    }
+  }
+  return undefined
+}
+
+/** The environment block as the client writes it among the messages. */
+const ENVIRONMENT_BLOCK_CWD =
+  /(?:^|\n)# Environment\nYou have been invoked in the following environment:[ \t]*\n[ \t]*- Primary working directory:[ \t]*([^\n<]+)/
+const SYSTEM_REMINDER_OPEN = "<system-reminder>"
+
+/**
+ * The reminder blocks the client opens a user message with: text blocks up to
+ * the first text block that is not a reminder. What follows is what the user
+ * typed, even when it looks like a reminder.
+ */
+function leadingReminderTexts(content: unknown[]): string[] {
+  const reminders: string[] = []
+  for (const block of content) {
+    const candidate = block as { type?: unknown; text?: unknown } | null
+    if (candidate?.type !== "text" || typeof candidate.text !== "string"
+      || !candidate.text.startsWith(SYSTEM_REMINDER_OPEN)) break
+    reminders.push(candidate.text)
+  }
+  return reminders
+}
+
+/** The text of a message's content: the string itself, or its top-level text blocks. */
+function textBlocksOf(content: unknown): string[] {
+  if (typeof content === "string") return [content]
+  if (!Array.isArray(content)) return []
+  return content.flatMap((block: unknown) => {
+    const candidate = block as { type?: unknown; text?: unknown } | null
+    return candidate?.type === "text" && typeof candidate.text === "string" ? [candidate.text] : []
+  })
 }
 
 /**
@@ -161,14 +224,83 @@ export const CLAUDE_CODE_REQUEST_CLASS_HEADER = "x-claude-code-request-class"
 const CLASSIFIER_STOP_SEQUENCES = new Set(["</block>", "</severity>"])
 
 /**
+ * Interactive Claude Code generates a session title on the first user turn via
+ * its streamed `toolFreeHelper` side-query path (`querySource:
+ * "generate_session_title"`): `stream: true`, no tools, one `user` message
+ * wrapping the prompt in `<session>…</session>` followed by the language
+ * instruction, and the session-naming system prompt block.
+ */
+const SESSION_TITLE_SYSTEM_PREFIX =
+  "You are naming a coding session so the user can pick it out of a long list of sessions."
+const SESSION_TITLE_SYSTEM_SUFFIX =
+  'Return JSON with a single "title" field. Capitalize the first letter of the title.'
+const SESSION_TITLE_DEFAULT_INSTRUCTION =
+  "\n</session>\n\nWrite the title in the predominant language of the session — a stray word or code token in another language doesn't change it, and neither does the English of these instructions."
+const SESSION_TITLE_LANGUAGE_INSTRUCTION =
+  /\n<\/session>\n\nWrite the title in [^\r\n]+\. Keep technical terms and code identifiers in their original form\.$/
+
+function isSessionTitleSystemText(text: string): boolean {
+  const trimmed = text.trim()
+  return (
+    trimmed.startsWith(SESSION_TITLE_SYSTEM_PREFIX)
+    || trimmed.includes(`\n${SESSION_TITLE_SYSTEM_PREFIX}`)
+  ) && trimmed.endsWith(SESSION_TITLE_SYSTEM_SUFFIX)
+}
+
+function hasSessionTitleSystemPrompt(system: unknown): boolean {
+  if (typeof system === "string") return isSessionTitleSystemText(system)
+  if (!Array.isArray(system)) return false
+  return system.some(entry => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false
+    const block = entry as { type?: unknown; text?: unknown }
+    return block.type === "text" && typeof block.text === "string" && isSessionTitleSystemText(block.text)
+  })
+}
+
+function isSessionTitleUserPrompt(text: string): boolean {
+  if (!text.startsWith("<session>\n")) return false
+  const rest = text.slice("<session>\n".length)
+  if (rest.endsWith(SESSION_TITLE_DEFAULT_INSTRUCTION)) {
+    return rest.length > SESSION_TITLE_DEFAULT_INSTRUCTION.length
+  }
+  const match = SESSION_TITLE_LANGUAGE_INSTRUCTION.exec(rest)
+  return match !== null && match.index > 0
+}
+
+function isClaudeCodeSessionTitleRequest(body: unknown): boolean {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false
+  const request = body as {
+    stream?: unknown
+    tools?: unknown
+    system?: unknown
+    messages?: unknown
+  }
+  if (request.stream !== true) return false
+  if (Array.isArray(request.tools) && request.tools.length > 0) return false
+  if (!hasSessionTitleSystemPrompt(request.system)) return false
+  if (!Array.isArray(request.messages) || request.messages.length !== 1) return false
+  const first = request.messages[0]
+  if (!first || typeof first !== "object" || Array.isArray(first)) return false
+  const message = first as { role?: unknown; content?: unknown }
+  if (message.role !== "user") return false
+  if (typeof message.content === "string") return isSessionTitleUserPrompt(message.content)
+  if (!Array.isArray(message.content) || message.content.length !== 1) return false
+  const block = message.content[0]
+  if (!block || typeof block !== "object" || Array.isArray(block)) return false
+  const textBlock = block as { type?: unknown; text?: unknown }
+  return textBlock.type === "text" && typeof textBlock.text === "string" && isSessionTitleUserPrompt(textBlock.text)
+}
+
+/**
  * Is this a Claude Code side call under the conversation's session id?
  *
  * NOTE: agent-specific (claude-code). The CLI sends several side calls with the
  * conversation's own `metadata.user_id` session id and a short transcript of
- * their own: the auto-mode permission classifier, and the classifier that sums
- * up the session's state ("Current state: … / Assistant message tail …"). Read
- * as a turn, each classifies `unrelated-history` and overwrites the
- * conversation's mapping, so the next real turn cannot resume.
+ * their own: the auto-mode permission classifier, the classifier that sums up
+ * the session's state ("Current state: … / Assistant message tail …"), and the
+ * interactive session-title generator (`generate_session_title`). Read as a
+ * turn, each classifies `unrelated-history` and overwrites the conversation's
+ * mapping, so the next real turn cannot resume.
  *
  * The CLI names its request class in `x-claude-code-request-class`, but sends
  * it only with `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`, to a first-party base URL,
@@ -176,8 +308,10 @@ const CLASSIFIER_STOP_SEQUENCES = new Set(["</block>", "</severity>"])
  * it decides outright. Otherwise the shape does: a session key, no tools, and
  * not streamed. Both classifiers go through the CLI's unstreamed side-query
  * helper without tools, while the conversation loop streams its turns and
- * keeps their tools when it retries one unstreamed. The streamed session-start
- * request, compaction and main turns all fall outside the shape.
+ * keeps their tools when it retries one unstreamed. The interactive
+ * session-title generator streams through `toolFreeHelper` and is matched by
+ * its exact system prompt and `<session>…</session>` user envelope; compaction
+ * and main turns fall outside both shapes.
  *
  * Other clients can reach this adapter with the same tool-less unstreamed
  * shape for real turns, so the shape alone counts only for a request from the
@@ -198,6 +332,7 @@ export function isClaudeCodeAuxiliaryRequest(
   if (!body || typeof body !== "object") return false
   if (extractClaudeCodeSessionId(body) === undefined) return false
   if (agentId !== undefined && CLAUDE_CODE_AGENT_ID.test(agentId) && isClaudeCodeProgressSummary(body)) return true
+  if (agentId === undefined && isClaudeCodeSessionTitleRequest(body)) return true
   const request = body as { tools?: unknown; stream?: unknown; stop_sequences?: unknown }
   if (Array.isArray(request.tools) && request.tools.length > 0) return false
   if (request.stream === true) return false

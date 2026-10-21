@@ -113,6 +113,11 @@ export interface ChatGptCredentialSource {
    * exchange per call; a call made while one runs gets that one's result.
    */
   renewDue?(): Promise<ChatGptRenewalPass>
+  /**
+   * owned only: resolves once every token exchange already dispatched has
+   * recorded its result. Shutdown awaits it before `release`.
+   */
+  settle?(): Promise<void>
 }
 
 /** What one `renewDue` call found and did. */

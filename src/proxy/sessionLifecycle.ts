@@ -2406,3 +2406,33 @@ function retiredGraceMs(options: SessionLifecycleOptions): number {
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
+
+const SQLITE_BOOKKEEPING_UNSUPPORTED =
+  "SQLite bookkeeping is not supported by this build: the lifecycle journal is kept in sessions.db"
+
+/**
+ * What upstream's SQLite bookkeeping modules take from this file. This build
+ * never installs that backend (bookkeepingMode refuses it), so everything here
+ * but the read-only process probe refuses instead of acting on sessions.db.
+ */
+export const sessionDeletionRuntime = Object.freeze({
+  processGroupIsEmpty,
+  deleteWithSdkChild: async (
+    _locator: TranscriptLocator,
+    _deletionToken: string,
+    _timeoutMs: number,
+    _attachExecutor: (executor: ProcessIncarnation, processGroupId: number, signal: AbortSignal) => Promise<void>,
+    _options: SessionLifecycleOptions,
+  ): Promise<void> => { throw new Error(SQLITE_BOOKKEEPING_UNSUPPORTED) },
+  awaitCustomDeleter: async (_deletion: Promise<void>, _timeoutMs: number, _directory?: string): Promise<void> => {
+    throw new Error(SQLITE_BOOKKEEPING_UNSUPPORTED)
+  },
+  isNotFoundError, DeletionStillRunningError,
+  maxDeletes: DEFAULT_MAX_DELETES, timeoutMs: DEFAULT_DELETE_TIMEOUT_MS,
+  retryBaseMs: DEFAULT_RETRY_BASE_MS, retryMaxMs: DEFAULT_RETRY_MAX_MS,
+})
+
+/** For upstream's bookkeeping migration, which this build refuses to run. */
+export function withLegacyLifecycleMaintenanceLock<T>(_directory: string, _operation: () => Promise<T>): Promise<T> {
+  return Promise.reject(new Error(SQLITE_BOOKKEEPING_UNSUPPORTED))
+}

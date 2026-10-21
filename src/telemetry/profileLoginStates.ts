@@ -17,7 +17,7 @@
  *    behind the red border and pill. The page interpolates isUnusableJs
  *    before this module, which calls it.
  *  - Expires soon: logged in, and `renewalRequiredSoon` from /profiles/list,
- *    the flag that turns the card's "Login expires" fact amber
+ *    the flag that turns the card's "Refresh deadline" fact amber
  *    (profileFacts.ts). The server sets it once the login deadline
  *    (refreshTokenExpiresAt) is MERIDIAN_AUTH_RENEWAL_WARN_DAYS away or less,
  *    3 days by default. A ChatGPT seat states no login deadline, so it is

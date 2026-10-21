@@ -205,6 +205,35 @@ describe("ChatGPT sign-in", () => {
     expect(connected).toHaveLength(0)
     expect(login.cancel(started.connectId)).toBe(false)
   })
+
+  it("closes only once a code exchange already out has filed its seat", async () => {
+    const connected: ChatGptConnectedAccount[] = []
+    let answer!: () => void
+    const answered = new Promise<void>(resolve => { answer = resolve })
+    const login = createChatGptLogin({
+      connect: account => { connected.push(account) },
+      renderPage: () => "",
+      fetchImpl: async () => {
+        await answered
+        return Response.json({ access_token: ACCESS, refresh_token: "rt-new", id_token: ID_TOKEN, expires_in: 3600 })
+      },
+      now: () => NOW,
+      listen: async () => ({ close() {} }),
+      log: () => {},
+    })
+    const started = await login.start()
+    const state = new URL(started.authorizeUrl).searchParams.get("state")!
+    const completing = login.complete(started.connectId, `?code=c&state=${state}`)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    let closed = false
+    const closing = login.close().then(() => { closed = true })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(closed).toBe(false)
+    answer()
+    await closing
+    expect(connected).toHaveLength(1)
+    expect((await completing).ok).toBe(true)
+  })
 })
 
 describe("ChatGPT device-code sign-in", () => {

@@ -12,6 +12,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
+import { createOwnedCredentialStore } from "./modelsMock"
 
 let queryError: string | undefined
 
@@ -43,13 +44,21 @@ mock.module("../proxy/models", () => ({
 
 const { createProxyServer } = await import("../proxy/server")
 const tokens = await import("../proxy/tokenRefresh")
+const HOUR = 3_600_000
+const root = mkdtempSync(join(tmpdir(), "meridian-login-lifetime-"))
+// The profiles' own credential files, behind a path guard: under the SDK mock
+// every other store is the empty fixture store.
+const fixtureStore = tokens.createPlatformCredentialStore
+const ownedStores = spyOn(tokens, "createPlatformCredentialStore").mockImplementation(options =>
+  options?.claudeConfigDir ? createOwnedCredentialStore(root, options.claudeConfigDir) : fixtureStore(options))
 const { createPlatformCredentialStore, getAuthRenewalStatus } = tokens
 const { authLifecycleFor, noteAuthLogin, noteRefreshRejected, noteRefreshSucceeded } = await import("../proxy/authLifecycle")
 const { setActiveProfile, resetActiveProfile } = await import("../proxy/profiles")
 
-const HOUR = 3_600_000
-const root = mkdtempSync(join(tmpdir(), "meridian-login-lifetime-"))
-afterAll(() => rmSync(root, { recursive: true, force: true }))
+afterAll(() => {
+  ownedStores.mockRestore()
+  rmSync(root, { recursive: true, force: true })
+})
 
 function profileDir(name: string, oauth: Record<string, unknown>): string {
   const dir = join(root, name)

@@ -97,6 +97,12 @@ export interface ChatGptRefresherOptions {
 
 export interface ChatGptRefresher {
   refreshAccount(accountUserId: string): Promise<RefreshOutcome>
+  /**
+   * Resolves once every exchange already dispatched has recorded its result.
+   * Shutdown waits for it before giving up the lease: an exchange cut off
+   * after spending its refresh token leaves the seat needing a sign-in.
+   */
+  settle(): Promise<void>
 }
 
 interface TokenExchangeResult {
@@ -223,8 +229,16 @@ export function createChatGptRefresher(options: ChatGptRefresherOptions): ChatGp
 
     const accessToken = parsed.accessToken
     const expiresAt = now() + parsed.expiresIn * 1000
-    store.commitAccount(accountUserId, current => {
+    let superseded = false
+    const committed = store.commitAccount(accountUserId, current => {
       if (!current) throw new Error(`[chatgpt] account ${accountUserId} disappeared mid-exchange`)
+      // A sign-in finished while this exchange was out and replaced the chain
+      // it spent from. That login is the newer one, so this result is dropped
+      // rather than written over it.
+      if (current.refreshToken !== account.refreshToken) {
+        superseded = true
+        return current
+      }
       return {
         ...current,
         refreshToken: parsed.refreshToken ?? current.refreshToken,
@@ -234,6 +248,12 @@ export function createChatGptRefresher(options: ChatGptRefresherOptions): ChatGp
         exchangeStartedAt: null,
       }
     })
+    if (superseded) {
+      console.log(`[chatgpt] account ${accountUserId} was signed in again while it was being renewed; keeping the new sign-in`)
+      return committed.accessToken && committed.expiresAt !== null
+        ? { status: "refreshed", accountUserId, accessToken: committed.accessToken, expiresAt: committed.expiresAt }
+        : { status: "unavailable", accountUserId, reason: "unknown-account" }
+    }
     // One line per renewal, so the operator can see a refresh happen. The
     // seat id is an identity, not a credential.
     console.log(`[chatgpt] account ${accountUserId} refreshed${parsed.refreshToken ? " (refresh token rotated)" : ""}; access token valid until ${new Date(expiresAt).toISOString()}`)
@@ -256,6 +276,10 @@ export function createChatGptRefresher(options: ChatGptRefresherOptions): ChatGp
       const attempt = exchangeOnce(accountUserId).finally(() => { inflight.delete(accountUserId) })
       inflight.set(accountUserId, attempt)
       return attempt
+    },
+
+    async settle() {
+      while (inflight.size > 0) await Promise.allSettled([...inflight.values()])
     },
   }
 }

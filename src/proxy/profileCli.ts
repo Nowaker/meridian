@@ -302,19 +302,20 @@ export function buildLoginCredentials(
   plan: OAuthPlanFields,
   now: number = Date.now(),
 ): CredentialsFile {
-  // The login's own deadline, the same field `claude login` writes. Without it
-  // a profile logged in here showed no expiry until its first refresh, hours
-  // later. Validated as the refresh path validates it: in the future, or not
-  // at all.
-  const refreshTokenExpiresAt =
-    tokenData.refresh_token_expires_at ??
-    (tokenData.refresh_token_expires_in ? now + tokenData.refresh_token_expires_in * 1000 : undefined)
+  // Preserve the provider's refresh deadline just as the refresh path does.
+  // Missing/malformed metadata is unknown; do not guess its units or lifetime.
+  const refreshDeadline = tokenData.refresh_token_expires_at ??
+    (typeof tokenData.refresh_token_expires_in === "number" && tokenData.refresh_token_expires_in > 0
+      ? now + tokenData.refresh_token_expires_in * 1000 : undefined)
+  const refreshTokenExpiresAt = typeof refreshDeadline === "number"
+    && Number.isFinite(refreshDeadline) && refreshDeadline > now && refreshDeadline <= 8.64e15
+    ? refreshDeadline : undefined
   return {
     claudeAiOauth: {
       accessToken: tokenData.access_token,
       refreshToken: tokenData.refresh_token,
       expiresAt: tokenData.expires_at ?? now + (tokenData.expires_in ?? 8 * 60 * 60) * 1000,
-      ...(refreshTokenExpiresAt && refreshTokenExpiresAt > now ? { refreshTokenExpiresAt } : {}),
+      ...(refreshTokenExpiresAt ? { refreshTokenExpiresAt } : {}),
       scopes: tokenData.scope?.split(" ").filter(Boolean) ?? OAUTH_SCOPES,
       ...plan,
     },
@@ -1036,8 +1037,8 @@ Examples:
   meridian profile add ci --oauth-token sk-ant-oat01-...
                                                     # Add headless CI profile (token from CLI argument)
   meridian profile login work --headless            # Re-authenticate via OAuth URL/code prompt
-  meridian profile add of-n-p20-gpt --chatgpt       # Add a ChatGPT seat
-  meridian profile login of-n-p20-gpt --headless    # Sign a ChatGPT seat in again by one-time code
+  meridian profile add work-gpt --chatgpt           # Add a ChatGPT seat
+  meridian profile login work-gpt --headless        # Sign a ChatGPT seat in again by one-time code
   meridian profile switch work                      # Switch to work account
   meridian profile rename work employer             # Rename; "work" still routes to it
   meridian profile list                             # Show all profiles`)

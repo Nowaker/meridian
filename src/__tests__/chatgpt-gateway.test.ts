@@ -158,7 +158,7 @@ const LUNA = {
   prompt_cache_key: "conversation-1", // gitleaks:allow - a conversation id, not a credential
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "chatgpt-gateway-"))
   process.env.MERIDIAN_CONFIG_DIR = join(dir, "meridian")
   poolDir = join(dir, "opencode")
@@ -175,7 +175,7 @@ beforeEach(() => {
   wham = () => undefined
   globalThis.fetch = mockFetch as typeof fetch
   telemetryStore.clear()
-  clearSessionCache()
+  await clearSessionCache()
   __setFetchOAuthUsageOverride(async () => null)
   // Another suite in the same process may have switched usage reads off, or
   // left a Claude `default` reading cached.
@@ -510,6 +510,12 @@ describe("plugins never touch ChatGPT requests", () => {
 })
 
 describe("/providers", () => {
+  it("lists no ChatGPT provider on an instance that does not serve it", async () => {
+    const { app } = await server("off")
+    const data = await (await app.fetch(new Request("http://localhost/providers/status"))).json() as { providers: Array<{ id: string }> }
+    expect(data.providers.map(p => p.id)).toEqual(["claude", "antigravity"])
+  })
+
   it("shows ChatGPT seats and their state without exposing any token", async () => {
     writePool([account(0), account(1, { enabled: false })])
     const { app } = await server("follow-external")
@@ -1396,6 +1402,72 @@ describe("owned mode signs its own seats in", () => {
       expect(existsSync(storePath)).toBe(false)
     } finally {
       proxy.chatGpt!.release()
+    }
+  })
+
+  it("refuses a ChatGPT change from a foreign page, and takes one from its own pages and the CLI", async () => {
+    const proxy = await server("owned")
+    await proxy.chatGpt!.acquire()
+    try {
+      const send = (method: string, path: string, origin?: string) => proxy.app.fetch(new Request(`http://localhost${path}`, {
+        method, headers: { "content-type": "text/plain", ...(origin ? { origin } : {}) }, body: JSON.stringify({}),
+      }))
+      const changes: Array<[string, string]> = [
+        ["POST", "/profiles/chatgpt/connect/start"], ["POST", "/profiles/chatgpt/connect/device"],
+        ["POST", "/profiles/chatgpt/connect/cancel"], ["POST", "/profiles/chatgpt/connect/complete"],
+        ["POST", "/profiles/chatgpt/refresh"], ["POST", "/profiles/chatgpt/remove"],
+        ["PATCH", "/settings/api/chatgpt"], ["DELETE", "/settings/api/chatgpt"],
+      ]
+      for (const origin of ["https://evil.example", "null", "http://localhost:9999", "not a url"]) {
+        for (const [method, path] of changes) expect([method, path, origin, (await send(method, path, origin)).status]).toEqual([method, path, origin, 403])
+      }
+      expect(codeExchanges).toBe(0)
+      expect((await send("POST", "/profiles/chatgpt/connect/start", "http://localhost")).status).toBe(200)
+      expect((await send("POST", "/profiles/chatgpt/connect/start")).status).toBe(200)
+    } finally {
+      proxy.chatGpt!.release()
+    }
+  })
+
+  it("serves an owned store read-only under MERIDIAN_CREDENTIALS_READONLY: no lease, no renewal, no sign-in", async () => {
+    mkdirSync(storeDir, { recursive: true, mode: 0o700 })
+    const seat = (n: number, expiresAt: number) => ({
+      accountUserId: `user-${n}__workspace-${n}`, accountId: `workspace-${n}`, email: `s${n}@example.test`,
+      refreshToken: `rt-${n}`, accessToken: signedIn, expiresAt, tokenRotatedAt: NOW, exchangeStartedAt: null,
+    })
+    writeFileSync(storePath, JSON.stringify({ version: 1, accounts: [seat(0, Date.now() + 3_600_000)] }), { mode: 0o600 })
+    const before = readFileSync(storePath, "utf8")
+    let refreshes = 0
+    const serve = globalThis.fetch
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url === TOKEN_URL) refreshes++
+      return serve(input, init)
+    }) as typeof fetch
+    process.env.MERIDIAN_CREDENTIALS_READONLY = "1"
+    try {
+      const proxy = await server("owned")
+      await proxy.chatGpt!.acquire()
+      expect(existsSync(`${storePath}.lock`)).toBe(false)
+      expect(proxy.chatGpt!.isServing()).toBe(true)
+      expect((await proxy.app.fetch(responses(LUNA))).status).toBe(200)
+      expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-0"])
+
+      for (const path of ["/profiles/chatgpt/connect/start", "/profiles/chatgpt/connect/device", "/profiles/chatgpt/refresh", "/profiles/chatgpt/remove"]) {
+        const res = await post(proxy.app, path, { profile: "s0-kspace-0" })
+        expect([path, res.status]).toEqual([path, 403])
+      }
+      expect(await proxy.chatGpt!.renewDue()).toBe(false)
+
+      // A token the owner has not renewed is not renewed here either.
+      writeFileSync(storePath, JSON.stringify({ version: 1, accounts: [seat(0, Date.now() - 1000)] }), { mode: 0o600 })
+      expect((await proxy.app.fetch(responses(LUNA))).status).not.toBe(200)
+      expect(refreshes).toBe(0)
+      expect(upstreamCalls).toHaveLength(1)
+      writeFileSync(storePath, before, { mode: 0o600 })
+      proxy.chatGpt!.release()
+    } finally {
+      delete process.env.MERIDIAN_CREDENTIALS_READONLY
     }
   })
 

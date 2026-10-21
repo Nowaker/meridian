@@ -7,7 +7,8 @@
  * 3. The error propagates normally when the model is already base
  */
 
-import { describe, it, expect, mock, beforeEach } from "bun:test"
+import { installModelsMock } from "./modelsMock"
+import { describe, it, expect, mock, beforeEach, spyOn } from "bun:test"
 import { installSdkMock } from "./sdkMock"
 import { installLoggerMock } from "./loggerMock"
 import { installMcpToolsMock } from "./mcpToolsMock"
@@ -42,6 +43,7 @@ let rateLimitBenches: Array<{ profileId: string | undefined; until: number; sess
 let lifecycleAtQuery: Array<LifecycleResourceSnapshot | undefined> = []
 let lifecycleBeforeSdkEvents: Array<LifecycleResourceSnapshot | undefined> = []
 let reconcileBeforeSdkEvents = false
+let resumeFallbackRefusal: "extra_usage" | "rate_limit" | undefined
 
 function readLifecycleResource(sessionId: string): LifecycleResourceSnapshot | undefined {
   const sidecar = readSessionGcSnapshot(getSessionStoreDir()) as {
@@ -82,20 +84,18 @@ function expectSafeFallbackTargets(reconciled: boolean) {
 }
 
 // Control what the mock does
-let mockBehavior: "extra_usage_then_succeed" | "always_extra_usage" | "out_of_extra_usage_then_succeed" | "resume_extra_usage_then_succeed" | "succeed" | "error_assistant_then_ratelimit" = "succeed"
+let unrelatedSdkDelayMs = 0
+let mockBehavior: "extra_usage_then_succeed" | "always_extra_usage" | "out_of_extra_usage_then_succeed" | "resume_extra_usage_then_succeed" | "succeed" | "error_assistant_then_ratelimit" | "rate_limit_twice_then_succeed" = "succeed"
 
 const EXTRA_USAGE_ERROR = "Claude Code returned an error result: API Error: Extra usage is required for 1M context · enable extra usage at claude.ai/settings/usage, or use --model to switch"
 const OUT_OF_EXTRA_USAGE_ERROR = "Claude Code returned an error result: API Error: 400 You're out of extra usage."
 
-// Pass through the real resolveSdkModelDefaults — mock.module is process-global
-// in Bun, and stubbing it as () => ({}) leaks to proxy-env-stripping.test.ts.
-import { resolveSdkModelDefaults } from "../proxy/models"
+// Unspecified model exports retain their real implementation.
 
 // Force sonnet[1m] regardless of auth status so tests are self-contained.
-mock.module("../proxy/models", () => ({
+installModelsMock(() => ({
   mapModelToClaudeModel: () => "sonnet[1m]",
   resolveClaudeExecutableAsync: async () => "claude",
-  resolveSdkModelDefaults,
   getClaudeAuthStatusAsync: async () => ({ loggedIn: true, subscriptionType: "max" }),
   hasExtendedContext: (model: string) => model.endsWith("[1m]"),
   stripExtendedContext: (model: string) => model.replace("[1m]", ""),
@@ -120,6 +120,14 @@ installSdkMock(() => ({
       const isStreaming = opts.options?.includePartialMessages === true
 
     return (async function* () {
+      // SDK latency is unrelated to Meridian's rate-limit retry timer.
+      if (unrelatedSdkDelayMs && callIndex === 1) {
+        await new Promise(resolve => setTimeout(resolve, unrelatedSdkDelayMs))
+      }
+      if (mockBehavior === "rate_limit_twice_then_succeed" && callIndex <= 2) {
+        // Stripping [1m] is free; the second refusal must back off on base.
+        throw new Error("429 rate limit exceeded")
+      }
       if (sessionId) {
         if (reconcileBeforeSdkEvents) {
           const resource = readLifecycleResource(sessionId)
@@ -135,6 +143,17 @@ installSdkMock(() => ({
       }
       if (mockBehavior === "always_extra_usage") {
         throw new Error(EXTRA_USAGE_ERROR)
+      }
+
+      // Model a resumed transcript that fits the extended window but not the
+      // base window. Its history belongs to the SDK, not the submitted delta.
+      if (resumeFallbackRefusal && opts.options?.resume) {
+        if (model.endsWith("[1m]")) {
+          throw new Error(resumeFallbackRefusal === "extra_usage"
+            ? EXTRA_USAGE_ERROR
+            : "429 rate limit exceeded for 1m context")
+        }
+        throw new Error('API Error: 400 {"type":"invalid_request_error","message":"prompt is too long: 435234 tokens > 200000 maximum"}')
       }
 
       if (mockBehavior === "extra_usage_then_succeed" && callIndex === 1) {
@@ -240,6 +259,8 @@ describe("Extra usage required fallback", () => {
     lifecycleAtQuery = []
     lifecycleBeforeSdkEvents = []
     reconcileBeforeSdkEvents = false
+    resumeFallbackRefusal = undefined
+    unrelatedSdkDelayMs = 0
     queryCallCount = 0
     mockBehavior = "succeed"
   })
@@ -380,41 +401,84 @@ describe("Extra usage required fallback", () => {
     })
   })
 
-  describe("No backoff needed", () => {
-    it("does not use exponential backoff for extra usage errors", async () => {
-      mockBehavior = "extra_usage_then_succeed"
-
-      // AMPLIFY the signal rather than tighten the threshold.
-      //
-      // This asserted `elapsed < 500` against a real backoff floor of 1000ms,
-      // leaving 500ms of headroom for the whole request — and it failed on CI
-      // at 756ms, which is BELOW the backoff floor. No backoff had happened; the
-      // test measured a contended runner (#917/#933). Nudging the bound to 1000
-      // would only move the coin-flip.
-      //
-      // Making the backoff enormous instead turns a ~500ms judgement call into
-      // an unmissable one: a rate-limit path would now sleep 10s, so anything
-      // near-instant proves the extra-usage path took no backoff at all, and no
-      // amount of runner noise closes that gap.
-      const priorDelay = process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS
-      process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS = "10000"
-      try {
+  describe("Resumed context exceeds the fallback window", () => {
+    for (const refusal of ["extra_usage", "rate_limit"] as const) {
+      it.each([false, true])(`preserves the client compaction signal after ${refusal} (stream=%s)`, async (stream) => {
         const app = createTestApp()
-        const start = Date.now()
-        await post(app, {
-          model: "sonnet",
-          stream: false,
-          messages: [{ role: "user", content: "hello" }],
+        const headers = { "x-opencode-session": `overflow-${refusal}-${stream}` }
+        // Large client history is accepted on the initial extended request;
+        // the next request resumes that SDK transcript with a short delta.
+        const history = { role: "user", content: "history ".repeat(110_000) }
+        const initial = await post(app, {
+          model: "sonnet", stream: false, messages: [history],
+        }, headers)
+        expect(initial.status).toBe(200)
+        const initialBody = await initial.json()
+        const sourceSessionId = queryCalls[0]!.sessionId
+        resumeFallbackRefusal = refusal
+
+        const response = await post(app, {
+          model: "sonnet", stream,
+          messages: [history, { role: "assistant", content: initialBody.content }, { role: "user", content: "continue" }],
+        }, headers)
+        const error = stream
+          ? parseSSE(await response.text()).find((event) => event.event === "error")?.data.error
+          : (await response.json()).error
+
+        expect(response.status).toBe(stream ? 200 : 400)
+        expect(queryCalls.map((call) => call.model)).toEqual(["sonnet[1m]", "sonnet[1m]", "sonnet"])
+        expect(queryCalls.slice(1).every((call) => call.resume === sourceSessionId)).toBe(true)
+        expect(error?.type).toBe("invalid_request_error")
+        expect(error?.message).toMatch(/prompt is too long/i)
+        // Failed forks must not replace the last successful source transcript.
+        expect(lookupSharedSession(headers["x-opencode-session"])?.claudeSessionId).toBe(sourceSessionId)
+      })
+    }
+  })
+
+  describe("backoff timers, independent of request duration", () => {
+    for (const stream of [false, true]) {
+      for (const scenario of ["extra-usage", "unrelated-delay", "rate-limit-control"] as const) {
+        it(`${scenario}: observes the actual backoff timer (stream=${stream})`, async () => {
+          const baseDelayMs = 317
+          const previousDelay = process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS
+          process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS = String(baseDelayMs)
+          mockBehavior = scenario === "rate-limit-control" ? "rate_limit_twice_then_succeed" : "extra_usage_then_succeed"
+          unrelatedSdkDelayMs = scenario === "unrelated-delay" ? 701 : 0
+          // Let real timers run. The positive control proves this observer sees
+          // the configured backoff; the SDK-latency fixture has a different delay.
+          const timerObserver = spyOn(globalThis, "setTimeout")
+          try {
+            const app = createTestApp()
+            const started = Date.now()
+            const response = await post(app, {
+              model: "sonnet",
+              stream,
+              messages: [{ role: "user", content: "hello" }],
+            })
+            expect(response.status).toBe(200)
+            if (stream) {
+              const events = parseSSE(await response.text())
+              expect(events.some(event => event.event === "error")).toBe(false)
+              expect(events.filter(event => event.event === "message_stop")).toHaveLength(1)
+            } else {
+              expect((await response.json()).stop_reason).toBe("end_turn")
+            }
+            const elapsed = Date.now() - started
+            const backoffTimers = timerObserver.mock.calls.filter(([, delay]) => delay === baseDelayMs)
+            expect(backoffTimers).toHaveLength(scenario === "rate-limit-control" ? 1 : 0)
+            expect(queryCalls.map(call => call.model)).toEqual(scenario === "rate-limit-control"
+              ? ["sonnet[1m]", "sonnet", "sonnet"] : ["sonnet[1m]", "sonnet"])
+            console.log(JSON.stringify({ scenario, stream, elapsedMs: elapsed,
+              backoffTimers: backoffTimers.length, models: queryCalls.map(call => call.model) }))
+          } finally {
+            timerObserver.mockRestore()
+            if (previousDelay === undefined) delete process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS
+            else process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS = previousDelay
+          }
         })
-        const elapsed = Date.now() - start
-        // Generous for the request itself, still an order of magnitude under
-        // the 10s a single backoff would now cost.
-        expect(elapsed).toBeLessThan(5_000)
-      } finally {
-        if (priorDelay === undefined) delete process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS
-        else process.env.MERIDIAN_RATE_LIMIT_BASE_DELAY_MS = priorDelay
       }
-    })
+    }
   })
 
   describe("Real SDK behaviour: error assistant emitted before throw", () => {

@@ -207,6 +207,6 @@ describe("the /profiles page wires the remove control", () => {
     // The poll rewrites innerHTML. Without this guard a tick lands between the
     // confirmation appearing and the click that answers it, and the click
     // reaches whichever card the redraw put in that spot.
-    expect(profilePageHtml).toContain("if (editingProfile || removingProfile) return;")
+    expect(profilePageHtml).toContain("if (editingProfile || removingProfile || detailFactFocused()) return;")
   })
 })

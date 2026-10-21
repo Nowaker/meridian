@@ -52,3 +52,28 @@ docs/maintenance/evidence/haiku55-nix-installed-20261011/harness-f67367a69d896f5
 # listing which control operations a drain leaves usable is documentation
 # text, byte-identical to upstream/main; verified at the 74ee9675 merge.
 docs/configuration.md:generic-api-key:782
+
+# Upstream 075e9e47 evidence scripts, e2e harnesses and bookkeeping code, byte-identical
+# to upstream/main: synthetic env tokens, empty or flag values, session mapping
+# keys, an SSH signing-key fingerprint and prose. Verified at the 075e9e47 merge.
+docs/maintenance/evidence/backlog-20261018/1396-live/baseline/analysis.json:generic-api-key:100
+docs/maintenance/evidence/backlog-20261018/1396-live/baseline/analysis.json:generic-api-key:127
+docs/maintenance/evidence/backlog-20261018/1396-live/candidate/analysis.json:generic-api-key:140
+docs/maintenance/evidence/backlog-20261018/1396-live/candidate/analysis.json:generic-api-key:167
+docs/maintenance/evidence/backlog-20261018/1396-live/candidate-owned-locators.json:generic-api-key:11
+docs/maintenance/evidence/backlog-20261018/1396-live/candidate-owned-locators.json:generic-api-key:5
+docs/maintenance/evidence/backlog-20261018/1396-live/native-fable-probe-attempt1.mjs:dreamhost-service-credentials:136
+docs/maintenance/evidence/backlog-20261018/1396-live/native-fable-probe.mjs:dreamhost-service-credentials:142
+docs/maintenance/evidence/backlog-20261018/1400-correction/signature-local.log:generic-api-key:1
+docs/maintenance/evidence/backlog-20261018/1410-live-heap/e42-preparation/extended-stable-flow.mjs:generic-api-key:31
+docs/maintenance/evidence/backlog-20261018/passthrough.md:generic-api-key:15
+docs/maintenance/evidence/backlog-20261018/passthrough.md:generic-api-key:3
+docs/maintenance/evidence/backlog-20261019/1399/native-client-preflight.mjs:dreamhost-service-credentials:45
+docs/maintenance/evidence/backlog-20261019/1399/native-refusal-control.mjs:dreamhost-service-credentials:30
+docs/maintenance/evidence/backlog-20261019/1399/run-native-load.mjs:dreamhost-service-credentials:80
+docs/maintenance/evidence/backlog-20261019/1406/resumed-session-probe.mjs:dreamhost-service-credentials:92
+scripts/e2e-opencode-one-shot-beta.mjs:dreamhost-service-credentials:151
+scripts/e2e-opencode-one-shot-stable.mjs:dreamhost-service-credentials:151
+scripts/e2e-passthrough-tool-isolation.mjs:dreamhost-service-credentials:86
+scripts/e2e-profile-history-client.mjs:dreamhost-service-credentials:168
+src/proxy/session/bookkeeping/mappings.ts:generic-api-key:137

@@ -211,6 +211,45 @@ describe("ChatGPT refresh - exactly one writer", () => {
     expect(onDisk()?.refreshToken).toBe("rotated-refresh")
   })
 
+  it("keeps a sign-in that finished while a renewal was out, rather than writing the older chain over it", async () => {
+    const store = await seededStore()
+    let answer!: () => void
+    const answered = new Promise<void>(resolve => { answer = resolve })
+    const mock = endpoint(async () => {
+      await answered
+      return tokenResponse({ access_token: "old-chain-access", refresh_token: "old-chain-rotated", expires_in: 3600 })
+    })
+    const refresher = createChatGptRefresher({ store, fetchImpl: mock.fetchImpl })
+
+    const renewing = refresher.refreshAccount(SEAT)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(mock.calls).toHaveLength(1)
+    store.commitAccount(SEAT, () => seat({ refreshToken: "signed-in-refresh", accessToken: "signed-in-access", expiresAt: 9_999_999_999_999 }))
+    answer()
+
+    expect(await renewing).toEqual({ status: "refreshed", accountUserId: SEAT, accessToken: "signed-in-access", expiresAt: 9_999_999_999_999 })
+    expect(onDisk()).toMatchObject({ refreshToken: "signed-in-refresh", accessToken: "signed-in-access", exchangeStartedAt: null })
+  })
+
+  it("settles only once every exchange already dispatched has recorded its result", async () => {
+    const store = await seededStore()
+    let answer!: () => void
+    const answered = new Promise<void>(resolve => { answer = resolve })
+    const mock = endpoint(async () => {
+      await answered
+      return tokenResponse({ access_token: "fresh-access", refresh_token: "rotated-refresh", expires_in: 3600 })
+    })
+    const refresher = createChatGptRefresher({ store, fetchImpl: mock.fetchImpl })
+    void refresher.refreshAccount(SEAT)
+    let settled = false
+    const settling = refresher.settle().then(() => { settled = true })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(settled).toBe(false)
+    answer()
+    await settling
+    expect(onDisk()?.refreshToken).toBe("rotated-refresh")
+  })
+
   it("refuses without write authority BEFORE dispatching anything", async () => {
     const writable = await seededStore()
     expect(writable.readAccount(SEAT)).toBeDefined()

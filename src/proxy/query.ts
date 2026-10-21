@@ -577,6 +577,23 @@ export function sdkThinking(thinking: NonNullable<QueryContext["thinking"]>): Th
 }
 
 /**
+ * The thinking option for a client that is forwarded the thinking blocks.
+ *
+ * Current models omit the thinking text unless a display is named, so a
+ * passthrough client that names none receives signed blocks with nothing in
+ * them. Ask for the summary on its behalf. A display the client did name is
+ * its own choice and is left alone, including one `sdkThinking` will drop.
+ */
+export function passthroughThinking(
+  thinking: QueryContext["thinking"],
+  thinkingPassthrough: boolean,
+): QueryContext["thinking"] {
+  if (!thinkingPassthrough || !thinking || thinking.type === "disabled") return thinking
+  if (thinking.display !== undefined) return thinking
+  return { ...thinking, display: "summarized" }
+}
+
+/**
  * Prompt-level counter-instruction to suppress writes to the CLI's proxy-host
  * scratchpad directory in passthrough mode (#627, #1049).
  * Avoids setting CLAUDE_CODE_SESSION_KIND=bg which causes CLI 2.1.274+ to
@@ -590,6 +607,21 @@ export const SCRATCHPAD_COUNTER_INSTRUCTION =
   `or system temporary directory as requested by the user.\n` +
   `</meridian-note>`
 
+/**
+ * Compact listing of deferred MCP tool names for passthrough turns when
+ * `CLAUDE_CODE_DISABLE_ATTACHMENTS=1` suppresses the CLI's native
+ * `deferred_tools_delta` attachment (#1368).
+ */
+export function buildDeferredToolsNote(deferredToolNames: readonly string[]): string {
+  if (deferredToolNames.length === 0) return ""
+  return (
+    `\n<meridian-note>\n` +
+    `The following deferred tools are available via ToolSearch (call ToolSearch with "select:<tool_name>" or keywords to load their schemas before invoking them):\n` +
+    `${deferredToolNames.join("\n")}\n` +
+    `</meridian-note>`
+  )
+}
+
 function resolveSystemPrompt(
   systemContext: string | undefined,
   passthrough: boolean,
@@ -597,6 +629,7 @@ function resolveSystemPrompt(
   codeSystemPrompt: boolean | undefined,
   clientSystemPrompt: boolean | undefined,
   cwdNote: string,
+  deferredToolsNote: string = "",
 ): { systemPrompt?: string | { type: "preset"; preset: "claude_code"; append?: string } } {
   const hasSettings = settingSources != null && settingSources.length > 0
   const usePreset = codeSystemPrompt ?? (hasSettings || (!passthrough && !!systemContext))
@@ -604,22 +637,23 @@ function resolveSystemPrompt(
   const clientContext = includeClient ? systemContext : undefined
   const scratchpadNote =
     passthrough && process.env.MERIDIAN_SUPPRESS_SCRATCHPAD !== "0" ? SCRATCHPAD_COUNTER_INSTRUCTION : ""
+  const tailNotes = REPLAY_PROVENANCE_NOTE + scratchpadNote + deferredToolsNote
 
   if (usePreset) {
     // Always non-empty: the gitStatus correction applies to every preset
     // request, whether or not the client sent a system prompt.
-    const append = [clientContext, cwdNote, GIT_STATUS_PROVENANCE_NOTE, REPLAY_PROVENANCE_NOTE, scratchpadNote].filter(Boolean).join("")
+    const append = [clientContext, cwdNote, GIT_STATUS_PROVENANCE_NOTE, REPLAY_PROVENANCE_NOTE, scratchpadNote, deferredToolsNote].filter(Boolean).join("")
     return { systemPrompt: { type: "preset" as const, preset: "claude_code" as const, append } }
   }
   const append = [clientContext, cwdNote].filter(Boolean).join("") || undefined
-  if (append) return { systemPrompt: append + REPLAY_PROVENANCE_NOTE + scratchpadNote }
+  if (append) return { systemPrompt: append + tailNotes }
   // Transport provenance is separate from the optional client prompt and
   // Claude Code persona. A plain string keeps an explicitly disabled preset
   // disabled, rather than letting an omitted option restore the SDK default.
-  if (codeSystemPrompt === false) return { systemPrompt: REPLAY_PROVENANCE_NOTE + scratchpadNote }
+  if (codeSystemPrompt === false) return { systemPrompt: tailNotes }
   // An omitted systemPrompt previously selected the SDK's default preset.
   // Preserve that choice while attaching the same transport note.
-  return { systemPrompt: { type: "preset", preset: "claude_code", append: REPLAY_PROVENANCE_NOTE + scratchpadNote } }
+  return { systemPrompt: { type: "preset", preset: "claude_code", append: tailNotes } }
 }
 
 export function buildQueryOptions(ctx: QueryContext, abortController?: AbortController): BuildQueryResult {
@@ -631,6 +665,11 @@ export function buildQueryOptions(ctx: QueryContext, abortController?: AbortCont
     effort, thinking, taskBudget, outputFormat, betas, settingSources, codeSystemPrompt, clientSystemPrompt,
     memory, dreaming, sharedMemory, maxBudgetUsd, maxOutputTokens, fallbackModel, sdkDebug, additionalDirectories,
   } = ctx
+  // Passthrough tool execution belongs to the client. Loading proxy-host
+  // settings also loads native plugins and SessionStart hooks: plugins: []
+  // does not disable installed plugins, and their names are not client tools.
+  // Keep client-provided instructions and explicit SDK settings/hooks instead.
+  const sdkSettingSources = passthrough ? [] : (settingSources ?? [])
   const resolvedModel = model === "haiku"
     ? ctx.envOverrides?.ANTHROPIC_DEFAULT_HAIKU_MODEL ?? cleanEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL ?? "claude-haiku-5-5"
     : model
@@ -692,7 +731,27 @@ export function buildQueryOptions(ctx: QueryContext, abortController?: AbortCont
       ...(stream || passthrough ? { includePartialMessages: true } : {}),
       permissionMode: "bypassPermissions" as const,
       allowDangerouslySkipPermissions: true,
-      ...resolveSystemPrompt(systemContext, passthrough, settingSources, codeSystemPrompt, clientSystemPrompt, cwdNote),
+      ...resolveSystemPrompt(
+        systemContext,
+        passthrough,
+        settingSources,
+        codeSystemPrompt,
+        clientSystemPrompt,
+        cwdNote,
+        passthrough &&
+        hasDeferredTools &&
+        ["1", "true", "yes", "on"].includes(
+          String(
+            ctx.envOverrides?.CLAUDE_CODE_DISABLE_ATTACHMENTS ??
+              cleanEnv.CLAUDE_CODE_DISABLE_ATTACHMENTS ??
+              (process.env.MERIDIAN_SUPPRESS_IMPLICIT_ATTACHMENTS !== "0" ? "1" : ""),
+          )
+            .toLowerCase()
+            .trim(),
+        )
+          ? buildDeferredToolsNote(passthroughMcp?.deferredToolNames ?? [])
+          : "",
+      ),
       ...(passthrough
         ? {
             // Strip the SDK's ~25k-token built-in tool catalog from the
@@ -703,7 +762,14 @@ export function buildQueryOptions(ctx: QueryContext, abortController?: AbortCont
             // from the upstream payload. Setting `tools: []` elides the
             // catalog from the request body. Closes #489 (diagnosis by
             // @albe-jj).
-            tools: [],
+            //
+            // When deferred tools are active (#1368, reported by @justprosh),
+            // keep only `ToolSearch` in the built-in catalog: the Claude Code
+            // CLI disables tool search whenever `ToolSearch` is absent from
+            // `--tools`, sending every deferred MCP tool with its full schema
+            // on every turn even when `ENABLE_TOOL_SEARCH=true`.
+            tools: hasDeferredTools ? ["ToolSearch"] : [],
+            strictMcpConfig: true,
             disallowedTools: [...allBlockedTools],
             ...(passthroughMcp ? {
               allowedTools: [...passthroughMcp.toolNames],
@@ -744,9 +810,9 @@ export function buildQueryOptions(ctx: QueryContext, abortController?: AbortCont
       // `--setting-sources=` → subprocess loads nothing. Omitting the key
       // makes claude-code fall back to its built-in default (user + project
       // + local) and slurp CLAUDE.md from the PROXY HOST's cwd into the
-      // system prompt regardless of claudeMd:"off" — #490 fixed this for
-      // passthrough; this extends the same guarantee to every adapter.
-      settingSources: settingSources ?? [],
+      // system prompt regardless of claudeMd:"off". Client-owned passthrough
+      // always stays isolated; SDK-owned tools retain the selected sources.
+      settingSources: sdkSettingSources,
       ...(onStderr ? { stderr: onStderr } : {}),
       env: {
         // First, so an operator-set value of any kind overrides it.

@@ -224,6 +224,8 @@ describe("a token refresh backfills a plan-blind credential", () => {
 
   it("takes the current plan when the endpoint reports a different one", async () => {
     const { refreshOAuthToken } = await import("../proxy/tokenRefresh")
+    // Only the missing half is being filled in; a plan already on disk was
+    // written by a login and is not up for revision by a backfill.
     const { store, oauth } = makeStore({ subscriptionType: "team" })
     stubEndpoints(() => jsonResponse(MAX_20X_PROFILE))
 

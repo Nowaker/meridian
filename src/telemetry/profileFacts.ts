@@ -30,6 +30,39 @@ function timeAgo(ts) {
   return new Date(ts).toLocaleString();
 }
 
+// The two largest units of an advisory stored expiry countdown.
+function expirySpan(ms) {
+  var mins = Math.floor(Math.abs(ms) / 60000);
+  var d = Math.floor(mins / 1440);
+  mins -= d * 1440;
+  var h = Math.floor(mins / 60);
+  var m = mins - h * 60;
+  if (d > 0) return d + 'd ' + h + 'h';
+  if (h > 0) return h + 'h ' + m + 'm';
+  return m + 'm';
+}
+
+function expiryFacts(p, now) {
+  var facts = [];
+  if (p.refreshTokenExpiresAt) {
+    var left = p.refreshTokenExpiresAt - now;
+    facts.push({ label: 'Refresh deadline',
+      value: left > 0 ? 'in ' + expirySpan(left) : 'passed \\u2014 login may need renewal',
+      tone: left <= 0 || p.renewalRequiredSoon ? 'warn' : '',
+      title: new Date(p.refreshTokenExpiresAt).toLocaleString()
+        + '. Reported by the stored credential; log in again before then. Authentication is checked separately.' });
+  }
+  if (p.accessTokenExpiresAt) {
+    var accessLeft = p.accessTokenExpiresAt - now;
+    facts.push({ label: 'Stored access token',
+      value: accessLeft > 0 ? 'expires in ' + expirySpan(accessLeft) : 'expiry passed',
+      tone: accessLeft <= 0 ? 'warn' : '',
+      title: new Date(p.accessTokenExpiresAt).toLocaleString()
+        + '. Recorded expiry, which may be estimated. Authentication is checked separately.' });
+  }
+  return facts;
+}
+
 function isChatGptProfile(p) {
   return !!p && (p.provider === 'chatgpt' || p.type === 'chatgpt');
 }
@@ -84,24 +117,10 @@ function ownerName(owner) {
   return owner.name + (owner.account ? ' \\u00b7 account ' + owner.account : '');
 }
 
-// "22d 4h", "5h 12m", "42m": the two largest units of a span.
-function spanText(ms) {
-  var mins = Math.floor(Math.abs(ms) / 60000);
-  var d = Math.floor(mins / 1440);
-  mins -= d * 1440;
-  var h = Math.floor(mins / 60);
-  var m = mins - h * 60;
-  if (d > 0) return d + 'd ' + h + 'h';
-  if (h > 0) return h + 'h ' + m + 'm';
-  return m + 'm';
-}
-
-// The login's lifetime, right under Status: when it has to be renewed is the
-// one fact here that someone has to act on before it happens. Past the
-// deadline nothing can renew it, and it keeps working only until the current
-// access token runs out.
+// What Meridian recorded about the login, right under Status: a recorded
+// logout replaces the stored deadlines, which no longer describe a login that
+// can serve; otherwise the deadlines, then when the login happened.
 function loginFacts(p, now) {
-  var facts = [];
   if (p.firstUnauthedAt) {
     var seat = isChatGptProfile(p);
     var why = p.unauthedReason === 'refresh_rejected'
@@ -109,25 +128,12 @@ function loginFacts(p, now) {
       : p.unauthedReason === 'credentials_cleared'
         ? (seat ? ' \\u2014 the seat has no usable sign-in' : ' \\u2014 the stored login was wiped')
         : '';
-    facts.push({ label: 'Logged out', value: spanText(now - p.firstUnauthedAt) + ' ago', tone: 'err',
-      title: 'Since ' + new Date(p.firstUnauthedAt).toLocaleString() + why });
-  } else if (p.refreshTokenExpiresAt) {
-    var left = p.refreshTokenExpiresAt - now;
-    var deadline = new Date(p.refreshTokenExpiresAt).toLocaleString();
-    var renewed = p.lastRefreshAt ? ' Token last renewed ' + timeAgo(p.lastRefreshAt) + '.' : '';
-    if (left > 0) {
-      facts.push({ label: 'Login expires', value: 'in ' + spanText(left), tone: p.renewalRequiredSoon ? 'warn' : '',
-        title: deadline + '. Log in again before then.' + renewed });
-    } else {
-      var stops = p.accessTokenExpiresAt && p.accessTokenExpiresAt > now
-        ? 'stops in ' + spanText(p.accessTokenExpiresAt - now)
-        : spanText(left) + ' ago';
-      facts.push({ label: 'Login expired', value: stops + ', log in again', tone: 'err',
-        title: 'Expired ' + deadline + '; it can no longer be renewed.' + renewed });
-    }
+    return [{ label: 'Logged out', value: expirySpan(now - p.firstUnauthedAt) + ' ago', tone: 'err',
+      title: 'Since ' + new Date(p.firstUnauthedAt).toLocaleString() + why }];
   }
+  var facts = expiryFacts(p, now);
   if (p.authObtainedAt) {
-    facts.push({ label: 'Logged in', value: spanText(now - p.authObtainedAt) + ' ago', tone: '',
+    facts.push({ label: 'Logged in', value: expirySpan(now - p.authObtainedAt) + ' ago', tone: '',
       title: new Date(p.authObtainedAt).toLocaleString() + (LOGIN_SOURCE[p.authObtainedVia] || '') });
   }
   return facts;

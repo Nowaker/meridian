@@ -11,8 +11,15 @@
  * owned lifecycle performs at startup, and it fails rather than degrades:
  * two processes exchanging one single-use refresh token is unrecoverable.
  * Without the lease `credentials` answers `no_authority` for every seat.
+ *
+ * UNDER MERIDIAN_CREDENTIALS_READONLY NO LEASE IS TAKEN. The instance serves
+ * each seat's access token as the store holds it, re-read on every request, so
+ * it follows the renewals of the instance that owns the store. It never
+ * renews, signs in or removes a seat, and a seat whose token has run out is
+ * unavailable until the owner renews it.
  */
 import type { CodexPoolResult } from "../codex/pool"
+import { isCredentialsReadOnly } from "../credentialsMode"
 import { decodeCodexToken } from "../codex/token"
 import { createChatGptCredentialStore, type ChatGptAccount, type ChatGptCredentialStore } from "./credentials"
 import { acquireWriterLease, type WriterLease } from "./lease"
@@ -94,7 +101,11 @@ export interface OwnedSourceOptions {
    * for a seat to be signed in through its web UI.
    */
   allowEmpty?: boolean
+  /** Serve without refresh authority (MERIDIAN_CREDENTIALS_READONLY); read from the environment when absent. */
+  readOnly?: boolean
 }
+
+const READ_ONLY_MESSAGE = "MERIDIAN_CREDENTIALS_READONLY=1 — this instance may not modify credentials."
 
 export const CHATGPT_NO_ACCOUNT_MESSAGE = "No ChatGPT account is connected to this Meridian. "
   + "Connect one in its web UI: open /profiles, name the profile under \"Add a profile\", then choose \"Connect with ChatGPT\"."
@@ -109,6 +120,7 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
   if (empty && !options.allowEmpty) return undefined
 
   const now = options.now ?? Date.now
+  const readOnly = options.readOnly ?? isCredentialsReadOnly()
   const reader = createChatGptCredentialStore({ path: storePath })
   let lease: WriterLease | undefined
   let store: ChatGptCredentialStore | undefined
@@ -177,6 +189,14 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
     },
 
     async credentials(seat) {
+      if (readOnly) {
+        const account = reader.readAccount(seat)
+        if (!account) return { ok: false, reason: "unknown" }
+        if (account.accessToken && account.expiresAt !== null && account.expiresAt - now() > ACCESS_TOKEN_BUFFER_MS) {
+          return { ok: true, account: { accountUserId: seat, accountId: account.accountId, accessToken: account.accessToken } }
+        }
+        return { ok: false, reason: "no_authority" }
+      }
       // Checked here rather than only at acquisition: a holder can be
       // displaced after a crash-recovery window, and the moment before a token
       // is spent is the only one at which discovering that is still useful.
@@ -193,7 +213,7 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
       return { ok: false, reason: outcome.status === "requires-reauth" ? "requires_reauth" : "no_authority" }
     },
 
-    isServing: holdsLease,
+    isServing: () => readOnly || holdsLease(),
 
     usagePool(): CodexPoolResult {
       // Read-only, and re-read so the dashboard observes token rotation.
@@ -218,13 +238,17 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
 
     describeUnavailable(reasons) {
       if (reader.readAccounts().length === 0) return CHATGPT_NO_ACCOUNT_MESSAGE
+      if (readOnly && reasons.has("no_authority")) {
+        return "This Meridian is read-only (MERIDIAN_CREDENTIALS_READONLY=1): it serves its ChatGPT accounts' access tokens "
+          + "but never renews them, and the instance that owns its store has not renewed these."
+      }
       if (reasons.has("no_authority")) return "This Meridian does not hold refresh authority for its ChatGPT accounts."
       if (reasons.has("requires_reauth")) return "Every ChatGPT account this Meridian owns needs an interactive login."
       return "Every ChatGPT account this Meridian owns is spent or unavailable."
     },
 
     async acquire() {
-      if (lease) return
+      if (lease || readOnly) return
       const acquired = await acquireWriterLease({
         lockPath: chatGptLockPath(storePath),
         ...(options.staleMs === undefined ? {} : { staleMs: options.staleMs }),
@@ -245,6 +269,7 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
     },
 
     connectAccount(account) {
+      if (readOnly) throw new Error(READ_ONLY_MESSAGE)
       if (!store || !holdsLease()) {
         throw new Error("This Meridian does not hold the writer lease for its ChatGPT store, so it cannot save a sign-in.")
       }
@@ -264,6 +289,7 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
     },
 
     removeAccount(seat) {
+      if (readOnly) throw new Error(READ_ONLY_MESSAGE)
       if (!store || !holdsLease()) {
         throw new Error("This Meridian does not hold the writer lease for its ChatGPT store, so it cannot remove a seat.")
       }
@@ -278,6 +304,10 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
     renewDue() {
       renewal ??= renewMostOverdue().finally(() => { renewal = undefined })
       return renewal
+    },
+
+    async settle() {
+      await refresher?.settle()
     },
   }
 }

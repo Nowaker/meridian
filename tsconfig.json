@@ -19,6 +19,11 @@
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
   },
-  "include": ["src/**/*", "index.ts", "provider.ts", "tests/**/*"],
-  "exclude": ["node_modules", "dist"]
+  "include": ["src/**/*", "bin/session-bookkeeping.ts", "index.ts", "provider.ts", "tests/**/*"],
+  "exclude": [
+    "node_modules", "dist",
+    "src/__tests__/bookkeeping-*", "src/__tests__/fixtures/bookkeeping-*", "src/__tests__/fixtures/full-document-store-rewrite.ts",
+    "src/__tests__/session-cache-clear-completion.test.ts", "src/__tests__/session-deletion-close.test.ts",
+    "src/__tests__/store-mutation-baseline.test.ts", "src/__tests__/session-lifecycle-gc-budgets.test.ts"
+  ]
 }

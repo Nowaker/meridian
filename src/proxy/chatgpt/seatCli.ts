@@ -228,7 +228,7 @@ export async function removeChatGptSeat(id: string, ctx: SeatCliContext): Promis
   })
   let outcome = "done" in local ? local.done : null
   if (!outcome) {
-    const reply = await call(io, "/profiles/remove", { profile: profile.id })
+    const reply = await call(io, "/profiles/chatgpt/remove", { profile: profile.id })
     if (!reply) return heldElsewhere(io, "held" in local ? local.held : "")
     if (reply.status !== 200) {
       io.error(`${RED}✗ ${String(reply.data.error ?? `Remove failed (HTTP ${reply.status}).`)}${RESET}`)

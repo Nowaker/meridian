@@ -606,6 +606,7 @@ describe("header active-profile chip", () => {
       setAttribute: () => undefined,
       addEventListener: () => undefined,
       replaceChildren: () => undefined,
+      contains: () => false,
       querySelector: () => stubElement(),
     }
   }

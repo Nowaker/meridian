@@ -7,13 +7,15 @@
  * the stored login it runs beside is left untouched, and that a root with a
  * request's Claude Code process in it is left alone until that request ends.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
 import { createHash } from "node:crypto"
 import { mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync, mkdirSync } from "node:fs"
 import { connect } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { installSdkMock } from "./sdkMock"
+import { createOwnedCredentialStore } from "./modelsMock"
+import * as tokens from "../proxy/tokenRefresh"
 import { installLoggerMock } from "./loggerMock"
 import { installMcpToolsMock } from "./mcpToolsMock"
 import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
@@ -109,15 +111,25 @@ describe.skipIf(process.platform === "darwin")("idle transcript sweep through th
     utimesSync(join(root, ".last-cleanup"), twoDaysAgo, twoDaysAgo)
   }
 
+  let storeOverride: { mockRestore(): void } | undefined
+
   beforeEach(() => {
     for (const key of ENV_KEYS) saved[key] = process.env[key]
     dir = mkdtempSync(join(tmpdir(), "meridian-proxy-transcript-sweep-"))
+    // The sweep reads each root's own login, so these roots keep the real file
+    // backend behind a path guard; the SDK mock leaves every other store empty.
+    tokens.setCredentialStorePlatformForTests("linux")
+    storeOverride = spyOn(tokens, "createPlatformCredentialStore").mockImplementation(options =>
+      createOwnedCredentialStore(dir, options?.claudeConfigDir))
     rootA = makeRoot("a")
     rootB = makeRoot("b")
     sweepChildren = []
   })
 
   afterEach(() => {
+    storeOverride?.mockRestore()
+    storeOverride = undefined
+    tokens.setCredentialStorePlatformForTests(null)
     for (const key of ENV_KEYS) {
       if (saved[key] === undefined) delete process.env[key]
       else process.env[key] = saved[key]
