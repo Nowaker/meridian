@@ -53,12 +53,12 @@ it("compares lifecycle results, errors and observed ledger after every JSON/SQLi
     }
     const a = await run("prepare", () => lifecycle.prepareFork(locator("a"), options))
     await run("publish false", () => lifecycle.publishPinnedTranscript(a, () => false, options))
-    const publish = async (key: string, target: lifecycle.TranscriptLocator) => (await store.storeSharedSession(
+    const publish = (key: string, target: lifecycle.TranscriptLocator) => store.storeSharedSession(
       key, target.sessionId, undefined, undefined, undefined, undefined, undefined, undefined,
-      undefined, undefined, target))
-    await run("publish success", () => lifecycle.publishPinnedTranscript(a, async () => (await publish("a", a)), options))
+      undefined, undefined, target)
+    await run("publish success", () => lifecycle.publishPinnedTranscript(a, () => publish("a", a), options))
     const b = locator("b")
-    await run("attach pinned", () => lifecycle.attachPinnedTranscript(b, async () => (await publish("b", b)), options))
+    await run("attach pinned", () => lifecycle.attachPinnedTranscript(b, () => publish("b", b), options))
     const lease = await run("acquire", () => lifecycle.acquireActiveTranscriptLease([a], options))
     await run("attach executor", () => lifecycle.attachActiveTranscriptExecutor(lease, owner, options))
     await run("release", () => lifecycle.releaseActiveTranscriptLease(lease, options))

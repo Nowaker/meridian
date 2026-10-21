@@ -56,7 +56,7 @@ it("installs both complete ports and retains the connection until the last owner
   expect(activeLifecycleBackend()).toBeDefined()
   expect(() => setSessionStoreDir(directory)).toThrow("proxies are running")
   initialized.close()
-  expect(await admitSessionStoreWrite(async () => (await storeSharedSession("key", "sdk")))).not.toBe(false)
+  expect(await admitSessionStoreWrite(() => storeSharedSession("key", "sdk"))).not.toBe(false)
   expect(lookupSharedSession("key")?.claudeSessionId).toBe("sdk")
   expect(readSessionTranscriptPins()).toEqual([])
   expect(existsSync(join(directory, "sessions.json"))).toBe(false)
@@ -73,7 +73,7 @@ it("releases only a nonfinal owner during admission while the last owner retains
   const second = retainProxyBookkeeping()
   if (!first || !second) throw new Error("SQL owners missing")
   handles.push(first, second)
-  const pending = admitSessionStoreWrite(async () => (await storeSharedSession("active-owner", "sdk")))
+  const pending = admitSessionStoreWrite(() => storeSharedSession("active-owner", "sdk"))
   expect(() => first.close()).not.toThrow()
   expect(() => second.close()).toThrow("cannot close during transaction/admission")
   await pending
@@ -89,7 +89,7 @@ it("a private native reader cannot release the last serving runtime during admis
   handles.push(runtime, reader)
   const gate = Promise.withResolvers<void>()
   const blocked = lifecycleLockQueue.run(connectionFor(directory).path, undefined, () => gate.promise)
-  const admitted = admitSessionStoreWrite(async () => (await storeSharedSession("runtime-owned", "sdk")))
+  const admitted = admitSessionStoreWrite(() => storeSharedSession("runtime-owned", "sdk"))
   try {
     expect(() => runtime.close()).toThrow("cannot close during transaction/admission")
     expect(activeStoreBackend()).toBeDefined()
@@ -146,18 +146,18 @@ it("migration priority rollback inside production admission preserves both canon
   expect(JSON.parse(String(raw))).toEqual(entry)
   const mapping = lookupSharedSessionResult("key"), route = lookupPriorityAssignmentResult("route")
   if (mapping.status === "error" || !mapping.generation || route.status === "error") throw new Error("lookup failed")
-  const publication = await admitSessionStoreWrite(async () => (await storeSharedSessionAndPriorityAssignment({
+  const publication = await admitSessionStoreWrite(() => storeSharedSessionAndPriorityAssignment({
     key: "key", claudeSessionId: "new", messageCount: 2, expectedMappingGeneration: mapping.generation!,
     lineageHash: "new-lineage", messageHashes: [], messageBlockHashes: [],
     priority: { routeKey: "route", profileId: "profile", lastHumanTurnDigest: "a".repeat(43),
       lastHumanTurnIssuedAt: 1, expectedAssignmentGeneration: route.generation },
-  })))
+  }))
   if (!publication) throw new Error("publication failed")
-  const rolledBack = await admitSessionStoreWrite(async () => (await rollbackSharedSessionAndPriorityAssignment({
+  const rolledBack = await admitSessionStoreWrite(() => rollbackSharedSessionAndPriorityAssignment({
     key: "key", routeKey: "route", expectedMappingGeneration: publication.mappingGeneration,
     expectedAssignmentGeneration: publication.assignmentGeneration,
     previousMapping: publication.previousMapping, previousAssignment: publication.previousAssignment,
-  })))
+  }))
   expect(rolledBack).not.toBe(false)
   const canonical = realpathSync(real)
   expect(handle.reader.all("SELECT slot,resource_key,generation FROM mapping_pins WHERE mapping_key='key' ORDER BY slot"))
@@ -190,7 +190,7 @@ it("default directory addressing performs no filesystem discovery inside product
       if (connectionFor(resolved).scope === "write") accesses.push(String(path))
       return original(path)
     })
-    expect(await admitSessionStoreWrite(async () => (await storeSharedSession("default", "sdk")))).not.toBe(false)
+    expect(await admitSessionStoreWrite(() => storeSharedSession("default", "sdk"))).not.toBe(false)
     expect(accesses).toEqual([])
   } finally {
     exists?.mockRestore()
@@ -244,14 +244,14 @@ it("async-admits real production store operations against another Node writer wi
     expect(String(bytes)).toContain("locked")
     timer = setInterval(() => ticks.push(performance.now()), 5)
     const started = performance.now()
-    await expect(admitSessionStoreWrite(async () => (await storeSharedSession("blocked", "sdk")), { lockWaitMs: 150 }))
+    await expect(admitSessionStoreWrite(() => storeSharedSession("blocked", "sdk"), { lockWaitMs: 150 }))
       .rejects.toBeInstanceOf(SessionLifecycleLockError)
     expect(performance.now() - started).toBeGreaterThanOrEqual(140)
     expect(ticks.length).toBeGreaterThanOrEqual(20)
     expect(lookupSharedSession("blocked")).toBeUndefined()
     child.stdin.write("release")
     expect((await exit)[0]).toBe(0)
-    expect(await admitSessionStoreWrite(async () => (await storeSharedSession("after", "sdk")))).not.toBe(false)
+    expect(await admitSessionStoreWrite(() => storeSharedSession("after", "sdk"))).not.toBe(false)
   } finally {
     if (timer) clearInterval(timer)
     if (child.exitCode === null) {

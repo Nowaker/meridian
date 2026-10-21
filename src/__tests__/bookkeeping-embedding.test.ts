@@ -51,7 +51,7 @@ function exclusiveAvailable(): boolean {
 function blockAdmission() {
   const gate = Promise.withResolvers<void>()
   const blocker = lifecycleLockQueue.run(connectionFor(directory).path, undefined, () => gate.promise)
-  const admitted = admitSessionStoreWrite(async () => (await storeSharedSession("owned-admission", "owned-sdk")))
+  const admitted = admitSessionStoreWrite(() => storeSharedSession("owned-admission", "owned-sdk"))
   return { gate, blocker, admitted }
 }
 
