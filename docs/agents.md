@@ -323,12 +323,14 @@ Set the OpenAI API base to `http://127.0.0.1:3456/v1` (clients append `/chat/com
 # OpenAI SDK: base_url="http://127.0.0.1:3456/v1", api_key="x"
 ```
 
-> **Note:** A request without a session key has its prior turns packed into the system prompt and runs on a fresh SDK session — the client replays the full history itself. A request keyed by `x-opencode-session` or `x-session-affinity` (Jcode: `x-jcode-session`) keeps its real messages and resumes one SDK session per key, under the contract every keyed client has:
+> **Note:** A request without a session key has its prior turns packed into the system prompt and runs on a fresh SDK session — the client replays the full history itself. A request keyed by `x-opencode-session`, `x-session-affinity` or `x-session-id` (Jcode: `x-jcode-session`) keeps its real messages and resumes one SDK session per key, under the contract every keyed client has:
 >
 > - turns under one key are serialized; a turn that lost the race and no longer holds the committed history is refused with HTTP 400 (`This session advanced while the request was waiting`) — retry it with the latest history;
 > - the history per key must be append-only: an edited turn forks at the edit as an undo, a rewritten middle replays fresh;
 > - a retry of an identical body is classified `replayed-request` and replays fresh — a second, billed answer;
-> - at this endpoint `x-session-affinity` is read as conversation identity, not a stickiness hint — send a distinct value per conversation, or omit it.
+> - at this endpoint `x-session-affinity` and `x-session-id` are read as conversation identity, not a stickiness hint — send a distinct value per conversation, or omit them.
+>
+> `x-session-id` is the header to send from a client that also talks to other providers: OpenRouter uses it as its own session key, and browser clients can send it there because OpenRouter's CORS allowlist names it. When several are present, `x-opencode-session` wins, then `x-session-affinity`, then `x-session-id`.
 
 ### Jcode
 

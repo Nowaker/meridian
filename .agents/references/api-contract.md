@@ -12,6 +12,7 @@ External plugins depend on these interfaces. **Changes require project owner app
 | `clearSessionCache(): Promise<void>` | `session/cache.ts`, exported by `server.ts` | Owner-approved #1244/#1277 cleanup: reset memory immediately; await ordered durable cleanup, retaining its best-effort error policy |
 | `ProxyConfig` type | `types.ts` | Plugin configuration |
 | `x-opencode-session` header | `adapters/opencode.ts` | Session tracking from agent plugins |
+| Generic OpenAI `x-session-id` on `/v1/chat/completions` | `adapters/openai.ts`, `server.ts` | Owner-approved #1441: distinct conversation identity after the existing OpenCode/session-affinity keys and agent scoping; blank values keep the headerless path |
 | `x-meridian-profile` header | `server.ts`, `profiles.ts` | Per-request profile selection |
 | `GET /health` response shape | `server.ts` | Plugin health checks |
 | `/health` `backend` field | `server.ts` / `backends/antigravity.ts` | Desktop provider compatibility check (#1073) |
@@ -31,6 +32,14 @@ External plugins depend on these interfaces. **Changes require project owner app
 | `POST /profiles/active` request/response | `server.ts` | Profile switching from CLI and UI |
 | ChatGPT additions: OpenAI model ids on `/v1/responses` routed to ChatGPT seats; new `POST /v1/images/generations` and `/v1/images/edits` (ChatGPT only, 404 without it); `/health` `chatgpt` and `backends`; `/profiles/list` entries with `type: "chatgpt"`, `activeProfiles`, `chatgpt.owner`; `provider` on `POST /profiles/active`; `chatgpt` in `GET /inflight`; `/profiles/chatgpt/*`, `/settings/api/chatgpt` | `server.ts`, `upstream/`, `backends/chatgpt.ts`, `chatgpt/` | Additive and absent unless `MERIDIAN_CHATGPT_CREDENTIALS` (or a populated owned store) enables ChatGPT; existing fields keep their meaning: `activeProfile` stays the Claude pointer wherever Claude profiles exist |
 If you need to modify any of these, open an issue first — breaking changes affect downstream plugin authors.
+
+The owner approved the generic OpenAI conversation-header contract in #1441
+on 2026-10-21. `x-opencode-session` and `x-session-affinity` retain precedence
+over `x-session-id`, including their existing agent scoping. A nonblank
+`x-session-id` must be distinct per conversation and follows the same serialized,
+append-only history, fork and retry behavior as the other explicit keys.
+Other adapters retain their identity rules; request-body and CORS policy are
+unchanged. Actual affected-flow evidence and final-head checks remain required.
 
 The owner approved executable selection in #1319 on 2026-10-08. System remains
 the default; `MERIDIAN_CLAUDE_PATH` has highest priority. The authenticated
