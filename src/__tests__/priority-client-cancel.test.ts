@@ -82,7 +82,10 @@ beforeEach(async () => {
 afterEach(async () => {
   // Consuming a response does not join its background GC. Close every proxy
   // before another fixture can change the process-wide session directory.
-  for (const proxy of proxies) await proxy.closeBackend()
+  for (const proxy of proxies) {
+    if (!proxy.closeBackend) throw new Error("Cancellation fixture requires backend cleanup")
+    await proxy.closeBackend()
+  }
   proxies.length = 0
   for (const [key, value] of Object.entries(savedEnv)) {
     if (value === undefined) delete process.env[key]
