@@ -156,15 +156,14 @@ export async function clearSessionCache(): Promise<void> {
   }
   try {
     if (!activeStoreBackend()) {
-      await clearSharedSessions()
+      await clearSharedSessions(clearMemory)
       return
     }
     const directory = getSessionStoreDir()
     const clearDurable = () => {
-      clearSharedSessions()
-      // Earlier FIFO writers may have repopulated memory while admission waited.
+      // Earlier FIFO writers or reads may have repopulated memory while admission waited.
       // Clear at COMMIT, before any later publication; never in an await continuation.
-      withStoreWrite(directory, tx => { tx.afterCommit(clearMemory) })
+      clearSharedSessions(clearMemory)
     }
     if (isSessionStoreTransactionActive()) {
       // Internal synchronous callers join their existing scope. Its COMMIT or

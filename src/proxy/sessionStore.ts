@@ -965,7 +965,7 @@ async function writeStore(path: string, document: SessionStoreDocument, beforePu
   }
 }
 
-async function mutateStore(mutator: (document: SessionStoreDocument) => boolean, beforePublish?: () => void): Promise<void> {
+async function mutateStore(mutator: (document: SessionStoreDocument) => boolean, beforePublish?: () => void, afterCommit?: () => void): Promise<void> {
   const path = getStorePath()
   const lockPath = `${path}.lock`
   await runStoreMutationInOrder(lockPath, async () => {
@@ -999,6 +999,8 @@ async function mutateStore(mutator: (document: SessionStoreDocument) => boolean,
         publishStoreCache(path, draft)
         await fsyncParentDirectory(path)
       }
+      // Complete local effects before releasing this writer or admitting the next.
+      afterCommit?.()
     } finally {
       await releaseLock(lock)
     }
@@ -1981,9 +1983,9 @@ export function listStoredSessions(): Array<{
   }))
 }
 
-export function clearSharedSessions(): void | Promise<void> {
+export function clearSharedSessions(afterCommit?: () => void): void | Promise<void> {
   const backend = activeStoreBackend()
-  if (backend) return backend.clearSharedSessions(getSessionStoreDir())
+  if (backend) return backend.clearSharedSessions(getSessionStoreDir(), afterCommit)
   return mutateStore(({ sessions: store, meta }) => {
     for (const key of Object.keys(store)) {
       delete store[key]
@@ -2001,5 +2003,5 @@ export function clearSharedSessions(): void | Promise<void> {
       }
     }
     return true
-  })
+  }, undefined, afterCommit)
 }

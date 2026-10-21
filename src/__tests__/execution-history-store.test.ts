@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto"
 import { captureProcessIncarnation } from "../proxy/session/processIncarnation"
 import { getConversationFingerprint } from "../proxy/session/fingerprint"
 import { join } from "node:path"
-import { lookupSession, rollbackPrioritySessionPublication, storeSession, type PrioritySessionPublication } from "../proxy/session/cache"
+import { clearSessionCache, lookupSession, rollbackPrioritySessionPublication, storeSession, type PrioritySessionPublication } from "../proxy/session/cache"
 import { computeLineageHash } from "../proxy/session/lineage"
 import { openCodePrimaryAgentContextHash } from "../proxy/adapters/opencodeAgentContext"
 import { claimPriorityAttempt, lookupPriorityAssignmentResult, lookupSharedSession, lookupSharedSessionResult, setSessionStoreDir } from "../proxy/sessionStore"
@@ -164,6 +164,42 @@ describe("durable raw proof and execution reuse proof", () => {
       expect(result.type).toBe("continuation")
       if (result.type !== "continuation") throw new Error("Expected restored fallback")
       expect(result.session.claudeSessionId).toBe("sdk-before")
+    } finally {
+      errors.mockRestore()
+      writeFileSync(path, stored)
+    }
+  })
+
+  it.each(["pending-clear", undefined])("clears JSON fallback repopulated while durable cleanup waits (%s)", async (key) => {
+    const cwd = "/fixture/pending-json-clear"
+    await storeSession(key, messages, "old-sdk", cwd)
+    const incarnation = captureProcessIncarnation()
+    if (!incarnation) throw new Error("fixture lock owner unavailable")
+    const path = join(directory, "sessions.json")
+    const lockPath = path + ".lock"
+    const token = JSON.stringify({ pid: process.pid, hostname: hostname(), token: randomUUID(), incarnation })
+    writeFileSync(lockPath, token, { flag: "wx", mode: 0o600 })
+    const pending = clearSessionCache()
+    const later = storeSession("later", messages, "later-sdk", cwd)
+    try {
+      expect(pending).toBeInstanceOf(Promise)
+      // A synchronous read can populate memory from the still-authoritative disk record.
+      const during = lookupSession(key, continuation, cwd)
+      expect(during.type).toBe("continuation")
+    } finally {
+      if (readFileSync(lockPath, "utf8") === token) unlinkSync(lockPath)
+      await Promise.all([pending, later])
+    }
+    expect(lookupSharedSessionResult(key ?? getConversationFingerprint(messages, cwd)).status).toBe("missing")
+    const stored = readFileSync(path, "utf8")
+    writeFileSync(path, "controlled read failure")
+    const errors = spyOn(console, "error").mockImplementation(() => {})
+    try {
+      expect(lookupSession(key, continuation, cwd).type).toBe("diverged")
+      const newest = lookupSession("later", continuation, cwd)
+      expect(newest.type).toBe("continuation")
+      if (newest.type !== "continuation") throw new Error("Later publication lost")
+      expect(newest.session.claudeSessionId).toBe("later-sdk")
     } finally {
       errors.mockRestore()
       writeFileSync(path, stored)

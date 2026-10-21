@@ -492,7 +492,9 @@ The owner-approved `clearSessionCache(): Promise<void>` resets both LRUs
 immediately and fences older cache commit hooks. SQL cleanup joins bounded FIFO
 admission; a second reset runs at its durable COMMIT before later publications.
 Internal synchronous scopes join the existing SQL transaction. JSON cleanup joins
-its ordered writer queue. Both paths keep the best-effort error policy, and
+its ordered writer queue and resets memory again inside that queue after durable
+publication, before admitting a later writer. Both backends carry this private
+clear effect through their commit boundary. Both paths keep the best-effort error policy, and
 callers await completion before relying on durable cleanup. Cache hooks are fenced
 by the epoch captured at invocation; priority publication metadata still follows
 its store commit even when cleanup superseded the cache hook. Unknown SQL COMMIT
