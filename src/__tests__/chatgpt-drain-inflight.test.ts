@@ -6,7 +6,7 @@
  * Without this a supervisor draining a ChatGPT-only instance read `total: 0`
  * while responses were still streaming, and restarted through them.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -33,6 +33,7 @@ delete process.env.MERIDIAN_API_KEY
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
 const { saveSettings } = await import("../settings")
 const { __setFetchOAuthUsageOverride, resetOAuthUsageCache } = await import("../proxy/oauthUsage")
+const { processSessionTree } = await import("../proxy/sessionTree")
 
 const CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 const LOOPBACK = { incoming: { socket: { remoteAddress: "127.0.0.1" } } }
@@ -114,7 +115,7 @@ async function server() {
   const proxy = createProxyServer({ port: 0, host: "127.0.0.1", silent: true, pluginDir: join(dir, "no-plugins"), pluginConfigPath })
   await proxy.initPlugins?.()
   const inflight = async () => (await (await proxy.app.fetch(new Request("http://localhost/inflight"), LOOPBACK)).json()) as InflightBody
-  return { app: proxy.app, inflight }
+  return { app: proxy.app, inflight, inFlightCount: () => proxy.getInFlightCount?.() ?? 0 }
 }
 
 beforeEach(async () => {
@@ -200,6 +201,23 @@ describe("GET /inflight counts ChatGPT turns", () => {
     const failed = await Promise.resolve(app.fetch(responses())).catch((error: unknown) => error)
     if (failed instanceof Response) await failed.text()
     expect((await inflight()).total).toBe(0)
+  })
+
+  it("drops a turn that fails before reaching the backend, after it was counted", async () => {
+    const { app, inflight, inFlightCount } = await server()
+    const register = spyOn(processSessionTree, "register").mockImplementation(() => {
+      throw new Error("session tree unavailable")
+    })
+    try {
+      const failed = await Promise.resolve(app.fetch(responses())).catch((error: unknown) => error)
+      if (failed instanceof Response) await failed.text()
+      expect(register).toHaveBeenCalledTimes(1)
+    } finally {
+      register.mockRestore()
+    }
+    expect(streams).toHaveLength(0)
+    expect((await inflight()).total).toBe(0)
+    expect(inFlightCount()).toBe(0)
   })
 })
 
