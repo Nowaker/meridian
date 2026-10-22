@@ -271,7 +271,8 @@ ${profileBarHtml}
   <p class="subtitle" style="max-width:720px;line-height:1.6">
     Meridian is installed and updated by hand, so an instance can sit on an old version for weeks without
     anyone noticing. Switch this on and it asks the npm registry once a day whether a newer version is
-    published; the site header then says so, beside the version it is running. Off unless you turn it on —
+    published; the site header then says so, beside the version it is running. The same check covers every
+    loaded plugin installed from an npm package, listed below. Off unless you turn it on —
     nothing contacts the registry until then. The header shows the running version either way.
   </p>
   <div class="adapter-card" id="updates-card">
@@ -1016,7 +1017,7 @@ async function loadUpdates() {
   else if (!build.latest) state = 'checking…';
   else state = build.updateAvailable ? telemetryEsc(build.latest) + ' available' : 'up to date';
 
-  document.getElementById('updates-body').innerHTML = settingRowHtml({
+  document.getElementById('updates-body').innerHTML = '<div class="setting-stack">' + settingRowHtml({
     label: 'Check for updates',
     forId: 'upd-enabled',
     controlHtml: '<input type="checkbox" id="upd-enabled"' + (cfg.checkForUpdates ? ' checked' : '') + (cfg.envOptOut ? ' disabled' : '') + '>',
@@ -1027,10 +1028,32 @@ async function loadUpdates() {
         + '.',
     ],
     envText: cfg.envOptOut ? envOverrideText(cfg.envSource, 'off, no update checks', cfg.checkForUpdates ? 'on' : null) : null,
-  });
+  }) + pluginUpdateRows(cfg) + '</div>';
 
   const box = document.getElementById('upd-enabled');
   if (box && !cfg.envOptOut) box.addEventListener('change', (e) => putUpdates(e.target.checked));
+}
+
+function pluginUpdateState(p, enabled) {
+  if (!p.checkable) return 'not checkable: ' + telemetryEsc(p.reason || 'no npm package');
+  const installed = telemetryEsc(p.installed);
+  const failed = p.error ? ' <span style="color:var(--red)">(last check failed: ' + telemetryEsc(p.error) + ')</span>' : '';
+  if (!enabled) return installed;
+  if (p.updateAvailable) return installed + ' → <span style="color:var(--yellow)">' + telemetryEsc(p.latest) + ' available</span>' + failed;
+  if (p.latest) return installed + ', <span style="color:var(--green)">up to date</span>' + failed;
+  return installed + (p.error ? failed : ', checking…');
+}
+
+function pluginUpdateRows(cfg) {
+  const plugins = cfg.plugins || [];
+  if (plugins.length === 0) return '<div class="setting-status">No plugins loaded.</div>';
+  return plugins.map(function (p) {
+    return settingRowHtml({
+      label: 'Plugin: ' + p.name,
+      controlHtml: p.package ? '<code>' + telemetryEsc(p.package) + '</code>' : '',
+      statusHtml: [pluginUpdateState(p, cfg.enabled)],
+    });
+  }).join('');
 }
 
 async function putUpdates(checkForUpdates) {
