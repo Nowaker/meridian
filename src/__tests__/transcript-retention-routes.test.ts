@@ -21,6 +21,7 @@ interface TranscriptSettingsResponse {
   saved: number | null
   effective: { days: number; source: string }
   envOverride: boolean
+  envSource: { name: string; value: string | null; secret: boolean } | null
   default: number
   limits: { min: number; max: number }
 }
@@ -69,6 +70,7 @@ describe("transcript retention settings routes", () => {
       saved: null,
       effective: { days: 30, source: "default" },
       envOverride: false,
+      envSource: null,
       default: 30,
       limits: { min: 0, max: 3650 },
     })
@@ -113,6 +115,7 @@ describe("transcript retention settings routes", () => {
     const state = await get()
     expect(state.saved).toBe(7)
     expect(state.envOverride).toBe(true)
+    expect(state.envSource).toEqual({ name: "MERIDIAN_TRANSCRIPT_RETENTION_DAYS", value: "21", secret: false })
     expect(state.effective).toEqual({ days: 21, source: "env" })
   })
 
