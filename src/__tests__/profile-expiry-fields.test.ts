@@ -186,6 +186,8 @@ if (!isScenario(arg)) {
     const { resetActiveProfile } = await import("../proxy/profiles")
     const expiryFields = ["refreshTokenExpiresAt", "daysUntilRenewal", "renewalRequiredSoon", "accessTokenExpiresAt"] as const
     const historyFields = ["authObtainedAt", "authObtainedVia", "lastRefreshAt", "firstUnauthedAt", "unauthedReason"] as const
+    // Duplicate-account and post-sign-in status, reported for every profile.
+    const statusFields = ["duplicateOf", "duplicateBasis", "factsRefresh"] as const
     const baseFields = [
       "id", "type", "isActive", "email", "subscriptionType", "organizationName", "rateLimitTier",
       "seatTier", "allowance", "allowanceWeight", "planLabel", "accountType", "planName", "loggedIn",
@@ -262,7 +264,7 @@ if (!isScenario(arg)) {
         for (const field of historyFields) check(Object.hasOwn(item, field), `Login history field ${field} missing`)
         equal(
           Object.keys(item).sort(),
-          [...baseFields, ...expiryFields, ...historyFields, ...(input.aliases ? ["aliases"] : [])].sort(),
+          [...baseFields, ...expiryFields, ...historyFields, ...statusFields, ...(input.aliases ? ["aliases"] : [])].sort(),
           "Profile response changed fields beyond the expiry and login-history additions",
         )
         equal(item.type, input.type ?? "claude-max", "Existing profile type changed")
