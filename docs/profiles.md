@@ -183,9 +183,9 @@ Signing a profile in from a browser that is still signed in to another account l
 | `duplicateOf` | Ids of the other profiles signed in to the same account, `[]` when there are none |
 | `duplicateBasis` | What proved it, or `null`: `account-organization`, `email-organization`, `seat` or `workspace-email` |
 
-One person legitimately holds several subscriptions - a personal plan and seats in several Team organizations - so an email alone never makes a duplicate. A Claude account is its account UUID **and** organization UUID, as `GET /api/oauth/profile` reports them. Until those have been read for both profiles, the email **and** organization name stand in, and `duplicateBasis` says `email-organization`. A ChatGPT seat is its seat id, or the same email in the same workspace. Profiles of different providers never match.
+One person legitimately holds several subscriptions - a personal plan and seats in several Team organizations - so an email alone never makes a duplicate. A Claude account is its account UUID **and** organization UUID, as `GET /api/oauth/profile` reports them. When a read for the current credential did not report them for one of the two profiles, the email **and** organization name stand in, and `duplicateBasis` says `email-organization`. A ChatGPT seat is its seat id, or the same email in the same workspace. Profiles of different providers never match.
 
-The account is read again whenever the stored credential changes - a login, a re-login or a token renewal - instead of waiting for the daily refresh, so a re-login into the right account clears the flag on the next poll. The badge is informational: routing treats each profile as its own account, as it always has.
+The account is read again whenever the stored credential changes - a login, a re-login or a token renewal - instead of waiting for the daily refresh, so a re-login into the right account clears the flag on the next poll. Until that read lands, the account recorded for the previous credential is not used: the profile is not flagged from it, and its email comes from `claude auth status`. Once it lands, the email shown is the one Anthropic reported for the credential the profile holds now. The badge is informational: routing treats each profile as its own account, as it always has.
 
 ### After a sign-in
 
