@@ -1637,43 +1637,14 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return { inner, exposure }
   }
 
-  /**
-   * Other Claude profiles PROVEN to be signed in to `profileId`'s account: the
-   * account and organization UUIDs on record match. They hold one quota, so a
-   * quota refusal on one is a refusal on all of them, and trying each in turn
-   * spends an attempt per name to learn what the first already said. Email
-   * and organization name are not proof enough to steer traffic by; the pages
-   * flag those matches, routing does not act on them.
-   */
-  function quotaSharedWith(profileId: string): string[] {
-    const records = organizationNames()
-    const claude = getEffectiveProfiles(finalConfig.profiles).filter(p => (p.type ?? "claude-max") === "claude-max")
-    const found = findDuplicateProfiles(claude.map((p): IdentifiedProfile => {
-      const record = records[p.id]
-      return record?.accountUuid && record.organizationUuid
-        ? { id: p.id, identity: { provider: "claude", accountUuid: record.accountUuid, organizationUuid: record.organizationUuid } }
-        : { id: p.id, identity: null }
-    }))
-    return found.get(profileId)?.duplicateOf ?? []
-  }
-
-  /** `sharedQuota` collects the profiles this refusal also spoke for, so the
-   *  request's remaining candidates can skip them. */
-  function markPriorityFailure(candidate: string, reason: string, sharedQuota?: Set<string>): number {
+  function markPriorityFailure(candidate: string, reason: string): number {
     const quotaRefusal = isQuotaRefusal(reason)
     const until = quotaRefusal
       ? priorityCooldownUntil(candidate, Date.now())
       : Date.now() + PRIORITY_DEFAULT_COOLDOWN_MS
     priorityExhaustion.mark(candidate, until, reason)
     claudeLog("priority.exhausted", { profile: candidate, until, reason })
-    if (quotaRefusal) {
-      for (const twin of quotaSharedWith(candidate)) {
-        priorityExhaustion.mark(twin, until, reason)
-        sharedQuota?.add(twin)
-        claudeLog("priority.exhausted", { profile: twin, until, reason, sharedWith: candidate })
-      }
-      refinePriorityCooldown(candidate)
-    }
+    if (quotaRefusal) refinePriorityCooldown(candidate)
     return until
   }
 
@@ -1705,7 +1676,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       previous: string | null
       previousReason: string
       earliestPoolReset: number | null
-      sharedQuota: Set<string>
     },
   ): Promise<Response> {
     const encoder = new TextEncoder()
@@ -1739,7 +1709,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           for (let attempt = start.attempt; attempt < options.candidateIds.length; attempt++) {
             const candidate = options.candidateIds[attempt]!
             const handed = attempt === start.attempt
-            if (!handed && start.sharedQuota.has(candidate)) continue
             // The handed attempt is always relayed: its reader owns the cancel.
             if (!handed && isCancelled()) break
             activeExposure = handed ? start.exposure : { committed: false }
@@ -1755,7 +1724,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               await verdict.discard()
               await responseCompletions.get(inner)?.catch(() => {})
               const reason = verdict.errorType
-              const cooldownUntil = markPriorityFailure(candidate, reason, start.sharedQuota)
+              const cooldownUntil = markPriorityFailure(candidate, reason)
               if (isCancelled()) break
               earliestPoolReset = Math.min(earliestPoolReset ?? cooldownUntil, cooldownUntil)
               lastError = verdict.errorPayload
@@ -1946,18 +1915,14 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // frees up, not the last one tried. Tracked across the loop so the caller's
     // Retry-After names the pool's earliest opening (#901).
     let earliestPoolReset: number | null = null
-    // Profiles a refusal in THIS request already spoke for: one account under
-    // another name, so asking it again only repeats the answer.
-    const sharedQuota = new Set<string>()
     for (const [attempt, candidate] of options.candidateIds.entries()) {
-      if (sharedQuota.has(candidate)) continue
       const { inner, exposure } = await runPriorityAttempt(options, attempt, candidate, attemptOwnerToken)
       // A non-SSE answer is decided here and keeps its HTTP status. Once an
       // account streams, headers go out and the remaining candidates are
       // tried inside the stream.
       if (options.wantsStream && isEventStream(inner)) {
         return streamPriorityDispatch(options, attemptOwnerToken, settleAttempt, {
-          attempt, inner, exposure, lastError, previous, previousReason, earliestPoolReset, sharedQuota,
+          attempt, inner, exposure, lastError, previous, previousReason, earliestPoolReset,
         })
       }
       const sniffed = await sniffAccountFailure(inner)
@@ -1996,7 +1961,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const reason = sniffed.errorType
       // Only a quota refusal has a reset to look up. Both cooldown tiers read
       // the account's five-hour window, which says nothing about entitlement.
-      const cooldownUntil = markPriorityFailure(candidate, reason, sharedQuota)
+      const cooldownUntil = markPriorityFailure(candidate, reason)
       if (earliestPoolReset === null || cooldownUntil < earliestPoolReset) {
         earliestPoolReset = cooldownUntil
       }

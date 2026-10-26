@@ -185,7 +185,7 @@ Signing a profile in from a browser that is still signed in to another account l
 
 One person legitimately holds several subscriptions - a personal plan and seats in several Team organizations - so an email alone never makes a duplicate. A Claude account is its account UUID **and** organization UUID, as `GET /api/oauth/profile` reports them. Until those have been read for both profiles, the email **and** organization name stand in, and `duplicateBasis` says `email-organization`. A ChatGPT seat is its seat id, or the same email in the same workspace. Profiles of different providers never match.
 
-The account is read again whenever the stored credential changes - a login, a re-login or a token renewal - instead of waiting for the daily refresh, so a re-login into the right account clears the flag on the next poll. Under priority routing, a quota refusal on one profile also cools down the profiles proven (by UUID) to be the same account, and the request moves on without trying them.
+The account is read again whenever the stored credential changes - a login, a re-login or a token renewal - instead of waiting for the daily refresh, so a re-login into the right account clears the flag on the next poll. The badge is informational: routing treats each profile as its own account, as it always has.
 
 ### After a sign-in
 
