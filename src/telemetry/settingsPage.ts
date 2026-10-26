@@ -243,7 +243,8 @@ ${profileBarHtml}
     Meridian is installed and updated by hand, so an instance can sit on an old version for weeks without
     anyone noticing. Switch this on and it asks the npm registry once a day whether a newer version is
     published; the site header then says so, beside the version it is running. The same check covers every
-    loaded plugin installed from an npm package, listed below. Off unless you turn it on —
+    loaded plugin installed from an npm package, listed below, so turning it on also sends those plugins'
+    package names to the registry. Off unless you turn it on —
     nothing contacts the registry until then. The header shows the running version either way.
   </p>
   <div class="adapter-card" id="updates-card">
