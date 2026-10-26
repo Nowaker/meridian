@@ -9547,7 +9547,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return {
       checkForUpdates: getSetting("checkForUpdates") === true,
       envOptOut: envBool("NO_UPDATE_CHECK"),
-      envSource: envBool("NO_UPDATE_CHECK") ? envSource("NO_UPDATE_CHECK") : null,
       enabled: isUpdateCheckEnabled(),
       build: currentBuild(),
     }

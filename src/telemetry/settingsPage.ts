@@ -954,7 +954,10 @@ async function loadUpdates() {
         + (build.source && build.source !== 'npm' ? ' from a ' + telemetryEsc(build.source) + ' build; the header shows its separate release and runtime provenance' : '')
         + '.',
     ],
-    envText: cfg.envOptOut ? envOverrideText(cfg.envSource, 'off, no update checks', cfg.checkForUpdates ? 'on' : null) : null,
+    envText: !cfg.envOptOut ? null
+      : cfg.checkForUpdates
+        ? envOverrideText({ name: 'MERIDIAN_NO_UPDATE_CHECK', value: null }, 'off, no update checks', 'on')
+        : 'In use: off, no update checks, from MERIDIAN_NO_UPDATE_CHECK (env); this setting is off as well',
   });
 
   const box = document.getElementById('upd-enabled');
@@ -1004,14 +1007,13 @@ async function loadClaudeExecutable() {
   const active = cfg.active
     ? claudeExeCandidate(cfg.active) + ' <span style="color:var(--muted)">(' + telemetryEsc(cfg.active.source) + ')</span>'
     : '<span style="color:var(--red)">' + telemetryEsc(cfg.activeError || 'none resolved') + '</span>';
-  const envPathName = (cfg.envSource && cfg.envSource.name) || 'MERIDIAN_CLAUDE_PATH';
   let envText = null;
   if (cfg.envOverride && cfg.active && cfg.active.source === 'env') {
-    envText = envOverrideText(cfg.envSource,
+    envText = envOverrideText({ name: 'MERIDIAN_CLAUDE_PATH', value: null },
       cfg.active.path + (cfg.active.version ? ' ' + cfg.active.version : ''),
       cfg.mode === 'custom' && cfg.customPath ? 'custom ' + cfg.customPath : cfg.mode);
   } else if (cfg.envOverride) {
-    envText = envPathName + ' is set but not used: ' + (cfg.envOverride.detail || 'it cannot run');
+    envText = 'MERIDIAN_CLAUDE_PATH is set but not used: ' + (cfg.envOverride.detail || 'it cannot run');
   }
   let h = '<div class="setting-stack">' + settingRowHtml({
     label: 'Executable',

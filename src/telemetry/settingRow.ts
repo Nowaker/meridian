@@ -16,7 +16,7 @@
 export interface EnvSourceView {
   /** The variable actually read, e.g. MERIDIAN_TELEMETRY_RETENTION_DAYS. */
   readonly name: string
-  /** Its raw value; null when the variable is credential-like and only its presence may be shown. */
+  /** Its raw value; null when it is credential-like or the caller does not know it. */
   readonly value: string | null
   readonly secret?: boolean
 }
@@ -32,9 +32,11 @@ export function envOverrideText(source: unknown, inUse: string | null, saved: st
   const record = source as Record<string, unknown>
   if (typeof record.name !== "string" || !record.name) return null
   const value = typeof record.value === "string" ? record.value : null
-  const origin = record.secret === true || value === null
+  const origin = record.secret === true
     ? record.name + " (env, set; value hidden)"
-    : value === ""
+    : value === null
+      ? record.name + " (env)"
+      : value === ""
       ? record.name + " (env, set but empty)"
       : record.name + "=" + value + " (env)"
   const head = inUse ? "In use: " + inUse + ", from " + origin : "In use: from " + origin

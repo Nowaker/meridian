@@ -43,6 +43,11 @@ describe("envOverrideText", () => {
     expect(overrideText({ name: "MERIDIAN_TELEMETRY_PERSIST", value: "", secret: false }, "memory", "SQLite"))
       .toBe("In use: memory, from MERIDIAN_TELEMETRY_PERSIST (env, set but empty); saved setting SQLite is ignored")
   })
+
+  test("a variable whose value the page does not know is named without one", () => {
+    expect(overrideText({ name: "MERIDIAN_CLAUDE_PATH", value: null }, "/opt/claude 9.9.3", "system"))
+      .toBe("In use: /opt/claude 9.9.3, from MERIDIAN_CLAUDE_PATH (env); saved setting system is ignored")
+  })
 })
 
 describe("settingRowHtml", () => {
@@ -75,6 +80,12 @@ describe("settingRowHtml", () => {
     expect(settingsPageHtml).toContain("var settingRowHtml = ")
     expect(settingsPageHtml).not.toContain("env override active")
     expect(settingsPageHtml).not.toContain("feature-info")
+  })
+
+  test("the page names the update and executable variables itself, not from a response field", () => {
+    expect(settingsPageHtml).not.toMatch(/cfg\.envSource\b/)
+    expect(settingsPageHtml).toContain("name: 'MERIDIAN_NO_UPDATE_CHECK'")
+    expect(settingsPageHtml).toContain("name: 'MERIDIAN_CLAUDE_PATH'")
   })
 })
 
