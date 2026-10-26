@@ -1220,9 +1220,10 @@ function writeProfilesUrl(hashId) {
   if (url.toString() !== location.href) history.replaceState(history.state, '', url.toString());
 }
 
-// A card shows when its provider's chip is on AND it matches the search; a
-// provider's heading shows while any of its cards does. The count and the
-// no-match message count only the providers on screen.
+// A card shows when its provider's chip is on AND it matches the search, or
+// is updating after a sign-in (see profileCardStatus.ts); a provider's heading
+// shows while any of its cards does. The count and the no-match message count
+// only the providers on screen.
 function applyProfileFilter() {
   var profiles = profilesForFind();
   var byId = Object.create(null);
@@ -1234,7 +1235,8 @@ function applyProfileFilter() {
   for (var c = 0; c < cards.length; c++) {
     var group = cards[c].getAttribute('data-group');
     var providerOn = meridianProviders.visible(group, providersPresent);
-    var match = providerOn && profileMatchesQuery(byId[cards[c].getAttribute('data-id')], profileQuery);
+    var cardProfile = byId[cards[c].getAttribute('data-id')];
+    var match = providerOn && (profileMatchesQuery(cardProfile, profileQuery) || meridianCardStatus.isUpdating(cardProfile));
     cards[c].hidden = !match;
     if (providerOn) inView++;
     if (match) { shown++; groupShown[group] = true; }

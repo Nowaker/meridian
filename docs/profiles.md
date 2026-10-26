@@ -189,7 +189,7 @@ The account is read again whenever the stored credential changes - a login, a re
 
 ### After a sign-in
 
-A finished sign-in (re-login by paste or redirect, adding a profile, connecting or re-signing a ChatGPT seat) is followed by the reads that say who it signed in as, its plan and its usage. Until they land, the profile's card stays where it is and shows **Updating with the new sign-in…**; if they fail, it shows the reason. The card stays visible even when a login-state filter would hide it. `GET /profiles/list` reports the state as `factsRefresh`: `null` when idle, `{ "state": "updating", "since" }`, or `{ "state": "failed", "since", "at", "error" }` for five minutes after a failed read.
+A finished sign-in (re-login by paste or redirect, adding a profile, connecting or re-signing a ChatGPT seat) is followed by the reads that say who it signed in as, its plan and its usage. Until they land, the profile's card stays where it is and shows **Updating with the new sign-in…**; if they fail, it shows the reason. On `/profiles` the card also stays visible during a search that no longer matches it, such as a search for the email it was signed in as before. `GET /profiles/list` reports the state as `factsRefresh`: `null` when idle, `{ "state": "updating", "since" }`, or `{ "state": "failed", "since", "at", "error" }` for five minutes after a failed read.
 
 `/` and `/profiles` refresh every ten seconds by updating each card in place, keyed by profile id, rather than redrawing the list, so the browser's find-in-page, a text selection, focus and scroll position survive a refresh.
 

@@ -13,8 +13,9 @@
  * learning the sign-in succeeded and its next answer, the server has not been
  * asked yet - so the page also remembers the sign-in itself, and an answer
  * that was REQUESTED before the sign-in finished is not allowed to clear it.
- * While a card is updating it stays on screen whatever the filters say: a card
- * the user just signed in must not vanish because its login state changed.
+ * While a card is updating it stays on screen whatever the /profiles search
+ * says: a card the user just signed in must not vanish because the email it was
+ * found by changed under the search.
  *
  * `profileFindJs`'s pattern: the single browser-side copy, interpolated as a
  * string into each page, and evaluated verbatim by its tests.
@@ -59,6 +60,12 @@ var meridianCardStatus=(function(){
     return null;
   }
   function updating(id){return !!pending[id]}
+  // Read-only: whether a card is updating, by the server's word or the page's
+  // own memory of the sign-in. Unlike updateOf, it never ends the update.
+  function isUpdating(p){
+    if(!p)return false;
+    return !!(p.factsRefresh&&p.factsRefresh.state==='updating')||updating(p.id);
+  }
   function updateHtml(view){
     if(!view)return '';
     if(view.state==='updating')return '<div class="card-updating" role="status"><span class="card-spinner" aria-hidden="true"></span>Updating with the new sign-in\\u2026</div>';
@@ -70,6 +77,7 @@ var meridianCardStatus=(function(){
     beginUpdate:beginUpdate,
     updateOf:updateOf,
     updating:updating,
+    isUpdating:isUpdating,
     updateHtml:updateHtml
   };
 })();
