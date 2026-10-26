@@ -213,8 +213,12 @@ export function rememberOrganization(profileId: string, lookup: OrganizationLook
     writeFileSync(temporary, JSON.stringify(merged, null, 2) + "\n", { mode: 0o600, flag: "wx" })
     renameSync(temporary, file)
   } catch (err) {
-    rmSync(temporary, { force: true })
     console.warn(`[meridian] Failed to write ${file}: ${err instanceof Error ? err.message : err}`)
+    try {
+      rmSync(temporary, { force: true })
+    } catch (cleanupErr) {
+      console.warn(`[meridian] Failed to remove ${temporary}: ${cleanupErr instanceof Error ? cleanupErr.message : cleanupErr}`)
+    }
   }
 }
 

@@ -10688,14 +10688,20 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // now and say so on /profiles/list meanwhile, so the card shows it is
   // updating instead of serving the previous login's facts as current ones.
   // Started before the route answers: see ProfileFactsRefresh.run.
-  function refreshClaudeFactsAfterLogin(profileId: string): void {
+  function refreshClaudeFactsAfterLogin(profileId: string, knownConfigDir?: string): void {
+    // resolveProfile falls back to the first profile for an id it does not
+    // know (a profile added while MERIDIAN_PROFILES pins the list), and that
+    // profile's credential must never be read for this one.
     const resolved = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, profileId)
-    const claudeConfigDir = resolved.env.CLAUDE_CONFIG_DIR
+    const env: Record<string, string> = resolved.id === profileId ? { ...resolved.env } : {}
+    if (knownConfigDir) env.CLAUDE_CONFIG_DIR = knownConfigDir
+    if (resolved.id !== profileId && !knownConfigDir) return
+    const claudeConfigDir = env.CLAUDE_CONFIG_DIR
     void profileFactsRefresh.run(profileId, async () => {
       const [record] = await Promise.all([
         refreshOrganizationNow(profileId, { claudeConfigDir }),
         fetchOAuthUsageResult({ profileId, claudeConfigDir, force: true }),
-        getInstanceAuthStatus(profileId, Object.keys(resolved.env).length > 0 ? resolved.env : undefined),
+        getInstanceAuthStatus(profileId, Object.keys(env).length > 0 ? env : undefined),
       ])
       if (!record && organizationLookupEnabled()) {
         throw new Error("Signed in, but Anthropic has not said which account this is yet. The card catches up on its own within minutes.")
@@ -10828,7 +10834,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // on the UI's next poll rather than after the 60s TTL.
     expireAuthStatusCache()
     clearStaleProfileHealth(result.profileId)
-    refreshClaudeFactsAfterLogin(result.profileId)
+    refreshClaudeFactsAfterLogin(result.profileId, result.claudeConfigDir)
     claudeLog("profile.add_completed", {
       profile: result.profileId,
       userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
