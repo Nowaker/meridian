@@ -55,4 +55,15 @@ describe("ProfileFactsRefresh", () => {
     gate.resolve()
     await pending
   })
+
+  test("a removed or renamed profile is forgotten, and its run's outcome dropped", async () => {
+    const tracker = new ProfileFactsRefresh(() => 1)
+    const gate = deferred()
+    const pending = tracker.run("old-name", () => gate.promise)
+    tracker.forget("old-name")
+    expect(tracker.view("old-name")).toBeNull()
+    gate.reject(new Error("late"))
+    await pending
+    expect(tracker.view("old-name")).toBeNull()
+  })
 })

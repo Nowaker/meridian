@@ -7,7 +7,7 @@
  * handling would pass regardless of what the module actually did.
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test"
-import { mkdirSync, rmSync, readFileSync, writeFileSync, statSync } from "node:fs"
+import { mkdirSync, readdirSync, rmSync, readFileSync, writeFileSync, statSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
@@ -15,17 +15,25 @@ import {
   enableOrganizationLookup,
   extractAccountIdentity,
   extractOrganizationName,
-  fetchOrganizationName,
+  fetchOrganization,
   organizationNames,
   organizationNeedsRefresh,
   organizationRecordCurrent,
   readOrganizations,
   refreshOrganizationNameSoon,
   refreshOrganizationNow,
-  rememberOrganizationName,
+  rememberOrganization,
   resetOrganizationLookupForTesting,
 } from "../proxy/organizationName"
 import type { CredentialStore } from "../proxy/tokenRefresh"
+
+async function fetchOrganizationName(store: CredentialStore, fetchImpl: Parameters<typeof fetchOrganization>[1]): Promise<string | null> {
+  return (await fetchOrganization(store, fetchImpl))?.lookup.name ?? null
+}
+
+function rememberOrganizationName(profileId: string, name: string): void {
+  rememberOrganization(profileId, { name, accountUuid: null, organizationUuid: null, email: null })
+}
 
 function storeWithToken(token: string | null, expiresAt?: number): CredentialStore {
   return {
@@ -148,7 +156,7 @@ describe("organizationNeedsRefresh", () => {
   })
 })
 
-describe("fetchOrganizationName", () => {
+describe("fetchOrganization", () => {
   test("returns the name for a token that works", async () => {
     const name = await fetchOrganizationName(storeWithToken("tok"), async () =>
       jsonResponse({ organization: { name: "Acme Inc" } }))
@@ -352,5 +360,29 @@ describe("persistence and background refresh", () => {
     let called = false
     expect(await refreshOrganizationNow("work", { fetchImpl: async () => { called = true; return jsonResponse({}) } })).toBeNull()
     expect(called).toBe(false)
+  })
+
+  test("the file is replaced whole, owner-only, with no temporary left behind", () => {
+    rememberOrganizationName("work", "Acme Inc")
+    rememberOrganizationName("side", "Globex")
+    expect(readdirSync(tempDir)).toEqual(["organizations.json"])
+    expect(statSync(cacheFile).mode & 0o777).toBe(0o600)
+    expect(Object.keys(JSON.parse(readFileSync(cacheFile, "utf-8")))).toEqual(["work", "side"])
+  })
+
+  test("a read made at sign-in counts as the attempt for that credential", async () => {
+    let calls = 0
+    const fetchImpl = async () => { calls++; return jsonResponse({}, 503) }
+    const store = storeWithToken("tok", 4_000)
+    // Anthropic did not answer the sign-in's read; the next poll sees the same
+    // stored token and must wait out the retry floor, not ask again at once.
+    expect(await refreshOrganizationNow("work", { store, fetchImpl })).toBeNull()
+    refreshOrganizationNameSoon("work", { store, fetchImpl, credentialMark: 4_000 })
+    await Bun.sleep(20)
+    expect(calls).toBe(1)
+    // A credential the sign-in did not read is still read at once.
+    refreshOrganizationNameSoon("work", { store: storeWithToken("tok", 5_000), fetchImpl, credentialMark: 5_000 })
+    await Bun.sleep(20)
+    expect(calls).toBe(2)
   })
 })

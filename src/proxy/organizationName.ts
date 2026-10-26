@@ -23,7 +23,7 @@
  * Leaf module — no imports from server.ts or session/.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { homedir } from "node:os"
 import { claudeLog } from "../logger"
@@ -205,16 +205,17 @@ export function rememberOrganization(profileId: string, lookup: OrganizationLook
   const file = organizationsFile()
   const record: OrganizationRecord = { ...lookup, fetchedAt: Date.now(), credentialMark }
   const merged = { ...organizationNames(), [profileId]: record }
+  // Written beside the file and renamed over it, so a reader (another
+  // instance, or a poll in this one) never sees half a file.
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`
   try {
     mkdirSync(dirname(file), { recursive: true })
-    writeFileSync(file, JSON.stringify(merged, null, 2) + "\n", { mode: 0o600 })
+    writeFileSync(temporary, JSON.stringify(merged, null, 2) + "\n", { mode: 0o600, flag: "wx" })
+    renameSync(temporary, file)
   } catch (err) {
+    rmSync(temporary, { force: true })
     console.warn(`[meridian] Failed to write ${file}: ${err instanceof Error ? err.message : err}`)
   }
-}
-
-export function rememberOrganizationName(profileId: string, name: string): void {
-  rememberOrganization(profileId, { name, accountUuid: null, organizationUuid: null, email: null })
 }
 
 // --- Lookup ----------------------------------------------------------------
@@ -235,12 +236,15 @@ export interface FetchedOrganization {
 export async function fetchOrganization(
   store: CredentialStore,
   fetchImpl: FetchLike = globalThis.fetch,
+  onCredential?: (credentialMark: number | null) => void,
 ): Promise<FetchedOrganization | null> {
   try {
     const credentials = await store.read()
     const token = credentials?.claudeAiOauth?.accessToken
     if (!token) return null
     const expiresAt = credentials?.claudeAiOauth?.expiresAt
+    const credentialMark = typeof expiresAt === "number" && isFinite(expiresAt) ? expiresAt : null
+    onCredential?.(credentialMark)
     const response = await fetchImpl(OAUTH_PROFILE_URL, {
       headers: {
         Authorization: `Bearer ${token}`,
@@ -256,19 +260,12 @@ export async function fetchOrganization(
     const body = await response.json()
     return {
       lookup: { name: extractOrganizationName(body), ...extractAccountIdentity(body) },
-      credentialMark: typeof expiresAt === "number" && isFinite(expiresAt) ? expiresAt : null,
+      credentialMark,
     }
   } catch (err) {
     claudeLog("organization.lookup_failed", { error: err instanceof Error ? err.message : String(err) })
     return null
   }
-}
-
-export async function fetchOrganizationName(
-  store: CredentialStore,
-  fetchImpl: FetchLike = globalThis.fetch,
-): Promise<string | null> {
-  return (await fetchOrganization(store, fetchImpl))?.lookup.name ?? null
 }
 
 /**
@@ -307,7 +304,9 @@ export interface RefreshOrganizationOpts {
 
 async function lookUpAndRemember(profileId: string, opts: RefreshOrganizationOpts): Promise<OrganizationRecord | null> {
   const store = opts.store ?? createPlatformCredentialStore({ claudeConfigDir: opts.claudeConfigDir })
-  const found = await fetchOrganization(store, opts.fetchImpl)
+  // The credential actually read is the one this attempt was for, whoever
+  // started it, so a poll that sees the same token does not read it again.
+  const found = await fetchOrganization(store, opts.fetchImpl, mark => { lastAttemptMark.set(profileId, mark) })
   if (!found || (!found.lookup.name && !found.lookup.accountUuid)) return null
   rememberOrganization(profileId, found.lookup, found.credentialMark)
   // Lengths and presence rather than values: this log is what gets pasted into

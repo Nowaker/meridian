@@ -162,3 +162,32 @@ test("the needs-login border is solid red, and an active card keeps its brand ri
   expect(profilePageHtml).toContain(".badge-needs-login { background: rgba(248,81,73,0.12); color: var(--red);")
   expect(profilePageHtml).not.toContain("dashed")
 })
+
+test("an older /profiles/list answer landing after a newer one is not drawn", async () => {
+  const pending: Array<(body: unknown) => void> = []
+  const drawn: string[] = []
+  const source = ["var refreshesIssued = 0; var refreshDrawn = 0;", pageFunction("refresh"),
+    "var exercise = { refresh: refresh, last: function () { return lastProfiles; } };"].join("\n")
+  const context: Record<string, unknown> = {
+    editingProfile: null, removingProfile: null, detailFactFocused: () => false,
+    lastQuota: null, lastProfiles: null, lastProfilesRequestedAt: null,
+    meridianReorder: { adopt() {} }, adoptChatGpt() {}, noticeNewChatGptSeats() {},
+    render: (data: { tag: string }) => { drawn.push(data.tag) },
+    document: { getElementById: () => ({ innerHTML: "" }) },
+    fetch: async (url: string) => url === "/profiles/list"
+      ? { ok: true, json: () => new Promise(resolve => pending.push(resolve)) }
+      : null,
+  }
+  runInNewContext(source, context)
+  const page = context.exercise as { refresh: () => Promise<void>; last: () => { tag: string } | null }
+  const older = page.refresh()
+  const newer = page.refresh()
+  for (let i = 0; i < 20 && pending.length < 2; i++) await Bun.sleep(1)
+  expect(pending).toHaveLength(2)
+  pending[1]!({ tag: "newer", profiles: [] })
+  await newer
+  pending[0]!({ tag: "older", profiles: [] })
+  await older
+  expect(drawn).toEqual(["newer"])
+  expect(page.last()?.tag).toBe("newer")
+})

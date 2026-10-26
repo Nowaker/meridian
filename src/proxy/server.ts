@@ -10511,6 +10511,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const plan = chatGptProfiles.planRename(body.from, body.to)
       if (!plan.ok) return c.json({ error: plan.error }, 400)
       applyChatGptRename(plan)
+      profileFactsRefresh.forget(plan.from)
       claudeLog("profile.renamed", {
         from: plan.from,
         to: plan.to,
@@ -10539,6 +10540,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // applyProfileRename moved the persisted pointer; this process holds its
     // own copy in memory and has to be told as well.
     if (getActiveProfileId() === body.from) setActiveProfile(body.to)
+    profileFactsRefresh.forget(result.from)
     claudeLog("profile.renamed", {
       from: result.from,
       to: result.to,
@@ -10571,7 +10573,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     }
     applyChatGptRemoval(seat, { moves: pointerMoves, to: successor?.seat })
     chatGptBackend?.forgetSeat(seat.seat)
-    for (const id of [seat.id, ...seat.aliases]) spentProfiles.forget(id)
+    for (const id of [seat.id, ...seat.aliases]) {
+      spentProfiles.forget(id)
+      profileFactsRefresh.forget(id)
+    }
     chatGptUsageAt = 0
     void chatGptCatalog?.refresh()
     claudeLog("profile.removed", {

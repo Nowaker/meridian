@@ -624,9 +624,16 @@ async function commitRemove(id) {
   redraw();
 }
 
+// Refreshes overlap (the 10s poll, the quicker one while a card updates, a
+// finished sign-in), and their answers can land out of order: one asked for
+// before an answer already drawn is older than the page and is dropped.
+var refreshesIssued = 0;
+var refreshDrawn = 0;
+
 async function refresh() {
   if (editingProfile || removingProfile || detailFactFocused()) return;
   var requestedAt = Date.now();
+  var seq = ++refreshesIssued;
   try {
     var [profilesRes, quotaRes, routingRes] = await Promise.all([
       fetch('/profiles/list'),
@@ -638,9 +645,15 @@ async function refresh() {
     if (quotaRes && quotaRes.ok) {
       try { quota = await quotaRes.json(); } catch (_) { quota = null; }
     }
-    if (quota) lastQuota = quota;
+    var routing = null;
     if (routingRes && routingRes.ok) {
-      try { meridianReorder.adopt(await routingRes.json()); } catch (_) { /* keep the last good order */ }
+      try { routing = await routingRes.json(); } catch (_) { routing = null; }
+    }
+    if (seq < refreshDrawn) return;
+    refreshDrawn = seq;
+    if (quota) lastQuota = quota;
+    if (routing) {
+      try { meridianReorder.adopt(routing); } catch (_) { /* keep the last good order */ }
     }
     lastProfiles = profiles;
     lastProfilesRequestedAt = requestedAt;
@@ -649,7 +662,7 @@ async function refresh() {
     render(profiles, lastQuota);
     noticeNewChatGptSeats(profiles.profiles || []);
   } catch {
-    if (detailFactFocused()) return;
+    if (seq < refreshDrawn || detailFactFocused()) return;
     document.getElementById('content').innerHTML = '<div class="empty-state"><h2>Could not load profiles</h2><p>Is Meridian running?</p></div>';
   }
 }
