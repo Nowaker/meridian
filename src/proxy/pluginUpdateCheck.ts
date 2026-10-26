@@ -181,7 +181,9 @@ function registryKey(url: string): string {
 
 /** Why a package cannot be checked against `registry`, or undefined when it can. */
 function registryMismatch(pkg: PluginPackage, registry: string): string | undefined {
-  if (!pkg.publishRegistry || registryKey(pkg.publishRegistry) === registryKey(registry)) return undefined
+  if (!pkg.publishRegistry) return undefined
+  const published = registryKey(pkg.publishRegistry)
+  if (published === registryKey(DEFAULT_REGISTRY) || published === registryKey(registry)) return undefined
   return `${pkg.name} is published to ${pkg.publishRegistry}, not ${registry}`
 }
 

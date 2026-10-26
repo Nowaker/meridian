@@ -519,7 +519,8 @@ the registry** (one switch covers both checks; there is no separate one for
 plugins). A plugin's package is the nearest `package.json` above the
 file Meridian loaded, which gives its name and installed version. A lone file
 dropped into `plugins/` (or a symlink to one), a private package, a package
-whose `publishConfig.registry` differs from the registry being asked, and a
+whose `publishConfig.registry` names a non-public registry other than the
+one being asked, and a
 package.json that is not a JSON object are listed as not checkable, with the
 reason. When `MERIDIAN_UPDATE_CHECK_URL` points Meridian's own check at a
 mirror and `MERIDIAN_UPDATE_CHECK_REGISTRY` is unset, no plugin is checked and

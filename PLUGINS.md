@@ -278,8 +278,9 @@ The same toggle governs both checks, so turning it on also sends every loaded
 plugin's npm package name to the registry (`https://registry.npmjs.org`, or
 `MERIDIAN_UPDATE_CHECK_REGISTRY`). Nothing is sent while it is off. A lone file
 in `plugins/` (or a symlink to one), a private package, and a package whose
-`publishConfig.registry` is not the registry being asked are listed as not
-checkable. An instance that points Meridian's own check at a mirror with
+`publishConfig.registry` names a non-public registry other than the one being
+asked are listed as not checkable; packages published to public npm are
+checked through a configured mirror. An instance that points Meridian's own check at a mirror with
 `MERIDIAN_UPDATE_CHECK_URL` checks no plugin until
 `MERIDIAN_UPDATE_CHECK_REGISTRY` names the registry to use. See
 [Build provenance](docs/configuration.md#build-provenance-and-staying-current).

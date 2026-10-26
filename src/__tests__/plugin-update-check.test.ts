@@ -297,6 +297,24 @@ describe("which registry plugin package names go to", () => {
     expect(calls).toEqual(["elsewhere"])
     expect(getPluginUpdates()[0]?.checkable).toBe(true)
   })
+
+  test("a package published to public npm is checked through a configured mirror", async () => {
+    process.env.MERIDIAN_UPDATE_CHECK_REGISTRY = "https://mirror.example.com/npm/"
+    const publicPkg = installPackage(join(dir, "a"), { name: "on-npmjs", version: "1.0.0", publishConfig: { registry: "https://registry.npmjs.org/" } })
+    const internal = installPackage(join(dir, "b"), { name: "internal", version: "1.0.0", publishConfig: { registry: "https://npm.corp.example" } })
+    trackPlugins([
+      { name: "on-npmjs", path: publicPkg, status: "active" },
+      { name: "internal", path: internal, status: "active" },
+    ])
+    const { calls, fetchLatest } = countingFetch({ "on-npmjs": "1.1.0", internal: "2.0.0" })
+
+    await refreshPluginUpdates({ cachePath, fetchLatest })
+
+    expect(calls).toEqual(["on-npmjs"])
+    const [first, second] = getPluginUpdates()
+    expect(first).toMatchObject({ checkable: true, latest: "1.1.0", updateAvailable: true })
+    expect(second).toMatchObject({ checkable: false, reason: "internal is published to https://npm.corp.example, not https://mirror.example.com/npm" })
+  })
 })
 
 describe("bounded passes", () => {

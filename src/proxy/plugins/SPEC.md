@@ -53,7 +53,9 @@ in `transform.ts`, owned by [`adapters`](../adapters/SPEC.md).
   `MERIDIAN_UPDATE_CHECK_URL` alone routes Meridian's check to a mirror, no
   plugin is checked, because a registry cannot be derived from that URL and
   the public one is what the operator routed around. A package whose
-  `publishConfig.registry` is not the registry being asked is not checkable.
+  `publishConfig.registry` names a registry other than public npm and the
+  one being asked is not checkable (its name may be internal); packages
+  published to public npm are checked through a configured mirror.
   A pass runs at most four lookups at once under one deadline equal to a
   single fetch timeout, so switching the check on answers in about one
   timeout; only one pass runs at a time, a request during it queues one
