@@ -177,14 +177,15 @@ export function organizationNeedsRefresh(
 }
 
 /**
- * Whether a record describes the credential a profile holds NOW. A record read
- * for an earlier credential may name the account the profile was signed in to
- * before - exactly what a sign-in into the wrong account leaves behind - so a
- * caller choosing between it and another source must ask.
+ * Whether a record describes the credential a profile holds NOW: it was read
+ * for the very access token stored now. A record read for an earlier
+ * credential may name the account the profile was signed in to before, and
+ * one whose current token is unknown cannot be shown to be current, so
+ * neither is trusted for the shown email or for duplicate detection.
  */
 export function organizationRecordCurrent(record: OrganizationRecord | undefined, credentialMark: number | null | undefined): boolean {
   if (!record || record.accountUuid === undefined) return false
-  return credentialMark == null || record.credentialMark === credentialMark
+  return credentialMark != null && record.credentialMark === credentialMark
 }
 
 // --- Persistence -----------------------------------------------------------

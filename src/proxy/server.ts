@@ -148,7 +148,7 @@ import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, res
 import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
 import { createChatGptLogin } from "./chatgpt/login"
 import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
-import { organizationNames, organizationNeedsRefresh, organizationRecordCurrent, organizationLookupEnabled, refreshOrganizationNameSoon, refreshOrganizationNow } from "./organizationName"
+import { organizationNames, organizationNeedsRefresh, organizationRecordCurrent, organizationLookupEnabled, refreshOrganizationNameSoon, refreshOrganizationNow, type OrganizationRecord } from "./organizationName"
 import { findDuplicateProfiles, type IdentifiedProfile } from "./duplicateProfiles"
 import { ProfileFactsRefresh } from "./profileFactsRefresh"
 import {
@@ -10034,6 +10034,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   app.get("/profiles/list", async (c) => {
     const profiles = listProfiles(finalConfig.profiles, finalConfig.defaultProfile)
     const organizations = organizationNames()
+    // Account records read for the credential each Claude profile holds now;
+    // see organizationRecordCurrent.
+    const currentAccounts = new Map<string, OrganizationRecord>()
     const expiryObservedAt = Date.now()
     const renewalWarnDays = resolveRenewalWarnDays(process.env.MERIDIAN_AUTH_RENEWAL_WARN_DAYS)
     // Enrich with live auth status
@@ -10088,8 +10091,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // `claude auth status` reads the email Claude Code last cached, which a
       // login Meridian performed does not touch - so it keeps naming the
       // account signed in before. A read made for this very credential knows.
-      const email = (organizationRecordCurrent(organization, credentialMark) ? organization?.email : null)
-        || auth?.email || null
+      const accountCurrent = resolved.type === "claude-max" && organization !== undefined
+        && organizationRecordCurrent(organization, credentialMark)
+      if (accountCurrent) currentAccounts.set(p.id, organization)
+      const email = (accountCurrent ? organization.email : null) || auth?.email || null
       const renewal = renewalStatusFor(stored?.refreshTokenExpiresAt, renewalWarnDays, expiryObservedAt)
       return {
         ...p,
@@ -10148,16 +10153,16 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       if ("seat" in entry && typeof entry.seat === "string") {
         return { id: entry.id, identity: { provider: "chatgpt", seat: entry.seat, email: entry.email } }
       }
-      if ((entry.type ?? "claude-max") !== "claude-max") return { id: entry.id, identity: null }
-      const record = organizations[entry.id]
+      const record = currentAccounts.get(entry.id)
+      if (!record) return { id: entry.id, identity: null }
       return {
         id: entry.id,
         identity: {
           provider: "claude",
-          accountUuid: record?.accountUuid,
-          organizationUuid: record?.organizationUuid,
+          accountUuid: record.accountUuid,
+          organizationUuid: record.organizationUuid,
           email: entry.email,
-          organizationName: entry.organizationName,
+          organizationName: record.name,
         },
       }
     }))

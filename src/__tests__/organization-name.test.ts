@@ -134,6 +134,9 @@ describe("organizationNeedsRefresh", () => {
     expect(organizationNeedsRefresh(record, 1_001, ORGANIZATION_REFRESH_AFTER_MS, 9_000)).toBe(true)
     expect(organizationRecordCurrent(record, 5_000)).toBe(true)
     expect(organizationRecordCurrent(record, 9_000)).toBe(false)
+    // A token that cannot be read now cannot be shown to match the record.
+    expect(organizationRecordCurrent(record, null)).toBe(false)
+    expect(organizationRecordCurrent({ ...record, credentialMark: null }, null)).toBe(false)
   })
 
   test("an aged record does", () => {
