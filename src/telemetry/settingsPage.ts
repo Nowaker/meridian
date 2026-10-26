@@ -60,7 +60,7 @@ export const settingsPageHtml = `<!DOCTYPE html>
      the row to whichever was wider - a select sized to its longest option
      left the text one word per line. On a narrow screen the control wraps
      under the label, never the description beside it. */
-  .setting-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .setting-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr)); gap: 10px; }
   .setting-stack { display: flex; flex-direction: column; gap: 10px; }
   /* Wide layout: one row across the whole window puts a toggle a thousand
      pixels from its label, so rows keep a readable width and add columns,
