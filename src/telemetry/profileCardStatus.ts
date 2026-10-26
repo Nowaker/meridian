@@ -76,12 +76,13 @@ var meridianCardStatus=(function(){
 `
 
 export const profileCardStatusCss = `
-  .badge-duplicate { background: rgba(210,153,34,0.14); color: var(--yellow); border: 1px solid rgba(210,153,34,0.45); }
-  .card-updating { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--accent, var(--text)); margin: 6px 0 10px; }
+  .badge-duplicate { background: rgba(210,153,34,0.14); color: var(--yellow); border: 1px solid rgba(210,153,34,0.4); }
+  .card-updating { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin: 6px 0 10px; }
   .card-update-failed { font-size: 12px; color: var(--red); margin: 6px 0 10px; }
   .card-spinner { width: 12px; height: 12px; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent;
     display: inline-block; animation: card-spin 0.8s linear infinite; flex: none; }
-  .profile-card.updating { opacity: 0.85; }
+  .profile-card.updating .usage-row, .profile-card.updating .no-usage,
+  .profile-card.updating .profile-details, .profile-card.updating .usage-section { opacity: 0.85; }
   @keyframes card-spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { .card-spinner { animation-duration: 2.4s; } }
 `

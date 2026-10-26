@@ -4,7 +4,7 @@
  * what / and /profiles run.
  */
 import { describe, expect, test } from "bun:test"
-import { profileCardStatusJs } from "../telemetry/profileCardStatus"
+import { profileCardStatusCss, profileCardStatusJs } from "../telemetry/profileCardStatus"
 import { landingHtml } from "../telemetry/landing"
 import { profilePageHtml } from "../telemetry/profilePage"
 
@@ -82,5 +82,20 @@ describe("the pages", () => {
     const begins = profilePageHtml.match(/meridianCardStatus\.beginUpdate\(/g) ?? []
     // Claude re-login, Claude add, ChatGPT re-login, ChatGPT connect.
     expect(begins.length).toBe(4)
+  })
+})
+
+describe("design language", () => {
+  test("an updating card dims only its figures, never the card or its name row", () => {
+    expect(profileCardStatusCss).not.toMatch(/\.profile-card\.updating\s*\{/)
+    expect(profileCardStatusCss).not.toMatch(/\.profile-card\.updating[^{]*\.(profile-head|profile-card-header)/)
+    expect(profileCardStatusCss).toMatch(/\.profile-card\.updating \.usage-row/)
+  })
+
+  test("tinted borders stay within 0.4 alpha and status text is not the interactive blue", () => {
+    for (const [, alpha] of profileCardStatusCss.matchAll(/border[^;]*rgba\([^)]*,\s*([\d.]+)\)/g)) {
+      expect(Number(alpha)).toBeLessThanOrEqual(0.4)
+    }
+    expect(profileCardStatusCss).not.toContain("--accent")
   })
 })
