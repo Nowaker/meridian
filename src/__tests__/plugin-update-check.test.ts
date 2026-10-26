@@ -19,11 +19,19 @@ import {
   refreshPluginUpdates,
   trackPlugins,
 } from "../proxy/pluginUpdateCheck"
+import { stopUpdateCheck } from "../proxy/updateCheck"
+
+const REGISTRY_ENV = ["MERIDIAN_UPDATE_CHECK_URL", "MERIDIAN_UPDATE_CHECK_REGISTRY"] as const
+const savedEnv: Record<string, string | undefined> = {}
 
 let dir: string
 let cachePath: string
 
 beforeEach(() => {
+  for (const key of REGISTRY_ENV) {
+    savedEnv[key] = process.env[key]
+    delete process.env[key]
+  }
   dir = mkdtempSync(join(tmpdir(), "meridian-plugin-update-"))
   cachePath = join(dir, "cache", "plugin-update-check.json")
   clearPluginUpdates()
@@ -33,6 +41,10 @@ beforeEach(() => {
 afterEach(() => {
   clearPluginUpdates()
   trackPlugins([])
+  for (const key of REGISTRY_ENV) {
+    if (savedEnv[key] === undefined) delete process.env[key]
+    else process.env[key] = savedEnv[key]
+  }
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -90,6 +102,22 @@ describe("findPluginPackage", () => {
   test("a package without a version cannot be compared", () => {
     const entry = installPackage(dir, { name: "no-version" })
     expect(findPluginPackage(entry)).toEqual({ reason: "no-version declares no version" })
+  })
+
+  test("a package.json that is valid JSON but not an object is reported, not thrown on", () => {
+    for (const [index, body] of ["null", "[]", "\"text\"", "42"].entries()) {
+      const entry = installPackage(join(dir, `odd-${index}`), { name: `odd-${index}`, version: "1.0.0" })
+      const manifest = join(entry, "..", "..", "package.json")
+      writeFileSync(manifest, body)
+      expect(findPluginPackage(entry)).toEqual({ reason: `${manifest} is not a JSON object` })
+    }
+  })
+
+  test("records a publishConfig registry and tolerates a malformed publishConfig", () => {
+    const named = installPackage(join(dir, "a"), { name: "elsewhere", version: "1.0.0", publishConfig: { registry: "https://npm.example.com/" } })
+    expect(findPluginPackage(named)).toEqual({ package: { name: "elsewhere", version: "1.0.0", publishRegistry: "https://npm.example.com/" } })
+    const odd = installPackage(join(dir, "b"), { name: "odd-config", version: "1.0.0", publishConfig: null })
+    expect(findPluginPackage(odd)).toEqual({ package: { name: "odd-config", version: "1.0.0" } })
   })
 })
 
@@ -198,5 +226,191 @@ describe("getPluginUpdates", () => {
     release()
     await pending
     expect(getPluginUpdates()[0]?.latest).toBeUndefined()
+  })
+})
+
+describe("which registry plugin package names go to", () => {
+  test("a mirror for Meridian's own check without a plugin registry checks no plugin", async () => {
+    process.env.MERIDIAN_UPDATE_CHECK_URL = "https://mirror.internal/meridian/dist-tags"
+    const entry = installPackage(dir, { name: "mirrored", version: "1.0.0" })
+    trackPlugins([{ name: "mirrored", path: entry, status: "active" }])
+    const { calls, fetchLatest } = countingFetch({ mirrored: "2.0.0" })
+
+    await refreshPluginUpdates({ cachePath, fetchLatest })
+
+    expect(calls).toEqual([])
+    expect(getPluginUpdates()).toEqual([{
+      name: "mirrored",
+      path: entry,
+      status: "active",
+      checkable: false,
+      reason: "set MERIDIAN_UPDATE_CHECK_REGISTRY to check plugins through your mirror",
+      package: "mirrored",
+      installed: "1.0.0",
+    }])
+  })
+
+  test("naming the plugin registry beside the mirror checks plugins through it", async () => {
+    process.env.MERIDIAN_UPDATE_CHECK_URL = "https://mirror.internal/meridian/dist-tags"
+    process.env.MERIDIAN_UPDATE_CHECK_REGISTRY = "https://mirror.internal/npm/"
+    const entry = installPackage(dir, { name: "mirrored", version: "1.0.0" })
+    trackPlugins([{ name: "mirrored", path: entry, status: "active" }])
+    const { calls, fetchLatest } = countingFetch({ mirrored: "2.0.0" })
+
+    await refreshPluginUpdates({ cachePath, fetchLatest })
+
+    expect(calls).toEqual(["mirrored"])
+    expect(getPluginUpdates()[0]).toMatchObject({ checkable: true, latest: "2.0.0", updateAvailable: true })
+  })
+
+  test("a package published to another registry is not checkable; one published to the configured registry is", async () => {
+    const elsewhere = installPackage(join(dir, "a"), { name: "elsewhere", version: "1.0.0", publishConfig: { registry: "https://npm.example.com" } })
+    const npmjs = installPackage(join(dir, "b"), { name: "on-npmjs", version: "1.0.0", publishConfig: { registry: "https://registry.npmjs.org/" } })
+    trackPlugins([
+      { name: "elsewhere", path: elsewhere, status: "active" },
+      { name: "on-npmjs", path: npmjs, status: "active" },
+    ])
+    const { calls, fetchLatest } = countingFetch({ elsewhere: "9.0.0", "on-npmjs": "1.1.0" })
+
+    await refreshPluginUpdates({ cachePath, fetchLatest })
+
+    expect(calls).toEqual(["on-npmjs"])
+    const [first, second] = getPluginUpdates()
+    expect(first).toMatchObject({
+      checkable: false,
+      reason: "elsewhere is published to https://npm.example.com, not https://registry.npmjs.org",
+      package: "elsewhere",
+      installed: "1.0.0",
+    })
+    expect(first?.latest).toBeUndefined()
+    expect(second).toMatchObject({ checkable: true, latest: "1.1.0" })
+  })
+
+  test("the configured registry decides which publishConfig registries match", async () => {
+    process.env.MERIDIAN_UPDATE_CHECK_REGISTRY = "https://npm.example.com/"
+    const entry = installPackage(dir, { name: "elsewhere", version: "1.0.0", publishConfig: { registry: "https://npm.example.com" } })
+    trackPlugins([{ name: "elsewhere", path: entry, status: "active" }])
+    const { calls, fetchLatest } = countingFetch({ elsewhere: "1.0.0" })
+
+    await refreshPluginUpdates({ cachePath, fetchLatest })
+
+    expect(calls).toEqual(["elsewhere"])
+    expect(getPluginUpdates()[0]?.checkable).toBe(true)
+  })
+})
+
+describe("bounded passes", () => {
+  const names = Array.from({ length: 10 }, (_, i) => `pkg-${i}`)
+
+  test("at most four lookups are in flight at once", async () => {
+    let inFlight = 0
+    let peak = 0
+    const fetchLatest = async () => {
+      inFlight++
+      peak = Math.max(peak, inFlight)
+      await Bun.sleep(5)
+      inFlight--
+      return "1.0.0"
+    }
+    const result = await checkPluginPackages(names, { cachePath, fetchLatest })
+    expect(Object.keys(result)).toHaveLength(10)
+    expect(peak).toBe(4)
+  })
+
+  test("one deadline bounds the whole pass; what it cut short is recorded and nothing more is asked", async () => {
+    const calls: string[] = []
+    const fetchLatest = (name: string) => {
+      calls.push(name)
+      return new Promise<string>(() => {})
+    }
+    const started = Date.now()
+    const result = await checkPluginPackages(names, { cachePath, fetchLatest, deadlineMs: 100, now: () => 7 })
+
+    expect(Date.now() - started).toBeLessThan(1000)
+    expect(calls).toHaveLength(4)
+    for (const name of names) expect(result[name]).toMatchObject({ checkedAt: 7, error: expect.any(String) })
+    expect(Object.keys(JSON.parse(readFileSync(cachePath, "utf8")).packages)).toHaveLength(10)
+  })
+
+  test("a registry that never answers holds a pass no longer than its deadline", async () => {
+    const hits: string[] = []
+    const hanging = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: (request) => {
+        hits.push(new URL(request.url).pathname)
+        return new Promise<Response>(() => {})
+      },
+    })
+    try {
+      const started = Date.now()
+      const result = await checkPluginPackages(names, { cachePath, registry: `http://127.0.0.1:${hanging.port}`, deadlineMs: 200 })
+      expect(Date.now() - started).toBeLessThan(2000)
+      expect(hits.length).toBeLessThanOrEqual(4)
+      expect(result["pkg-0"]?.error).toBeString()
+    } finally {
+      hanging.stop(true)
+    }
+  })
+
+  test("clearing cancels a pass in flight without recording the cancelled lookups", async () => {
+    const entry = installPackage(dir, { name: "slow", version: "0.1.0" })
+    trackPlugins([{ name: "slow", path: entry, status: "active" }])
+    const pending = refreshPluginUpdates({ cachePath, fetchLatest: () => new Promise<string>(() => {}) })
+    await Bun.sleep(10)
+
+    const started = Date.now()
+    clearPluginUpdates()
+    await pending
+
+    expect(Date.now() - started).toBeLessThan(500)
+    expect(getPluginUpdates()[0]?.checkedAt).toBeUndefined()
+    expect(() => readFileSync(cachePath, "utf8")).toThrow()
+  })
+
+  test("one pass at a time: requests during a pass share one queued pass that sees the latest plugins", async () => {
+    const first = installPackage(join(dir, "a"), { name: "first", version: "1.0.0" })
+    const added = installPackage(join(dir, "b"), { name: "added", version: "1.0.0" })
+    trackPlugins([{ name: "first", path: first, status: "active" }])
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const calls: string[] = []
+    let inFlight = 0
+    let peak = 0
+    const fetchLatest = async (name: string) => {
+      calls.push(name)
+      inFlight++
+      peak = Math.max(peak, inFlight)
+      await gate
+      inFlight--
+      return "2.0.0"
+    }
+    const options = { cachePath, fetchLatest }
+
+    const running = refreshPluginUpdates(options)
+    await Bun.sleep(10)
+    trackPlugins([{ name: "first", path: first, status: "active" }, { name: "added", path: added, status: "active" }])
+    const queued = refreshPluginUpdates(options)
+    expect(refreshPluginUpdates(options)).toBe(queued)
+    expect(calls).toEqual(["first"])
+
+    release()
+    await Promise.all([running, queued])
+
+    expect(calls).toEqual(["first", "added"])
+    expect(peak).toBe(1)
+    expect(getPluginUpdates().map((plugin) => plugin.latest)).toEqual(["2.0.0", "2.0.0"])
+  })
+})
+
+describe("stopUpdateCheck", () => {
+  test("forgets the tracked plugins, so a later start checks nothing left from before", () => {
+    const entry = installPackage(dir, { name: "left-over", version: "1.0.0" })
+    trackPlugins([{ name: "left-over", path: entry, status: "active" }])
+    expect(getPluginUpdates()).toHaveLength(1)
+
+    stopUpdateCheck()
+
+    expect(getPluginUpdates()).toEqual([])
   })
 })

@@ -29,7 +29,7 @@ import { homedir } from "node:os"
 import { env, envBool } from "../env"
 import { getSetting } from "../settings"
 import { compareVersions } from "./buildInfo"
-import { clearPluginUpdates, refreshPluginUpdates, type PluginUpdateCheckOptions } from "./pluginUpdateCheck"
+import { refreshPluginUpdates, resetPluginUpdates, type PluginUpdateCheckOptions } from "./pluginUpdateCheck"
 
 const PACKAGE_NAME = "@rynfar/meridian"
 const DEFAULT_REGISTRY_URL = `https://registry.npmjs.org/-/package/${PACKAGE_NAME}/dist-tags`
@@ -194,12 +194,18 @@ export function checkPluginsNow(): Promise<void> {
   return refreshPluginUpdates({ ...pluginOptions, enabled: isUpdateCheckEnabled })
 }
 
-/** Stop the background refresh (shutdown, and between tests). */
+/**
+ * Stop the background refresh (shutdown, and between tests).
+ *
+ * Also forgets the tracked plugins, so nothing left from an earlier server or
+ * test is checked by a later start; a caller that keeps serving tracks its
+ * plugins again.
+ */
 export function stopUpdateCheck(): void {
   if (refreshTimer) clearInterval(refreshTimer)
   refreshTimer = undefined
   pluginOptions = undefined
   latestVersion = undefined
   generation++
-  clearPluginUpdates()
+  resetPluginUpdates()
 }

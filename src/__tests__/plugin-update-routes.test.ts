@@ -166,15 +166,75 @@ describe("plugin updates on /settings/api/updates", () => {
     expect(requested).toEqual(["/-/package/meridian-plugin-added/dist-tags"])
   })
 
-  it("switching off forgets what the plugin check found", async () => {
+  it("switching off forgets what the plugin check found, and keeps listing the plugins", async () => {
     writePluginsJson([installPlugin("meridian-plugin-behind", "0.2.0")])
     published["meridian-plugin-behind"] = "0.3.0"
-    const { put } = await startProxy()
+    const { put, get } = await startProxy()
     await put({ checkForUpdates: true })
 
     const { plugins } = await put({ checkForUpdates: false })
 
     expect(byName(plugins, "meridian-plugin-behind")?.latest).toBeUndefined()
     expect(byName(plugins, "meridian-plugin-behind")?.installed).toBe("0.2.0")
+    expect(byName((await get()).plugins, "meridian-plugin-behind")).toMatchObject({ checkable: true, installed: "0.2.0" })
   })
+
+  it("a mirror for Meridian's check without a plugin registry sends no plugin name anywhere", async () => {
+    delete process.env.MERIDIAN_UPDATE_CHECK_REGISTRY
+    writePluginsJson([installPlugin("meridian-plugin-behind", "0.2.0")])
+    published["meridian-plugin-behind"] = "0.3.0"
+    const { put } = await startProxy()
+
+    const { plugins } = await put({ checkForUpdates: true })
+
+    expect(byName(plugins, "meridian-plugin-behind")).toMatchObject({
+      checkable: false,
+      reason: "set MERIDIAN_UPDATE_CHECK_REGISTRY to check plugins through your mirror",
+      installed: "0.2.0",
+    })
+    expect(requested).toEqual(["/meridian/dist-tags"])
+  })
+
+  it("a reload over a package.json that is not an object still answers, listing the plugin as not checkable", async () => {
+    const { call, get } = await startProxy()
+    const entry = installPlugin("meridian-plugin-odd", "1.0.0")
+    const manifest = join(entry, "..", "..", "package.json")
+    writeFileSync(manifest, "null")
+    writePluginsJson([entry])
+
+    const response = await call("/plugins/reload", { method: "POST" })
+
+    expect(response.status).toBe(200)
+    expect(byName((await get()).plugins, "meridian-plugin-odd")).toMatchObject({ checkable: false, reason: `${manifest} is not a JSON object` })
+  })
+
+  it("switching on answers within about one fetch timeout when the registry never responds", async () => {
+    const hits: string[] = []
+    const hanging = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: (request) => {
+        hits.push(new URL(request.url).pathname)
+        return new Promise<Response>(() => {})
+      },
+    })
+    try {
+      process.env.MERIDIAN_UPDATE_CHECK_URL = `http://127.0.0.1:${hanging.port}/meridian/dist-tags`
+      process.env.MERIDIAN_UPDATE_CHECK_REGISTRY = `http://127.0.0.1:${hanging.port}`
+      writePluginsJson(Array.from({ length: 6 }, (_, i) => installPlugin(`meridian-plugin-${i}`, "1.0.0")))
+      const { put } = await startProxy()
+
+      const started = Date.now()
+      const { plugins } = await put({ checkForUpdates: true })
+      const elapsed = Date.now() - started
+
+      // Serially that is 7 × 5s; four at a time without a pass deadline, 10s.
+      expect(elapsed).toBeLessThan(8000)
+      // Meridian's own lookup plus the first four plugin lookups; the rest were never sent.
+      expect(hits.length).toBeLessThanOrEqual(5)
+      for (let i = 0; i < 6; i++) expect(byName(plugins, `meridian-plugin-${i}`)?.error).toBeString()
+    } finally {
+      hanging.stop(true)
+    }
+  }, 15_000)
 })

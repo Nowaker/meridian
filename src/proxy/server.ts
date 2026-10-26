@@ -9556,10 +9556,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // Takes effect now rather than on the next start: the checker is one
     // unref'd timer with no store to swap out from under in-flight work, so
     // there is nothing to justify making someone restart for it. Switching on
-    // waits for the first answer (bounded by the fetch timeout) so the reply
-    // already says whether an update exists.
-    if (isUpdateCheckEnabled()) await beginUpdateCheck(finalConfig)
-    else stopUpdateCheck()
+    // waits for the first answer so the reply already says whether an update
+    // exists; Meridian's lookup and the plugin pass run side by side, each
+    // bounded by one fetch timeout. The plugins stay listed either way.
+    const enabled = isUpdateCheckEnabled()
+    if (!enabled) stopUpdateCheck()
+    trackPlugins(loadedPlugins, [pluginDir])
+    if (enabled) await beginUpdateCheck(finalConfig)
 
     return c.json(updateSettingsState())
   })
