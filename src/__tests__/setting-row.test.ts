@@ -7,7 +7,7 @@
  * the page actually runs.
  */
 import { afterEach, describe, expect, test } from "bun:test"
-import { envSource, envVarSource } from "../env"
+import { envInt, envIntValue, envSource, envVarSource } from "../env"
 import { envOverrideText, settingRowHtml, type SettingRowView } from "../telemetry/settingRow"
 import { settingsPageHtml } from "../telemetry/settingsPage"
 
@@ -39,9 +39,26 @@ describe("envOverrideText", () => {
       .not.toContain("s3cr3t-value")
   })
 
-  test("an empty variable is reported as empty rather than as a bare '='", () => {
-    expect(overrideText({ name: "MERIDIAN_TELEMETRY_PERSIST", value: "", secret: false }, "memory", "SQLite"))
+  test("an empty variable the resolver still uses is reported as empty rather than as a bare '='", () => {
+    // Persist reads any set value, "" included (as off), so the saved value really is ignored.
+    expect(overrideText({ name: "MERIDIAN_TELEMETRY_PERSIST", value: "", secret: false, use: "value" }, "memory", "SQLite"))
       .toBe("In use: memory, from MERIDIAN_TELEMETRY_PERSIST (env, set but empty); saved setting SQLite is ignored")
+  })
+
+  test("a variable the resolver passed over does not claim the saved setting is ignored", () => {
+    expect(overrideText({ name: "MERIDIAN_TELEMETRY_RETENTION_DAYS", value: "abc", secret: false, use: "ignored" }, "14 days", "14 days"))
+      .toBe("MERIDIAN_TELEMETRY_RETENTION_DAYS is set but not a valid number (abc); saved setting 14 days used")
+    expect(overrideText({ name: "MERIDIAN_TELEMETRY_SIZE", value: "", secret: false, use: "ignored" }, "3,000 rows", "3,000 rows"))
+      .toBe("MERIDIAN_TELEMETRY_SIZE is set but empty; saved setting 3,000 rows used")
+    expect(overrideText({ name: "MERIDIAN_TELEMETRY_RETENTION_DAYS", value: "", secret: false, use: "ignored" }, "7 days", null))
+      .toBe("MERIDIAN_TELEMETRY_RETENTION_DAYS is set but empty; default 7 days used")
+  })
+
+  test("an unusable variable that still outranks the saved setting says the default is in use", () => {
+    expect(overrideText({ name: "MERIDIAN_TELEMETRY_SIZE", value: "lots", secret: false, use: "default" }, "1,000 rows", "3,000 rows"))
+      .toBe("In use: 1,000 rows (default), from MERIDIAN_TELEMETRY_SIZE=lots (env, not a positive number); saved setting 3,000 rows is ignored")
+    expect(overrideText({ name: "MERIDIAN_DIAGNOSTIC_LOG_SIZE", value: "", secret: false, use: "default" }, "500 entries", null))
+      .toBe("In use: 500 entries (default), from MERIDIAN_DIAGNOSTIC_LOG_SIZE (env, set but empty); no setting saved here")
   })
 
   test("a variable whose value the page does not know is named without one", () => {
@@ -90,7 +107,7 @@ describe("settingRowHtml", () => {
 })
 
 describe("envSource", () => {
-  const touched = ["MERIDIAN_TEST_SETTING", "CLAUDE_PROXY_TEST_SETTING", "MERIDIAN_TEST_TOKEN"]
+  const touched = ["MERIDIAN_TEST_SETTING", "CLAUDE_PROXY_TEST_SETTING", "MERIDIAN_TEST_TOKEN", "MERIDIAN_TEST_INT"]
   const saved = Object.fromEntries(touched.map(name => [name, process.env[name]]))
   afterEach(() => {
     for (const name of touched) {
@@ -107,6 +124,15 @@ describe("envSource", () => {
     expect(envSource("TEST_SETTING")).toEqual({ name: "CLAUDE_PROXY_TEST_SETTING", value: "legacy", secret: false })
     process.env.MERIDIAN_TEST_SETTING = "new"
     expect(envSource("TEST_SETTING")).toEqual({ name: "MERIDIAN_TEST_SETTING", value: "new", secret: false })
+  })
+
+  test("envIntValue is the parse envInt applies: undefined exactly where envInt falls back", () => {
+    for (const [raw, parsed] of [[undefined, undefined], ["", undefined], ["abc", undefined], ["30", 30], ["-5", -5], ["12days", 12]] as const) {
+      if (raw === undefined) delete process.env.MERIDIAN_TEST_INT
+      else process.env.MERIDIAN_TEST_INT = raw
+      expect(envIntValue("TEST_INT")).toBe(parsed)
+      expect(envInt("TEST_INT", 99)).toBe(parsed ?? 99)
+    }
   })
 
   test("a credential-like name reports presence only", () => {

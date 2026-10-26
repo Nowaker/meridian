@@ -51,7 +51,7 @@ import { resolveSdkWorkingDirectory } from "./cwd"
 import type { Context } from "hono"
 import { DEFAULT_PROXY_CONFIG, resolveBackendConfig } from "./types"
 import { createAntigravityServer } from "./backends/antigravity"
-import { env, envBool, envInt, envSource, envVarSource } from "../env"
+import { env, envBool, envInt, envVarSource } from "../env"
 import { installErrorReporter } from "../errorReporting"
 import type { ProxyConfig, ProxyInstance, ProxyServer } from "./types"
 export type { ProxyConfig, ProxyInstance, ProxyServer }
@@ -94,7 +94,7 @@ import { classifyTurnOutcome, createRecoveryLifter, hasTruncatableText, shouldAt
 import { resolveAgentAlias } from "./agentMatch"
 import { LRUMap } from "../utils/lruMap"
 
-import { telemetryStore, diagnosticLog, createTelemetryRoutes, landingHtml, renderPrometheusMetrics, resolveTelemetryConfig, diagnosticLogCapacity } from "../telemetry"
+import { telemetryStore, diagnosticLog, createTelemetryRoutes, landingHtml, renderPrometheusMetrics, resolveTelemetryConfig, telemetryEnvSources, diagnosticLogCapacity } from "../telemetry"
 import { detectSupervision } from "./supervision"
 import type { RequestMetric } from "../telemetry"
 import { canRecoverCapturedToolUses, uncapturedRecoveryVeto, streamedToolBlockVeto, cliRejectedToolResults, type StreamedToolBlockRecord, type UncapturedDeliveryVeto, classifyError, extractSdkTermination, formatSdkTermination, classifyResumeRefusal, isRateLimitError, isExtraUsageRequiredError, isExpiredTokenError, isAccountFailoverError, isQuotaRefusal, isOutputTokenCapExceeded } from "./errors"
@@ -9422,7 +9422,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // The variable behind each override, for the page to name beside the
       // value it produced (`routing`, `profileOrder` above are that value).
       envSources: {
-        routing: process.env.MERIDIAN_ROUTING ? envVarSource("MERIDIAN_ROUTING") : null,
+        routing: envVarSource("MERIDIAN_ROUTING"),
         profileOrder: process.env.MERIDIAN_PROFILE_ORDER?.trim() ? envVarSource("MERIDIAN_PROFILE_ORDER") : null,
       },
     })
@@ -9503,13 +9503,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         diagnosticLogSize: env("DIAGNOSTIC_LOG_SIZE") !== undefined,
         telemetryDb: env("TELEMETRY_DB") !== undefined,
       },
-      // Which variable each override reads; `wanted` holds the value it resolves to.
-      envSources: {
-        telemetryPersist: envSource("TELEMETRY_PERSIST"),
-        telemetryRetentionDays: envSource("TELEMETRY_RETENTION_DAYS"),
-        telemetrySize: envSource("TELEMETRY_SIZE"),
-        diagnosticLogSize: envSource("DIAGNOSTIC_LOG_SIZE"),
-      },
+      // Which variable each override reads and whether its value was used;
+      // `wanted` holds the value the setting resolves to.
+      envSources: telemetryEnvSources(),
       pendingRestart,
       supervision: detectSupervision(),
       limits: TELEMETRY_SETTING_LIMITS,

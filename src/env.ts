@@ -80,8 +80,16 @@ export function resolvePassthrough(defaultValue: boolean): boolean {
  * Resolve an integer env var with a default.
  */
 export function envInt(suffix: string, defaultValue: number): number {
+  return envIntValue(suffix) ?? defaultValue
+}
+
+/**
+ * The integer envInt reads, or undefined when the variable is unset, empty or
+ * not a number (where envInt returns its default).
+ */
+export function envIntValue(suffix: string): number | undefined {
   const val = env(suffix)
-  if (!val) return defaultValue
+  if (!val) return undefined
   const parsed = parseInt(val, 10)
-  return Number.isFinite(parsed) ? parsed : defaultValue
+  return Number.isFinite(parsed) ? parsed : undefined
 }

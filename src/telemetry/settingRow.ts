@@ -19,6 +19,13 @@ export interface EnvSourceView {
   /** Its raw value; null when it is credential-like or the caller does not know it. */
   readonly value: string | null
   readonly secret?: boolean
+  /**
+   * How the resolver used it (telemetryEnvSources): `value` (the default when
+   * absent) means the setting resolves to it; `default` means it is not a
+   * usable value, so the built-in default applies and the saved setting stays
+   * outranked; `ignored` means resolution went on as though it were unset.
+   */
+  readonly use?: "value" | "default" | "ignored"
 }
 
 /**
@@ -31,15 +38,29 @@ export function envOverrideText(source: unknown, inUse: string | null, saved: st
   if (typeof source !== "object" || source === null) return null
   const record = source as Record<string, unknown>
   if (typeof record.name !== "string" || !record.name) return null
-  const value = typeof record.value === "string" ? record.value : null
-  const origin = record.secret === true
+  const hidden = record.secret === true
+  const value = !hidden && typeof record.value === "string" ? record.value : null
+  if (record.use === "ignored") {
+    const problem = hidden
+      ? "not usable"
+      : value === ""
+        ? "empty"
+        : "not a valid number" + (value === null ? "" : " (" + value + ")")
+    const fallback = saved
+      ? "saved setting " + saved + " used"
+      : inUse ? "default " + inUse + " used" : "default used"
+    return record.name + " is set but " + problem + "; " + fallback
+  }
+  const unusable = record.use === "default"
+  const origin = hidden
     ? record.name + " (env, set; value hidden)"
     : value === null
-      ? record.name + " (env)"
+      ? record.name + " (env" + (unusable ? ", not usable" : "") + ")"
       : value === ""
-      ? record.name + " (env, set but empty)"
-      : record.name + "=" + value + " (env)"
-  const head = inUse ? "In use: " + inUse + ", from " + origin : "In use: from " + origin
+        ? record.name + " (env, set but empty)"
+        : record.name + "=" + value + " (env" + (unusable ? ", not a positive number" : "") + ")"
+  const shown = inUse && unusable ? inUse + " (default)" : inUse
+  const head = shown ? "In use: " + shown + ", from " + origin : "In use: from " + origin
   const tail = saved ? "; saved setting " + saved + " is ignored" : "; no setting saved here"
   return head + tail
 }
