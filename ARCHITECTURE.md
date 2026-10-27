@@ -1,6 +1,52 @@
+---
+id: architecture
+type: architecture-design
+title: Meridian architecture
+status: active
+parent: meridian
+references:
+  - api-contract
+  - design-language
+---
+
 # Architecture
 
-A local proxy that bridges supported Anthropic- and OpenAI-compatible clients to Claude through the Agent SDK or Antigravity through the official agy CLI. This document defines the module structure, dependency rules, and design decisions.
+A local proxy that bridges supported Anthropic- and OpenAI-compatible clients to Claude through the Agent SDK, Antigravity through the official agy CLI, or (opt-in) ChatGPT subscription seats. This document defines the module structure, dependency rules, and design decisions.
+
+## Module specs
+
+Each module has a short spec stating its responsibility and boundary; the
+detailed contracts stay in the sections below and are linked from there.
+
+| Module | Spec | Code |
+|---|---|---|
+| Proxy core (HTTP orchestration, admission, cancellation, translation, models) | [`proxy-core`](src/proxy/SPEC.md) | `src/proxy/` (top-level files) |
+| Client adapters & transforms | [`adapters`](src/proxy/adapters/SPEC.md) | `src/proxy/adapters/`, `src/proxy/transforms/`, `adapter.ts`, `transform.ts` |
+| Sessions & bookkeeping | [`session`](src/proxy/session/SPEC.md) | `src/proxy/session/`, `sessionStore.ts`, `sessionLifecycle.ts`, `executionHistory.ts` |
+| Profiles, auth & routing | [`profiles-routing`](src/proxy/profiles-routing.spec.md) | `src/proxy/profile*.ts`, `routing.ts`, `rateLimitStore.ts`, `auth*.ts` |
+| User plugins | [`plugins`](src/proxy/plugins/SPEC.md) | `src/proxy/plugins/` |
+| Antigravity backend | [`antigravity-backend`](src/proxy/backends/SPEC.md) | `src/proxy/backends/antigravity*.ts` |
+| ChatGPT backend | [`chatgpt-backend`](src/proxy/chatgpt/SPEC.md) | `src/proxy/chatgpt/`, `codex/`, `upstream/`, `instanceImport/`, `backends/chatgpt*.ts` |
+| Telemetry & web UI | [`telemetry-ui`](src/telemetry/SPEC.md) | `src/telemetry/` |
+| Desktop app | [`desktop-app`](apps/desktop/SPEC.md) | `apps/desktop/` |
+| Client integrations | [`client-integrations`](plugin/SPEC.md) | `plugin/` |
+
+Module-level dependencies (the main edges and the prohibitions that matter, not
+an exhaustive allow-list; file-level rules follow in
+[Dependency Rules](#dependency-rules)):
+
+- `proxy-core` orchestrates every other server module. Its leaf modules
+  (`messages`, `tools`, `fileChanges`, `retryAfter`, the pure OpenAI
+  translators, …) may be imported by the other server modules.
+- `adapters` uses `session` (fingerprinting) and `profiles-routing`
+  (attestation), and owns the transform pipeline that `plugins` extends.
+- `chatgpt-backend` reuses `session` durability primitives, `profiles-routing`
+  and `telemetry-ui` pricing/presentation; `profileCli.ts` reaches back into
+  `chatgpt/seatCli` because one `meridian profile` CLI covers both providers.
+- `antigravity-backend` never imports `session`.
+- `telemetry-ui` is a leaf over settings/config that the other modules may use.
+- `desktop-app` and `client-integrations` reach the server only over HTTP; the
+  desktop app shares only pure `telemetry-ui` presentation.
 
 ## Request Flow
 
@@ -75,6 +121,10 @@ server orchestration. The build packages self-contained retry integrations under
 `dist/antigravity-clients`; npm, Nix and Docker installations carry those assets.
 Setup prepares edits before writing, preserves unrelated settings, rejects malformed
 or conflicting input, creates private backups and uses per-file atomic replacement.
+`piSetup.ts` owns `meridian setup --client pi`: it copies the TypeScript Pi
+extension from `plugin/pi/` (with the shared `plugin/priority-attestation.ts`
+signer) into Pi's `extensions/meridian/`, replacing only a copy Meridian wrote,
+and provides the startup, `/health` and pluginless-request checks.
 `chatgpt/migrate/` implements `meridian chatgpt-migrate`: credential discovery
 (`sources.ts`), /proc scanning (`processes.ts`), opencode config resolution and
 jsonc editing (`opencodeConfig.ts`), stripping under oc-codex-multi-auth's own
@@ -106,8 +156,8 @@ arguments and native structured results. It never fetches remote references or
 coerces client data. Tool definitions travel in the prompt as well as MCP, so
 model calls do not depend on access to private CLI schema files.
 `antigravity.ts` adapts the standard Request/Response
-interface to Anthropic JSON/SSE. Only `server.ts` imports Hono and binds the
-public listener. Backend modules do not import Claude session or cache modules.
+interface to Anthropic JSON/SSE. Only `server.ts` binds the public listener;
+backend modules do not import Hono. Backend modules do not import Claude session or cache modules.
 
 The runtime maps contain live/warm conversations and outstanding tool correlations,
 like `sessionTree.ts`; they are not another durable session cache. Tool calls
@@ -209,8 +259,19 @@ src/
 │   ├── upstreamReachabilityConfig.ts ← Dynamic environment/settings acquisition injected by server orchestration
 │   ├── adapter.ts             ← AgentAdapter interface (extensibility point for multi-agent support)
 │   ├── adapters/
+│   │   ├── detect.ts          ← Ordered client detection (see docs/development.md#agent-detection)
 │   │   ├── opencode.ts        ← OpenCode adapter (session headers, CWD extraction, tool config)
-│   │   └── forgecode.ts       ← ForgeCode adapter (fingerprint sessions, XML CWD, passthrough)
+│   │   ├── forgecode.ts       ← ForgeCode adapter (fingerprint sessions, XML CWD, passthrough)
+│   │   └── …                  ← claudecode, pi, prime, codex, crush, droid, jcode, letta, cherry, polytoken, openai, passthrough
+│   ├── transforms/            ← Built-in per-adapter transforms, registered in registry.ts
+│   ├── transform.ts           ← Transform interface and pipeline runner (adapters and plugins)
+│   ├── plugins/               ← User plugin loader, validation, stats and plugin page
+│   ├── backends/              ← Antigravity runtime (antigravity*.ts), ChatGPT backend, provider status
+│   ├── upstream/              ← Provider-neutral upstream seam: which provider serves a model
+│   ├── chatgpt/               ← ChatGPT seats: owned/follow-external sources, refresh, login; migrate/ CLI
+│   ├── codex/                 ← Read-only oc-codex-multi-auth pool reader and usage (never writes the pool)
+│   ├── instanceImport/        ← `meridian instance-import` (never imported by the server)
+│   ├── openai.ts, openaiResponses.ts ← Pure OpenAI Chat Completions / Responses translation
 │   ├── query.ts               ← SDK query options builder (shared between stream/non-stream paths)
 │   ├── transcriptRetention.ts ← Claude Code transcript retention period per SDK config root
 │   ├── transcriptSweep.ts     ← Idle sweep: an offline, promptless Claude Code process per idle config root
@@ -236,6 +297,7 @@ src/
 │   ├── buildObserver.ts       ← Single-flight bounded disk observation cache
 │   ├── buildObservationWorker.ts ← Off-thread source/artifact observation
 │   ├── updateCheck.ts         ← Opt-in cached npm registry lookup for the newest published version
+│   ├── pluginUpdateCheck.ts   ← Same check for each loaded plugin's npm package, run in updateCheck's pass
 │   ├── tools.ts               ← Tool blocking lists, MCP server name, allowed tools
 │   ├── messages.ts            ← Content normalization, message parsing
 │   ├── replay.ts              ← Pure rendering of assistant calls and tool results for SDK replay
@@ -260,7 +322,8 @@ src/
 │   ├── agentDefs.ts           ← Subagent definition extraction from tool descriptions
 │   ├── agentMatch.ts          ← Fuzzy agent name matching
 │   ├── design.ts              ← Claude Design MCP proxy (token store/refresh, auth precedence, login flow)
-│   └── passthroughTools.ts    ← Tool forwarding mode (agent handles execution)
+│   ├── passthroughTools.ts    ← Tool forwarding mode (agent handles execution)
+│   └── session/bookkeeping/   ← Optional SQLite bookkeeping backend (see SQLite bookkeeping boundary)
 ├── fileChanges.ts             ← PostToolUse hook: tracks write/edit ops, formats summary
 ├── mcpTools.ts                ← MCP tool definitions (read, write, edit, bash, glob, grep)
 ├── logger.ts                  ← Logging with AsyncLocalStorage context
@@ -289,7 +352,9 @@ src/
 
 plugin/                       ← Repository root, alongside src/
 ├── meridian.ts               ← OpenCode V1 session header plugin
-└── meridian-v2.ts            ← OpenCode V2 plugin
+├── meridian-v2.ts            ← OpenCode V2 plugin
+├── priority-attestation.ts   ← Client-side human-turn signer (OpenCode and Pi)
+└── pi/                       ← Pi extension: meridian provider, catalog, request identity
 ```
 
 ## Dependency Rules
@@ -329,7 +394,7 @@ server.ts (HTTP layer)
 
 2. **`session/cache.ts` owns all mutable session state.** No other module should create or manage LRU caches for sessions.
 
-3. **`errors.ts`, `retryAfter.ts`, `toolInputJson.ts`, `models.ts`, `tools.ts`, `messages.ts`, `profiles.ts`, `profileCli.ts`, `buildInfo.ts`, `updateCheck.ts`, `sseFailureSniff.ts` are leaf modules.** They must not import from `server.ts`, `session/`, or `adapter.ts`. `buildInfo.ts`, `retryAfter.ts` and `toolInputJson.ts` are additionally pure — every export is a function of its arguments (plus `process.env` for `buildInfo.ts`), so the registry I/O lives in `updateCheck.ts` instead. `sseFailureSniff.ts` keeps pure framing separate from reader/queue lifecycle helpers; account selection, publication and durable settlement remain in `server.ts`.
+3. **`errors.ts`, `retryAfter.ts`, `toolInputJson.ts`, `models.ts`, `tools.ts`, `messages.ts`, `profiles.ts`, `profileCli.ts`, `buildInfo.ts`, `updateCheck.ts`, `pluginUpdateCheck.ts`, `sseFailureSniff.ts` are leaf modules.** They must not import from `server.ts`, `session/`, or `adapter.ts`. `buildInfo.ts`, `retryAfter.ts` and `toolInputJson.ts` are additionally pure — every export is a function of its arguments (plus `process.env` for `buildInfo.ts`), so the registry I/O lives in `updateCheck.ts` and `pluginUpdateCheck.ts` instead. `sseFailureSniff.ts` keeps pure framing separate from reader/queue lifecycle helpers; account selection, publication and durable settlement remain in `server.ts`.
 
 4. **`server.ts` owns Hono route registration and orchestration.** Hono
    middleware stays at the proxy boundary. Standard `Request`/`Response`
@@ -377,7 +442,7 @@ Agent-specific behavior is isolated behind the `AgentAdapter` interface (`adapte
 ### Adding a New Agent
 
 1. Create `adapters/myagent.ts` implementing `AgentAdapter`
-2. Wire it into `server.ts` (currently hardcoded to `openCodeAdapter`; future work will auto-detect)
+2. Register it in `adapters/detect.ts` (`ADAPTER_MAP` and, if it has a detection signal, the ordered detection list) and its built-in transforms, if any, in `transforms/registry.ts`
 3. No changes needed to `query.ts`, `session/`, or other infrastructure
 
 ### What the Adapter Controls
@@ -401,7 +466,6 @@ Agent-specific behavior is isolated behind the `AgentAdapter` interface (`adapte
 |-------|----------|--------|
 | `buildAgentDefinitions` | `agentDefs.ts`, `transforms/opencode.ts` | Pure OpenCode Task parser invoked by the adapter transform. |
 | Passthrough mode | `passthroughTools.ts` | Agent-agnostic but OpenCode-motivated. Keep as-is. |
-| `ALLOWED_MCP_TOOLS` usage in `server.ts` | Line ~176 | Used for `buildAgentDefinitions`. Move when adapter handles agent defs. |
 
 ## Session Management
 
@@ -666,8 +730,8 @@ Three tiers, each catching different classes of bugs:
 
 | Tier | Files | SDK | Speed | Runs In |
 |------|-------|-----|-------|---------|
-| **Unit** | `src/__tests__/*-unit.test.ts` | None | Fast | CI (`bun test`) |
-| **Integration** | `src/__tests__/proxy-*.test.ts` | Mocked | Fast | CI (`bun test`) |
+| **Unit** | `src/__tests__/*-unit.test.ts` | None | Fast | CI (`npm test`) |
+| **Integration** | `src/__tests__/proxy-*.test.ts` | Mocked | Fast | CI (`npm test`) |
 | **E2E** | `E2E.md` | Real (Claude Max) | Slow | Manual, pre-release |
 
 - **Unit tests**: Pure functions, no mocks, no I/O.
@@ -682,8 +746,11 @@ Tests that need `clearSessionCache` or `createProxyServer` import from `../proxy
 Every change must pass all existing unit and integration tests:
 
 ```bash
-npm test    # runs: bun test
+npm test    # typechecks (pretest), then the full suite with process-global mocks isolated
 ```
+
+A targeted `bun test <file>` does not typecheck; run `npm run typecheck` (and
+`npm run build` for Node entrypoints) before relying on it.
 
 E2E tests (`E2E.md`) should be run before releases or after major refactors.
 
