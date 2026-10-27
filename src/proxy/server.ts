@@ -9705,11 +9705,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     }
     const value = (input as Record<string, unknown>).transcriptRetentionDays
     if (value !== undefined) {
-      if (value !== null && !isTranscriptRetentionDays(value)) {
+      if (value !== null && value !== 0 && !isTranscriptRetentionDays(value)) {
         const { min, max } = TRANSCRIPT_RETENTION_LIMITS
-        return c.json({ error: `transcriptRetentionDays must be an integer between ${min} and ${max}, or null to unset` }, 400)
+        return c.json({ error: `transcriptRetentionDays must be an integer between ${min} and ${max}, or 0 or null to turn retention off` }, 400)
       }
-      setSetting("transcriptRetentionDays", value ?? undefined)
+      setSetting("transcriptRetentionDays", value === null || value === 0 ? undefined : value)
     }
     const state = transcriptRetentionState()
     plog(`[PROXY] Transcript retention updated: ${state.effective.days === 0 ? "off" : `${state.effective.days}d`} (${state.effective.source})`)

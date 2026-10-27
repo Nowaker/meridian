@@ -1,10 +1,11 @@
 /**
  * The transcript retention settings API behind the /settings page.
  *
- * What the page relies on: a save round-trips through settings.json, an
- * invalid value is refused without touching what is saved, null returns to the
- * default, and an env override is reported so the form does not imply that a
- * saved value applies when the environment outranks it.
+ * What the page relies on: retention is off until someone sets it, a save
+ * round-trips through settings.json, an invalid value is refused without
+ * touching what is saved, 0 or null turns it back off, and an env override is
+ * reported so the form does not imply that a saved value applies when the
+ * environment outranks it.
  */
 import { describe, it, expect, beforeEach, afterEach } from "bun:test"
 import { mkdtempSync, rmSync } from "node:fs"
@@ -64,13 +65,13 @@ describe("transcript retention settings routes", () => {
     })))
   }
 
-  it("reports the 30-day default when nothing is saved", async () => {
+  it("reports retention off when nothing is saved", async () => {
     expect(await get()).toEqual({
       saved: null,
-      effective: { days: 30, source: "default" },
+      effective: { days: 0, source: "default" },
       envOverride: false,
-      default: 30,
-      limits: { min: 0, max: 3650 },
+      default: 0,
+      limits: { min: 1, max: 3650 },
     })
   })
 
@@ -84,23 +85,24 @@ describe("transcript retention settings routes", () => {
     expect(state.effective).toEqual({ days: 7, source: "settings" })
   })
 
-  it("saves 0 as off, and null returns to the default", async () => {
-    await put({ transcriptRetentionDays: 0 })
-    expect((await get()).effective).toEqual({ days: 0, source: "settings" })
-
-    await put({ transcriptRetentionDays: null })
-    expect(getSetting("transcriptRetentionDays")).toBeUndefined()
-    const state = await get()
-    expect(state.saved).toBeNull()
-    expect(state.effective).toEqual({ days: 30, source: "default" })
+  it("turns retention off with 0 or null, leaving nothing saved", async () => {
+    for (const off of [0, null]) {
+      await put({ transcriptRetentionDays: 9 })
+      expect(getSetting("transcriptRetentionDays")).toBe(9)
+      expect((await put({ transcriptRetentionDays: off })).status).toBe(200)
+      expect(getSetting("transcriptRetentionDays")).toBeUndefined()
+      const state = await get()
+      expect(state.saved).toBeNull()
+      expect(state.effective).toEqual({ days: 0, source: "default" })
+    }
   })
 
   it("refuses a value it cannot use and leaves the saved one alone", async () => {
     await put({ transcriptRetentionDays: 14 })
-    for (const bad of [-1, 2.5, 3651, "30", true]) {
+    for (const bad of [-1, 2.5, 3651, "30", true, 1e9]) {
       const response = await put({ transcriptRetentionDays: bad })
       expect(response.status).toBe(400)
-      expect(((await response.json()) as { error: string }).error).toContain("between 0 and 3650")
+      expect(((await response.json()) as { error: string }).error).toContain("between 1 and 3650")
     }
     expect((await put("not json")).status).toBe(400)
     expect((await put([30])).status).toBe(400)

@@ -85,9 +85,10 @@ export interface MeridianSettings {
    */
   errorReportingDsn?: string
   /**
-   * Days Claude Code keeps the transcripts requests leave on disk before its
-   * own sweep deletes them; 0 keeps every one. Unset means 30, Claude Code's
-   * default. MERIDIAN_TRANSCRIPT_RETENTION_DAYS wins, and a profile whose own
+   * Opt-in: when set (1-3650), Claude Code's own retention cleanup runs in
+   * Meridian's SDK children and deletes its files older than this many days in
+   * each profile's config directory. Unset is off.
+   * MERIDIAN_TRANSCRIPT_RETENTION_DAYS wins, and a profile whose own
    * settings.json names `cleanupPeriodDays` keeps that. Re-read on every
    * request; see proxy/transcriptRetention.ts.
    */

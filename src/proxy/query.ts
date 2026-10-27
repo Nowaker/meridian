@@ -245,9 +245,10 @@ export interface QueryContext {
   sharedMemory?: boolean
   /** Run the WebFetch domain safety check (hostname sent to api.anthropic.com) */
   webFetchPreflight?: boolean
-  /** Days Claude Code keeps transcripts before its own sweep deletes them, as
-   *  resolved by transcriptRetention.ts; 0 passes no period. Required so a
-   *  new call site cannot silently leave its transcripts on disk forever. */
+  /** `cleanupPeriodDays` for Claude Code's own retention cleanup, as resolved
+   *  by transcriptRetention.ts. Anything but a positive integer (0 = off, the
+   *  default) passes no period, exactly as before #1261. Required so a new call
+   *  site states its retention instead of silently differing. */
   transcriptRetentionDays: number
   /** Load the account's claude.ai MCP connectors (ignored in passthrough) */
   claudeAiConnectors?: boolean
@@ -799,12 +800,11 @@ export function buildQueryOptions(ctx: QueryContext, abortController?: AbortCont
         // the check. `webFetchPreflight` is the positive form the settings
         // UI shows; the SDK setting is the negative one.
         skipWebFetchPreflight: ctx.webFetchPreflight === false,
-        // Claude Code sweeps old transcripts only when an enabled settings
-        // source names a period, and settingSources below enables none, so the
-        // period has to arrive here (see transcriptRetention.ts). Omitted
-        // rather than sent as 0 when off: current Claude Code rejects 0, and
-        // older versions read it as "write no transcripts at all".
-        ...(ctx.transcriptRetentionDays > 0 ? { cleanupPeriodDays: ctx.transcriptRetentionDays } : {}),
+        // Opt-in retention (transcriptRetention.ts): only a positive integer
+        // is ever sent; off sends no key at all. See src/proxy/SPEC.md.
+        ...(Number.isSafeInteger(ctx.transcriptRetentionDays) && ctx.transcriptRetentionDays > 0
+          ? { cleanupPeriodDays: ctx.transcriptRetentionDays }
+          : {}),
       },
       // #634/#490: always explicit. Empty array → SDK emits
       // `--setting-sources=` → subprocess loads nothing. Omitting the key

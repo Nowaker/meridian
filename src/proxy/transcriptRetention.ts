@@ -1,48 +1,38 @@
 /**
- * How long Claude Code keeps the transcripts Meridian's SDK children write.
+ * Whether, and for how long, Claude Code's own retention cleanup runs in
+ * Meridian's SDK children. Off unless the operator turns it on.
  *
- * Every query leaves a transcript, `projects/<project>/<session>.jsonl` plus
- * its sidecar files, under the child's config root. Claude Code deletes
- * transcripts that have gone untouched for `cleanupPeriodDays` (default 30) in
- * a background sweep shortly after a process starts. But it sweeps only when
- * the user settings source is enabled or an enabled source names a period, and
- * Meridian starts every child with `settingSources: []` so no CLAUDE.md, hook
- * or permission file on the proxy host leaks into a request (#490, #634). With
- * nothing enabled, Claude Code skips the sweep ("userSettings source is
- * disabled (--setting-sources) and no enabled source provides
- * cleanupPeriodDays"), so every transcript Meridian's own lifecycle GC no
- * longer tracked stayed on disk forever.
- *
- * Flag settings are always an enabled source, so handing the period over in
- * the SDK `settings` object brings the sweep back without loading any file.
- * This module decides that period:
+ * Meridian starts every child with `settingSources: []` (#490, #634), and
+ * Claude Code skips its cleanup when no enabled settings source names
+ * `cleanupPeriodDays`. Flag settings are always enabled, so passing the period
+ * there brings the cleanup back without loading any settings file. Rationale,
+ * what the cleanup deletes and its limits: `src/proxy/SPEC.md` (Decisions) and
+ * `docs/configuration.md` (Transcript retention).
  *
  *   1. Meridian's own period: MERIDIAN_TRANSCRIPT_RETENTION_DAYS, else
- *      `transcriptRetentionDays` in settings.json, else 30, Claude Code's own
- *      default. 0 passes nothing, which leaves the sweep off as it always was.
+ *      `transcriptRetentionDays` in settings.json, else off. The env var
+ *      accepts 0 to pin retention off over a saved period.
  *   2. When that is on, a config root whose own settings.json names a
- *      `cleanupPeriodDays` keeps it. Without profiles the root is the user's
- *      ~/.claude, shared with their interactive Claude Code, and overriding a
- *      longer retention they chose there would delete their own transcripts.
- *   3. A settings.json that cannot be read, or names a period Claude Code
- *      would reject, passes nothing: the period it means cannot be known, and
- *      Claude Code itself skips its sweep in that case rather than guess.
+ *      `cleanupPeriodDays` keeps it.
+ *   3. A root settings.json that cannot be read, or names a period Claude Code
+ *      would reject, passes nothing.
  *
- * Resolved on every request, like routing, so a change applies to the next
- * child.
+ * Resolved on every request, so a change applies to the next child.
  */
 
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { parse, type ParseError } from "jsonc-parser"
-import { env } from "../env"
+import { env, envSource } from "../env"
 import { getSetting } from "../settings"
 
-export const DEFAULT_TRANSCRIPT_RETENTION_DAYS = 30
+/** Off: no period is passed and Claude Code's cleanup stays skipped, as before #1261. */
+export const DEFAULT_TRANSCRIPT_RETENTION_DAYS = 0
 
-/** Accepted Meridian-level periods, shared by the form and the validator.
- *  0 is off; ten years is the same cap telemetry retention has. */
-export const TRANSCRIPT_RETENTION_LIMITS = { min: 0, max: 3650 } as const
+/** Accepted periods when retention is on. Claude Code rejects 0
+ *  (`int().positive()`), so the minimum is 1; ten years is the same cap
+ *  telemetry retention has. */
+export const TRANSCRIPT_RETENTION_LIMITS = { min: 1, max: 3650 } as const
 
 export type TranscriptRetentionSource =
   | "env"
@@ -60,22 +50,37 @@ export interface TranscriptRetention {
   source: TranscriptRetentionSource
 }
 
+/** A period that turns retention on: an integer within the limits. */
 export function isTranscriptRetentionDays(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value)
     && value >= TRANSCRIPT_RETENTION_LIMITS.min && value <= TRANSCRIPT_RETENTION_LIMITS.max
 }
 
+/** The env value as a period, 0 for an explicit off, or undefined when it is
+ *  unset or unusable (then resolution goes on as though it were unset). */
+function envTranscriptRetentionDays(): number | undefined {
+  const raw = env("TRANSCRIPT_RETENTION_DAYS")?.trim()
+  if (!raw || !/^\d+$/.test(raw)) return undefined
+  const days = Number(raw)
+  return days === 0 || isTranscriptRetentionDays(days) ? days : undefined
+}
+
 /** Meridian's own period, before any config root's choice. An env value or a
  *  saved setting outside the limits is ignored rather than clamped. */
 export function meridianTranscriptRetention(): TranscriptRetention {
-  const raw = env("TRANSCRIPT_RETENTION_DAYS")?.trim()
-  if (raw) {
-    const fromEnv = Number(raw)
-    if (isTranscriptRetentionDays(fromEnv)) return { days: fromEnv, source: "env" }
-  }
+  const fromEnv = envTranscriptRetentionDays()
+  if (fromEnv !== undefined) return { days: fromEnv, source: "env" }
   const saved = getSetting("transcriptRetentionDays")
   if (isTranscriptRetentionDays(saved)) return { days: saved, source: "settings" }
   return { days: DEFAULT_TRANSCRIPT_RETENTION_DAYS, source: "default" }
+}
+
+/** The env var for the settings page's override line, with how resolution
+ *  used it (`EnvSourceView.use` in telemetry/settingRow.ts). */
+export function transcriptRetentionEnvSource(): { name: string; value: string | null; secret: boolean; use: "value" | "ignored" } | null {
+  const source = envSource("TRANSCRIPT_RETENTION_DAYS")
+  if (source === null) return null
+  return { ...source, use: envTranscriptRetentionDays() === undefined ? "ignored" : "value" }
 }
 
 /** The period to hand a child whose config root is `configDir`. */

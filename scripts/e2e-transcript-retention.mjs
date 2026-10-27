@@ -2,16 +2,15 @@
 // installed Claude Code CLI through the Agent SDK with the options Meridian
 // builds, in disposable directories, and never sends the model a message.
 //
-//   bun scripts/e2e-transcript-retention.mjs                 # the sweep runs
-//   MERIDIAN_TRANSCRIPT_RETENTION_DAYS=0 \
-//     bun scripts/e2e-transcript-retention.mjs --expect-kept # nothing is deleted
+//   MERIDIAN_TRANSCRIPT_RETENTION_DAYS=30 \
+//     bun scripts/e2e-transcript-retention.mjs   # opted in: the cleanup runs
+//   bun scripts/e2e-transcript-retention.mjs     # default, off: nothing is deleted
 import assert from "node:assert/strict"
 import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { query } from "@anthropic-ai/claude-agent-sdk"
 
-const expectKept = process.argv.includes("--expect-kept")
 const retentionDays = process.env.MERIDIAN_TRANSCRIPT_RETENTION_DAYS
 const fixtureRoot = mkdtempSync(join(tmpdir(), "meridian-transcript-retention-e2e-"))
 for (const key of Object.keys(process.env)) if (/^(MERIDIAN_|CLAUDE_PROXY_|CLAUDE_|ANTHROPIC_)/.test(key)) delete process.env[key]
@@ -41,6 +40,7 @@ const fortyDaysAgo = (Date.now() - 40 * 86_400_000) / 1000
 utimesSync(transcriptPath(oldSession), fortyDaysAgo, fortyDaysAgo)
 
 const retention = resolveTranscriptRetention(configDir)
+const expectKept = retention.days === 0
 const claudeExecutable = await resolveClaudeExecutableAsync()
 
 /** Run one SDK child that never receives a message, for at most `windowMs`. */
@@ -79,6 +79,7 @@ try {
     freshTranscriptKept: existsSync(transcriptPath(freshSession)),
   }
   assert.deepEqual(report.settingSources, [], "no settings file may be loaded")
+  if (expectKept) assert.equal(report.cleanupPeriodDays, null, "retention is off, yet a period was passed")
   assert.equal(report.freshTranscriptKept, true, "a fresh transcript must survive the sweep")
   assert.equal(report.oldTranscriptKept, expectKept, expectKept
     ? "the 40-day-old transcript was deleted although no period was passed"

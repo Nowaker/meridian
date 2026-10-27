@@ -778,6 +778,20 @@ describe("buildQueryOptions", () => {
     expect(flagSettings({ transcriptRetentionDays: 0 })).not.toHaveProperty("cleanupPeriodDays")
   })
 
+  it("sends exactly main's flag settings when retention is off", () => {
+    expect(flagSettings({ transcriptRetentionDays: 0 })).toEqual({
+      autoMemoryEnabled: true,
+      autoDreamEnabled: false,
+      skipWebFetchPreflight: false,
+    })
+  })
+
+  it("never sends a period Claude Code would reject", () => {
+    for (const days of [-1, 2.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(flagSettings({ transcriptRetentionDays: days })).not.toHaveProperty("cleanupPeriodDays")
+    }
+  })
+
   it("passes the retention period in passthrough mode without enabling any settings source", () => {
     const { options } = buildQueryOptions(makeContext({ passthrough: true, settingSources: [], transcriptRetentionDays: 7 }))
     expect(options.settingSources).toEqual([])

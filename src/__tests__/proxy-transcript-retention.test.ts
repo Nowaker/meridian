@@ -1,12 +1,13 @@
 /**
  * Transcript retention, through the HTTP path and the mocked SDK.
  *
- * Two things are pinned here. Every SDK child is handed the retention period
- * in its flag settings, resolved per request, so a saved change reaches the
- * next request without a restart. And a conversation whose transcript the
- * retention sweep has already deleted still gets its answer: the resume is
- * refused, and Meridian replays the history into a fresh session instead of
- * failing the request.
+ * Three things are pinned here. With nothing configured, an SDK child gets no
+ * retention period at all, exactly as before #1261. Once the operator turns
+ * retention on, every child is handed the period in its flag settings,
+ * resolved per request, so a saved change reaches the next request without a
+ * restart. And a conversation whose transcript the cleanup has already deleted
+ * still gets its answer: the resume is refused, and Meridian replays the
+ * history into a fresh session instead of failing the request.
  */
 import { describe, it, expect, beforeEach, afterEach } from "bun:test"
 import { installSdkMock } from "./sdkMock"
@@ -143,11 +144,27 @@ describe("transcript retention through the proxy", () => {
 
   const createApp = () => createProxyServer({ port: 0, host: "127.0.0.1" }).app
 
-  it("hands a new conversation's SDK child the default 30-day period, with no settings source enabled", async () => {
+  it("passes no period at all when retention is unset, as before #1261", async () => {
+    // Even a root that names its own period changes nothing while Meridian's is off.
+    writeFileSync(join(claudeConfigDir, "settings.json"), JSON.stringify({ cleanupPeriodDays: 120 }))
     const app = createApp()
     for (const stream of [false, true]) {
       queryCalls = []
-      const response = await post(app, { model: "sonnet", stream, messages: [{ role: "user", content: "hello" }] }, `sess-default-${stream}`)
+      const response = await post(app, { model: "sonnet", stream, messages: [{ role: "user", content: "hello" }] }, `sess-unset-${stream}`)
+      expect(response.status).toBe(200)
+      await response.text()
+      expect(queryCalls.length).toBeGreaterThan(0)
+      for (const call of queryCalls) expect(flagSettings(call)).not.toHaveProperty("cleanupPeriodDays")
+      expect(queryCalls[0]?.options.settingSources).toEqual([])
+    }
+  })
+
+  it("hands every SDK child the period once the env turns retention on, with no settings source enabled", async () => {
+    process.env.MERIDIAN_TRANSCRIPT_RETENTION_DAYS = "30"
+    const app = createApp()
+    for (const stream of [false, true]) {
+      queryCalls = []
+      const response = await post(app, { model: "sonnet", stream, messages: [{ role: "user", content: "hello" }] }, `sess-env-${stream}`)
       expect(response.status).toBe(200)
       await response.text()
       expect(flagSettings(queryCalls[0]).cleanupPeriodDays).toBe(30)
@@ -167,6 +184,7 @@ describe("transcript retention through the proxy", () => {
   })
 
   it("keeps the period named by the child's own config root", async () => {
+    setSetting("transcriptRetentionDays", 30)
     writeFileSync(join(claudeConfigDir, "settings.json"), JSON.stringify({ cleanupPeriodDays: 120 }))
     const app = createApp()
     await (await post(app, { model: "sonnet", stream: false, messages: [{ role: "user", content: "hi" }] }, "sess-own")).text()
@@ -187,6 +205,7 @@ describe("transcript retention through the proxy", () => {
         const app = createApp()
         const sessionId = `sess-swept-${stream}`
         sweptSessionId = `sdk-swept-${stream}`
+        setSetting("transcriptRetentionDays", 30)
         storeSession(sessionId, priorMessages, sweptSessionId, "/tmp/test")
 
         const response = await post(app, { model: "sonnet", stream, messages: continuation }, sessionId)
