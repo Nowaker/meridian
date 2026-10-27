@@ -91,7 +91,7 @@ async function seed(accounts: ChatGptAccount[]): Promise<void> {
 }
 
 /** An owned source over the seeded store, with a mock token endpoint that records which refresh tokens it was sent. */
-function owned(reply: (refreshToken: string) => Response = renewed, renewalIntervals?: () => Record<string, number>) {
+function owned(reply: (refreshToken: string) => Response | Promise<Response> = renewed, renewalIntervals?: () => Record<string, number>) {
   const sent: string[] = []
   const source = createOwnedCredentialSource({
     storePath,
@@ -257,6 +257,47 @@ describe("renewing owned seats ahead of expiry", () => {
     expect(source.renewDue!()).toBe(first)
     await first
     expect(sent).toEqual(["refresh-due"])
+  })
+})
+
+// A renewal stamps its seat before the exchange goes out and clears the stamp
+// when the result is recorded. Read in between, the seat is neither signed
+// out nor waiting for a sign-in: it was being listed as needing one, so every
+// renewal left a logout and a recovery in its record a second apart.
+describe("a seat read while its exchange is in flight", () => {
+  const view = (source: { seats(): Array<{ id: string; eligible: boolean; reason?: string }> }, id: string) =>
+    source.seats().find(seat => seat.id === id)!
+
+  it("keeps the state it had, and needs a sign-in only once the exchange fails", async () => {
+    await seed([account("due", NOW - 9 * DAY)])
+    let answer!: (response: Response) => void
+    const { source, sent } = owned(() => new Promise<Response>(resolve => { answer = resolve }))
+    await source.acquire()
+
+    const pass = source.renewDue!()
+    while (sent.length === 0) await new Promise(resolve => setTimeout(resolve, 5))
+    expect(onDisk("due")?.exchangeStartedAt).not.toBeNull()
+    expect(view(source, "due")).toMatchObject({ eligible: true })
+    expect(view(source, "due").reason).toBeUndefined()
+
+    answer(refused(401, { error: { code: "refresh_token_reused" } }))
+    await pass
+    expect(view(source, "due")).toMatchObject({ eligible: false, reason: "requires_reauth" })
+  })
+
+  it("needs a sign-in when the stamp is left from an exchange that never finished", async () => {
+    await seed([account("stuck", NOW - 12 * DAY, { exchangeStartedAt: NOW - 1000 })])
+    const { source } = owned()
+    await source.acquire()
+    expect(view(source, "stuck")).toMatchObject({ eligible: false, reason: "requires_reauth" })
+  })
+
+  it("on a read-only instance, keeps the state a stamp younger than an exchange can take, and not an older one", async () => {
+    await seed([account("fresh", NOW - 9 * DAY, { exchangeStartedAt: NOW - 1000 }), account("old", NOW - 9 * DAY, { exchangeStartedAt: NOW - 60_000 })])
+    const source = createOwnedCredentialSource({ storePath, now: () => clock, readOnly: true })!
+    held.push(source)
+    expect(view(source, "fresh")).toMatchObject({ eligible: true })
+    expect(view(source, "old")).toMatchObject({ eligible: false, reason: "requires_reauth" })
   })
 })
 

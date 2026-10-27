@@ -41,7 +41,7 @@ const { __setFetchOAuthUsageOverride, resetOAuthUsageCache } = await import("../
 const { getSetting, saveSettings } = await import("../settings")
 const { resetCodexUsageCache } = await import("../proxy/codex/service")
 const { __setChatGptLoginListenOverride } = await import("../proxy/chatgpt/login")
-const { noteRefreshRejected } = await import("../proxy/authLifecycle")
+const { authLifecycleFor, noteRefreshRejected } = await import("../proxy/authLifecycle")
 const { chatGptAuthLifecycleKey } = await import("../proxy/chatgpt/refresh")
 
 const NOW = Date.now()
@@ -1385,6 +1385,74 @@ describe("owned mode signs its own seats in", () => {
       proxy.chatGpt!.release()
     }
   })
+
+  // Read while its renewal is out, a seat was listed as needing a sign-in, and
+  // the record took that for a wiped credential: a logout and a recovery in
+  // the same second, at every renewal.
+  for (const ending of ["renewed", "refused"] as const) {
+    it(`lists a seat as it was while its renewal is out, and records only what the exchange ${ending === "renewed" ? "did" : "refused"}`, async () => {
+      mkdirSync(storeDir, { recursive: true, mode: 0o700 })
+      const day = 24 * 3_600_000
+      const seat = `user-8${ending}__workspace-8`
+      const token = (issuedAt: number) => `${part({ alg: "none" })}.${part({
+        iat: Math.floor(issuedAt / 1000),
+        exp: Math.floor((issuedAt + 10 * day) / 1000),
+        "https://api.openai.com/auth": { chatgpt_account_id: "workspace-8", chatgpt_account_user_id: seat },
+      })}.sig`
+      const issuedAt = NOW - 9 * day
+      writeFileSync(storePath, JSON.stringify({ version: 1, accounts: [{
+        accountUserId: seat, accountId: "workspace-8", email: "busy@example.test",
+        refreshToken: "rt-busy", accessToken: token(issuedAt), expiresAt: issuedAt + 10 * day,
+        tokenRotatedAt: issuedAt, exchangeStartedAt: null,
+      }] }), { mode: 0o600 })
+      let started = false
+      let answer!: (response: Response) => void
+      const serve = globalThis.fetch
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+        if (url === TOKEN_URL && new URLSearchParams(String(init?.body)).get("grant_type") === "refresh_token") {
+          started = true
+          return new Promise<Response>(resolve => { answer = resolve })
+        }
+        return serve(input, init)
+      }) as typeof fetch
+      const proxy = await server("owned")
+      await proxy.chatGpt!.acquire()
+      try {
+        const listed = async () => {
+          await proxy.app.fetch(new Request("http://localhost/v1/usage/quota/all"))
+          const list = await (await proxy.app.fetch(new Request("http://localhost/profiles/list"))).json() as {
+            profiles: Array<{ seat?: string; loggedIn: boolean; tokenState?: string; firstUnauthedAt?: number | null }>
+          }
+          return list.profiles.find(p => p.seat === seat)!
+        }
+        const kinds = () => (authLifecycleFor(chatGptAuthLifecycleKey(seat))?.events ?? []).map(e => e.kind)
+        expect(await listed()).toMatchObject({ loggedIn: true, tokenState: "ok" })
+
+        const pass = proxy.chatGpt!.renewDue()
+        while (!started) await new Promise(resolve => setTimeout(resolve, 5))
+        expect(JSON.parse(readFileSync(storePath, "utf8")).accounts[0].exchangeStartedAt).not.toBeNull()
+        expect(await listed()).toMatchObject({ loggedIn: true, tokenState: "ok" })
+        expect(kinds()).toEqual([])
+
+        if (ending === "renewed") {
+          answer(Response.json({ access_token: token(Date.now()), refresh_token: "rt-renewed", expires_in: 10 * 86_400 }))
+          expect(await pass).toBe(true)
+          expect(await listed()).toMatchObject({ loggedIn: true, tokenState: "ok" })
+          expect(kinds()).toEqual([])
+        } else {
+          answer(new Response(JSON.stringify({ error: { code: "refresh_token_reused" } }), { status: 401, headers: { "content-type": "application/json" } }))
+          expect(await pass).toBe(false)
+          expect(await listed()).toMatchObject({ loggedIn: false, tokenState: "requires_reauth" })
+          const events = authLifecycleFor(chatGptAuthLifecycleKey(seat))!.events
+          expect(events.map(e => e.kind)).toEqual(["logged_out"])
+          expect(events[0]).toMatchObject({ reason: "refresh_rejected", detail: "rejected: refresh token already used" })
+        }
+      } finally {
+        proxy.chatGpt!.release()
+      }
+    })
+  }
 
   it("cancels a pending sign-in on request, so its code can no longer be spent", async () => {
     const proxy = await server("owned")
