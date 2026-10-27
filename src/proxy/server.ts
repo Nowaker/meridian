@@ -46,12 +46,13 @@ import { AdmissionHold, parseDrainOptions, type AdmissionReservation } from "./a
 import { DrainBodyError, readDrainBody } from "./drainBody"
 import { isGenerationSubmission, onGenerationResponseSettled } from "./generationAdmission"
 import { closeServerWithGracePeriod, trackServerConnections, waitForShutdownIdle, withShutdownDeadline } from "./shutdown"
-import { fetchOAuthUsage, fetchOAuthUsageResult, toUsageEntry, peekOAuthUsage, clearOAuthUsageForProfile } from "./oauthUsage"
+import { fetchOAuthUsage, fetchOAuthUsageResult, toUsageEntry, peekOAuthUsage, clearOAuthUsageForProfile, quotaResetBody, redeemOAuthQuotaResetOnce } from "./oauthUsage"
+import { isSameOriginRequest } from "../sameOrigin"
 import { resolveSdkWorkingDirectory } from "./cwd"
 import type { Context } from "hono"
 import { DEFAULT_PROXY_CONFIG, resolveBackendConfig } from "./types"
 import { createAntigravityServer } from "./backends/antigravity"
-import { env, envBool, envInt } from "../env"
+import { env, envBool, envInt, envVarSource } from "../env"
 import { installErrorReporter } from "../errorReporting"
 import type { ProxyConfig, ProxyInstance, ProxyServer } from "./types"
 export type { ProxyConfig, ProxyInstance, ProxyServer }
@@ -83,7 +84,7 @@ import { promisify } from "util"
 import { randomUUID } from "crypto"
 import { withClaudeLogContext } from "../logger"
 import { parseToolInputObject } from "./toolInputJson"
-import { createPassthroughMcpServer, sharedToolList, createPassthroughReplayToolNameRenderer, resolveClientToolName, normalizeToolInput, hasRepairableToolInput, computeToolSetKey, toolUseSignature, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX, passthroughMcpPrefix, autoDeferDecision, getAutoDeferThreshold } from "./passthroughTools"
+import { createPassthroughMcpServer, sharedPassthroughMcpServer, sharedToolList, createPassthroughReplayToolNameRenderer, resolveClientToolName, normalizeToolInput, hasRepairableToolInput, computeToolSetKey, toolUseSignature, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX, passthroughMcpPrefix, autoDeferDecision, getAutoDeferThreshold } from "./passthroughTools"
 import { describeLocalBootIdentity } from "./session/processIncarnation"
 import { openCodePrimaryAgentContextHash, requiresOpenCodeAgentReplay } from "./adapters/opencodeAgentContext"
 import { getOpenCodeSourceFeatureOverrides } from "./adapters/opencodeSourceFeatures"
@@ -94,7 +95,7 @@ import { classifyTurnOutcome, createRecoveryLifter, hasTruncatableText, shouldAt
 import { resolveAgentAlias } from "./agentMatch"
 import { LRUMap } from "../utils/lruMap"
 
-import { telemetryStore, diagnosticLog, createTelemetryRoutes, landingHtml, renderPrometheusMetrics, resolveTelemetryConfig, diagnosticLogCapacity } from "../telemetry"
+import { telemetryStore, diagnosticLog, createTelemetryRoutes, landingHtml, renderPrometheusMetrics, resolveTelemetryConfig, telemetryEnvSources, diagnosticLogCapacity } from "../telemetry"
 import { detectSupervision } from "./supervision"
 import type { RequestMetric } from "../telemetry"
 import { canRecoverCapturedToolUses, uncapturedRecoveryVeto, streamedToolBlockVeto, cliRejectedToolResults, type StreamedToolBlockRecord, type UncapturedDeliveryVeto, classifyError, extractSdkTermination, formatSdkTermination, classifyResumeRefusal, isRateLimitError, isExtraUsageRequiredError, isExpiredTokenError, isAccountFailoverError, isQuotaRefusal, isOutputTokenCapExceeded } from "./errors"
@@ -114,9 +115,11 @@ import {
   DESIGN_UPSTREAM_ORIGIN,
 } from "./design"
 import { checkPluginConfigured, isPluginlessOpenCodeRequest, notePluginlessOpenCodeRequest } from "./setup"
+import { checkPiExtensionConfigured, notePluginlessPiRequest } from "./piSetup"
 import { describeBuildDrift } from "./buildInfo"
 import { buildRuntime } from "./buildRuntime"
-import { getLatestVersion, isUpdateCheckEnabled, startUpdateCheck, stopUpdateCheck } from "./updateCheck"
+import { checkPluginsNow, getLatestVersion, isUpdateCheckEnabled, startUpdateCheck, stopUpdateCheck } from "./updateCheck"
+import { getPluginUpdates, trackPlugins } from "./pluginUpdateCheck"
 import { createAuthStatusOwner } from "./authStatusOwnership"
 import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, expireAuthStatusCache, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, subscriptionIncludesExtendedContext } from "./models"
 import { livenessReport, readinessReport, renderProbe } from "./probes"
@@ -147,7 +150,9 @@ import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, res
 import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
 import { createChatGptLogin } from "./chatgpt/login"
 import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
-import { organizationNames, organizationNeedsRefresh, refreshOrganizationNameSoon } from "./organizationName"
+import { organizationNames, organizationNeedsRefresh, organizationRecordCurrent, organizationLookupEnabled, refreshOrganizationNameSoon, refreshOrganizationNow, type OrganizationRecord } from "./organizationName"
+import { findDuplicateProfiles, type IdentifiedProfile } from "./duplicateProfiles"
+import { ProfileFactsRefresh } from "./profileFactsRefresh"
 import {
   getRoutingMode,
   classifyRouteKind,
@@ -1293,6 +1298,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // forgot to gate it" mistake (issue #477 was the catalyst — `/settings/*`
   // was registered without going through requireAuth, so unauthenticated
   // callers could mutate adapter SDK feature config via PATCH).
+  app.use("/v1/usage/quota/reset", async (c, next) => {
+    c.header("Cache-Control", "no-store")
+    await next()
+  })
   app.use("/v1/*", requireAuth)
   app.use("/messages", requireAuth)
   app.use("/telemetry/*", requireAuth)
@@ -1411,6 +1420,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // percentages of its last successful read (measured: `5h 67% / 7d 7%` while
   // every request through it was being refused).
   const spentProfiles = new SpentStore()
+  const profileFactsRefresh = new ProfileFactsRefresh()
   const failoverEvents = new FailoverEventLog()
 
   function priorityProfileOrderSetting(): string[] | undefined {
@@ -1536,7 +1546,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
    *  it's skipped too — the conservative default is the safer thing to
    *  leave standing. */
   function refinePriorityCooldown(profileId: string): void {
-    const target = getEffectiveProfiles(finalConfig.profiles).find(p => p.id === profileId)
+    const profiles = getEffectiveProfiles(finalConfig.profiles)
+    const target = profiles.find(p => p.id === profileId)
     // Only `claude-max` profiles have credentials this can consult. `api`
     // profiles authenticate with a key and have no usage endpoint; `oauth-token`
     // profiles carry their token in `CLAUDE_CODE_OAUTH_TOKEN` with a config dir
@@ -1547,8 +1558,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // Mirrors the `not_oauth` guard in `/v1/usage/quota/all` and
     // `credentialStoreForProfile`. Tier 3's conservative default already stands
     // when this returns early (#699).
-    if ((target?.type ?? "claude-max") !== "claude-max") return
-    void fetchOAuthUsage({ profileId, claudeConfigDir: target?.claudeConfigDir, force: true })
+    const resolved = target ? resolveProfile([target], target.id, target.id) : undefined
+    if (resolved && resolved.type !== "claude-max") return
+    if (!resolved && profiles.length > 0) return
+    void fetchOAuthUsage({ profileId, claudeConfigDir: resolved?.env.CLAUDE_CONFIG_DIR, force: true })
       .then(usage => {
         if (!usage || usage.stale) return
         const now = Date.now()
@@ -3020,12 +3033,17 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           agentModeHeader: c.req.header("x-opencode-agent-mode"),
           sessionId: agentSessionId,
         })
-        if (pluginlessWarning) {
-          plog(`[PROXY] ${requestMeta.requestId} ${pluginlessWarning}`)
+        const pluginlessPiWarning = notePluginlessPiRequest({
+          adapterName: adapter.baseName ?? adapter.name,
+          sessionId: agentSessionId,
+        })
+        for (const warning of [pluginlessWarning, pluginlessPiWarning]) {
+          if (!warning) continue
+          plog(`[PROXY] ${requestMeta.requestId} ${warning}`)
           diagnosticLog.log({
             level: "warn",
             category: "session",
-            message: `${requestMeta.requestId} ${pluginlessWarning}`,
+            message: `${requestMeta.requestId} ${warning}`,
             requestId: requestMeta.requestId,
           })
         }
@@ -4253,7 +4271,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         if (cachedMcp && cachedMcp.key === toolSetKey) {
           passthroughMcp = cachedMcp.mcp
         } else {
-          passthroughMcp = createPassthroughMcpServer(requestTools, coreNamesForDefer, passthroughMcpName, pinnedDefer)
+          passthroughMcp = sharedPassthroughMcpServer(requestTools, coreNamesForDefer, passthroughMcpName, pinnedDefer)
           if (mcpCacheKey) {
             sessionMcpCache.set(mcpCacheKey, { key: toolSetKey, mcp: passthroughMcp })
             if (cachedMcp) {
@@ -9407,9 +9425,19 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       modes: ROUTING_MODES,
       profileOrder: resolvePriorityOrder(profileIds, priorityProfileOrderSetting()).order,
       profiles: profileIds,
+      saved: {
+        routing: getSetting("routing") ?? null,
+        profileOrder: getSetting("profileOrder") ?? null,
+      },
       envOverride: {
         routing: Boolean(process.env.MERIDIAN_ROUTING),
         profileOrder: Boolean(process.env.MERIDIAN_PROFILE_ORDER),
+      },
+      // The variable behind each override, for the page to name beside the
+      // value it produced (`routing`, `profileOrder` above are that value).
+      envSources: {
+        routing: envVarSource("MERIDIAN_ROUTING"),
+        profileOrder: process.env.MERIDIAN_PROFILE_ORDER?.trim() ? envVarSource("MERIDIAN_PROFILE_ORDER") : null,
       },
     })
   })
@@ -9489,6 +9517,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         diagnosticLogSize: env("DIAGNOSTIC_LOG_SIZE") !== undefined,
         telemetryDb: env("TELEMETRY_DB") !== undefined,
       },
+      // Which variable each override reads and whether its value was used;
+      // `wanted` holds the value the setting resolves to.
+      envSources: telemetryEnvSources(),
       pendingRestart,
       supervision: detectSupervision(),
       limits: TELEMETRY_SETTING_LIMITS,
@@ -9528,6 +9559,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       envOptOut: envBool("NO_UPDATE_CHECK"),
       enabled: isUpdateCheckEnabled(),
       build: currentBuild(),
+      plugins: getPluginUpdates(),
     }
   }
 
@@ -9550,10 +9582,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // Takes effect now rather than on the next start: the checker is one
     // unref'd timer with no store to swap out from under in-flight work, so
     // there is nothing to justify making someone restart for it. Switching on
-    // waits for the first answer (bounded by the fetch timeout) so the reply
-    // already says whether an update exists.
-    if (isUpdateCheckEnabled()) await beginUpdateCheck(finalConfig)
-    else stopUpdateCheck()
+    // waits for the first answer so the reply already says whether an update
+    // exists; Meridian's lookup and the plugin pass run side by side, each
+    // bounded by one fetch timeout. The plugins stay listed either way.
+    const enabled = isUpdateCheckEnabled()
+    if (!enabled) stopUpdateCheck()
+    trackPlugins(loadedPlugins, [pluginDir])
+    if (enabled) await beginUpdateCheck(finalConfig)
 
     return c.json(updateSettingsState())
   })
@@ -10002,7 +10037,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         },
         mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
         ...(claudeExecutableInfo ? { claudeExecutable: claudeExecutableInfo } : {}),
-        plugin: { opencode: checkPluginConfigured() ? "configured" : "not-configured" },
+        plugin: {
+          opencode: checkPluginConfigured() ? "configured" : "not-configured",
+          pi: checkPiExtensionConfigured() ? "configured" : "not-configured",
+        },
       }, 200)
     } catch {
       if (!servesClaude(null)) return replyHealth(c, null, 200)
@@ -10024,6 +10062,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   app.get("/profiles/list", async (c) => {
     const profiles = listProfiles(finalConfig.profiles, finalConfig.defaultProfile)
     const organizations = organizationNames()
+    // Account records read for the credential each Claude profile holds now;
+    // see organizationRecordCurrent.
+    const currentAccounts = new Map<string, OrganizationRecord>()
     const expiryObservedAt = Date.now()
     const renewalWarnDays = resolveRenewalWarnDays(process.env.MERIDIAN_AUTH_RENEWAL_WARN_DAYS)
     // Enrich with live auth status
@@ -10036,13 +10077,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       )
       const cacheInfo = getAuthCacheInfo(p.id !== "default" ? p.id : undefined)
       const organization = organizations[p.id]
-      // Only claude-max profiles have an OAuth account to ask about, and only
-      // their credentials are a directory this can name — an API-key profile
-      // would otherwise be looked up against the host's own ~/.claude and
-      // labelled with an unrelated organization.
-      if (resolved.type === "claude-max" && organizationNeedsRefresh(organization, Date.now())) {
-        refreshOrganizationNameSoon(p.id, { claudeConfigDir: resolved.env.CLAUDE_CONFIG_DIR })
-      }
       // The tier that sizes the plan is never in `claude auth status` — only
       // the family (`max`), which covers both 5x and 20x. It is on disk, in
       // the profile's own credential file.
@@ -10072,10 +10106,27 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // empty stored OAuth grant cannot invalidate those credentials.
       const stored = profileStore ? await readStoredCredentialSnapshot(profileStore) : undefined
       const presence = stored?.presence ?? "unknown"
+      // Only claude-max profiles have an OAuth account to ask about, and only
+      // their credentials are a directory this can name — an API-key profile
+      // would otherwise be looked up against the host's own ~/.claude and
+      // labelled with an unrelated organization. The stored access token's
+      // expiry marks which credential a record was read for, so a login or a
+      // renewal re-reads the account instead of keeping the previous one's.
+      const credentialMark = stored?.accessTokenExpiresAt ?? null
+      if (resolved.type === "claude-max" && organizationNeedsRefresh(organization, Date.now(), undefined, credentialMark)) {
+        refreshOrganizationNameSoon(p.id, { claudeConfigDir: resolved.env.CLAUDE_CONFIG_DIR, credentialMark })
+      }
+      // `claude auth status` reads the email Claude Code last cached, which a
+      // login Meridian performed does not touch - so it keeps naming the
+      // account signed in before. A read made for this very credential knows.
+      const accountCurrent = resolved.type === "claude-max" && organization !== undefined
+        && organizationRecordCurrent(organization, credentialMark)
+      if (accountCurrent) currentAccounts.set(p.id, organization)
+      const email = (accountCurrent ? organization.email : null) || auth?.email || null
       const renewal = renewalStatusFor(stored?.refreshTokenExpiresAt, renewalWarnDays, expiryObservedAt)
       return {
         ...p,
-        email: auth?.email || null,
+        email,
         subscriptionType: auth?.subscriptionType || null,
         organizationName: organization?.name ?? null,
         rateLimitTier: plan.rateLimitTier ?? null,
@@ -10125,8 +10176,32 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // from and why switching is refused. Absent unless MERIDIAN_FOLLOW_ACTIVE.
     const follow = followStatus(profiles.map(p => p.id))
     const claudeActiveProfile = resolveActiveProfileId(profiles.map(p => p.id)) || finalConfig.defaultProfile || profiles[0]?.id || "default"
+    const listed = chatGptProfiles ? [...enriched, ...chatGptProfiles.listEntries()] : enriched
+    const duplicates = findDuplicateProfiles(listed.map((entry): IdentifiedProfile => {
+      if ("seat" in entry && typeof entry.seat === "string") {
+        return { id: entry.id, identity: { provider: "chatgpt", seat: entry.seat, email: entry.email } }
+      }
+      const record = currentAccounts.get(entry.id)
+      if (!record) return { id: entry.id, identity: null }
+      return {
+        id: entry.id,
+        identity: {
+          provider: "claude",
+          accountUuid: record.accountUuid,
+          organizationUuid: record.organizationUuid,
+          email: entry.email,
+          organizationName: record.name,
+        },
+      }
+    }))
     return c.json({
-      profiles: chatGptProfiles ? [...enriched, ...chatGptProfiles.listEntries()] : enriched,
+      // Additive: `duplicateOf` names the other profiles signed in to the
+      // same account (one quota under two names), `[]` when there are none;
+      // `duplicateBasis` says what proved it. Present on every profile so a
+      // reader can tell "none" from an instance too old to say.
+      // `factsRefresh` (additive, null when idle): a sign-in finished and its
+      // facts are being re-read (`updating`), or that read failed (`failed`).
+      profiles: listed.map(entry => ({ ...entry, ...duplicates.get(entry.id), factsRefresh: profileFactsRefresh.view(entry.id) })),
       ...activeProfileFields(profiles.length > 0 ? claudeActiveProfile : null, claudeActiveProfile),
       // Additive (#383): current routing mode so UIs can surface it.
       routing: routingModeNow,
@@ -10296,6 +10371,14 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // seat on the next poll rather than after their own intervals.
       chatGptUsageAt = 0
       void chatGptCatalog?.refresh()
+      // The seat's card says it is updating until that usage read is in.
+      const seatProfileId = chatGptProfiles?.profileIdFor(account.accountUserId)
+      if (seatProfileId) {
+        void profileFactsRefresh.run(seatProfileId, async () => {
+          chatGptUsageAt = 0
+          await refreshChatGptUsage()
+        })
+      }
     },
     renderPage: (result) => renderLoginCallbackPage(result.ok
       ? { ok: true, okMessage: `ChatGPT seat${result.email ? ` ${result.email}` : ""} is connected to Meridian. You can close this tab.`, ...(result.returnTo ? { backHref: result.returnTo } : {}) }
@@ -10456,6 +10539,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const plan = chatGptProfiles.planRename(body.from, body.to)
       if (!plan.ok) return c.json({ error: plan.error }, 400)
       applyChatGptRename(plan)
+      profileFactsRefresh.forget(plan.from)
       claudeLog("profile.renamed", {
         from: plan.from,
         to: plan.to,
@@ -10484,6 +10568,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // applyProfileRename moved the persisted pointer; this process holds its
     // own copy in memory and has to be told as well.
     if (getActiveProfileId() === body.from) setActiveProfile(body.to)
+    profileFactsRefresh.forget(result.from)
     claudeLog("profile.renamed", {
       from: result.from,
       to: result.to,
@@ -10516,7 +10601,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     }
     applyChatGptRemoval(seat, { moves: pointerMoves, to: successor?.seat })
     chatGptBackend?.forgetSeat(seat.seat)
-    for (const id of [seat.id, ...seat.aliases]) spentProfiles.forget(id)
+    for (const id of [seat.id, ...seat.aliases]) {
+      spentProfiles.forget(id)
+      profileFactsRefresh.forget(id)
+    }
     chatGptUsageAt = 0
     void chatGptCatalog?.refresh()
     claudeLog("profile.removed", {
@@ -10623,6 +10711,50 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     clearOAuthUsageForProfile(profileId)
   }
 
+  function clearResetProfileHealth(profileId: string, cleared: readonly string[]): void {
+    rateLimitStore.clearBuckets(profileId, cleared)
+    const spent = spentProfiles.get(profileId)
+    if (!spent?.diagnosis.reported || !spent.diagnosis.bucket || !cleared.includes(spent.diagnosis.bucket)) return
+    spentProfiles.forget(profileId)
+    const now = Date.now()
+    const stillRejected = rateLimitStore.getAll(profileId).some(entry =>
+      ((entry.status === "rejected" || (entry.utilization ?? 0) >= 1) && (entry.resetsAt === undefined || entry.resetsAt > now))
+      || (entry.overageStatus === "rejected" && (entry.overageResetsAt === undefined || entry.overageResetsAt > now)))
+    if (stillRejected) return
+    const exhausted = priorityExhaustion.snapshot().find(entry => entry.id === profileId)
+    // Longer or non-quota marks may describe a different refusal we cannot identify.
+    if (exhausted && isQuotaRefusal(exhausted.reason)
+      && exhausted.until <= Math.max(spent.diagnosis.resetsAt ?? 0, now + PRIORITY_DEFAULT_COOLDOWN_MS)) {
+      priorityExhaustion.forget(profileId)
+    }
+  }
+
+  // A finished sign-in changes who the profile is (email, organization,
+  // account), its plan and its usage, and each is its own read. Re-read them
+  // now and say so on /profiles/list meanwhile, so the card shows it is
+  // updating instead of serving the previous login's facts as current ones.
+  // Started before the route answers: see ProfileFactsRefresh.run.
+  function refreshClaudeFactsAfterLogin(profileId: string, knownConfigDir?: string): void {
+    // resolveProfile falls back to the first profile for an id it does not
+    // know (a profile added while MERIDIAN_PROFILES pins the list), and that
+    // profile's credential must never be read for this one.
+    const resolved = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile, profileId)
+    const env: Record<string, string> = resolved.id === profileId ? { ...resolved.env } : {}
+    if (knownConfigDir) env.CLAUDE_CONFIG_DIR = knownConfigDir
+    if (resolved.id !== profileId && !knownConfigDir) return
+    const claudeConfigDir = env.CLAUDE_CONFIG_DIR
+    void profileFactsRefresh.run(profileId, async () => {
+      const [record] = await Promise.all([
+        refreshOrganizationNow(profileId, { claudeConfigDir }),
+        fetchOAuthUsageResult({ profileId, claudeConfigDir, force: true }),
+        getInstanceAuthStatus(profileId, Object.keys(env).length > 0 ? env : undefined),
+      ])
+      if (!record && organizationLookupEnabled()) {
+        throw new Error("Signed in, but Anthropic has not said which account this is yet. The card catches up on its own within minutes.")
+      }
+    })
+  }
+
   app.post("/profiles/login/complete", async (c) => {
     let body: { loginId?: string; code?: string }
     try {
@@ -10647,6 +10779,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // drop it so /profiles/list reflects the login on the UI's next poll.
     expireAuthStatusCache()
     clearStaleProfileHealth(result.profileId)
+    refreshClaudeFactsAfterLogin(result.profileId)
     claudeLog("profile.login_completed", {
       profile: result.profileId,
       userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
@@ -10679,6 +10812,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     }
     expireAuthStatusCache()
     clearStaleProfileHealth(result.profileId)
+    refreshClaudeFactsAfterLogin(result.profileId)
     claudeLog("profile.login_completed", { profile: result.profileId, via: "callback" })
     plog(`[PROXY] Profile login completed for "${result.profileId}" (browser redirect)`)
     return c.html(renderLoginCallbackPage({ ok: true, profileId: result.profileId }))
@@ -10746,6 +10880,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // on the UI's next poll rather than after the 60s TTL.
     expireAuthStatusCache()
     clearStaleProfileHealth(result.profileId)
+    refreshClaudeFactsAfterLogin(result.profileId, result.claudeConfigDir)
     claudeLog("profile.add_completed", {
       profile: result.profileId,
       userAgent: c.req.header("user-agent")?.slice(0, 120) ?? null,
@@ -10777,6 +10912,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     try {
       loadedPlugins = await loadPlugins(pluginDir, pluginConfigPath)
       pluginTransforms = getActiveTransforms(loadedPlugins)
+      trackPlugins(loadedPlugins, [pluginDir])
+      void checkPluginsNow()
       const active = loadedPlugins.filter(p => p.status === "active").length
       plog(`[PROXY] Plugins reloaded: ${active} active`)
       return c.json({
@@ -11238,6 +11375,50 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     return c.json({ object: "list", data: [...buildModelList(extendedContext, undefined, disable1mContext), ...chatGptModels] })
   })
 
+  app.post("/v1/usage/quota/reset", async (c) => {
+    if (!isSameOriginRequest(c.req.raw)) {
+      return c.json({ code: "forbidden_origin", error: "Cross-origin reset requests are not allowed" }, 403)
+    }
+    let input: unknown
+    try {
+      input = await c.req.json()
+    } catch {
+      return c.json({ code: "invalid_request", error: "Invalid JSON request body" }, 400)
+    }
+    const parsed = quotaResetBody.safeParse(input)
+    if (!parsed.success) {
+      return c.json({ code: "invalid_request", error: "Explicit profile, grantId and requestId are required" }, 400)
+    }
+    const body = parsed.data
+    const profiles = getEffectiveProfiles(finalConfig.profiles)
+    const profile = profiles.find(p => p.id === body.profile)
+    const singleAccount = profiles.length === 0 && body.profile === "default"
+    if (!profile && !singleAccount) {
+      return c.json({ code: "profile_not_found", error: "Profile not found" }, 404)
+    }
+    const resolved = profile ? resolveProfile([profile], profile.id, profile.id) : undefined
+    if (resolved && resolved.type !== "claude-max") {
+      return c.json({ code: "not_oauth", error: "Profile does not use Claude OAuth" }, 400)
+    }
+    const attempt = await redeemOAuthQuotaResetOnce(body, {
+      profileId: singleAccount ? undefined : body.profile,
+      claudeConfigDir: resolved?.env.CLAUDE_CONFIG_DIR,
+      store: resolved ? credentialStoreForProfile(resolved) : undefined,
+    })
+    if (attempt.kind === "in_progress") {
+      return c.json({ code: "reset_in_progress", error: "Another reset for this profile is still in progress", indeterminate: false }, 409)
+    }
+    if (attempt.kind === "request_id_conflict") {
+      return c.json({ code: "request_id_conflict", error: "This requestId was already used with a different grantId", indeterminate: false }, 409)
+    }
+    const { result, replayed } = attempt
+    if (!result.ok) {
+      return c.json({ code: result.code, error: result.message, indeterminate: result.indeterminate, replayed }, result.status)
+    }
+    if (!replayed && result.outcome.result === "reset") clearResetProfileHealth(body.profile, result.outcome.cleared)
+    return c.json({ ...body, ...result.outcome, replayed })
+  })
+
   // --- Subscription Quota ---
   // Returns the most recent SDK-reported quota state for the Claude Max
   // subscription, broken down by rate-limit bucket (five_hour, seven_day,
@@ -11275,6 +11456,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       || profilesList[0]?.id
       || null
     const targetProfile = targetProfileId ? profilesList.find(p => p.id === targetProfileId) : undefined
+    const resolvedTarget = targetProfile ? resolveProfile([targetProfile], targetProfile.id, targetProfile.id) : undefined
 
     // Filter out the internal "default" bucket — it's a Meridian-side
     // fallback for SDK events missing `rateLimitType`, not a real Anthropic
@@ -11285,10 +11467,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     const sdkEntries = rateLimitStore.getAll(targetProfileId ?? "default")
       .filter(entry => entry.rateLimitType !== undefined)
 
-    const oauth = await fetchOAuthUsage({
-      profileId: targetProfileId ?? undefined,
-      claudeConfigDir: targetProfile?.claudeConfigDir,
-    })
+    const oauth = (resolvedTarget?.type === "claude-max"
+      || (profilesList.length === 0 && (!targetProfileId || targetProfileId === "default")))
+      ? await fetchOAuthUsage({
+        profileId: targetProfileId ?? undefined,
+        claudeConfigDir: resolvedTarget?.env.CLAUDE_CONFIG_DIR,
+      })
+      : null
 
     type Bucket = {
       type: string
@@ -11419,15 +11604,17 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
 
     const chatgptPending = chatGptEntries()
     const results = await Promise.all(profilesList.map(async (p) => {
-      // Skip API-key profiles — OAuth usage endpoint only applies to Claude Max OAuth.
-      const type = p.type ?? "claude-max"
+      // Resolve inferred token profiles before consulting any on-disk OAuth account.
+      const resolved = resolveProfile([p], p.id, p.id)
+      const type = resolved.type
       if (type !== "claude-max") {
         return {
           id: p.id,
           isActive: p.id === activeId,
           type,
-          windows: [] as any[],
+          windows: [],
           extraUsage: null,
+          bankedResets: null,
           fetchedAt: null,
           stale: false,
           error: "not_oauth" as const,
@@ -11441,7 +11628,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         type,
         ...toUsageEntry(await fetchOAuthUsageResult({
           profileId: p.id,
-          claudeConfigDir: p.claudeConfigDir,
+          claudeConfigDir: resolved.env.CLAUDE_CONFIG_DIR,
         })),
         // Separate from `windows` on purpose: those are what we last READ, this
         // is what the API is doing right now. An account can be refusing while
@@ -11611,6 +11798,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     try {
       loadedPlugins = await loadPlugins(pluginDir, pluginConfigPath)
       pluginTransforms = getActiveTransforms(loadedPlugins)
+      trackPlugins(loadedPlugins, [pluginDir])
       if (loadedPlugins.length > 0) {
         const active = loadedPlugins.filter(p => p.status === "active").length
         const disabled = loadedPlugins.filter(p => p.status === "disabled").length

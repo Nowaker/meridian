@@ -1,3 +1,54 @@
+## Pi extension (#1408)
+
+Two harnesses use the actual Pi CLI with the extension that
+`meridian setup --client pi` installs into a scratch `PI_CODING_AGENT_DIR`:
+
+- `bun scripts/e2e-pi-extension-side-calls.mjs --pi=<pi>` needs no
+  credentials. It drives Pi's RPC mode against a recording stub with canned SSE
+  replies, through two prompts, a manual `compact` and a third prompt. Each
+  primary request must carry Pi's own session ID as `x-session-affinity`, no
+  `x-meridian-source` and a `pi1` attestation that Meridian verifies for that
+  session, with a distinct turn per prompt. Every compaction request must carry
+  a fresh session key, `x-meridian-source: fork-side-call` and no
+  attestation.
+- `E2E_PLUGIN_PATH=<installed pi-scrub>/dist/index.js bun
+  scripts/e2e-pi-extension.mjs --pi=<pi>` runs Pi print mode through an
+  in-process Meridian and real Claude: a Haiku tool loop, a
+  `MERIDIAN_SOURCE=subagent-e2e` child and Opus 5.5 at high effort. Meridian
+  loads only the named Pi scrub (`E2E_SCRUB_VERSION` pins its version), which
+  must be active and must process the requests. It asserts model discovery,
+  the wire identity and Meridian's adapter/source telemetry, and reports
+  generation separately.
+
+Pass the Pi executable explicitly. A version manager can select a
+project-local Pi from the working directory. Run under a qualified SQLite
+runtime (see `src/proxy/session/bookkeeping/nativeDatabase.ts`).
+
+Recorded 2026-10-25 on Darwin arm64, Bun 1.3.14, Node 22.22.3: the side-call
+harness passed on Pi 1.4.0 and 1.3.0, with two compaction requests each. The
+Claude harness passed every identity assertion on Pi 1.4.0, but that first run
+omitted the Pi scrub, and Claude refused all three generations as third-party
+traffic. Rerun the same day with pi-scrub 0.2.2, the harness passed: the
+Haiku tool loop continued on one signed turn and returned the fixture, the
+`subagent-e2e` child answered on the base tier, and Opus 5.5 at high effort
+answered on `opus[1m]`. The scrub was active and processed every request
+without errors. Without the scrub, the same Pi request through the extension
+was still refused; in the first run a plain request through the same server
+succeeded. Paid Extra Usage stayed off.
+
+Recorded 2026-10-25 against the owner's launchd Meridian (main `cb767de`,
+pi-scrub 0.2.0) with Pi 1.4.0 on Claude Max: `pi -c` resumed a saved session
+as `lineage=continuation` with cache reads, and recalled its codeword. An
+in-process foreground child of pi-subagents 0.82.1's builtin `delegate` agent
+went out as `fork-side-call` on `opus[1m]`. That agent appends its prompt, so
+its `<active_agent>` marker sits inside Pi's `<addendum>` section; the
+extension now reads it there, and the same run sent `subagent-delegate` on the
+base `opus` tier while the parent stayed signed on `opus[1m]`
+([evidence](docs/maintenance/evidence/pi-subagents-addendum-20261025/README.md)).
+A live `next-user-turn` promotion remains unqualified: it needs the priority
+account to run out. The promotion path is covered by
+`src/__tests__/priority-routing-integration.test.ts`.
+
 ## Awaited session-cache cleanup (#1244/#1277)
 
 Run `bun test src/__tests__/session-cache-clear-completion.test.ts` with a
@@ -5223,7 +5274,13 @@ Anthropic traffic to a real Meridian SDK/model through a local relay. It checks
 title and generate detachment, signed primary headers, a resumed session's prior
 user input, cold model discovery of `#xhigh`, a real read-tool result, a fork
 that cannot advance or attest as the original root, and compaction that remains
-on the root while using its lower tier. The relay stores sanitized request facts
+on the root and keeps the conversation's model tier (`fork-compaction`; the
+routed model is read from Meridian's request log, and
+`E2E_EXPECT_COMPACTION_MODEL=opus[1m]` asserts it for an Opus run; `E2E_COMPACTION_SOURCE`
+observes an older plugin build as a control). On a Claude subscription set
+`E2E_PLUGIN_PATH` to the installed OpenCode server scrub, which the harness loads into its
+isolated Meridian config; without it Claude can refuse the client as third-party
+("extra usage"). The relay stores sanitized request facts
 and system-block lengths, and the per-turn client output remains in its isolated
 artifact directory. Model wording is not used as the sole assertion.
 
