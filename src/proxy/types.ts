@@ -1,7 +1,6 @@
 import type { AntigravityPlugin } from "./backends/antigravityPlugins"
 import type { Server } from "node:http"
 import type { ProfileConfig } from "./profiles"
-import type { TranscriptSweep } from "./transcriptSweep"
 
 export interface AntigravityOptions {
   executable?: string
@@ -122,8 +121,6 @@ export interface ProxyServer {
   getInFlightCount?(): number
   /** Run one fail-closed transcript maintenance sweep. */
   sweepSessionGc?(): Promise<void>
-  /** Claude Code's transcript cleanup for idle config roots; startProxyServer starts and stops it. */
-  transcriptSweep?: TranscriptSweep
   /** Present only when this instance has a ChatGPT credential source. */
   chatGpt?: ChatGptUpstreamControl
 }

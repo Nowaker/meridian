@@ -274,7 +274,6 @@ src/
 │   ├── openai.ts, openaiResponses.ts ← Pure OpenAI Chat Completions / Responses translation
 │   ├── query.ts               ← SDK query options builder (shared between stream/non-stream paths)
 │   ├── transcriptRetention.ts ← Claude Code transcript retention period per SDK config root
-│   ├── transcriptSweep.ts     ← Idle sweep: an offline, promptless Claude Code process per idle config root
 │   ├── errors.ts              ← Error classification (SDK errors → HTTP responses)
 │   ├── toolInputJson.ts       ← Tool input JSON repair for raw control characters in strings (PURE)
 │   ├── retryAfter.ts          ← Retry-After computation for 429/503/529 (PURE)
