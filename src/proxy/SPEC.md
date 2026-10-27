@@ -84,9 +84,9 @@ Contract*, *Cancellation Contract*; public routes and headers are in
   tool list (#1444), found through process-wide indexes keyed by a digest of
   the exact bytes (tool, key and schema property order included) and held by
   `WeakRef`: an index never keeps anything alive, so the session caches alone
-  bound memory. Measured with a 230-tool OpenCode list: built sets from about
-  30 MB per session to one shared set; the remaining per-session heap from
-  about 1 MB to about 80 KB. Shared values are read-only; each query still
+  bound memory. Measured with a 230-tool OpenCode list in isolated harnesses
+  (not whole-server memory): built sets from about 20 MiB per session to one
+  shared set; the remaining per-session heap from about 1 MiB to about 80 KiB. Shared values are read-only; each query still
   builds its own MCP server from them.
 - **`max_tokens` is not enforced by default:** the Agent SDK exposes no output
   cap, and the CLI's cap counts thinking plus text, so an answer-sized cap can
