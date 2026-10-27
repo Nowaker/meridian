@@ -1225,7 +1225,7 @@ describe("owned mode signs its own seats in", () => {
   // Read while its renewal is out, a seat was listed as needing a sign-in for
   // as long as the exchange took, at every renewal.
   for (const ending of ["renewed", "refused"] as const) {
-    it(`lists a seat as it was while its renewal is out, and as the exchange left it once it is done`, async () => {
+    it(`lists a seat as it was while its renewal is out, and as the exchange left it once it is done (${ending})`, async () => {
       mkdirSync(storeDir, { recursive: true, mode: 0o700 })
       const day = 24 * 3_600_000
       const seat = `user-8${ending}__workspace-8`
@@ -1272,7 +1272,7 @@ describe("owned mode signs its own seats in", () => {
           answer(Response.json({ access_token: token(Date.now()), refresh_token: "rt-renewed", expires_in: 10 * 86_400 }))
           expect(await pass).toBe(true)
           expect(await listed()).toMatchObject({ loggedIn: true, tokenState: "ok" })
-          } else {
+        } else {
           answer(new Response(JSON.stringify({ error: { code: "refresh_token_reused" } }), { status: 401, headers: { "content-type": "application/json" } }))
           expect(await pass).toBe(false)
           expect(await listed()).toMatchObject({ loggedIn: false, tokenState: "requires_reauth" })
