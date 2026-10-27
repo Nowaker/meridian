@@ -940,8 +940,13 @@ interactive Claude Code.
 - **When it runs:** Claude Code cleans up in the background a few seconds after
   a request's process starts, at most once a day per config directory
   (`.last-cleanup` there records the last run). A short request's process often
-  ends before the cleanup gets going, and a profile that serves no requests is
-  never cleaned: Meridian runs no cleanup process of its own.
+  ends before the cleanup gets going (in testing, a process that lived under
+  about 5 s never cleaned up), and a profile that serves no requests is never
+  cleaned: Meridian runs no cleanup process of its own.
+- **The first cleanup can wait a day.** Claude Code stamps `.last-cleanup`
+  even when retention is off and it skips the deletion, so after you turn
+  retention on, a config directory that served a request in the previous
+  24 hours deletes nothing until that stamp is a day old.
 - **Race with a resume:** a conversation idle for longer than the period whose
   resume is still loading its transcript while a concurrent cleanup deletes it
   can lose its earlier SDK-side history without Meridian noticing. This only

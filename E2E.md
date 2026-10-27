@@ -650,8 +650,20 @@ deleted.
 **Verified 2026-10-03** (contributor, before retention became opt-in): Linux,
 Claude Code 2.1.284, Agent SDK 0.2.141: with 30 days the old transcript was
 deleted, the fresh one kept, and the resume classified `unresumable`; with
-retention off both transcripts were kept. Not yet rerun against the opt-in
-default.
+retention off both transcripts were kept.
+
+**Verified 2026-10-27** (maintainer, opt-in default, real transcripts): macOS
+arm64, Meridian `371e9362e` launching Claude Code 2.1.311 (Agent SDK 0.2.141),
+`claude-haiku-4-5`, a disposable profile directory with an access-only token.
+Real transcripts written by real requests, two aged to 3 days. With
+`MERIDIAN_TRANSCRIPT_RETENTION_DAYS=1` the CLI received `--settings
+{…"cleanupPeriodDays":1}` and empty `--setting-sources`; the aged pair was
+deleted and every fresh transcript kept. With retention unset the argv had no
+`cleanupPeriodDays` and nothing was deleted. Cross-origin, `text/plain` and
+`Origin: null` writes to `/settings/api/transcripts` returned 403 and saved
+nothing. Found: an off request stamps `.last-cleanup`, so the first opted-in
+cleanup can wait up to a day (documented in configuration.md); a child that
+lives under about 5 s never cleans up.
 
 ## Antigravity subscription CLI backend
 
