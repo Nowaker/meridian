@@ -158,7 +158,10 @@ export function createOwnedCredentialSource(options: OwnedSourceOptions): ChatGp
   const exchangeOut = (account: ChatGptAccount): boolean => {
     if (account.exchangeStartedAt === null) return false
     if (refresher && holdsLease()) return refresher.exchanging(account.accountUserId)
-    return now() - account.exchangeStartedAt < EXCHANGE_TIMEOUT_MS + 5_000
+    // A stamp from the future (another host's clock ahead of ours) is not
+    // trusted to be in flight.
+    const age = now() - account.exchangeStartedAt
+    return age >= 0 && age < EXCHANGE_TIMEOUT_MS + 5_000
   }
 
   return {

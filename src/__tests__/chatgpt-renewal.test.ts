@@ -266,6 +266,15 @@ describe("a seat read while its exchange is in flight", () => {
     expect(view(source, "fresh")).toMatchObject({ eligible: true })
     expect(view(source, "old")).toMatchObject({ eligible: false, reason: "requires_reauth" })
   })
+
+  it("on a read-only instance, does not trust a stamp dated in the future", async () => {
+    // Another host's clock ahead of this one must not hold a lost sign-in
+    // as healthy for the size of the skew.
+    await seed([account("ahead", NOW - 9 * DAY, { exchangeStartedAt: NOW + 10 * 60_000 })])
+    const source = createOwnedCredentialSource({ storePath, now: () => clock, readOnly: true })!
+    held.push(source)
+    expect(view(source, "ahead")).toMatchObject({ eligible: false, reason: "requires_reauth" })
+  })
 })
 
 describe("the renewal schedule", () => {
