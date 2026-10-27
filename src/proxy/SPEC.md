@@ -79,6 +79,15 @@ Contract*, *Cancellation Contract*; public routes and headers are in
   (Mythos follows Fable). Values are normalized; an unrecognized value warns
   once and keeps the default, because with Extra Usage enabled a silent 1M
   choice is silently billed. A generic multi-tier switch was rejected.
+- **Passthrough tool sets are shared by content, never by lifetime.** Sessions
+  sending identical tools share one built definition set (#1410) and one raw
+  tool list (#1444), found through process-wide indexes keyed by a digest of
+  the exact bytes (tool, key and schema property order included) and held by
+  `WeakRef`: an index never keeps anything alive, so the session caches alone
+  bound memory. Measured with a 230-tool OpenCode list in isolated harnesses
+  (not whole-server memory): built sets from about 20 MiB per session to one
+  shared set; the remaining per-session heap from about 1 MiB to about 80 KiB. Shared values are read-only; each query still
+  builds its own MCP server from them.
 - **Transcript retention is opt-in and delegated to Claude Code (#1261,
   owner decision 2026-10-27).** Meridian's empty `settingSources` (#490/#634)
   also skips Claude Code's retention cleanup, so transcripts Meridian's own GC
