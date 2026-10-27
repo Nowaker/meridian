@@ -26,7 +26,7 @@ export function transcriptRetentionSettingsState() {
     saved: isTranscriptRetentionDays(saved) ? saved : null,
     effective,
     envOverride: effective.source === "env",
-    envSource: transcriptRetentionEnvSource(),
+    envSources: { transcriptRetentionDays: transcriptRetentionEnvSource() },
     default: DEFAULT_TRANSCRIPT_RETENTION_DAYS,
     limits: TRANSCRIPT_RETENTION_LIMITS,
   }

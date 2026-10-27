@@ -22,7 +22,7 @@ interface TranscriptSettingsResponse {
   saved: number | null
   effective: { days: number; source: string }
   envOverride: boolean
-  envSource: { name: string; value: string | null; use: string } | null
+  envSources: { transcriptRetentionDays: { name: string; value: string | null; use: string } | null }
   default: number
   limits: { min: number; max: number }
 }
@@ -71,7 +71,7 @@ describe("transcript retention settings routes", () => {
       saved: null,
       effective: { days: 0, source: "default" },
       envOverride: false,
-      envSource: null,
+      envSources: { transcriptRetentionDays: null },
       default: 0,
       limits: { min: 1, max: 3650 },
     })

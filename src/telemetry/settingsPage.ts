@@ -967,7 +967,7 @@ async function loadTranscripts() {
       + '<span class="setting-unit">days</span>',
     desc: 'Leave blank or 0 for off. ' + lim.min + ' to ' + lim.max + ' days turns the cleanup on.',
     statusHtml: [nowLine(telemetryEsc(now))],
-    envText: envOverrideText(cfg.envSource, eff.days > 0 ? days(eff.days) : 'off', days(cfg.saved)),
+    envText: envOverrideText((cfg.envSources || {}).transcriptRetentionDays, eff.days > 0 ? days(eff.days) : 'off', days(cfg.saved)),
   });
 
   document.getElementById('tr-days').addEventListener('change', async (e) => {
