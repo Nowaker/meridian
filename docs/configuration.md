@@ -61,7 +61,7 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_TELEMETRY_PERSIST` | `CLAUDE_PROXY_TELEMETRY_PERSIST` | unset | Enable SQLite telemetry persistence. Data survives proxy restarts. |
 | `MERIDIAN_TELEMETRY_DB` | `CLAUDE_PROXY_TELEMETRY_DB` | `~/.config/meridian/telemetry.db` | SQLite database path (when persistence is enabled) |
 | `MERIDIAN_TELEMETRY_RETENTION_DAYS` | `CLAUDE_PROXY_TELEMETRY_RETENTION_DAYS` | `7` | Days to retain telemetry data before cleanup |
-| `MERIDIAN_TRANSCRIPT_RETENTION_DAYS` | `CLAUDE_PROXY_TRANSCRIPT_RETENTION_DAYS` | `30` | Days Claude Code keeps the transcripts requests leave on disk before deleting them; `0` keeps them all. `transcriptRetentionDays` in `settings.json` (or the `/settings` page) is the alternative, and the environment wins. See [Transcript retention](#transcript-retention). |
+| `MERIDIAN_TRANSCRIPT_RETENTION_DAYS` | `CLAUDE_PROXY_TRANSCRIPT_RETENTION_DAYS` | unset (off) | **Opt-in.** `1`-`3650` turns on Claude Code's own cleanup in request processes, which deletes **all** of its files older than that many days in each profile's config directory, not only transcripts. `0` pins it off over a saved setting; any other value is ignored. Wins over `transcriptRetentionDays` in `settings.json` (or the `/settings` page). See [Transcript retention](#transcript-retention). |
 | `MERIDIAN_DEFAULT_PROFILE` | — | *(first profile)* | Default profile ID when no header is sent |
 | `MERIDIAN_ADAPTER_INSTANCES` | — | unset | JSON [adapter instance](agents.md#adapter-instances) definitions, overriding `~/.config/meridian/adapter-instances.json` |
 | `MERIDIAN_BETA_POLICY` | — | `allow-safe` | Client `anthropic-beta` header handling: `allow-safe`, `strip-all`, or `allow-all` |
@@ -898,36 +898,61 @@ While draining:
 Every request leaves a Claude Code transcript on disk -
 `projects/<project>/<session>.jsonl` and its sidecar files - in the config
 directory of the profile that served it (`~/.claude` without profiles).
-Claude Code deletes transcripts nobody has touched for `cleanupPeriodDays`,
-but it only reads that setting from a settings source it is allowed to load,
-and Meridian starts Claude Code with every settings file switched off so
-nothing on the proxy host leaks into a request. Meridian therefore hands the
-period over itself, as a flag setting, which loads no file.
+Claude Code has its own retention cleanup, but it runs only when an enabled
+settings source names `cleanupPeriodDays` or its user settings are loaded, and
+Meridian normally starts Claude Code with every settings file switched off so
+nothing on the proxy host leaks into a request. So, by default, nothing cleans
+that directory and it keeps growing.
 
-- **30 days by default**, Claude Code's own default. Change it with
-  `MERIDIAN_TRANSCRIPT_RETENTION_DAYS`, `transcriptRetentionDays` in
-  `settings.json`, or the `/settings` page; the environment wins. A change
-  applies to the next request.
-- **`0` keeps every transcript.** Meridian then passes no period and Claude
-  Code deletes nothing. Meridian never passes `0` itself: current Claude Code
-  rejects it, and older versions read it as "write no transcripts".
+**Retention is off by default.** Turn it on with
+`MERIDIAN_TRANSCRIPT_RETENTION_DAYS`, `transcriptRetentionDays` in
+`settings.json`, or the `/settings` page (1 to 3650 days; the environment
+wins, and `MERIDIAN_TRANSCRIPT_RETENTION_DAYS=0` pins it off over a saved
+value). Meridian then passes the period to every request's Claude Code process
+as a flag setting, which loads no settings file. A change applies to the next
+request.
+
+**What it deletes.** This is Claude Code's cleanup, not Meridian's, and it is
+not limited to transcripts. In each profile's config directory it deletes,
+by modification time alone, everything of its kind older than the period:
+
+- transcripts, **including conversations Meridian still maps or pins** -
+  their next request finds no transcript to resume and Meridian replays the
+  history the client sent into a fresh session (flattened text trimmed to the
+  model's context window; SDK thinking is not restored);
+- file history, plans, tasks, uploads, shell snapshots, debug logs, backups,
+  and Claude Code's other caches, jobs and logs.
+
+Without profiles that directory is your own `~/.claude`, shared with your
+interactive Claude Code.
+
 - **A config directory's own `settings.json` wins** when it sets
-  `cleanupPeriodDays` and retention is on here. Without profiles that
-  directory is your own `~/.claude`, so a retention you chose for interactive
-  Claude Code still holds. If that file cannot be parsed, or names a value
-  Claude Code would reject, no period is passed and nothing is deleted there.
+  `cleanupPeriodDays` and retention is on here, so a retention you chose for
+  interactive Claude Code still holds. If that file cannot be parsed, or names
+  a value Claude Code would reject, no period is passed for that directory.
   A `cleanupPeriodDays` from your organisation's managed settings outranks all
   of these inside Claude Code.
-- **When it runs:** Claude Code sweeps in the background a few seconds after a
-  process starts, at most once a day per config directory (`.last-cleanup`
-  there records the last run). A request's process often ends before the
-  sweep gets going. After upgrading, the first sweep can take up to a day:
-  older versions let Claude Code record a skipped sweep as a run.
-- **Resuming an expired conversation:** a conversation idle for longer than the
-  period has no transcript left to resume. Meridian retries the resume a few
-  times, then replays the history into a fresh session, so the request still
-  succeeds; the replay is flattened text trimmed to the model's context window
-  and cannot restore SDK thinking.
+- **Meridian never passes `0`.** Current Claude Code rejects
+  `cleanupPeriodDays: 0` as invalid, and older versions read it as "write no
+  transcripts at all".
+- **When it runs:** Claude Code cleans up in the background a few seconds after
+  a request's process starts, at most once a day per config directory
+  (`.last-cleanup` there records the last run). A short request's process often
+  ends before the cleanup gets going, and a profile that serves no requests is
+  never cleaned: Meridian runs no cleanup process of its own.
+- **Race with a resume:** a conversation idle for longer than the period whose
+  resume is still loading its transcript while a concurrent cleanup deletes it
+  can lose its earlier SDK-side history without Meridian noticing. This only
+  happens with retention on.
+
+**Off does not mean "keep everything".** With retention off Meridian passes no
+period and changes nothing about Claude Code's own behavior, which is exactly
+what it does without this setting. If an instance loads Claude Code settings
+files (`MERIDIAN_LOAD_CONTEXT=1`, or an adapter's `claudeMd` set to `full`
+outside passthrough), Claude Code's user settings are enabled and it applies
+your own `cleanupPeriodDays`, or its default of 30 days, as it always has. A
+loaded project settings file or your organisation's managed settings that name
+a period are applied the same way.
 
 ## Session identity
 
