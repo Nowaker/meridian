@@ -931,7 +931,9 @@ interactive Claude Code.
   interactive Claude Code still holds. If that file cannot be parsed, or names
   a value Claude Code would reject, no period is passed for that directory.
   A `cleanupPeriodDays` from your organisation's managed settings outranks all
-  of these inside Claude Code.
+  of these inside Claude Code. With `MERIDIAN_LOAD_CONTEXT=1` or `claudeMd:
+  full`, the period Meridian passes also outranks one in a loaded project or
+  local settings file.
 - **Meridian never passes `0`.** Current Claude Code rejects
   `cleanupPeriodDays: 0` as invalid, and older versions read it as "write no
   transcripts at all".
