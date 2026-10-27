@@ -22,11 +22,12 @@ interface TranscriptSettingsResponse {
   saved: number | null
   effective: { days: number; source: string }
   envOverride: boolean
+  envSource: { name: string; value: string | null; use: string } | null
   default: number
   limits: { min: number; max: number }
 }
 
-const ENV_KEYS = ["MERIDIAN_CONFIG_DIR", "MERIDIAN_TRANSCRIPT_RETENTION_DAYS"]
+const ENV_KEYS = ["MERIDIAN_CONFIG_DIR", "MERIDIAN_TRANSCRIPT_RETENTION_DAYS", "CLAUDE_PROXY_TRANSCRIPT_RETENTION_DAYS"]
 
 describe("transcript retention settings routes", () => {
   let dir: string
@@ -57,10 +58,10 @@ describe("transcript retention settings routes", () => {
     return await response.json() as TranscriptSettingsResponse
   }
 
-  function put(body: unknown): Promise<Response> {
+  function put(body: unknown, headers: Record<string, string> = { "Content-Type": "application/json" }): Promise<Response> {
     return Promise.resolve(app.fetch(new Request("http://localhost/settings/api/transcripts", {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: typeof body === "string" ? body : JSON.stringify(body),
     })))
   }
@@ -70,8 +71,42 @@ describe("transcript retention settings routes", () => {
       saved: null,
       effective: { days: 0, source: "default" },
       envOverride: false,
+      envSource: null,
       default: 0,
       limits: { min: 1, max: 3650 },
+    })
+  })
+
+  it("is never cached", async () => {
+    const read = await app.fetch(new Request("http://localhost/settings/api/transcripts"))
+    expect(read.headers.get("cache-control")).toBe("no-store")
+    expect((await put({ transcriptRetentionDays: 3 })).headers.get("cache-control")).toBe("no-store")
+  })
+
+  describe("browser writes", () => {
+    it("refuses a page on another origin", async () => {
+      const response = await put({ transcriptRetentionDays: 1 }, { "Content-Type": "application/json", Origin: "https://evil.example" })
+      expect(response.status).toBe(403)
+      expect(getSetting("transcriptRetentionDays")).toBeUndefined()
+    })
+
+    it("refuses a cross-site text/plain write, the kind a form can send without a preflight", async () => {
+      const response = await put(JSON.stringify({ transcriptRetentionDays: 1 }), { "Content-Type": "text/plain", Origin: "http://attacker.test" })
+      expect(response.status).toBe(403)
+      expect(getSetting("transcriptRetentionDays")).toBeUndefined()
+    })
+
+    it("refuses an opaque origin and a different port", async () => {
+      for (const origin of ["null", "http://localhost:9999"]) {
+        expect((await put({ transcriptRetentionDays: 1 }, { "Content-Type": "application/json", Origin: origin })).status).toBe(403)
+      }
+      expect(getSetting("transcriptRetentionDays")).toBeUndefined()
+    })
+
+    it("accepts this server's own page", async () => {
+      const response = await put({ transcriptRetentionDays: 12 }, { "Content-Type": "application/json", Origin: "http://localhost" })
+      expect(response.status).toBe(200)
+      expect(getSetting("transcriptRetentionDays")).toBe(12)
     })
   })
 
@@ -116,6 +151,15 @@ describe("transcript retention settings routes", () => {
     expect(state.saved).toBe(7)
     expect(state.envOverride).toBe(true)
     expect(state.effective).toEqual({ days: 21, source: "env" })
+  })
+
+  it("lets the env pin retention off over a saved period", async () => {
+    await put({ transcriptRetentionDays: 7 })
+    process.env.MERIDIAN_TRANSCRIPT_RETENTION_DAYS = "0"
+    const state = await get()
+    expect(state.saved).toBe(7)
+    expect(state.envOverride).toBe(true)
+    expect(state.effective).toEqual({ days: 0, source: "env" })
   })
 
   it("is the API the settings page loads and saves through", () => {

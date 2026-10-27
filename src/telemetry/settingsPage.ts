@@ -253,14 +253,15 @@ ${profileBarHtml}
 
   <h1 style="margin-top:40px">Transcript Retention</h1>
   <p class="subtitle" style="max-width:720px;line-height:1.6">
-    Every request leaves a Claude Code transcript on disk, under <code>projects/</code> in the config directory of
-    the profile that served it. Claude Code deletes transcripts nobody has touched for this many days, the same
-    cleanup it runs for your own Claude Code sessions, so that directory stops growing forever. The cleanup runs
-    inside the Claude Code processes that serve requests, at most once a day per profile. A conversation idle for
-    longer than this has no transcript left to resume from;
-    Meridian then replays its history into a fresh session. 0 keeps every transcript. A profile whose own
-    <code>settings.json</code> sets <code>cleanupPeriodDays</code> keeps its own value.
-    Changes apply to the next request - no restart needed.
+    Every request leaves a Claude Code transcript on disk, in the config directory of the profile that served it,
+    and Meridian starts Claude Code with its own cleanup switched off, so that directory keeps growing.
+    <strong style="color:var(--text)">Off by default.</strong> Set a number of days to turn on Claude Code's own
+    cleanup in the processes that serve requests. <strong style="color:var(--yellow)">When on, Claude Code deletes
+    all of its files older than that in each profile directory</strong>, not only transcripts: transcripts (including
+    conversations Meridian still maps, which then replay from the client's history), file history, plans, tasks,
+    uploads, shell snapshots, debug logs and backups. Without profiles that directory is your own
+    <code>~/.claude</code>. A profile whose own <code>settings.json</code> sets <code>cleanupPeriodDays</code> keeps
+    its value. Changes apply to the next request; no restart needed.
   </p>
   <div class="adapter-card" id="transcripts-card">
     <div id="transcripts-body">Loading…</div>
@@ -953,19 +954,21 @@ async function putTelemetry(body) {
 
 async function loadTranscripts() {
   const cfg = await (await fetch('/settings/api/transcripts')).json();
-  const lim = cfg.limits || { min: 0, max: 3650 };
+  const lim = cfg.limits || { min: 1, max: 3650 };
   const eff = cfg.effective || {};
-  const now = eff.days === 0 ? 'off, every transcript is kept'
-    : eff.days + ' days' + (eff.source === 'default' ? ' (default)' : '');
+  const days = (n) => n == null || n === 0 ? null : n.toLocaleString() + ' days';
+  const now = eff.days > 0 ? 'Claude Code deletes its files older than ' + days(eff.days) : 'off, nothing is deleted';
 
-  document.getElementById('transcripts-body').innerHTML = telemetryRow('Delete after',
-    '<input type="number" id="tr-days" value="' + (cfg.saved == null ? '' : cfg.saved) + '"'
-      + ' min="' + lim.min + '" max="' + lim.max + '" step="1" placeholder="' + cfg.default + '"'
-      + ' style="width:110px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px">'
-      + ' <span style="color:var(--muted);font-size:12px">days</span>',
-    telemetryEsc(now),
-    cfg.envOverride ? ' <span style="font-size:11px;color:var(--yellow)">(MERIDIAN_TRANSCRIPT_RETENTION_DAYS wins over this setting)</span>' : '')
-    + '<div class="pricing-note" style="margin-top:4px">Leave blank for the default of ' + cfg.default + ' days.</div>';
+  document.getElementById('transcripts-body').innerHTML = settingRowHtml({
+    label: 'Delete after',
+    forId: 'tr-days',
+    controlHtml: '<input type="number" class="setting-input" id="tr-days" value="' + (cfg.saved == null ? '' : cfg.saved) + '"'
+      + ' min="' + lim.min + '" max="' + lim.max + '" step="1" placeholder="off" style="width:110px">'
+      + '<span class="setting-unit">days</span>',
+    desc: 'Leave blank or 0 for off. ' + lim.min + ' to ' + lim.max + ' days turns the cleanup on.',
+    statusHtml: [nowLine(telemetryEsc(now))],
+    envText: envOverrideText(cfg.envSource, eff.days > 0 ? days(eff.days) : 'off', days(cfg.saved)),
+  });
 
   document.getElementById('tr-days').addEventListener('change', async (e) => {
     const raw = e.target.value.trim();

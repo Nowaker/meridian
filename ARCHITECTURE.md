@@ -273,7 +273,8 @@ src/
 │   ├── instanceImport/        ← `meridian instance-import` (never imported by the server)
 │   ├── openai.ts, openaiResponses.ts ← Pure OpenAI Chat Completions / Responses translation
 │   ├── query.ts               ← SDK query options builder (shared between stream/non-stream paths)
-│   ├── transcriptRetention.ts ← Claude Code transcript retention period per SDK config root
+│   ├── transcriptRetention.ts ← Opt-in Claude Code retention period per SDK config root (off by default)
+│   ├── transcriptRetentionSettings.ts ← GET/PUT /settings/api/transcripts (same-origin browser writes)
 │   ├── errors.ts              ← Error classification (SDK errors → HTTP responses)
 │   ├── toolInputJson.ts       ← Tool input JSON repair for raw control characters in strings (PURE)
 │   ├── retryAfter.ts          ← Retry-After computation for 429/503/529 (PURE)
@@ -402,8 +403,8 @@ server.ts (HTTP layer)
    persisted consent, using standard web types and `settings.ts`;
    it must not import a server, provider, Hono or session module. The Origin
    policy for settings that disclose something or choose what runs lives in
-   `src/sameOrigin.ts` (standard web types only), used by the header and
-   Claude Code executable settings. Backend auth remains at each caller's
+   `src/sameOrigin.ts` (standard web types only), used by the header,
+   Claude Code executable and transcript retention settings. Backend auth remains at each caller's
    existing boundary. Shared same-origin browser-write policy is
    reused by the loopback reachability override; it confers no peer/key authority.
    `upstreamReachability.ts` has no imports or settings/filesystem I/O; its

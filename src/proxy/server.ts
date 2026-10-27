@@ -139,13 +139,8 @@ import { requireAuth, authEnabled } from "./auth"
 import { detectAdapter } from "./adapters/detect"
 import { rootSessionIdOf } from "./adapter"
 import { buildQueryOptions, isCliThinkingDisplay, promptCachingDisabled, passthroughThinking, resolveQueryConfigDir, singleTurnCapLiftRaisesBudget, type QueryContext } from "./query"
-import {
-  DEFAULT_TRANSCRIPT_RETENTION_DAYS,
-  isTranscriptRetentionDays,
-  meridianTranscriptRetention,
-  resolveTranscriptRetention,
-  TRANSCRIPT_RETENTION_LIMITS,
-} from "./transcriptRetention"
+import { resolveTranscriptRetention } from "./transcriptRetention"
+import { transcriptRetentionSettingsResponse } from "./transcriptRetentionSettings"
 import { normalizeEffort } from "./effort"
 import { parseOutputFormat, structuredOutputText } from "./structuredOutput"
 import { runTransformHook, buildPipeline, createRequestContext } from "./transform"
@@ -9678,43 +9673,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   app.get("/settings/api/claude-executable", (c) => executableSettings(c.req.raw))
   app.put("/settings/api/claude-executable", (c) => executableSettings(c.req.raw))
 
-  /**
-   * How long Claude Code keeps the transcripts requests leave on disk. Read on
-   * every request, so unlike telemetry there is no pending-restart state:
-   * `effective` is what the next SDK child gets, unless its config root's own
-   * settings.json names a period (see transcriptRetention.ts).
-   */
-  function transcriptRetentionState() {
-    const saved = getSetting("transcriptRetentionDays")
-    const effective = meridianTranscriptRetention()
-    return {
-      saved: isTranscriptRetentionDays(saved) ? saved : null,
-      effective,
-      envOverride: effective.source === "env",
-      default: DEFAULT_TRANSCRIPT_RETENTION_DAYS,
-      limits: TRANSCRIPT_RETENTION_LIMITS,
-    }
-  }
-
-  app.get("/settings/api/transcripts", (c) => c.json(transcriptRetentionState()))
-  app.put("/settings/api/transcripts", async (c) => {
-    let input: unknown
-    try { input = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
-    if (typeof input !== "object" || input === null || Array.isArray(input)) {
-      return c.json({ error: "Settings must be a JSON object" }, 400)
-    }
-    const value = (input as Record<string, unknown>).transcriptRetentionDays
-    if (value !== undefined) {
-      if (value !== null && value !== 0 && !isTranscriptRetentionDays(value)) {
-        const { min, max } = TRANSCRIPT_RETENTION_LIMITS
-        return c.json({ error: `transcriptRetentionDays must be an integer between ${min} and ${max}, or 0 or null to turn retention off` }, 400)
-      }
-      setSetting("transcriptRetentionDays", value === null || value === 0 ? undefined : value)
-    }
-    const state = transcriptRetentionState()
-    plog(`[PROXY] Transcript retention updated: ${state.effective.days === 0 ? "off" : `${state.effective.days}d`} (${state.effective.source})`)
-    return c.json(state)
-  })
+  app.get("/settings/api/transcripts", (c) => transcriptRetentionSettingsResponse(c.req.raw, plog))
+  app.put("/settings/api/transcripts", (c) => transcriptRetentionSettingsResponse(c.req.raw, plog))
 
   app.get("/settings/api/pricing", (c) => {
     const { BUILTIN_MODEL_PRICING } = require("../telemetry/pricing") as typeof import("../telemetry/pricing")
