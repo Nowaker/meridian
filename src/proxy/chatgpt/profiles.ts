@@ -99,6 +99,8 @@ export interface ChatGptProfile extends ChatGptPlanFields {
   accessTokenExpiresAt: number | null
   /** When the seat signed in to OpenAI, as its access token states, epoch ms. */
   signedInAt: number | null
+  /** When Meridian renews the seat next because chatgpt.com refused its access token, epoch ms. */
+  renewalRetryAt: number | null
 }
 
 /** One window in Claude's `/v1/usage/quota` vocabulary. */
@@ -262,6 +264,7 @@ export function chatGptProfiles(
       storeIndex: seat.storeIndex ?? null,
       accessTokenExpiresAt: seat.expiresAt,
       signedInAt: seat.signedInAt ?? null,
+      renewalRetryAt: seat.renewalRetryAt ?? null,
       ...chatGptPlanFields(options.planTypes?.get(seat.id) ?? seat.planType),
     }
   })

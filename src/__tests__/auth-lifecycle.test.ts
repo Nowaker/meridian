@@ -12,6 +12,7 @@ import {
   MAX_AUTH_LIFECYCLE_EVENTS,
   MAX_AUTH_RENEWALS,
   NEW_GRANT_MIN_JUMP_MS,
+  applyApiRejected,
   applyLogin,
   applyObservation,
   applyRefreshRejected,
@@ -121,6 +122,15 @@ describe("the renewal history", () => {
     })
     expect(read.a!.renewals).toEqual([{ at: T0, outcome: "rotated", issuedAt: T0, expiresAt: T0 + DAY }, { at: T0, outcome: "refused" }])
     expect(read.b).toEqual({ events: [] })
+  })
+})
+
+describe("a renewal after chatgpt.com refused the access token", () => {
+  test("ends the logout, and says it was a renewal that ended it", () => {
+    const refused = applyApiRejected({ lastRefreshAt: T0 - DAY, events: [] }, { at: T0, startedAt: T0 }).record
+    const { record, events } = applyRefreshSucceeded(refused, { at: T0 + HOUR })
+    expect(record.firstUnauthedAt).toBeUndefined()
+    expect(events).toEqual([{ at: T0 + HOUR, kind: "recovered", detail: "renewed after its access token was refused" }])
   })
 })
 

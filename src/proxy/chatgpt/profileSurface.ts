@@ -355,6 +355,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
           daysUntilRenewal: null,
           renewalRequiredSoon: false,
           accessTokenExpiresAt: profile.accessTokenExpiresAt,
+          renewalRetryAt: profile.renewalRetryAt,
           authObtainedAt: signIn.at,
           authObtainedVia: signIn.via,
           lastRefreshAt: lifecycle?.lastRefreshAt ?? null,

@@ -96,6 +96,8 @@ export interface ChatGptSeatRefusal {
   until: number
   /** The limit state the refusing response stated, when it stated one. */
   rateLimit: ChatGptRateLimit | null
+  /** When the refused attempt started, so a refusal of a token since renewed can be told apart. */
+  startedAt: number
 }
 
 export interface ChatGptHooks {
@@ -645,7 +647,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
 
           const refusal: ChatGptSeatRefusal = {
             requestId, seat, kind: failureKind, status: upstream.status,
-            until: bench(seat, failureKind, rateLimit), rateLimit,
+            until: bench(seat, failureKind, rateLimit), rateLimit, startedAt: authAttemptStartedAt,
           }
           if (failureKind === "requires_reauth") noteApiRejected(chatGptAuthLifecycleKey(seat), { startedAt: authAttemptStartedAt })
           refusals.push(refusal)

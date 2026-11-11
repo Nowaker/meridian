@@ -34,6 +34,8 @@ export interface ChatGptSeatView {
   expiresAt: number | null
   /** When the seat signed in to OpenAI, as its access token states, epoch ms. */
   signedInAt?: number | null
+  /** owned only: when Meridian renews the seat next because chatgpt.com refused its access token, epoch ms. */
+  renewalRetryAt?: number | null
   /** The seat the credential owner itself would pick next. */
   active?: boolean
   /** 0-based position in the store; the owner's own account numbers are this plus one. */
@@ -113,6 +115,15 @@ export interface ChatGptCredentialSource {
    * exchange per call; a call made while one runs gets that one's result.
    */
   renewDue?(): Promise<ChatGptRenewalPass>
+  /**
+   * owned only: chatgpt.com refused the seat's access token in a read or
+   * request that started at `observedAt`. Its refresh token may still be good,
+   * so the renewal pass renews the seat at once, then backs off while each
+   * renewed token is refused too (owned.ts `ACCESS_REFUSAL_RETRY_MS`).
+   */
+  accessRefused?(seat: string, observedAt: number): void
+  /** owned only: chatgpt.com accepted the seat's access token in a read that started at `observedAt`. */
+  accessAccepted?(seat: string, observedAt: number): void
   /**
    * owned only: resolves once every token exchange already dispatched has
    * recorded its result. Shutdown awaits it before `release`.

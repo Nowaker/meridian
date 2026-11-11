@@ -282,6 +282,7 @@ export function applyRefreshSucceeded(
   if (record.firstUnauthedAt) {
     const event: AuthLifecycleEvent = { at: input.at, kind: "recovered" }
     if (record.refreshTokenExpiresAt) event.refreshTokenExpiresAt = record.refreshTokenExpiresAt
+    if (record.unauthedReason === "api_rejected") event.detail = "renewed after its access token was refused"
     record = withEvents(markLoggedIn(record), [event])
     events.push(event)
   }
