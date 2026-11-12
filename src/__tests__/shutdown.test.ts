@@ -1,6 +1,6 @@
 import { createServer, get, type IncomingMessage, type ServerResponse } from "node:http"
 import { describe, expect, test } from "bun:test"
-import { closeServerWithGracePeriod, trackServerConnections } from "../proxy/shutdown"
+import { closeServerWithGracePeriod, joinShutdownCleanup, trackServerConnections } from "../proxy/shutdown"
 
 async function listen(
   handler: (request: IncomingMessage, response: ServerResponse) => void,
@@ -74,5 +74,55 @@ describe("closeServerWithGracePeriod", () => {
     expect(warnings[0]).toContain("forcing remaining HTTP connections closed")
     connectionTracker.dispose()
     request.destroy()
+  })
+})
+
+describe("joinShutdownCleanup", () => {
+  test("releases ChatGPT ownership while durable cleanup is still running", async () => {
+    let finishDurable = () => {}
+    const durableRunning = new Promise<void>((resolve) => { finishDurable = resolve })
+    let chatGptReleased!: () => void
+    const released = new Promise<void>((resolve) => { chatGptReleased = resolve })
+
+    const joined = joinShutdownCleanup({
+      idle: Promise.resolve(),
+      durable: () => durableRunning,
+      chatGpt: async () => { chatGptReleased() },
+    })
+
+    await released
+    finishDurable()
+    await joined
+  })
+
+  test("waits for admitted work before releasing ChatGPT ownership", async () => {
+    let finishIdle = () => {}
+    const idle = new Promise<void>((resolve) => { finishIdle = resolve })
+    const order: string[] = []
+
+    const joined = joinShutdownCleanup({
+      idle,
+      durable: async () => { order.push("durable") },
+      chatGpt: async () => { order.push("chatGpt") },
+    })
+    await Promise.resolve()
+    expect(order).toEqual([])
+
+    finishIdle()
+    await joined
+    expect(order.sort()).toEqual(["chatGpt", "durable"])
+  })
+
+  test("still releases ChatGPT ownership when durable cleanup fails, and reports the failure", async () => {
+    let released = false
+
+    const joined = joinShutdownCleanup({
+      idle: Promise.resolve(),
+      durable: async () => { throw new Error("sweep failed") },
+      chatGpt: async () => { released = true },
+    })
+
+    await expect(joined).rejects.toThrow("sweep failed")
+    expect(released).toBe(true)
   })
 })

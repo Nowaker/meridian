@@ -457,7 +457,9 @@ changes while a SQLite runtime is owned are rejected.
 control/provider operations and their finalizers before releasing its owner.
 `ProxyInstance.close()` bounds the wait after HTTP drain: an unjoined cleanup
 rejects instead of reporting success, while the original cleanup retains SQL
-and ChatGPT ownership until those operations join. Repeated calls return the
+ownership until those operations join. ChatGPT ownership is released once
+admitted work has joined, beside GC and backend close (`joinShutdownCleanup`),
+so a slow GC sweep cannot keep the writer lease past the deadline. Repeated calls return the
 same promise. `session/deletionCleanup.ts` separately owns GC from admission,
 including gaps between transactions and native child creation. Its per-proxy
 async context keeps sibling shutdown independent; its directory ledger retains
