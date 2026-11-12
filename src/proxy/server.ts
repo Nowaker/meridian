@@ -932,6 +932,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   const sessionDeletionOwner = new SessionDeletionCleanupOwner()
   let sessionGcBacklog: (GcBacklog & { observedAt: string }) | undefined
   let sessionGcSaturationLoggedAt = 0
+  // Shutdown joins a running sweep within a short deadline, so a sweep stops
+  // claiming once the drain starts; deletions already claimed are fenced and
+  // finish or are recovered by the next process.
+  sessionGcOptions.shouldStop = () => draining
   sessionGcOptions.onBacklog = (backlog) => {
     sessionGcBacklog = { ...backlog, observedAt: new Date().toISOString() }
   }

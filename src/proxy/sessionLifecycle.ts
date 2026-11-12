@@ -183,6 +183,8 @@ export interface SessionLifecycleOptions {
   pinProvider?: () => readonly TranscriptLocator[]
   /** Stop claiming new deletions after this long. A claimed deletion keeps its whole budget. */
   runTimeoutMs?: number
+  /** Checked before each claim: true stops the run after the batch already claimed. */
+  shouldStop?: () => boolean
   /** Called after every sweep with the transcript backlog it left behind. */
   onBacklog?: (backlog: GcBacklog) => void
   /** Test seam. Overrides the resolved @anthropic-ai/claude-agent-sdk module the
@@ -871,7 +873,7 @@ export async function runGc(
   let claimed = 0
   let deletionStillRunning = false
 
-  while (claimed < limit && !deletionStillRunning && Date.now() < deadline) {
+  while (claimed < limit && !deletionStillRunning && Date.now() < deadline && !options.shouldStop?.()) {
     const refreshedPins = options.pinProvider?.()
     if (refreshedPins) {
       currentPins = indexPins(refreshedPins)

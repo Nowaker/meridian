@@ -101,6 +101,20 @@ describe("session GC throughput", () => {
     expect(result.deferred).toBe(12)
   })
 
+  it("claims nothing new once asked to stop, finishing the batch it already claimed", async () => {
+    await retire(20)
+    let stopping = false
+    const result = await runGc([], {
+      ...options,
+      maxDeletesPerRun: 20,
+      shouldStop: () => stopping,
+      deleter: async () => { stopping = true },
+    })
+
+    expect(result.deleted).toBe(8)
+    expect(result.deferred).toBe(12)
+  })
+
   it("reports a saturated backlog when superseded transcripts wait for a full pending budget", async () => {
     for (let index = 0; index < 5; index++) await registerLiveTranscript(locator(`live-${index}`), options)
     const backlogs: GcBacklog[] = []
