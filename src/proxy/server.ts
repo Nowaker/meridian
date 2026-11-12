@@ -61,7 +61,7 @@ import { plog, setProxyDiagnosticSink, setProxyLogSilent } from "./operationalLo
 import { AdmissionHold, parseDrainOptions, type AdmissionReservation } from "./admissionHold"
 import { DrainBodyError, readDrainBody } from "./drainBody"
 import { isGenerationSubmission, onGenerationResponseSettled } from "./generationAdmission"
-import { closeServerWithGracePeriod, trackServerConnections, waitForShutdownIdle, withShutdownDeadline } from "./shutdown"
+import { closeServerWithGracePeriod, joinShutdownCleanup, trackServerConnections, waitForShutdownIdle, withShutdownDeadline } from "./shutdown"
 import { fetchOAuthUsage, fetchOAuthUsageResult, toUsageEntry, peekOAuthUsage, clearOAuthUsageForProfile, quotaResetBody, redeemOAuthQuotaResetOnce } from "./oauthUsage"
 import { isSameOriginRequest } from "../sameOrigin"
 import { resolveSdkWorkingDirectory } from "./cwd"
@@ -12607,18 +12607,20 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
         }
         // Keep the original cleanup alive after a bounded failure. The backend
         // joins request finalizers and admitted durable work before releasing SQL;
-        // ChatGPT ownership must remain attached to that actual cleanup as well.
+        // ChatGPT ownership is released once admitted work has joined, beside it.
         const joined = (async () => {
-          try {
-            await waitForShutdownIdle(() => (getInFlightCount?.() ?? 0) > 0)
-            if (sweepSessionGc) await sweepSessionGc()
-            await closeBackend?.()
-          }
-          finally {
-            await chatGptRenewalStopped
-            await chatGpt?.settle()
-            chatGpt?.release()
-          }
+          await joinShutdownCleanup({
+            idle: waitForShutdownIdle(() => (getInFlightCount?.() ?? 0) > 0),
+            durable: async () => {
+              if (sweepSessionGc) await sweepSessionGc()
+              await closeBackend?.()
+            },
+            chatGpt: async () => {
+              await chatGptRenewalStopped
+              await chatGpt?.settle()
+              chatGpt?.release()
+            },
+          })
           if (httpCloseError) throw httpCloseError
         })()
         await withShutdownDeadline(joined)

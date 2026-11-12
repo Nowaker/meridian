@@ -23,6 +23,33 @@ export async function waitForShutdownIdle(hasPendingWork: () => boolean): Promis
   }
 }
 
+export interface ShutdownCleanupSteps {
+  /** Admitted work, including finalizers after HTTP has been closed. */
+  idle: Promise<void>
+  /** Session GC and backend close. */
+  durable: () => Promise<void>
+  /** Stop ChatGPT renewal and release its writer lease. */
+  chatGpt: () => Promise<void>
+}
+
+/**
+ * Join shutdown cleanup. ChatGPT ownership is released as soon as admitted
+ * work has joined, beside durable cleanup rather than after it: a session GC
+ * sweep can outlast the shutdown deadline, and a process that exits holding
+ * the writer lease refuses its successor's start. Every step runs even when
+ * another fails; the first failure is reported once all have settled.
+ */
+export async function joinShutdownCleanup(steps: ShutdownCleanupSteps): Promise<void> {
+  const idle = steps.idle.then(() => undefined, () => undefined)
+  const settled = await Promise.allSettled([
+    steps.idle,
+    idle.then(steps.durable),
+    idle.then(steps.chatGpt),
+  ])
+  const failure = settled.find((result): result is PromiseRejectedResult => result.status === "rejected")
+  if (failure) throw failure.reason
+}
+
 /** Bound the caller's wait without abandoning or releasing the original owner. */
 export function withShutdownDeadline(joined: Promise<void>, timeoutMs = 2_000): Promise<void> {
   let timedOut = false

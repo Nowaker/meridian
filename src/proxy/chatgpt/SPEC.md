@@ -37,7 +37,12 @@ Code: `src/proxy/chatgpt/` (incl. `migrate/`), `src/proxy/codex/`,
   (`refresh_token_reused`). Hence:
   - `owned` mode holds a machine-wide **writer lease**, taken explicitly at
     startup (never in `createProxyServer`, which tests and embedders call), and
-    fails rather than degrades if it cannot;
+    fails rather than degrades if it cannot. A lease is taken over only when
+    the OS proves its holder dead on this host; staleness only paces that
+    probe (every attempt when stale, at most once a second when fresh), so a
+    restart's successor starts as soon as a predecessor that exited without
+    releasing is gone. Shutdown releases the lease once admitted work has
+    joined, beside session GC and backend close rather than after them;
   - `follow-external` and `codex/` only **read** the oc-codex-multi-auth pool
     and never write it, its locks or the token endpoint;
   - migration *moves* refresh authority rather than copying it;
