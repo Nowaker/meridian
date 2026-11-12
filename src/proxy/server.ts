@@ -293,6 +293,7 @@ import {
   releaseJoinedTranscriptLease,
   releaseSupersededProfileCopies,
   runGc as runSessionGc,
+  type GcBacklog,
   getTranscriptResourceKey,
   SessionLifecycleError,
   type SessionLifecycleOptions,
@@ -898,9 +899,15 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       retryDelayMs: Math.max(1, envInt("SESSION_TURN_RETRY_MS", 25)),
     },
   )
+  const SESSION_GC_CONTINUATION_MS = 5 * 60_000
+  const SESSION_GC_SATURATION_LOG_INTERVAL_MS = 10 * 60_000
   const sessionGcOptions: SessionLifecycleOptions = {
-    maxPending: Math.max(1, envInt("SESSION_GC_MAX_PENDING", 256)),
-    maxDeletesPerRun: Math.max(1, envInt("SESSION_GC_MAX_DELETES", 16)),
+    // Retired transcripts hold a pending slot through their grace period, so
+    // the budget caps deletion throughput at maxPending per grace: 256 per 11
+    // minutes is below the rate busy agents supersede forks (one per resumed
+    // request), and the excess piled up as live transcripts.
+    maxPending: Math.max(1, envInt("SESSION_GC_MAX_PENDING", 2048)),
+    maxDeletesPerRun: Math.max(1, envInt("SESSION_GC_MAX_DELETES", 64)),
     // A prepared fork is an active write lease. Never age it out before the
     // request watchdog plus a drain margin, even if an unsafe lower value is configured.
     preparedGraceMs: Math.max(
@@ -923,6 +930,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   }
   let sessionGcRunning: Promise<void> | undefined
   const sessionDeletionOwner = new SessionDeletionCleanupOwner()
+  let sessionGcBacklog: (GcBacklog & { observedAt: string }) | undefined
+  let sessionGcSaturationLoggedAt = 0
+  sessionGcOptions.onBacklog = (backlog) => {
+    sessionGcBacklog = { ...backlog, observedAt: new Date().toISOString() }
+  }
 
   const activeSessionGcPins = new Map<string, { locator: TranscriptLocator; refs: number }>()
   const pinActiveSessionGcLocators = (...locators: TranscriptLocator[]): (() => void) => {
@@ -988,16 +1000,33 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     }
   }
 
+  const reportSessionGcSaturation = (): void => {
+    const backlog = sessionGcBacklog
+    if (!backlog?.saturated || Date.now() - sessionGcSaturationLoggedAt < SESSION_GC_SATURATION_LOG_INTERVAL_MS) return
+    sessionGcSaturationLoggedAt = Date.now()
+    claudeLog("session.gc_backlog_saturated", { ...backlog })
+    plog(`[PROXY] session GC backlog saturated: ${backlog.awaitingRetirement} superseded transcript(s) wait for retirement, pending ${backlog.pending}/${backlog.maxPending}, ${backlog.dueForDeletion} due for deletion; raise MERIDIAN_SESSION_GC_MAX_PENDING if this persists`)
+  }
+
   const sweepSessionGc = (): Promise<void> => {
     if (sessionGcRunning) return sessionGcRunning
     sessionGcRunning = (async () => {
       if (profileCopyPruningEnabled) await pruneSupersededProfileCopies()
-      const result = await sessionDeletionOwner.run(() => runSessionGc(collectSessionGcPins(), sessionGcOptions))
-      if (result.deleted || result.notFound || result.failed) {
-        claudeLog("session.gc", { ...result })
-        if (result.failed) {
-          plog(`[PROXY] session GC deferred ${result.failed} failed deletion(s); retry is scheduled`)
+      // A run claims a bounded number of deletions. While retired transcripts
+      // are still due and runs make progress, the next run follows at once
+      // rather than a full interval later, up to a bounded sweep length.
+      const sweepDeadline = Date.now() + SESSION_GC_CONTINUATION_MS
+      for (;;) {
+        const result = await sessionDeletionOwner.run(() => runSessionGc(collectSessionGcPins(), sessionGcOptions))
+        if (result.deleted || result.notFound || result.failed) {
+          claudeLog("session.gc", { ...result })
+          if (result.failed) {
+            plog(`[PROXY] session GC deferred ${result.failed} failed deletion(s); retry is scheduled`)
+          }
         }
+        reportSessionGcSaturation()
+        const progressed = result.deleted + result.notFound > 0
+        if (!progressed || !sessionGcBacklog?.dueForDeletion || draining || Date.now() >= sweepDeadline) break
       }
       try {
         const checkpoint = await checkpointProxyBookkeeping()
@@ -10570,6 +10599,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         mode: envBool("PASSTHROUGH") ? "passthrough" : "internal",
         ...(claudeExecutableInfo ? { claudeExecutable: claudeExecutableInfo } : {}),
         plugin: { opencode: checkPluginConfigured() ? "configured" : "not-configured" },
+        ...(sessionGcBacklog ? { sessionGc: sessionGcBacklog } : {}),
       }, 200)
     } catch {
       if (!servesClaude(null)) return replyHealth(c, null, 200)

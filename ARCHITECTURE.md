@@ -732,6 +732,17 @@ but a running durable callback always finishes before returning ownership.
 Cleanup never receives the canceled admission signal. Publication callbacks
 remain synchronous; same-context recursive acquisition is rejected explicitly.
 
+## Transcript deletion throughput
+
+Every resumed request writes a new SDK fork, so a busy instance supersedes about one transcript per request. A superseded transcript is retired into the pending budget (`maxPending`), waits its grace period there and is then deleted; superseded transcripts that find the budget full stay live until a slot frees. Deletion therefore has to outpace fork creation in two ways:
+
+- **Pending capacity.** A retired transcript holds its slot through the grace period, so the budget caps throughput at `maxPending` per grace period. The server default is 2048 (about 11,000 per hour at the default grace); 256 capped it at about 1,400 per hour and less once deletion lagged.
+- **Lock cost.** Each deletion takes three lifecycle transactions: claim, executor handshake and verdict. Under request load the lifecycle lock is saturated and each transaction waits in its FIFO, so deleting one transcript at a time ran at a few hundred per hour. `runGc` claims up to 8 transcripts in one transaction, runs their children side by side, each with its own token, executor and process group, and records their verdicts in one transaction.
+
+The run deadline stops new claims only. A claimed deletion keeps its whole budget, and its child waits for its gate past that budget long enough for a handshake queued behind two stalled-holder windows. Truncating the budget to the run's remainder made the last claim of nearly every sweep fail with exit 75 on a loaded host. While transcripts are still due and runs make progress, the server starts the next run at once, for up to 5 minutes per sweep; shutdown stops after the current run.
+
+Each sweep reports its backlog (`GcBacklog`: pending, budget, superseded transcripts awaiting retirement, transcripts due for deletion). When superseded transcripts wait for a full budget the backlog is saturated: the server logs `session GC backlog saturated` at most every 10 minutes, and healthy `/health` carries the latest backlog as `sessionGc`. Saturation never changes the health status: deletion lagging is not a reason to stop routing requests.
+
 ## Session store write cost
 
 `sessionStore.ts` mutations are synchronous and run on the event loop, so their cost is lag for every request. The parsed document is cached by file identity (device, inode, size, mtime, ctime); every writer publishes by rename while holding the store lock, so a locked mutation that finds the cache current builds on it without re-parsing. Mutators receive a copy-on-write draft and replace entries rather than editing them. New entries own a deep copy of caller data before serialization. Cached entries/maps and metadata are frozen; privately parsed nested arrays are frozen before a lookup or snapshot exposes them, avoiding a full nested walk for a single cold lookup. Each entry's serialized UTF-8 bytes are memoized, so a write encodes only the entries it changed. Unchanged entries keep their identity and serialized bytes. The file format, lock, fsync and rename are unchanged.
