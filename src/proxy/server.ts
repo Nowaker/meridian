@@ -155,7 +155,7 @@ import { inspectExecutionHistory } from "./executionHistory"
 import { getAdapterTransforms } from "./transforms/registry"
 import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
-import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, hasProfiles, restoreActiveProfile, invalidateDiskProfileCache, shareableCredentialDir, resetActiveProfile, type ProfileConfig, type ResolvedProfile } from "./profiles" 
+import { resolveProfile, unknownPinnedProfile, unknownProfileResponse, listProfiles, setActiveProfile, getActiveProfileId, resolveActiveProfileId, getEffectiveProfiles, hasProfiles, restoreActiveProfile, invalidateDiskProfileCache, shareableCredentialDir, resetActiveProfile, type ProfileConfig, type ResolvedProfile } from "./profiles" 
 import { followStatus, startFollowPolling, stopFollowPolling, logFollowBanner, FOLLOW_POLL_INTERVAL_MS } from "./followActive"
 import { startFollowUsagePolling, stopFollowUsagePolling } from "./followUsage"
 import { createChatGptLogin } from "./chatgpt/login"
@@ -2625,6 +2625,17 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // it failed.
       let attributedRoutingMode: RoutingMode | undefined
       try {
+        const unknownPin = options.forcedProfileId
+          ? undefined
+          : unknownPinnedProfile(
+            c.req.header("x-meridian-profile"),
+            getEffectiveProfiles(finalConfig.profiles),
+            (id) => chatGptProfiles?.resolve(id) !== undefined,
+          )
+        if (unknownPin !== undefined) {
+          claudeLog("profile.pin_unknown", { requestId: requestMeta.requestId, profile: unknownPin })
+          return unknownProfileResponse(unknownPin)
+        }
         const body = options.body
         // #874: `max_tokens` is required on /v1/messages and is a hard cap on
         // output, but nothing on this path ever read it. Honour it through the
@@ -9575,6 +9586,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const warm = turn.headers.get("x-meridian-internal-hop") === internalHopToken
         && turn.headers.get("x-meridian-routing-purpose") === "warm"
       const route = chatGptProfiles!.route(turn.headers.get("x-meridian-profile") ?? undefined, warm ? "warm" : "work")
+      if (route.kind === "unknown") return { kind: "refuse", error: "unknown_profile", response: unknownProfileResponse(route.id) }
       if (route.kind !== "refuse") return warm ? { ...route, spendCredits: false, warm: true } : route
       if (route.reason === "held") {
         return {
