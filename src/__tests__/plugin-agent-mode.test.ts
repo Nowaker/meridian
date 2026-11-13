@@ -175,6 +175,15 @@ describe("plugin/meridian.ts agent-mode header", () => {
     expect(h["User-Agent"]).toStartWith("opencode/1.18.11 ")
   })
 
+  it("tags anthropic-meridian requests as it tags anthropic ones, and no other clone", async () => {
+    const hooks = await instance()
+    const pinned = await headersFor(hooks, "explore", "anthropic-meridian", "ses_test", { "x-meridian-profile": "work" })
+    expect(pinned["x-opencode-session"]).toBe("ses_test")
+    expect(pinned["x-opencode-agent-mode"]).toBe("subagent")
+    expect(pinned["x-meridian-profile"]).toBe("work")
+    expect(await pluginHeadersFor(hooks, "explore", "anthropic2")).toEqual({})
+  })
+
   it("agent names are sanitized to printable ASCII", async () => {
     const hooks = await instance()
     const h = await headersFor(hooks, "expl\u200bore\u2728")

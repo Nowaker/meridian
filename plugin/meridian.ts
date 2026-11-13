@@ -60,6 +60,8 @@ const BUILTIN_AGENT_MODES: Record<string, string> = {
 }
 
 const INTERNAL_AGENT_IDS = new Set(["title", "summary", "compaction"])
+/** OpenCode providers whose requests go to Meridian and carry its session headers. */
+const MERIDIAN_PROVIDER_IDS = new Set(["anthropic", "anthropic-meridian"])
 const ROOT_SESSION_CACHE_MAX = 256
 const ROOT_SESSION_CACHE_TTL_MS = 5_000
 const LOOKUP_TIMEOUT_MS = 250
@@ -162,8 +164,9 @@ const MeridianPlugin: Plugin = async (pluginInput) => {
       // This is V1's final supported outbound boundary. Remove an earlier
       // plugin/provider spoof even when this request is not eligible.
       deleteHeader(output.headers, PRIORITY_ATTESTATION_HEADER)
-      // Only inject headers for Anthropic provider requests.
-      if (incoming.model.providerID !== "anthropic") return
+      // Only inject headers for providers that reach Meridian: Anthropic, and
+      // anthropic-meridian, whose models pin one Meridian profile each.
+      if (!MERIDIAN_PROVIDER_IDS.has(incoming.model.providerID)) return
 
       // Session tracking. Replace case-insensitively so the values compared by
       // the proxy are the same trusted hook inputs that are signed below.
