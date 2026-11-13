@@ -1,6 +1,6 @@
 import { createServer, get, type IncomingMessage, type ServerResponse } from "node:http"
 import { describe, expect, test } from "bun:test"
-import { closeServerWithGracePeriod, joinShutdownCleanup, trackServerConnections } from "../proxy/shutdown"
+import { closeServerWithGracePeriod, joinShutdownCleanup, ShutdownProgress, trackServerConnections, withShutdownDeadline } from "../proxy/shutdown"
 
 async function listen(
   handler: (request: IncomingMessage, response: ServerResponse) => void,
@@ -124,5 +124,51 @@ describe("joinShutdownCleanup", () => {
 
     await expect(joined).rejects.toThrow("sweep failed")
     expect(released).toBe(true)
+  })
+})
+
+describe("shutdown cleanup progress", () => {
+  test("names the cleanup step still running when the deadline passes", async () => {
+    const progress = new ShutdownProgress()
+    let finishGc = () => {}
+    const gc = new Promise<void>((resolve) => { finishGc = resolve })
+    const joined = joinShutdownCleanup({
+      idle: Promise.resolve(),
+      durable: () => progress.run("session GC sweep", () => gc),
+      chatGpt: async () => {},
+    }, progress)
+
+    const outcome = await withShutdownDeadline(joined, 50, { describe: () => progress.describe() })
+      .then(() => "joined", (error: Error) => error.message)
+
+    expect(outcome).toContain("session GC sweep still running")
+    expect(outcome).toMatch(/ChatGPT release [0-9]+ms/)
+    finishGc()
+    await joined
+  })
+
+  test("warns about slow cleanup without failing a shutdown that still joins in time", async () => {
+    const warnings: string[] = []
+    const progress = new ShutdownProgress()
+    let finishBackend = () => {}
+    const backend = new Promise<void>((resolve) => { finishBackend = resolve })
+    const joined = joinShutdownCleanup({
+      idle: Promise.resolve(),
+      durable: () => progress.run("backend close", () => backend),
+      chatGpt: async () => {},
+    }, progress)
+
+    const closing = withShutdownDeadline(joined, 5_000, {
+      slowAfterMs: 20,
+      describe: () => progress.describe(),
+      warn: (message) => {
+        warnings.push(message)
+        finishBackend()
+      },
+    })
+
+    await closing
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain("backend close still running")
   })
 })
