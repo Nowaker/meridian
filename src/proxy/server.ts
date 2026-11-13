@@ -10920,6 +10920,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         const activation = chatGptProfiles.activate(requested)
         if (!activation.ok) {
           if (activation.code === "needs_login") return c.json({ error: activation.error, code: activation.code }, 409)
+          if (activation.code === "held") return profileHeldResponse(chatGptProfiles.resolve(requested)!.id)
           return activation.status === 409
             ? profileExcludedResponse(chatGptProfiles.resolve(requested)!.id)
             : c.json({ error: activation.error }, 400)

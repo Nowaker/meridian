@@ -125,7 +125,7 @@ function seatSignIn(
 
 export type ChatGptActivation =
   | { ok: true; profile: ChatGptProfile }
-  | { ok: false; status: 400 | 409; error: string; code?: "needs_login" }
+  | { ok: false; status: 400 | 409; error: string; code?: "needs_login" | "held" }
 
 export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
   const planTypes = (): Map<string, string | null> => new Map(
@@ -251,7 +251,7 @@ export function createChatGptProfileSurface(deps: ChatGptProfileSurfaceDeps) {
         return { ok: false, status: 409, code: "needs_login", error: `Profile "${profile.id}" needs a login before it can be activated` }
       }
       if (heldSeats(list).has(profile.seat)) {
-        return { ok: false, status: 409, error: `Profile "${profile.id}" is held out of rotation` }
+        return { ok: false, status: 409, code: "held", error: `Profile "${profile.id}" is held out of rotation` }
       }
       if (excludedSeats(list).has(profile.seat)) {
         return { ok: false, status: 409, error: `Profile "${profile.id}" is excluded from work routing` }

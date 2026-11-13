@@ -186,7 +186,7 @@ afterEach(() => {
   __setFetchOAuthUsageOverride(null)
   saveSettings({
     chatGptActiveSeat: undefined, chatGptProfileNames: undefined, chatGptProfileAliases: undefined, profileOrder: undefined,
-    routingExcludedProfiles: undefined, routingManagedExcludedProfiles: undefined, usageReserves: undefined, chatgpt: undefined,
+    routingExcludedProfiles: undefined, routingManagedExcludedProfiles: undefined, routingHeldProfiles: undefined, usageReserves: undefined, chatgpt: undefined,
   })
   globalThis.fetch = realFetch
   delete process.env.MERIDIAN_CHATGPT_CREDENTIALS
@@ -727,6 +727,12 @@ describe("ChatGPT seats on the profile surface", () => {
     const pinned = await app.fetch(responses(LUNA, { "x-meridian-profile": "seat0-pace-0" }))
     expect(pinned.status).toBe(409)
     expect(upstreamCalls.map(c => c.accountId)).toEqual(["workspace-1"])
+
+    // A held seat is refused as held, not as excluded, so a supervisor can tell them apart.
+    saveSettings({ routingManagedExcludedProfiles: [], routingHeldProfiles: ["seat1-pace-1"] })
+    const held = await post(app, "/profiles/active", { profile: "seat1-pace-1" })
+    expect(held.status).toBe(409)
+    expect(((await held.json()) as { error: { type: string } }).error.type).toBe("profile_held")
   })
 
   it("never serves unpinned work from an excluded seat, even when the others refuse", async () => {
