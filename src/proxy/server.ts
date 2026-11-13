@@ -61,7 +61,7 @@ import { plog, setProxyDiagnosticSink, setProxyLogSilent } from "./operationalLo
 import { AdmissionHold, parseDrainOptions, type AdmissionReservation } from "./admissionHold"
 import { DrainBodyError, readDrainBody } from "./drainBody"
 import { isGenerationSubmission, onGenerationResponseSettled } from "./generationAdmission"
-import { closeServerWithGracePeriod, joinShutdownCleanup, trackServerConnections, waitForShutdownIdle, withShutdownDeadline } from "./shutdown"
+import { closeServerWithGracePeriod, joinShutdownCleanup, ShutdownProgress, trackServerConnections, waitForShutdownIdle, withShutdownDeadline } from "./shutdown"
 import { fetchOAuthUsage, fetchOAuthUsageResult, toUsageEntry, peekOAuthUsage, clearOAuthUsageForProfile, quotaResetBody, redeemOAuthQuotaResetOnce } from "./oauthUsage"
 import { isSameOriginRequest } from "../sameOrigin"
 import { resolveSdkWorkingDirectory } from "./cwd"
@@ -376,6 +376,12 @@ const UPSTREAM_IDLE_MAX_CONSECUTIVE = envInt("UPSTREAM_IDLE_MAX_CONSECUTIVE", 3)
 // closes the HTTP server anyway. Plugins that already call close() for
 // graceful shutdown (see the Stable API Contract) get this drain for free.
 const SHUTDOWN_GRACE_MS = envInt("SHUTDOWN_GRACE_MS", 30_000)
+// Cleanup after the HTTP drain (GC sweep, backend close, ChatGPT release) does
+// fsyncs and joins child processes, which take seconds on a loaded host; two
+// seconds made a busy instance exit 1 on every restart. The slow report keeps
+// that time visible without failing the shutdown.
+const SHUTDOWN_CLEANUP_DEADLINE_MS = Math.max(1, envInt("SHUTDOWN_CLEANUP_DEADLINE_MS", 10_000))
+const SHUTDOWN_CLEANUP_SLOW_MS = 2_000
 
 interface RequestMeta {
   requestId: string
@@ -12608,22 +12614,27 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
         // Keep the original cleanup alive after a bounded failure. The backend
         // joins request finalizers and admitted durable work before releasing SQL;
         // ChatGPT ownership is released once admitted work has joined, beside it.
+        const progress = new ShutdownProgress()
         const joined = (async () => {
           await joinShutdownCleanup({
             idle: waitForShutdownIdle(() => (getInFlightCount?.() ?? 0) > 0),
             durable: async () => {
-              if (sweepSessionGc) await sweepSessionGc()
-              await closeBackend?.()
+              if (sweepSessionGc) await progress.run("session GC sweep", sweepSessionGc)
+              if (closeBackend) await progress.run("backend close", closeBackend)
             },
             chatGpt: async () => {
               await chatGptRenewalStopped
               await chatGpt?.settle()
               chatGpt?.release()
             },
-          })
+          }, progress)
           if (httpCloseError) throw httpCloseError
         })()
-        await withShutdownDeadline(joined)
+        await withShutdownDeadline(joined, SHUTDOWN_CLEANUP_DEADLINE_MS, {
+          slowAfterMs: SHUTDOWN_CLEANUP_SLOW_MS,
+          describe: () => `${progress.describe()}; ${getInFlightCount?.() ?? 0} in flight`,
+          warn: (message) => console.warn(message),
+        })
       })()
       return closePromise
     },
