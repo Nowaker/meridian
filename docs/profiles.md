@@ -242,6 +242,17 @@ MERIDIAN_ROUTING=priority MERIDIAN_PROFILE_ORDER=work,personal meridian
 - An explicit `x-meridian-profile` header always bypasses the pool (per-session pinning keeps working).
 - Failovers are logged (`profile.failover` in the diagnostic stream; `profile=<id>(priority)` in request lines).
 
+### Held profiles
+
+A profile can be held out of rotation, for example to measure what one job spends on an account nothing else touches. `routingHeldProfiles` in `PUT /settings/api/routing` (a supervisor writes the whole list; `GET` returns it) names Claude profiles or ChatGPT seats that:
+
+- take no unpinned work, are skipped by priority failover, and are moved off when they are the active profile;
+- are never warmed: `POST /profiles/<id>/warm` on one answers `409` with `profile_held`;
+- cannot be made active (`POST /profiles/active` answers `409` with `profile_held`);
+- still serve every request pinned to them with `x-meridian-profile`.
+
+Unlike `routingExcludedProfiles`, which refuses pinned work and still allows warms, a hold refuses warms and still allows pinned work.
+
 ### Profile commands
 
 | Command | Description |

@@ -77,3 +77,28 @@ describe("routing exclusions", () => {
     expect(access).toEqual({ kind: "allowed", eligibleProfileIds: ["work", "personal"] })
   })
 })
+
+describe("held profiles", () => {
+  const pool = { availableProfileIds: ["work", "personal", "spare"], excludedProfileIds: ["spare"], heldProfileIds: ["work"] }
+
+  it("keeps unpinned work off a held profile", () => {
+    expect(resolveRoutingAccess({ ...pool, purpose: "work" })).toEqual({ kind: "allowed", eligibleProfileIds: ["personal"] })
+  })
+
+  it("serves work pinned to a held profile", () => {
+    expect(resolveRoutingAccess({ ...pool, purpose: "work", explicitProfileId: "work" }))
+      .toEqual({ kind: "allowed", eligibleProfileIds: ["work", "personal"] })
+  })
+
+  it("refuses a warm of a held profile and leaves it out of unpinned warms", () => {
+    expect(resolveRoutingAccess({ ...pool, purpose: "warm", explicitProfileId: "work" }))
+      .toEqual({ kind: "explicit_held", profileId: "work" })
+    expect(resolveRoutingAccess({ ...pool, purpose: "warm" }))
+      .toEqual({ kind: "allowed", eligibleProfileIds: ["personal", "spare"] })
+  })
+
+  it("still refuses work pinned to an excluded profile", () => {
+    expect(resolveRoutingAccess({ ...pool, purpose: "work", explicitProfileId: "spare" }))
+      .toEqual({ kind: "explicit_excluded", profileId: "spare" })
+  })
+})

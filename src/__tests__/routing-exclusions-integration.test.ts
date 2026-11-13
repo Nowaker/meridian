@@ -122,6 +122,7 @@ beforeEach(async () => {
   resetFollowActive()
   setSetting("routingExcludedProfiles", [])
   setSetting("routingManagedExcludedProfiles", [])
+  setSetting("routingHeldProfiles", [])
   setSetting("routing", "active")
   setSetting("profileOrder", [])
   delete process.env.MERIDIAN_API_KEY
@@ -133,6 +134,7 @@ beforeEach(async () => {
 afterEach(() => {
   setSetting("routingExcludedProfiles", [])
   setSetting("routingManagedExcludedProfiles", [])
+  setSetting("routingHeldProfiles", [])
   setSetting("routing", "active")
   setSetting("profileOrder", [])
   resetFollowActive()
@@ -624,5 +626,61 @@ describe("Design and warm routing", () => {
     // Then
     expect(response.status).toBe(401)
     expect(queryCalls).toHaveLength(0)
+  })
+})
+
+describe("held profiles", () => {
+  async function holdWork(app: TestApp): Promise<Response> {
+    return app.fetch(new Request("http://localhost/settings/api/routing", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ routingHeldProfiles: ["work"] }),
+    }))
+  }
+
+  it("keeps unpinned work off a held profile, the active one included", async () => {
+    setActiveProfile("work")
+    const app = createTestApp()
+
+    expect((await holdWork(app)).status).toBe(200)
+    const routing = await (await app.fetch(new Request("http://localhost/settings/api/routing"))).json()
+    expect(routing).toMatchObject({ routingHeldProfiles: ["work"], routingManagedExcludedProfiles: [] })
+    expect(getActiveProfileId()).toBe("personal")
+
+    const response = await app.fetch(anthropicRequest())
+    expect(response.status).toBe(200)
+    expect(queryCalls.map(call => call.oauthToken)).toEqual(["token-personal"])
+  })
+
+  it("serves a request pinned to a held profile there", async () => {
+    const app = createTestApp()
+    await holdWork(app)
+
+    const response = await app.fetch(anthropicRequest("/v1/messages", "work"))
+    expect(response.status).toBe(200)
+    expect(queryCalls.map(call => call.oauthToken)).toEqual(["token-work"])
+  })
+
+  it("refuses to make a held profile the active one", async () => {
+    const app = createTestApp()
+    await holdWork(app)
+
+    const response = await app.fetch(new Request("http://localhost/profiles/active", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ profile: "work" }),
+    }))
+    expect(response.status).toBe(409)
+    expect(await responseErrorType(response)).toBe("profile_held")
+  })
+
+  it("rejects a held list that is not an array of ids", async () => {
+    const app = createTestApp()
+    const response = await app.fetch(new Request("http://localhost/settings/api/routing", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ routingHeldProfiles: "work" }),
+    }))
+    expect(response.status).toBe(400)
   })
 })

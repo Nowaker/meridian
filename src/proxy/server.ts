@@ -163,7 +163,7 @@ import { createHookDispatcher, HOOK_EVENTS, HOOK_LIMITS, hookTargetLabel, parseH
 import { createOAuthCallbackRegistry, normalizePublicUrl, requestPublicOrigin } from "./oauthCallbacks"
 import { renderLoginCallbackPage } from "../telemetry/loginCallbackPage"
 import { filterEligibleProfileIds, mergeRoutingExcludedProfiles, parseRoutingExcludedProfiles } from "./routingExclusions"
-import { canonicalRoutingExcludedProfileIds, evaluateRoutingProfileAccess, noEligibleProfilesResponse, profileExcludedResponse, replacementForExcludedActive } from "./routingExclusionRuntime"
+import { canonicalRoutingExcludedProfileIds, evaluateRoutingProfileAccess, noEligibleProfilesResponse, profileExcludedResponse, profileHeldResponse, replacementForExcludedActive } from "./routingExclusionRuntime"
 import {
   allHeldMessage,
   describeUsageReserveHold,
@@ -1158,6 +1158,20 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     configuredRoutingExcludedProfileIds(),
   )
   const routingExcludedProfileIds = () => routingExcludedProfileIdsFor(getEffectiveProfiles(finalConfig.profiles))
+  // Held profiles (`routingHeldProfiles`, supervisor-owned): out of every
+  // unpinned pick and every warm, yet served when a request pins one - the
+  // account a measured run spends alone.
+  const configuredRoutingHeldProfileIds = () => parseRoutingExcludedProfiles(getSetting("routingHeldProfiles"))
+  const routingHeldProfileIdsFor = (profiles: readonly ProfileConfig[]) => canonicalRoutingExcludedProfileIds(
+    profiles,
+    configuredRoutingHeldProfileIds(),
+  )
+  const routingHeldProfileIds = () => routingHeldProfileIdsFor(getEffectiveProfiles(finalConfig.profiles))
+  /** What unpinned work never reaches: excluded and held profiles alike. */
+  const routingUnavailableProfileIdsFor = (profiles: readonly ProfileConfig[]) => [
+    ...new Set([...routingExcludedProfileIdsFor(profiles), ...routingHeldProfileIdsFor(profiles)]),
+  ]
+  const routingUnavailableProfileIds = () => routingUnavailableProfileIdsFor(getEffectiveProfiles(finalConfig.profiles))
 
   // profiles.ts has no clear of its own: `resetActiveProfile` drops the
   // in-memory pointer but leaves settings.json naming a profile that may have
@@ -1189,7 +1203,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       profiles,
       defaultProfile: finalConfig.defaultProfile,
       activeProfile: getActiveProfileId(),
-      excludedProfileIds: routingExcludedProfileIds(),
+      excludedProfileIds: routingUnavailableProfileIds(),
     })
     if (!replacement.change) return
     applyActiveProfile(replacement.profileId, { source: "routing-exclusions" })
@@ -2728,10 +2742,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           purpose: warmProfileId ? "warm" : "work",
           explicitProfileId: requestedProfileId,
           excludedProfileIds: routingExcludedProfileIds(),
+          heldProfileIds: routingHeldProfileIds(),
         })
         switch (routingAccess.access.kind) {
           case "explicit_excluded":
             return profileExcludedResponse(routingAccess.access.profileId)
+          case "explicit_held":
+            return profileHeldResponse(routingAccess.access.profileId)
           case "no_eligible_profiles":
             return noEligibleProfilesResponse()
           case "allowed":
@@ -9413,6 +9430,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     aliases: () => getSetting("chatGptProfileAliases"),
     activeSeat: () => getSetting("chatGptActiveSeat"),
     excluded: configuredRoutingExcludedProfileIds,
+    held: configuredRoutingHeldProfileIds,
     order: priorityProfileOrderSetting,
     spent: (profileId) => spentProfiles.get(profileId),
     freeSeatOrder: () => getChatGptFeatures().freeSeatOrder,
@@ -9558,6 +9576,15 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         && turn.headers.get("x-meridian-routing-purpose") === "warm"
       const route = chatGptProfiles!.route(turn.headers.get("x-meridian-profile") ?? undefined, warm ? "warm" : "work")
       if (route.kind !== "refuse") return warm ? { ...route, spendCredits: false, warm: true } : route
+      if (route.reason === "held") {
+        return {
+          kind: "refuse",
+          error: "profile_held",
+          response: new Response(JSON.stringify({ error: { type: "profile_held", message: `Profile "${route.profile.id}" is held out of rotation; only requests pinned to it reach it`, code: null } }), {
+            status: 409, headers: { "content-type": "application/json" },
+          }),
+        }
+      }
       return {
         kind: "refuse",
         error: "profile_excluded",
@@ -9846,6 +9873,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       profileOrder: resolvePriorityOrder(profileIds, priorityProfileOrderSetting()).order,
       routingExcludedProfiles: parseRoutingExcludedProfiles(getSetting("routingExcludedProfiles")),
       routingManagedExcludedProfiles: parseRoutingExcludedProfiles(getSetting("routingManagedExcludedProfiles")),
+      routingHeldProfiles: configuredRoutingHeldProfileIds(),
       usageReserves: usageReserves(),
       profiles: profileIds,
       saved: {
@@ -9870,6 +9898,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       profileOrder?: unknown
       routingExcludedProfiles?: unknown
       routingManagedExcludedProfiles?: unknown
+      routingHeldProfiles?: unknown
       usageReserves?: unknown
     }
     try { body = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
@@ -9903,6 +9932,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       }
       updates.routingManagedExcludedProfiles = parseRoutingExcludedProfiles(body.routingManagedExcludedProfiles)
     }
+    if (body.routingHeldProfiles !== undefined) {
+      if (!Array.isArray(body.routingHeldProfiles) || body.routingHeldProfiles.some(profileId => typeof profileId !== "string")) {
+        return c.json({ error: "routingHeldProfiles must be an array of profile ids" }, 400)
+      }
+      updates.routingHeldProfiles = parseRoutingExcludedProfiles(body.routingHeldProfiles)
+    }
     // The whole map at once, as the managed exclusions are written: the
     // supervisor that owns the policy sends every reserve it means, and a
     // profile it leaves out has none.
@@ -9915,7 +9950,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       updates.usageReserves = parsed.value
     }
     if (Object.keys(updates).length > 0) saveSettings(updates)
-    if (body.routingExcludedProfiles !== undefined || body.routingManagedExcludedProfiles !== undefined) {
+    if (body.routingExcludedProfiles !== undefined || body.routingManagedExcludedProfiles !== undefined || body.routingHeldProfiles !== undefined) {
       reconcileActiveProfileWithExclusions()
     }
     plog(`[PROXY] Routing settings updated: routing=${getSetting("routing") ?? "active"} order=${(getSetting("profileOrder") ?? []).join(",") || "(config order)"}`)
@@ -10631,7 +10666,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     const availableProfileIds = listedProfiles.length > 0
       ? listedProfiles.map(profile => profile.id)
       : ["default"]
-    const excludedProfileIds = routingExcludedProfileIdsFor(
+    const excludedProfileIds = routingUnavailableProfileIdsFor(
       listedProfiles.length > 0 ? getEffectiveProfiles(finalConfig.profiles) : [],
     )
     const eligibleProfileIds = filterEligibleProfileIds(
@@ -10923,6 +10958,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     }
     if (routingExcludedProfileIds().includes(body.profile)) {
       return profileExcludedResponse(body.profile)
+    }
+    if (routingHeldProfileIds().includes(body.profile)) {
+      return profileHeldResponse(body.profile)
     }
     // The pointer would name a profile no work can reach: refused, so the
     // switch is seen not to happen. A supervisor lifting a reserve on purpose
@@ -11280,7 +11318,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // follows the alias onto the renamed profile, so choose another eligible
     // account rather than activating a work-ineligible one.
     if (getActiveProfileId() === body.from) {
-      const excludedProfileIds = routingExcludedProfileIdsFor(result.profiles)
+      const excludedProfileIds = routingUnavailableProfileIdsFor(result.profiles)
       const renamedProfileId = result.to
       const nextProfileId = excludedProfileIds.includes(renamedProfileId)
         ? filterEligibleProfileIds(result.profiles.map(profile => profile.id), excludedProfileIds)[0]
@@ -11390,7 +11428,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // first remaining work-eligible profile, or clear the pointer when none is
     // eligible, so neither requests nor the UI fall onto an excluded account.
     if (getActiveProfileId() === removedId) {
-      const excludedProfileIds = routingExcludedProfileIdsFor(result.profiles)
+      const excludedProfileIds = routingUnavailableProfileIdsFor(result.profiles)
       const nextProfileId = filterEligibleProfileIds(
         result.profiles.map(profile => profile.id),
         excludedProfileIds,
@@ -12477,10 +12515,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       purpose: "work",
       explicitProfileId: requestedProfileId,
       excludedProfileIds: routingExcludedProfileIds(),
+      heldProfileIds: routingHeldProfileIds(),
     })
     switch (routingAccess.access.kind) {
       case "explicit_excluded":
         return profileExcludedResponse(routingAccess.access.profileId)
+      case "explicit_held":
+        return profileHeldResponse(routingAccess.access.profileId)
       case "no_eligible_profiles":
         return noEligibleProfilesResponse()
       case "allowed":

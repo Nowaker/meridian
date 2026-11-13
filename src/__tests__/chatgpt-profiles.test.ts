@@ -216,6 +216,19 @@ describe("profile surface routing", () => {
     expect(s.activate("user-c__ws-cccccc")).toMatchObject({ ok: true })
   })
 
+  it("serves work pinned to a held seat, refuses its warm, and keeps the pool off it", () => {
+    const s = createChatGptProfileSurface({
+      source, observed: () => new Map(), usage: () => null, reserved: () => new Set(), names: () => undefined,
+      activeSeat: () => "user-b__ws-bbbbbb", held: () => ["b-bbbbbb"], spent: () => undefined,
+    })
+    expect(s.route("b-bbbbbb", "work")).toEqual({ kind: "pinned", seat: "user-b__ws-bbbbbb" })
+    expect(s.route("b-bbbbbb", "warm")).toMatchObject({ kind: "refuse", reason: "held" })
+    const unpinned = s.route(undefined, "work")
+    expect(unpinned.kind === "pool" && [...unpinned.excluded]).toEqual(["user-b__ws-bbbbbb"])
+    expect(s.activeProfileId()).toBe("a-aaaaaa")
+    expect(s.activate("b-bbbbbb")).toMatchObject({ ok: false, status: 409 })
+  })
+
   it("ignores a pin that names no ChatGPT seat", () => {
     expect(surface().route("kwiat-dh-p", "work").kind).toBe("pool")
   })

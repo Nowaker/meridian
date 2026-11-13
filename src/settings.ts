@@ -48,6 +48,13 @@ export interface MeridianSettings {
   routingExcludedProfiles?: string[]
   routingManagedExcludedProfiles?: string[]
   /**
+   * Profiles held out of rotation by a supervisor, for a measured run: no
+   * unpinned work, failover or warm reaches them, but a request pinned with
+   * `x-meridian-profile` is served there. Written through
+   * `PUT /settings/api/routing`; re-read per request.
+   */
+  routingHeldProfiles?: string[]
+  /**
    * Per profile id, how far work may take its 5-hour and weekly windows
    * (proxy/usageReserve.ts). Written by a supervisor through
    * `PUT /settings/api/routing`; re-read per request.

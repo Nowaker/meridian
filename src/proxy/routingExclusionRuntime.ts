@@ -26,8 +26,15 @@ export function evaluateRoutingProfileAccess(input: {
   readonly purpose: RoutingPurpose
   readonly explicitProfileId?: string
   readonly excludedProfileIds: readonly string[]
+  readonly heldProfileIds?: readonly string[]
 }): RoutingProfileAccess {
-  const excludedProfileIds = canonicalRoutingExcludedProfileIds(input.profiles, input.excludedProfileIds)
+  const heldProfileIds = canonicalRoutingExcludedProfileIds(input.profiles, input.heldProfileIds ?? [])
+  // What unpinned routing (the priority pool) must pass by: the excluded
+  // profiles and the held ones alike.
+  const excludedProfileIds = canonicalRoutingExcludedProfileIds(
+    input.profiles,
+    [...input.excludedProfileIds, ...heldProfileIds],
+  )
   const explicitProfileId = input.explicitProfileId
     ? canonicalProfileId(input.profiles, input.explicitProfileId)
     : undefined
@@ -38,7 +45,8 @@ export function evaluateRoutingProfileAccess(input: {
   const access = resolveRoutingAccess({
     purpose: input.purpose,
     availableProfileIds,
-    excludedProfileIds,
+    excludedProfileIds: canonicalRoutingExcludedProfileIds(input.profiles, input.excludedProfileIds),
+    heldProfileIds,
     ...(explicitProfileId ? { explicitProfileId } : {}),
   })
   if (access.kind !== "allowed") {
@@ -79,6 +87,16 @@ export function profileExcludedResponse(profileId: string): Response {
     error: {
       type: "profile_excluded",
       message: `Profile "${profileId}" is excluded from work routing`,
+    },
+  }), { status: 409, headers: { "Content-Type": "application/json" } })
+}
+
+export function profileHeldResponse(profileId: string): Response {
+  return new Response(JSON.stringify({
+    type: "error",
+    error: {
+      type: "profile_held",
+      message: `Profile "${profileId}" is held out of rotation; only requests pinned to it reach it`,
     },
   }), { status: 409, headers: { "Content-Type": "application/json" } })
 }

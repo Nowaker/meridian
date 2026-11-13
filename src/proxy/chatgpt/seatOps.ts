@@ -35,6 +35,7 @@ export function storedChatGptSurface(source: ChatGptCredentialSource, reserved: 
     aliases: () => getSetting("chatGptProfileAliases"),
     activeSeat: () => getSetting("chatGptActiveSeat"),
     excluded: configuredRoutingExclusions,
+    held: () => parseRoutingExcludedProfiles(getSetting("routingHeldProfiles")),
     order: () => getSetting("profileOrder"),
     spent: () => undefined,
     freeSeatOrder: () => getChatGptFeatures().freeSeatOrder,
