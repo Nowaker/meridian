@@ -16,7 +16,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test"
 import * as fsPromises from "node:fs/promises"
 import { mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir, uptime } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { pathToFileURL } from "node:url"
 import AsyncDatabase from "libsql/promise"
 import * as durableFileSystem from "../proxy/session/durableFileSystem"
@@ -78,14 +78,20 @@ describe("process-lifetime lock and gate files", () => {
     expect(synced).toEqual([])
   })
 
-  test("a turn lock is acquired and released without fsync", async () => {
+  // The exception: a turn lock's owner is flushed so a host crash cannot tear it.
+  test("a turn lock flushes its owner record and directories at acquire, and nothing at release", async () => {
     const locks = join(root("meridian-fsync-turn-"), "turn-locks")
-    const turns = new CrossProcessTurnCoordinator(locks, { acquireTimeoutMs: 2_000 })
+    const turns = new CrossProcessTurnCoordinator(locks, { acquireTimeoutMs: 10_000 })
     const { synced } = await recordSyncs(async () => {
       const lease = await turns.acquire("conversation")
       await lease.release()
     })
-    expect(synced).toEqual([])
+    // A directory sync shows twice: syncDirectoryDurably opens it through fs.promises.
+    const paths = [...new Set(synced)]
+    expect(paths).toHaveLength(3)
+    expect(paths[0]).toEndWith("/owner.json")
+    expect(paths[1]).toBe(dirname(paths[0]!))
+    expect(paths[2]).toBe(locks)
   })
 
   test("an SDK process gate is published without fsync", async () => {
