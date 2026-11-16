@@ -30,7 +30,7 @@
 
 import { followTarget } from "./followActive"
 import { claudeLog } from "../logger"
-import type { OAuthBankedResets, OAuthUsageSnapshot, OAuthUsageWindow, OAuthExtraUsageInfo } from "./oauthUsage"
+import type { OAuthBankedResets, OAuthExtraUsageInfo, OAuthUsageSnapshot, OAuthUsageWindow } from "./oauthUsage"
 
 /**
  * Poll cadence.
@@ -63,6 +63,9 @@ export const FOLLOW_USAGE_FETCH_TIMEOUT_MS = 8_000
  */
 export const FOLLOW_USAGE_MAX_AGE_MS = 10 * 60_000
 
+/** Past two missed polls, followed figures are still served but marked stale. */
+export const FOLLOW_USAGE_STALE_AFTER_MS = 5 * 60_000
+
 interface FollowedUsage {
   byProfile: Map<string, OAuthUsageSnapshot>
   fetchedAt: number
@@ -70,6 +73,7 @@ interface FollowedUsage {
 
 let followed: FollowedUsage | undefined
 let timer: ReturnType<typeof setInterval> | undefined
+let generation = 0
 
 function asFiniteOrNull(raw: unknown): number | null {
   return typeof raw === "number" && Number.isFinite(raw) ? raw : null
@@ -95,11 +99,19 @@ function readExtraUsage(raw: unknown): OAuthExtraUsageInfo | null {
   }
 }
 
+function readBankedResets(raw: unknown): OAuthBankedResets | null {
+  if (!raw || typeof raw !== "object") return null
+  const value = raw as { eligible?: unknown; grants?: unknown }
+  if (typeof value.eligible !== "boolean" || !Array.isArray(value.grants)) return null
+  return raw as OAuthBankedResets
+}
+
 /**
  * Pure: the usable snapshots in a `/v1/usage/quota/all` body.
  *
  * Entries carrying an `error`, or with no windows at all, are DROPPED rather
- * than imported as empty snapshots. The followed instance failing to read an
+ * than imported as empty snapshots. A `stale` entry (the followed instance's
+ * last good reading, inside its own stale bound) is kept and stays marked. The followed instance failing to read an
  * account is not evidence about that account — importing its failure would
  * launder the peer's transient 429 into ours, and would also stop the
  * follower's own credential read from ever being tried.
@@ -118,6 +130,7 @@ export function readFollowedUsage(body: unknown): Map<string, OAuthUsageSnapshot
       extraUsage?: unknown
       bankedResets?: unknown
       fetchedAt?: unknown
+      stale?: unknown
       error?: unknown
     }
     const id = typeof entry.id === "string" ? entry.id : undefined
@@ -140,8 +153,9 @@ export function readFollowedUsage(body: unknown): Map<string, OAuthUsageSnapshot
     out.set(id, {
       windows,
       extraUsage: readExtraUsage(entry.extraUsage),
-      bankedResets: (entry.bankedResets ?? null) as OAuthBankedResets | null,
+      bankedResets: readBankedResets(entry.bankedResets),
       fetchedAt: asFiniteOrNull(entry.fetchedAt) ?? Date.now(),
+      ...(entry.stale === true ? { stale: true } : {}),
     })
   }
   return out
@@ -149,18 +163,23 @@ export function readFollowedUsage(body: unknown): Map<string, OAuthUsageSnapshot
 
 /**
  * The followed instance's snapshot for a profile, if there is a fresh one.
- * Called on the usage path — synchronous, cache-only, no I/O.
+ * Called on the usage path — synchronous, cache-only, no I/O. `profileId` is
+ * the id the quota routes report, so the unscoped account is `default`.
  */
 export function followedUsageSnapshot(profileId: string): OAuthUsageSnapshot | undefined {
   if (!followed || !followTarget()) return undefined
-  if (Date.now() - followed.fetchedAt > FOLLOW_USAGE_MAX_AGE_MS) return undefined
-  return followed.byProfile.get(profileId)
+  const age = Date.now() - followed.fetchedAt
+  if (age > FOLLOW_USAGE_MAX_AGE_MS) return undefined
+  const snapshot = followed.byProfile.get(profileId)
+  if (!snapshot || snapshot.stale || age <= FOLLOW_USAGE_STALE_AFTER_MS) return snapshot
+  return { ...snapshot, stale: true }
 }
 
 /** One poll of the followed instance's usage. Never throws. */
 export async function pollFollowedUsage(): Promise<void> {
   const target = followTarget()
   if (!target) return
+  const started = generation
   try {
     const res = await fetch(`${target.url}/v1/usage/quota/all`, {
       headers: { Accept: "application/json" },
@@ -171,6 +190,7 @@ export async function pollFollowedUsage(): Promise<void> {
       return
     }
     const byProfile = readFollowedUsage(await res.json())
+    if (started !== generation) return
     if (byProfile.size === 0) {
       claudeLog("follow_usage.empty", { url: target.url })
       return
@@ -194,6 +214,7 @@ export function startFollowUsagePolling(): void {
 }
 
 export function stopFollowUsagePolling(): void {
+  generation++
   if (!timer) return
   clearInterval(timer)
   timer = undefined

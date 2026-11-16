@@ -28,8 +28,8 @@ import { claudeLog } from "../logger"
 import { isCredentialsReadOnly } from "./credentialsMode"
 import { parseRetryAfterMs } from "./retryAfter"
 import { createPlatformCredentialStore, refreshOAuthToken, type CredentialStore } from "./tokenRefresh"
-import { bundledClaudeCodeVersion } from "./models"
 import { followedUsageSnapshot } from "./followUsage"
+import { bundledClaudeCodeVersion } from "./models"
 import { noteApiRejected, noteProviderAccepted } from "./authLifecycle"
 
 // Policy for the query flag and User-Agent: profiles-routing.spec.md, "OAuth usage request identity".
@@ -854,14 +854,16 @@ async function fetchOAuthUsageImpl(opts?: FetchOAuthUsageOpts): Promise<RawUsage
   // credential read because the point is to make no upstream call at all:
   // two instances polling the same account share one rate-limit budget, and
   // the one that loses it gets 429 for every account it holds. Above the
-  // cooldown for the same reason: these figures arrive over loopback and cost
-  // the rate limit nothing, so a 429 this instance collected earlier has no
-  // business suppressing them — that would blank the follower's dashboard for
-  // the length of the backoff, which is the exact failure this consult exists
-  // to remove.
-  const followed = followedUsageSnapshot(cacheKey)
+  // cooldown for the same reason: these figures cost the rate limit nothing,
+  // so a 429 this instance collected earlier must not suppress them.
+  // A forced read wants this account's figures now (a limit just hit, a new
+  // login), not a copy that may be minutes old.
+  const followed = opts?.force ? undefined : followedUsageSnapshot(opts?.profileId ?? "default")
   if (followed) {
+    const local = cacheByProfile.get(cacheKey)
+    if (local && local.fetchedAt > followed.fetchedAt) return { snapshot: local, error: null }
     cacheByProfile.set(cacheKey, followed)
+    failureByProfile.delete(cacheKey)
     return { snapshot: followed, error: null }
   }
 
