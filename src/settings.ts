@@ -18,7 +18,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import { configPath } from "./configDir"
-import type { PriorityFailbackPolicy } from "./proxy/routing"
+import type { ClaudeExtraUsagePolicy, PriorityFailbackPolicy } from "./proxy/routing"
 import type { UsageReserveMap } from "./proxy/usageReserve"
 import type { ClaudeExecutableMode } from "./proxy/claudeExecutablePreference"
 import type { PageLayout } from "./telemetry/pageLayout"
@@ -63,6 +63,9 @@ export interface MeridianSettings {
    * `PUT /settings/api/routing`; re-read per request.
    */
   usageReserves?: UsageReserveMap
+  /** Pool routing: when an account on Extra Usage may take work (`reserve`
+   *  default). MERIDIAN_CLAUDE_EXTRA_USAGE env var takes precedence. */
+  claudeExtraUsage?: ClaudeExtraUsagePolicy
   /** The ChatGPT seat (accountUserId) unpinned ChatGPT turns go to first; POST /profiles/active. */
   chatGptActiveSeat?: string
   /** Operator-chosen profile ids for ChatGPT seats, keyed by seat id (accountUserId). */
