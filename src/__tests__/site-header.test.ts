@@ -363,6 +363,13 @@ describe("profiles page layout", () => {
     return profilePageHtml.slice(start, profilePageHtml.indexOf("}", start))
   }
 
+  test("adding a profile comes before the list, in a panel lighter than a card", () => {
+    const add = profilePageHtml.indexOf('<div class="add-card"><div id="add-slot"></div></div>')
+    expect(add).toBeGreaterThanOrEqual(0)
+    expect(add).toBeLessThan(profilePageHtml.indexOf('id="profiles-section"'))
+    expect(rule(".add-card")).toContain("background: var(--surface2)")
+  })
+
   test("a card's header wraps instead of pushing its actions past a phone's edge", () => {
     // Measured at 320px and 375px: the name, type badge and rename button
     // sat on one unwrapping row and scrolled the page to 536px.

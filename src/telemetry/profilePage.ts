@@ -262,6 +262,12 @@ export const profilePageHtml = `<!DOCTYPE html>
     background: var(--bg); padding: 1px 5px; border-radius: 4px; color: var(--accent2);
   }
   .add-note { font-size: 11px; color: var(--muted); margin-top: 8px; }
+  /* Lighter than .profile-card: the panel sits above the account list, where
+     a card's weight would read as the page's headline account. */
+  .add-card {
+    padding: 14px 16px; background: var(--surface2);
+    border: 1px solid var(--border); border-radius: 8px;
+  }
 
   .mono { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px; }
   .copy-cmd {
@@ -346,6 +352,13 @@ export const profilePageHtml = `<!DOCTYPE html>
 <div class="subtitle" id="profiles-subtitle">Manage Claude account profiles</div>
 
 
+<!-- Outside #content on purpose: render() rebuilds that element wholesale on
+     every poll, which would destroy a half-typed name or a pasted code. -->
+<div class="section">
+  <div class="section-title">Add a profile</div>
+  <div class="add-card"><div id="add-slot"></div></div>
+</div>
+
 <!-- The heading and search box sit outside #content, which render() rebuilds
      on every poll: a box inside it would lose its text every ten seconds. -->
 <div class="section" id="profiles-section">
@@ -366,13 +379,6 @@ export const profilePageHtml = `<!DOCTYPE html>
   <div class="provider-none login-none" id="profiles-login-none" hidden>${LOGIN_STATES_NONE_SHOWN_HTML}</div>
 </div>
 ${reorderLiveRegionHtml}
-
-<!-- Outside #content on purpose: render() rebuilds that element wholesale on
-     every poll, which would destroy a half-typed name or a pasted code. -->
-<div class="section">
-  <div class="section-title">Add a profile</div>
-  <div class="profile-card"><div id="add-slot"></div></div>
-</div>
 
 <div class="section" style="margin-top:32px">
   <h2 class="section-title">Setup Guide</h2>
