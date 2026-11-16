@@ -86,6 +86,14 @@ describe("readFollowedUsage", () => {
     expect(readFollowedUsage({ profiles: [null, 7, { noId: true }] }).size).toBe(0)
   })
 
+  test("converts extra usage from a followed instance that still serves cents", () => {
+    const parsed = readFollowedUsage(quotaBody([
+      { id: "personal", windows: [{ type: "five_hour", utilization: 1, resetsAt: null }], fetchedAt: 999, error: null,
+        extraUsage: { isEnabled: true, monthlyLimit: 500, usedCredits: 539, utilization: 1, currency: "USD" } },
+    ]))
+    expect(parsed.get("personal")!.extraUsage).toEqual({ isEnabled: true, monthlyLimit: 5, usedCredits: 5.39, utilization: 1, currency: "USD", exponent: 2 })
+  })
+
   test("skips malformed windows but keeps the usable ones", () => {
     const parsed = readFollowedUsage(quotaBody([
       {
