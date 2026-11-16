@@ -32,12 +32,12 @@ export function statusPillView(health: unknown): StatusPillView {
 
   if (!isRecord(health)) return { tone: "unhealthy", text: "Offline", title: "", alert: null }
   const tone = health.status === "healthy" ? "healthy" : health.status === "degraded" ? "degraded" : "unhealthy"
-  const plain: StatusPillView = {
-    tone,
-    text: tone === "healthy" ? "Operational" : tone === "degraded" ? "Degraded" : "Offline",
-    title: "",
-    alert: null,
-  }
+  const text = tone === "healthy" ? "Operational" : tone === "degraded" ? "Degraded" : "Offline"
+  // A degraded or unhealthy /health names its cause in `error` (not logged
+  // in, a ChatGPT seat source not serving, ...); without it the pill says
+  // only "Offline" or "Degraded" and the reason is a curl away.
+  const error = tone !== "healthy" && typeof health.error === "string" ? health.error.trim() : ""
+  const plain: StatusPillView = { tone, text, title: error ? text + ": " + error : "", alert: null }
   if (health.status === "draining") {
     return { tone: "unhealthy", text: "Draining", title: "Meridian is shutting down; route new requests to another instance.", alert: null }
   }

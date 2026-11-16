@@ -28,6 +28,15 @@ describe("statusPillView", () => {
     expect(statusPillView(null)).toMatchObject({ tone: "unhealthy", text: "Offline", alert: null })
   })
 
+  it("names the cause /health reports when it is not healthy", () => {
+    expect(statusPillView({ status: "unhealthy", error: "Not logged in. Run: claude login" }))
+      .toEqual({ tone: "unhealthy", text: "Offline", title: "Offline: Not logged in. Run: claude login", alert: null })
+    expect(statusPillView({ status: "degraded", error: "Could not verify auth status" }).title)
+      .toBe("Degraded: Could not verify auth status")
+    expect(statusPillView({ status: "healthy", error: "stale" }).title).toBe("")
+    expect(statusPillView({ status: "degraded", error: 42 }).title).toBe("")
+  })
+
   it("shows an outage, with since and the last error on hover", () => {
     const view = statusPillView({ status: "healthy", upstream: { claude: UNREACHABLE } })
     expect(view).toMatchObject({ tone: "unhealthy", text: "Claude connection failed", alert: "outage" })
