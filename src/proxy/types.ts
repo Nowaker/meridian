@@ -1,7 +1,6 @@
 import type { AntigravityPlugin } from "./backends/antigravityPlugins"
 import type { Server } from "node:http"
 import type { ProfileConfig } from "./profiles"
-import type { TranscriptSweep } from "./transcriptSweep"
 
 export interface AntigravityOptions {
   executable?: string
@@ -124,8 +123,6 @@ export interface ProxyServer {
   sweepSessionGc?(): Promise<void>
   /** Start any prompt-cache keepalive beats that are due; nothing is tracked unless the operator switched keepalive on. */
   tickCacheKeepalive?(): void
-  /** Claude Code's transcript cleanup for idle config roots; startProxyServer starts and stops it. */
-  transcriptSweep?: TranscriptSweep
   /** Present only when this instance has a ChatGPT credential source. */
   chatGpt?: ChatGptUpstreamControl
 }
