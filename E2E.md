@@ -687,35 +687,6 @@ joins are recorded. This is a deterministic fingerprint file-cap failure, **not
 an actual loaded-Linux-host timeout reproduction**. Stock Node controls also
 cover the aggregate Git budget, TERM resistance, detached/stale launcher facts
 and failed status. [Source mappings, sanitized proof and limits](docs/maintenance/evidence/1330-source-build-identity.md).
-## Idle transcript sweep (fork)
-
-```sh
-MERIDIAN_TRANSCRIPT_RETENTION_DAYS=30 bun scripts/e2e-transcript-retention.mjs
-```
-
-The retention harness is described under *Transcript retention* below.
-On Linux, where Claude Code keeps its OAuth login in `.credentials.json`, the
-opted-in run then drives the idle sweep (`transcriptSweep.ts`) through the real
-CLI against four synthetic config roots, each with a synthetic login, a
-40-day-old transcript and a `.last-cleanup` two days old. A dead login and a
-valid one must be cleaned; an expired one, which Claude Code would try to
-refresh, must be skipped. The expired root is then swept with the token check
-overridden, to show the refusing proxy alone holds. Every login file must keep
-its inode, mtime and content hash.
-
-**Verified 2026-10-03:** Linux, Claude Code 2.1.284, Agent SDK 0.2.141. Idle
-sweep: dead and valid logins were cleaned (0 and 6 connections refused), the
-expired one was skipped, and with the token check overridden it was cleaned
-with 6 connections refused; no login file changed.
-
-Before the gate existed, the same idle process was probed behind a logging
-proxy. With an expired or nearly expired login it tried to refresh at
-platform.claude.com 12 times. With a valid login it made 13 attempts to fetch
-the profile, remote settings and policy limits from api.anthropic.com. A dead
-login made no connection at all. Under `strace -f` with the refusing proxy, all
-25 `connect()` calls of the process tree went to the proxy and none bypassed
-it.
-
 ## Startup warning under Bun (E87)
 
 **What it proves:** a proxy started under Bun says at startup that it cannot
@@ -805,6 +776,35 @@ deleted and every fresh transcript kept. With retention unset the argv had no
 nothing. Found: an off request stamps `.last-cleanup`, so the first opted-in
 cleanup can wait up to a day (documented in configuration.md); a child that
 lives under about 5 s never cleans up.
+
+### Idle transcript sweep
+
+```sh
+bun scripts/e2e-transcript-sweep.mjs
+```
+
+Needs no credentials, network or model. It starts a real Meridian server
+(`startProxyServer`) in disposable directories with retention at 30 days, a
+3-second sweep interval and two profiles signed in with synthetic logins, and
+lets the idle sweep run the installed Claude Code CLI. Profile `idle` holds 200
+transcripts 40 days old, one 40-day-old transcript the session store maps (with
+a sidecar file) and a fresh one. Profile `stuck` gets a stand-in CLI that
+ignores SIGTERM and leaves a grandchild holding its output pipe for 20 s;
+`close()` runs while it lives. Asserts: the real CLI's cleanup ran, deleted
+the 200 and kept the mapped and the fresh transcripts, left the login file
+byte-identical, and had exited before the sweep moved on; `close()` did not
+succeed while the stuck process lived (past the shutdown deadline it rejects
+with ownership retained); the SDK permit stayed held until that process was
+joined.
+
+**Verified 2026-11-15** (Linux, Claude Code 2.1.322, Bun 1.4.4, at load ~100):
+PASS. The real CLI cleaned in one process; 2 transcripts left; the mapped
+transcript's mtime refreshed; `close()` rejected at 2 s with ownership
+retained; process gone and permit freed together at 19 s. The same harness
+against the earlier idle sweep proposed with #1261: the mapped transcript and
+its sidecar were deleted, the CLI was still alive when the sweep moved on,
+`close()` resolved at 0 s with the stuck process alive, and the permit was free
+at 0 s while the process lived until 19 s.
 
 ## Antigravity subscription CLI backend
 

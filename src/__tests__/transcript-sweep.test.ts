@@ -1,26 +1,32 @@
 /**
  * The idle transcript sweep's decisions, with the Claude Code child replaced
  * by a stub that behaves like one: it writes `.last-cleanup` when its cleanup
- * finishes and exits only when aborted.
+ * finishes and exits only when stopped, optionally some time after.
  *
  * What is pinned: which roots get a child at all (due, idle, retention on, a
- * login that cannot be refreshed during the child's life, a free SDK slot),
- * that a child is stopped as soon as the cleanup lands or after the timeout,
- * that roots are visited strictly one at a time, and that a stored login
- * changing under a child stops the sweep for good.
+ * login that cannot be refreshed during the child's life, a free SDK slot);
+ * process custody (the slot is held, and stop() waits, until the child has
+ * exited, however late); the root reservation in both race orders with a
+ * request; how a stored login changing under a child is read; and that the
+ * transcripts Meridian still needs survive the cleanup.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { AbortableSemaphore } from "../proxy/concurrency"
+import type { TranscriptLocator } from "../proxy/session/bookkeeping/locator"
 import type { CredentialsFile } from "../proxy/tokenRefresh"
 import {
+  classifyLoginChange,
   classifyStoredLogin,
   createTranscriptSweep,
   listSweepRoots,
+  protectPinnedTranscripts,
   type IdleChildOutcome,
+  type RootReservation,
   type SweepRoot,
+  type SweepSlot,
   type TranscriptSweepOptions,
 } from "../proxy/transcriptSweep"
 import { setSetting } from "../settings"
@@ -49,8 +55,23 @@ async function waitFor(condition: () => boolean, timeoutMs = 10_000): Promise<vo
 
 function touch(path: string, ageMs: number): void {
   writeFileSync(path, new Date().toISOString())
+  age(path, ageMs)
+}
+
+function age(path: string, ageMs: number): void {
   const at = (Date.now() - ageMs) / 1000
   utimesSync(path, at, at)
+}
+
+/** A reservation the test can preempt, recording when it was released. */
+function reservation() {
+  const preempt = new AbortController()
+  const state = { released: false, preempt }
+  const handle: RootReservation = {
+    preempted: preempt.signal,
+    release: () => { state.released = true },
+  }
+  return { handle, state }
 }
 
 describe("idle transcript sweep", () => {
@@ -78,19 +99,35 @@ describe("idle transcript sweep", () => {
     return { configDir, explicitConfigDir: true, profileIds: [name] }
   }
 
-  interface ChildCall { readonly root: SweepRoot; readonly retentionDays: number; readonly signal: AbortSignal }
+  interface ChildCall {
+    readonly root: SweepRoot
+    readonly retentionDays: number
+    readonly signal: AbortSignal
+    exited: boolean
+  }
 
-  /** Cleans after `cleanAfterMs` (never when null) and exits when aborted. */
-  function stubChild(calls: ChildCall[], cleanAfterMs: number | null = 10) {
-    return (root: SweepRoot, retentionDays: number, signal: AbortSignal): Promise<IdleChildOutcome> => {
-      calls.push({ root, retentionDays, signal })
+  /**
+   * Cleans after `cleanAfterMs` (never when null) and exits `exitDelayMs`
+   * after it is stopped. Like the proxy's runner, it releases the slot only
+   * once it has exited.
+   */
+  function stubChild(calls: ChildCall[], cleanAfterMs: number | null = 10, exitDelayMs = 0) {
+    return (root: SweepRoot, retentionDays: number, slot: SweepSlot, signal: AbortSignal): Promise<IdleChildOutcome> => {
+      const call: ChildCall = { root, retentionDays, signal, exited: false }
+      calls.push(call)
       if (cleanAfterMs !== null) {
         setTimeout(() => {
           if (existsSync(root.configDir)) touch(join(root.configDir, ".last-cleanup"), 0)
         }, cleanAfterMs)
       }
       return new Promise((resolve) => {
-        signal.addEventListener("abort", () => resolve({ refusedConnections: 3 }), { once: true })
+        signal.addEventListener("abort", () => {
+          setTimeout(() => {
+            call.exited = true
+            slot.release()
+            resolve({ refusedConnections: 3 })
+          }, exitDelayMs)
+        }, { once: true })
       })
     }
   }
@@ -101,11 +138,12 @@ describe("idle transcript sweep", () => {
     const storedLogin = login(6 * HOUR)
     const sweep = createTranscriptSweep({
       listRoots: () => roots,
-      isRootBusy: () => false,
+      reserveRoot: () => reservation().handle,
       isDraining: () => false,
       credentialsReadOnly: () => false,
       tryAcquireSlot: () => ({ release: () => undefined }),
       readCredentials: async () => storedLogin,
+      pinnedTranscripts: () => [],
       runChild: stubChild(calls),
       log: (line) => log.push(line),
       pollMs: 5,
@@ -153,16 +191,6 @@ describe("idle transcript sweep", () => {
     expect((await sweep.runPass())[0]?.outcome).toMatchObject({ kind: "failed", error: "Claude Code process exited with code 1" })
   })
 
-  it("never starts a child beside a request running in the same root", async () => {
-    const busy = root("busy", 2 * DAY)
-    const idle = root("idle", 2 * DAY)
-    const { sweep, calls } = sweepWith([busy, idle], { isRootBusy: (configDir) => configDir === busy.configDir })
-    const results = await sweep.runPass()
-    expect(results.map((result) => result.outcome.kind === "skipped" ? result.outcome.reason : result.outcome.kind))
-      .toEqual(["busy", "swept"])
-    expect(calls.map((call) => call.root.profileIds[0])).toEqual(["idle"])
-  })
-
   it("starts nothing while Meridian drains", async () => {
     const { sweep, calls } = sweepWith([root("draining", 2 * DAY)], { isDraining: () => true })
     expect((await sweep.runPass())[0]?.outcome).toEqual({ kind: "skipped", reason: "draining" })
@@ -199,13 +227,13 @@ describe("idle transcript sweep", () => {
     let active = 0
     let maxActive = 0
     const calls: ChildCall[] = []
-    const child = stubChild(calls, 15)
+    const child = stubChild(calls, 15, 10)
     const { sweep } = sweepWith(roots, {
-      runChild: async (sweepRoot, days, signal) => {
+      runChild: async (sweepRoot, days, slot, signal) => {
         active++
         maxActive = Math.max(maxActive, active)
         try {
-          return await child(sweepRoot, days, signal)
+          return await child(sweepRoot, days, slot, signal)
         } finally {
           active--
         }
@@ -223,6 +251,127 @@ describe("idle transcript sweep", () => {
     const [first, second] = await Promise.all([sweep.runPass(), sweep.runPass()])
     expect(second).toBe(first)
     expect(calls).toHaveLength(1)
+  })
+
+  describe("process custody", () => {
+    it("holds the SDK slot until the child has exited, however long it ignores its stop", async () => {
+      const semaphore = new AbortableSemaphore(2)
+      const calls: ChildCall[] = []
+      let releases = 0
+      let releasedWhileAlive = false
+      const { sweep } = sweepWith([root("slow-exit", 2 * DAY)], {
+        runChild: stubChild(calls, 10, 300),
+        tryAcquireSlot: () => {
+          const lease = semaphore.tryAcquire(1)
+          return lease && {
+            release: () => {
+              releases++
+              if (calls.some((call) => !call.exited)) releasedWhileAlive = true
+              lease.release()
+            },
+          }
+        },
+      })
+      const pass = sweep.runPass()
+      await waitFor(() => calls[0]?.signal.aborted === true)
+      // Stopped but not yet exited: the slot is still the child's.
+      await Bun.sleep(150)
+      expect(calls[0]?.exited).toBe(false)
+      expect(semaphore.snapshot.active).toBe(1)
+      expect((await pass)[0]?.outcome.kind).toBe("swept")
+      expect(calls[0]?.exited).toBe(true)
+      expect(releasedWhileAlive).toBe(false)
+      // The runner and the sweep both release; the permit goes back once.
+      expect(releases).toBe(1)
+      expect(semaphore.snapshot).toEqual({ active: 0, queued: 0, limit: 2 })
+    })
+
+    it("stop() returns only once the running child has exited", async () => {
+      const calls: ChildCall[] = []
+      const { sweep } = sweepWith([root("stopping", 2 * DAY)], {
+        runChild: stubChild(calls, null, 300),
+        childTimeoutMs: 60_000,
+      })
+      const pass = sweep.runPass()
+      await waitFor(() => calls.length === 1)
+      await sweep.stop()
+      expect(calls[0]?.signal.aborted).toBe(true)
+      expect(calls[0]?.exited).toBe(true)
+      expect((await pass)[0]?.outcome.kind).toBe("stopped")
+    })
+
+    it("takes only a free SDK slot that leaves one for a request, never queues, and gives it back", async () => {
+      const semaphore = new AbortableSemaphore(2)
+      const held = await semaphore.acquire()
+      const { sweep, calls } = sweepWith([root("crowded", 2 * DAY)], { tryAcquireSlot: () => semaphore.tryAcquire(1) })
+      expect((await sweep.runPass())[0]?.outcome).toEqual({ kind: "skipped", reason: "no-slot" })
+      expect(semaphore.snapshot).toEqual({ active: 1, queued: 0, limit: 2 })
+      held.release()
+      expect((await sweep.runPass())[0]?.outcome.kind).toBe("swept")
+      expect(calls).toHaveLength(1)
+      expect(semaphore.snapshot).toEqual({ active: 0, queued: 0, limit: 2 })
+    })
+  })
+
+  describe("the root reservation", () => {
+    it("leaves a root alone, without reading its login, while a request runs there", async () => {
+      const busy = root("busy", 2 * DAY)
+      const idle = root("idle", 2 * DAY)
+      const read: string[] = []
+      const { sweep, calls } = sweepWith([busy, idle], {
+        reserveRoot: (configDir) => configDir === busy.configDir ? undefined : reservation().handle,
+        readCredentials: async (sweepRoot) => {
+          read.push(sweepRoot.profileIds[0]!)
+          return login(6 * HOUR)
+        },
+      })
+      const results = await sweep.runPass()
+      expect(results.map((result) => result.outcome.kind === "skipped" ? result.outcome.reason : result.outcome.kind))
+        .toEqual(["busy", "swept"])
+      expect(calls.map((call) => call.root.profileIds[0])).toEqual(["idle"])
+      expect(read.filter((name) => name === "busy")).toHaveLength(0)
+    })
+
+    it("starts no child when a request arrives in the root while its login is read", async () => {
+      const { handle, state } = reservation()
+      const { sweep, calls } = sweepWith([root("racing", 2 * DAY)], {
+        reserveRoot: () => handle,
+        readCredentials: async () => {
+          state.preempt.abort()
+          return login(6 * HOUR)
+        },
+      })
+      expect((await sweep.runPass())[0]?.outcome).toEqual({ kind: "skipped", reason: "busy" })
+      expect(calls).toHaveLength(0)
+      expect(state.released).toBe(true)
+    })
+
+    it("stops the child at once when a request arrives, and frees the root only after it exited", async () => {
+      const { handle, state } = reservation()
+      const calls: ChildCall[] = []
+      let releasedWhileAlive = false
+      const { sweep, log } = sweepWith([root("preempted", 2 * DAY)], {
+        reserveRoot: () => ({
+          preempted: handle.preempted,
+          release: () => {
+            if (calls.some((call) => !call.exited)) releasedWhileAlive = true
+            handle.release()
+          },
+        }),
+        runChild: stubChild(calls, null, 100),
+        childTimeoutMs: 60_000,
+      })
+      const pass = sweep.runPass()
+      await waitFor(() => calls.length === 1)
+      state.preempt.abort()
+      const [result] = await pass
+      expect(result?.outcome.kind).toBe("preempted")
+      expect(calls[0]?.signal.aborted).toBe(true)
+      expect(state.released).toBe(true)
+      expect(releasedWhileAlive).toBe(false)
+      expect(sweep.disabled).toBe(false)
+      expect(log.join("\n")).toContain("a request arrived there")
+    })
   })
 
   describe("the stored login", () => {
@@ -258,12 +407,27 @@ describe("idle transcript sweep", () => {
       expect(await outcomeFor(new Error("keychain refused"))).toEqual({ outcome: { kind: "skipped", reason: "login-unreadable" }, started: 0 })
     })
 
-    it("stops the sweep for good when a stored login changes while a child runs", async () => {
+    it("keeps sweeping when the login was renewed elsewhere while a child ran", async () => {
+      let reads = 0
+      const { sweep, calls, log } = sweepWith([root("renewed", 2 * DAY), root("next", 2 * DAY)], {
+        // A refresh or sign-in elsewhere: new tokens, a later expiry.
+        readCredentials: async () => (reads++ === 0
+          ? login(6 * HOUR)
+          : login(8 * HOUR, { accessToken: "renewed-access", refreshToken: "renewed-refresh" })),
+      })
+      const results = await sweep.runPass()
+      expect(results.map((result) => result.outcome.kind)).toEqual(["swept", "swept"])
+      expect(sweep.disabled).toBe(false)
+      expect(calls).toHaveLength(2)
+      expect(log.join("\n")).toContain("renewed elsewhere")
+    })
+
+    it("stops the sweep for good when a stored login changes in a way no renewal explains", async () => {
       let reads = 0
       const first = root("rotated", 2 * DAY)
       const second = root("untouched", 2 * DAY)
       const { sweep, calls, log } = sweepWith([first, second], {
-        readCredentials: async () => (reads++ === 0 ? login(6 * HOUR) : login(8 * HOUR)),
+        readCredentials: async () => (reads++ === 0 ? login(6 * HOUR) : login(2 * HOUR, { accessToken: "other" })),
       })
       const results = await sweep.runPass()
       expect(results).toHaveLength(1)
@@ -295,6 +459,78 @@ describe("idle transcript sweep", () => {
       expect(classifyStoredLogin(login(HOUR), now)).toBe("valid")
       expect(classifyStoredLogin(login(29 * 60_000), now)).toBe("refresh-due")
     })
+
+    it("reads a change as a renewal only when the login is usable and no older afterwards", () => {
+      const now = Date.now()
+      const before = login(6 * HOUR)
+      expect(classifyLoginChange(before, { ...before }, now)).toBe("none")
+      expect(classifyLoginChange(before, login(8 * HOUR, { accessToken: "new" }), now)).toBe("renewed-elsewhere")
+      expect(classifyLoginChange(before, login(2 * HOUR, { accessToken: "new" }), now)).toBe("unexplained")
+      expect(classifyLoginChange(before, login(-HOUR, { accessToken: "new" }), now)).toBe("unexplained")
+      expect(classifyLoginChange(before, null, now)).toBe("unexplained")
+      expect(classifyLoginChange(before, undefined, now)).toBe("unexplained")
+    })
+  })
+
+  describe("transcripts Meridian still needs", () => {
+    /** projects/<project>/<id>.jsonl plus a sidecar file, `ageDays` old. */
+    function transcript(configDir: string, id: string, ageDays: number): { file: string; sidecar: string } {
+      const project = join(configDir, "projects", "-work-repo")
+      mkdirSync(join(project, id, "subagents"), { recursive: true })
+      const file = join(project, `${id}.jsonl`)
+      const sidecar = join(project, id, "subagents", "agent-1.jsonl")
+      touch(file, ageDays * DAY)
+      touch(sidecar, ageDays * DAY)
+      return { file, sidecar }
+    }
+
+    /** What Claude Code's cleanup does: delete transcripts older than the period, by mtime alone. */
+    function cleanup(configDir: string, retentionDays: number): void {
+      const projects = join(configDir, "projects")
+      for (const project of readdirSync(projects)) {
+        for (const name of readdirSync(join(projects, project))) {
+          const path = join(projects, project, name)
+          if (name.endsWith(".jsonl") && Date.now() - statSync(path).mtimeMs > retentionDays * DAY) unlinkSync(path)
+        }
+      }
+    }
+
+    it("keeps a pinned transcript the cleanup would have deleted, and deletes the rest", async () => {
+      const sweepRoot = root("pinned", 2 * DAY)
+      const pinned = transcript(sweepRoot.configDir, "pinned-session", 40)
+      const loose = transcript(sweepRoot.configDir, "loose-session", 40)
+      const elsewhere: TranscriptLocator = { sessionId: "loose-session", configDir: join(dir, "another-root") }
+      const { sweep } = sweepWith([sweepRoot], {
+        pinnedTranscripts: () => [{ sessionId: "pinned-session", configDir: sweepRoot.configDir }, elsewhere],
+        runChild: async (child, days, slot) => {
+          cleanup(child.configDir, days)
+          touch(join(child.configDir, ".last-cleanup"), 0)
+          slot.release()
+          return { refusedConnections: 0 }
+        },
+      })
+      const [result] = await sweep.runPass()
+      expect(result?.outcome).toMatchObject({ kind: "swept", pinsProtected: 1 })
+      expect(existsSync(pinned.file)).toBe(true)
+      expect(existsSync(pinned.sidecar)).toBe(true)
+      expect(Date.now() - statSync(pinned.sidecar).mtimeMs).toBeLessThan(HOUR)
+      expect(existsSync(loose.file)).toBe(false)
+    })
+
+    it("refreshes only pinned transcripts the next cleanup could reach", async () => {
+      const configDir = root("reach").configDir
+      const young = transcript(configDir, "young", 10)
+      const close = transcript(configDir, "close", 29.5)
+      const youngMtime = statSync(young.file).mtimeMs
+      const pins = ["young", "close"].map((sessionId) => ({ sessionId, configDir }))
+      expect(await protectPinnedTranscripts(configDir, pins, 30)).toBe(1)
+      expect(statSync(young.file).mtimeMs).toBe(youngMtime)
+      expect(Date.now() - statSync(close.file).mtimeMs).toBeLessThan(HOUR)
+      // A short period leaves no margin: half of it counts as reachable.
+      expect(await protectPinnedTranscripts(configDir, pins, 2)).toBe(1)
+      expect(await protectPinnedTranscripts(configDir, pins, 0)).toBe(0)
+      expect(await protectPinnedTranscripts(join(dir, "missing"), pins, 30)).toBe(0)
+    })
   })
 
   it("never starts a child under MERIDIAN_CREDENTIALS_READONLY", async () => {
@@ -305,18 +541,6 @@ describe("idle transcript sweep", () => {
     expect(calls).toHaveLength(0)
     expect(log.join("\n")).toContain("MERIDIAN_CREDENTIALS_READONLY")
     await sweep.stop()
-  })
-
-  it("takes only a free SDK slot, never queues for one, and gives it back", async () => {
-    const semaphore = new AbortableSemaphore(1)
-    const held = await semaphore.acquire()
-    const { sweep, calls } = sweepWith([root("crowded", 2 * DAY)], { tryAcquireSlot: () => semaphore.tryAcquire() })
-    expect((await sweep.runPass())[0]?.outcome).toEqual({ kind: "skipped", reason: "no-slot" })
-    expect(semaphore.snapshot).toEqual({ active: 1, queued: 0, limit: 1 })
-    held.release()
-    expect((await sweep.runPass())[0]?.outcome.kind).toBe("swept")
-    expect(calls).toHaveLength(1)
-    expect(semaphore.snapshot).toEqual({ active: 0, queued: 0, limit: 1 })
   })
 
   it("runs a pass after the initial delay and again every interval, and stop() ends a running child", async () => {
@@ -340,7 +564,7 @@ describe("idle transcript sweep", () => {
     expect(listed).toBe(3)
     expect(calls[0]?.signal.aborted).toBe(false)
     await sweep.stop()
-    expect(calls[0]?.signal.aborted).toBe(true)
+    expect(calls[0]?.exited).toBe(true)
     await Bun.sleep(100)
     expect(listed).toBe(3)
   })
