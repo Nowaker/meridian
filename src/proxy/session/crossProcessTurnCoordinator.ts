@@ -572,18 +572,23 @@ export class CrossProcessTurnCoordinator {
       incarnation,
     }
     const candidate = `${lockPath}.candidate-${process.pid}-${owner.token}`
+    let handle: Awaited<ReturnType<typeof open>> | undefined
     let published = false
     try {
       await mkdir(candidate, { mode: 0o700 })
-      await writeFile(join(candidate, OWNER_FILE), JSON.stringify(owner), {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      })
+      // Flush the owner record and both directory entries before the lock
+      // counts as held. Otherwise a crash can leave owner.json with its size
+      // but not its data, and nobody can tell whose lock it was.
+      handle = await open(join(candidate, OWNER_FILE), "wx", 0o600)
+      await handle.writeFile(JSON.stringify(owner), "utf8")
+      await handle.sync()
+      await handle.close()
+      handle = undefined
       await writeFile(join(candidate, heartbeatName(owner.token)), "", {
         flag: "wx",
         mode: 0o600,
       })
+      await syncDirectoryDurably(candidate)
       // Renaming a fully initialized, non-empty directory publishes one lock
       // generation atomically. A competing initialized directory cannot be
       // replaced by rename on supported filesystems (EEXIST/ENOTEMPTY).
@@ -595,8 +600,18 @@ export class CrossProcessTurnCoordinator {
         throw error
       }
 
-      return this.createLease(lockPath, owner, Date.now() - arrivedAt)
+      const lease = this.createLease(lockPath, owner, Date.now() - arrivedAt)
+      try {
+        await syncDirectoryDurably(this.root)
+      } catch (error) {
+        // A published lock that is never released wedges its session for as
+        // long as this process lives, so give it back before failing.
+        await lease.release().catch(() => undefined)
+        throw error
+      }
+      return lease
     } finally {
+      await handle?.close().catch(() => undefined)
       if (!published) await rm(candidate, { recursive: true, force: true }).catch(() => undefined)
     }
   }
