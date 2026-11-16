@@ -375,6 +375,13 @@ describe("profiles page layout", () => {
     expect(rule(".rename-input")).toContain("max-width: 100%")
   })
 
+  test("the sign-in panel's title and the no-match notice wrap a long name or query", () => {
+    // Measured at 320px: "Create <long name>" widened the page to 564px and a
+    // long unmatched query echoed in the notice to 902px.
+    expect(rule(".login-panel-title")).toContain("overflow-wrap: anywhere")
+    expect(rule(".profile-no-match")).toContain("overflow-wrap: anywhere")
+  })
+
   test("long values wrap inside the card rather than widening it", () => {
     // A bare 1fr track is as wide as its longest unbreakable value, so an
     // email address pushed the detail grid past the card.
