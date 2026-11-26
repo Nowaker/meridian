@@ -52,6 +52,9 @@ const { clearAccountModels, fetchAccountModels } = await import("../proxy/accoun
 const { rateLimitStore } = await import("../proxy/rateLimitStore")
 const tokens = await import("../proxy/tokenRefresh")
 const { setSetting } = await import("../settings")
+const { recordCvpReading, resetCvpAccessCacheForTests } = await import("../proxy/cvpAccess")
+const { configPath } = await import("../configDir")
+const { rmSync } = await import("node:fs")
 
 const ALL_DIRS = ["nr-work", "nr-personal", "nr-spare"]
 const PROFILES = [
@@ -101,9 +104,10 @@ function setFleetEvidence(app: TestApp, reasons: Record<string, string>, observe
   }))
 }
 
-function post(app: TestApp, opts: { stream?: boolean; content?: string; requestId?: string; profile?: string; attest?: boolean; model?: string } = {}) {
+function post(app: TestApp, opts: { stream?: boolean; content?: string; requestId?: string; profile?: string; attest?: boolean; model?: string; require?: string } = {}) {
   const headers = new Headers({ "Content-Type": "application/json" })
   if (opts.requestId) headers.set("x-request-id", opts.requestId)
+  if (opts.require) headers.set("x-meridian-require", opts.require)
   if (opts.profile) headers.set("x-meridian-profile", opts.profile)
   if (opts.attest) headers.set("x-meridian-route-refusal", "1")
   return Promise.resolve(app.fetch(new Request("http://localhost/v1/messages", {
@@ -184,6 +188,8 @@ afterEach(() => {
   __setFetchOAuthUsageOverride(null)
   rateLimitStore.clear()
   resetActiveProfile()
+  rmSync(configPath("cvp-access.json"), { force: true })
+  resetCvpAccessCacheForTests()
 })
 
 describe("no_routable_account before the stream starts", () => {
@@ -261,6 +267,30 @@ describe("early refusal for fresh, spent plan windows", () => {
     } else {
       expect(await res.text()).toContain("ok from")
     }
+  })
+})
+
+describe("restricted work", () => {
+  it("attests quota_exhausted over the restricted accounts alone while a CVP holder is still open", async () => {
+    process.env.MERIDIAN_CLAUDE_EXTRA_USAGE = "never"
+    recordCvpReading("work", [{ id: "claude-opus-5-5", badge: { message: "CVP: Defense Access" } }])
+    const now = Date.now()
+    for (const id of ["personal", "spare"]) {
+      rateLimitStore.record(id, { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt: now + 3_600_000 }, now)
+    }
+    const app = createTestApp()
+
+    const res = await post(app, { stream: true, requestId: "5f0b8a3e-2c41-4d7a-9e1b-6a2f3c4d5e6f", attest: true, require: "restricted" })
+
+    expect(res.status).toBe(429)
+    const error = await errorOf(res)
+    expect(error.code).toBe("no_routable_account")
+    expect(error.route_refusal).toMatchObject({ sent: false, model: "claude-sonnet-4-5", reason: "quota_exhausted" })
+    expect(error.profiles!.map(p => [p.id, p.reason])).toEqual([["personal", "spent"], ["spare", "spent"]])
+    expect(sdkCalls).toBe(0)
+
+    expect((await post(app)).status).toBe(200)
+    expect(sdkCalls).toBe(1)
   })
 })
 
@@ -606,6 +636,103 @@ describe("no_routable_account when the supervisor's exclusions empty the pool", 
     const res = await createTestApp().fetch(new Request("http://localhost/settings/api/routing"))
     const body = await res.json() as { capabilities?: string[] }
     expect(body.capabilities).toContain("managed-exclusion-no-routable")
+  })
+})
+
+function putEvidence(app: TestApp, managed: string[], reasons: Record<string, string>, observedAt = Date.now()) {
+  return app.fetch(new Request("http://localhost/settings/api/routing", {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ routingManagedExcludedProfiles: managed,
+      routingManagedExclusionEvidence: { version: 1, observedAt, reasons } }),
+  }))
+}
+
+describe("cybersec-preserved managed exclusion evidence", () => {
+  const ATTEST = { stream: true, attest: true, requestId: "0c4b7e2a-9d15-4f3e-a6b8-2e7d1c5f9a40" }
+
+  it("covers preserved holders so an all-excluded pool whose others are spent attests, without naming a holder's reset", async () => {
+    const holderReset = Date.now() + 30 * 60_000
+    rateLimitStore.record("work", { status: "rejected", rateLimitType: "seven_day", utilization: 1, resetsAt: holderReset })
+    const app = createTestApp()
+    expect((await putEvidence(app, ["work", "personal", "spare"], { work: "cybersec-preserved", personal: "spent", spare: "weekly-reserve" })).status).toBe(200)
+
+    const res = await post(app, ATTEST)
+
+    expect(res.status).toBe(429)
+    const error = await errorOf(res)
+    expect(error.code).toBe("no_routable_account")
+    expect(error.route_refusal).toMatchObject({ sent: false, reason: "quota_exhausted" })
+    expect(error.profiles!.find(p => p.id === "work")).toEqual({ id: "work", reason: "excluded", resets_at: null })
+    expect(!error.reset_at || Date.parse(error.reset_at) !== holderReset).toBe(true)
+    expect(sdkCalls).toBe(0)
+  })
+
+  it("attests over the pool when the non-holders are freshly spent and the holders preserved", async () => {
+    process.env.MERIDIAN_CLAUDE_EXTRA_USAGE = "never"
+    const now = Date.now()
+    for (const id of ["personal", "spare"]) {
+      rateLimitStore.record(id, { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt: now + 3_600_000 }, now)
+    }
+    const app = createTestApp()
+    expect((await putEvidence(app, ["work"], { work: "cybersec-preserved" })).status).toBe(200)
+
+    const res = await post(app, ATTEST)
+
+    expect(res.status).toBe(429)
+    const error = await errorOf(res)
+    expect(error.route_refusal).toMatchObject({ sent: false, reason: "quota_exhausted" })
+    expect(sdkCalls).toBe(0)
+  })
+
+  it("still blocks the attestation for a managed-excluded holder carrying no reason", async () => {
+    const app = createTestApp()
+    expect((await putEvidence(app, ["work", "personal", "spare"], { work: "cybersec-preserved", spare: "spent" })).status).toBe(200)
+
+    const res = await post(app, ATTEST)
+
+    expect(res.status).toBe(429)
+    expect((await errorOf(res)).route_refusal).toBeUndefined()
+    expect(sdkCalls).toBe(0)
+  })
+
+  it("does not attest quota exhaustion when every account is only preserved", async () => {
+    const app = createTestApp()
+    expect((await putEvidence(app, ["work", "personal", "spare"], { work: "cybersec-preserved", personal: "cybersec-preserved", spare: "cybersec-preserved" })).status).toBe(200)
+
+    const res = await post(app, ATTEST)
+
+    expect(res.status).toBe(429)
+    expect((await errorOf(res)).route_refusal).toBeUndefined()
+  })
+
+  it("rejects the whole payload on an unknown reason beside it", async () => {
+    setSetting("routingManagedExcludedProfiles", ["work", "personal", "spare"])
+    const app = createTestApp()
+
+    const update = await putEvidence(app, ["work", "personal", "spare"], { work: "cybersec-preserved", personal: "spent", spare: "on-holiday" })
+
+    expect(update.status).toBe(400)
+    const res = await post(app, ATTEST)
+    expect(res.status).toBe(429)
+    expect((await errorOf(res)).route_refusal).toBeUndefined()
+  })
+
+  it("never makes a preserved holder routable for unflagged work", async () => {
+    const app = createTestApp()
+    expect((await putEvidence(app, ["work"], { work: "cybersec-preserved" })).status).toBe(200)
+
+    const res = await post(app, { content: "plain work beside a preserved holder" })
+
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).toContain("nr-personal")
+    expect(text).not.toContain("nr-work")
+  })
+
+  it("advertises managed-exclusion-cybersec-preserved", async () => {
+    const res = await createTestApp().fetch(new Request("http://localhost/settings/api/routing"))
+    const body = await res.json() as { capabilities?: string[] }
+    expect(body.capabilities).toEqual(expect.arrayContaining(["managed-exclusion-evidence-v1", "managed-exclusion-cybersec-preserved"]))
   })
 })
 

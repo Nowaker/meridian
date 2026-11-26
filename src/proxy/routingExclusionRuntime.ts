@@ -119,6 +119,16 @@ export function profileNoCvpResponse(profileId: string, model: string): Response
   }), { status: 403, headers: { "Content-Type": "application/json" } })
 }
 
+export function profileHasCvpResponse(profileId: string): Response {
+  return new Response(JSON.stringify({
+    type: "error",
+    error: {
+      type: "profile_has_cvp",
+      message: `Profile "${profileId}" holds CVP access, which restricted work never reaches`,
+    },
+  }), { status: 403, headers: { "Content-Type": "application/json" } })
+}
+
 export function noEligibleProfilesResponse(): Response {
   return new Response(JSON.stringify({
     type: "error",

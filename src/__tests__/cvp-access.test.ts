@@ -9,6 +9,7 @@ import {
   cvpTierFromBadge,
   cyberVerificationOf,
   forgetCvpAccess,
+  holdsCvpAccess,
   normalizeCvpModel,
   parseRoutingRequirements,
   recordCvpReading,
@@ -218,11 +219,31 @@ describe("persistence", () => {
   })
 })
 
+describe("holdsCvpAccess", () => {
+  it("counts active access on any model, its own or its organization's", () => {
+    recordCvpReading("team", [{ id: "claude-opus-5-5", badge: DEFENSE }, { id: "claude-sonnet-5-5" }], T0)
+    recordCvpRefusal("max", "claude-opus-5-5", { type: "inactive", reason: "organization_not_approved" }, T0)
+    setCvpOrganizationLookup(() => ({ team: "org", team2: "org", max: "personal" }))
+
+    expect(holdsCvpAccess("team", T0)).toBe(true)
+    expect(holdsCvpAccess("team2", T0)).toBe(true)
+    expect(holdsCvpAccess("max", T0)).toBe(false)
+    expect(holdsCvpAccess("unread", T0)).toBe(false)
+  })
+})
+
 describe("x-meridian-require", () => {
   it("parses cvp and reports unknown requirements", () => {
-    expect(parseRoutingRequirements(undefined)).toEqual({ cvp: false, known: [], unknown: [] })
-    expect(parseRoutingRequirements(" CVP ")).toEqual({ cvp: true, known: ["cvp"], unknown: [] })
-    expect(parseRoutingRequirements("cvp, zdr")).toEqual({ cvp: true, known: ["cvp"], unknown: ["zdr"] })
+    expect(parseRoutingRequirements(undefined)).toEqual({ cvp: false, restricted: false, known: [], unknown: [], error: null })
+    expect(parseRoutingRequirements(" CVP ")).toEqual({ cvp: true, restricted: false, known: ["cvp"], unknown: [], error: null })
+    expect(parseRoutingRequirements("cvp, zdr")).toMatchObject({ cvp: true, known: ["cvp"], unknown: ["zdr"], error: "x-meridian-require: unknown requirement zdr" })
+  })
+
+  it("parses restricted and refuses it beside cvp", () => {
+    expect(parseRoutingRequirements(" Restricted ")).toEqual({ cvp: false, restricted: true, known: ["restricted"], unknown: [], error: null })
+    const conflict = parseRoutingRequirements("cvp,restricted")
+    expect(conflict).toMatchObject({ cvp: true, restricted: true, known: ["cvp", "restricted"], unknown: [] })
+    expect(conflict.error).toContain("cvp and restricted conflict")
   })
 
   it("normalizes model ids the same on every side", () => {

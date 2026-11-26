@@ -137,6 +137,7 @@ export type NoRoutableReason =
   | "excluded"
   | "held"
   | "no_cvp"
+  | "no_restricted"
   | "extra_usage_off"
   | "logged_out"
 

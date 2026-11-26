@@ -308,21 +308,51 @@ export function cvpActive(profileId: string, model: string, now = Date.now()): b
   return cvpAccessOn(profileId, model, now)?.type === "active"
 }
 
+/**
+ * Whether the map, organization inference included, shows `active` access on
+ * any model: a CVP holder, which `x-meridian-require: restricted` work never
+ * reaches. Account-wide, since every model spends the same weekly allowance.
+ */
+export function holdsCvpAccess(profileId: string, now = Date.now()): boolean {
+  return cvpAccessFor(profileId, now).some(entry => entry.type === "active")
+}
+
 /** Header naming what an unpinned request's account must hold. */
 export const ROUTING_REQUIRE_HEADER = "x-meridian-require"
-const KNOWN_REQUIREMENTS = new Set(["cvp"])
+const KNOWN_REQUIREMENTS = new Set(["cvp", "restricted"])
+
+export interface RoutingRequirements {
+  /** Only accounts holding CVP access on the requested model. */
+  readonly cvp: boolean
+  /** Only accounts holding CVP access on no model. */
+  readonly restricted: boolean
+  readonly known: string[]
+  readonly unknown: string[]
+  /** Why the header cannot be honored (400), or null. */
+  readonly error: string | null
+}
 
 /**
  * Read `x-meridian-require` (comma-separated, case-insensitive). A requirement
- * this build does not know is returned in `unknown`, so the caller can refuse
- * it rather than route as if it had been met.
+ * this build does not know, or two that no account can meet together, give an
+ * `error`, so the caller refuses the request rather than route as if they had
+ * been met.
  */
-export function parseRoutingRequirements(header: string | undefined): { cvp: boolean; known: string[]; unknown: string[] } {
+export function parseRoutingRequirements(header: string | undefined): RoutingRequirements {
   const tokens = [...new Set((header ?? "").split(",").map(token => token.trim().toLowerCase()).filter(Boolean))]
+  const cvp = tokens.includes("cvp")
+  const restricted = tokens.includes("restricted")
+  const unknown = tokens.filter(token => !KNOWN_REQUIREMENTS.has(token))
   return {
-    cvp: tokens.includes("cvp"),
+    cvp,
+    restricted,
     known: tokens.filter(token => KNOWN_REQUIREMENTS.has(token)),
-    unknown: tokens.filter(token => !KNOWN_REQUIREMENTS.has(token)),
+    unknown,
+    error: unknown.length > 0
+      ? `${ROUTING_REQUIRE_HEADER}: unknown requirement ${unknown.join(", ")}`
+      : cvp && restricted
+        ? `${ROUTING_REQUIRE_HEADER}: cvp and restricted conflict: cvp work needs an account holding CVP access, restricted work one holding none`
+        : null,
   }
 }
 

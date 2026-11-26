@@ -1,8 +1,15 @@
 export const CAPACITY_OBSERVATION_MAX_AGE_MS = 120_000
 
+/**
+ * A CVP holder the supervisor keeps out of general work by policy: it covers
+ * the account for an attestation without proving any capacity spent.
+ */
+export const POLICY_PRESERVED_REASON = "cybersec-preserved"
+
 const PROTECTION_REASONS = new Set([
   "spent", "usage-reserve", "weekly-reserve", "extra-usage",
   "loaner-gate", "unmeasured-loaner", "unmeasured-loaner-cap",
+  POLICY_PRESERVED_REASON,
 ])
 
 export interface ManagedExclusionEvidence {
