@@ -253,6 +253,22 @@ function forwardHeaders(upstream: Response): Headers {
   return headers
 }
 
+/**
+ * A turn is always requested as a stream, yet chatgpt.com has been seen
+ * labelling that stream `text/plain; charset=UTF-8` (2026-11-27). Everything
+ * that reads a stream - the failure sniff below, summary stripping and Max
+ * Budget in the parity wrapper - goes by `text/event-stream`, and the client
+ * gets this label too, so a successful reply is labelled once, here, where it
+ * enters Meridian. A JSON answer stays JSON.
+ */
+function asEventStream(upstream: Response): Response {
+  const type = upstream.headers.get("content-type")?.toLowerCase() ?? ""
+  if (!upstream.ok || type.startsWith("text/event-stream") || type.startsWith("application/json")) return upstream
+  const headers = new Headers(upstream.headers)
+  headers.set("content-type", "text/event-stream")
+  return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers })
+}
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined
 }
@@ -576,6 +592,7 @@ export function createChatGptBackend<Ctx>(options: ChatGptBackendOptions<Ctx>): 
           let upstream: Response
           try {
             upstream = await dispatch(url, { method: "POST", headers, body: outbound, redirect: "error", signal: inbound.signal })
+            if (!imageOperation) upstream = asEventStream(upstream)
           } catch {
             // Unreachable for one seat is unreachable for all; report the shape only.
             settle(null)
