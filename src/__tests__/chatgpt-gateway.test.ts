@@ -207,6 +207,7 @@ describe("ChatGPT gateway routing", () => {
     const res = await app.fetch(responses(LUNA))
     expect(res.status).toBe(200)
     expect(res.headers.get("set-cookie")).toBeNull()
+    expect(res.headers.get("content-type")).toBe("text/event-stream")
     expect(await res.text()).toContain('"delta":"pong"')
 
     expect(upstreamCalls).toHaveLength(1)

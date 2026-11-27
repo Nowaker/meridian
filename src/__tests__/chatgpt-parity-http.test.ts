@@ -234,6 +234,45 @@ describe("Thinking Passthrough", () => {
   })
 })
 
+describe("a Responses stream chatgpt.com labels text/plain", () => {
+  const plainLabelled = (text: string) => new Response(text, { headers: { "content-type": "text/plain; charset=UTF-8" } })
+
+  it("reaches the client as text/event-stream, byte for byte", async () => {
+    const { app } = makeServer()
+    const upstreamText = completedStream("gpt-5.6-sol")
+    upstream = () => plainLabelled(upstreamText)
+    const res = await post(app, codexBody("gpt-5.6-sol"))
+    expect(res.headers.get("content-type")).toBe("text/event-stream")
+    expect(await res.text()).toBe(upstreamText)
+  })
+
+  it("still moves a stream that fails before any output to the next seat", async () => {
+    const { app } = makeServer()
+    let failNext = true
+    upstream = () => {
+      if (!failNext) return plainLabelled(completedStream("gpt-5.6-sol"))
+      failNext = false
+      return plainLabelled(
+        sse("response.created", { response: { id: "r", output: [] } })
+        + sse("response.failed", { response: { id: "r", status: "failed", error: { code: "server_error" } } }),
+      )
+    }
+    const text = await (await post(app, codexBody("gpt-5.6-sol"))).text()
+    expect(text).toContain("response.completed")
+    expect(text).not.toContain("response.failed")
+    expect(new Set(calls.map(call => call.headers.get("chatgpt-account-id"))).size).toBe(2)
+  })
+
+  it("still has its summaries removed with Thinking Passthrough off", async () => {
+    updateChatGptFeatures({ thinkingPassthrough: false })
+    const { app } = makeServer()
+    upstream = () => plainLabelled(completedStream("gpt-5.6-sol"))
+    const text = await (await post(app, codexBody("gpt-5.6-sol"))).text()
+    expect(text).not.toContain("Weighing options")
+    expect(text).toContain("gAAAA-opaque")
+  })
+})
+
 describe("telemetry", () => {
   it("records provider tokens with cached and reasoning tokens counted once, and values them at the built-in OpenAI rate", async () => {
     const { app } = makeServer()
