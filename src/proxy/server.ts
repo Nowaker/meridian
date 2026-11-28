@@ -10,9 +10,10 @@ import { internalClientAttributionHeaders, meridianWarmAttribution, readClientAt
 import { sanitizeClaudeEgressEnv } from "./claudeEgress"
 import { resolveChatGptSource } from './chatgpt/config'
 import { startRenewalSchedule } from './chatgpt/owned'
+import { startResetSchedule } from './chatgpt/resetScheduler'
 import { ChatGptTurnLedger, chatGptTokenFields, createChatGptAdmission, createChatGptParityBackend, createUnpricedModelWarning, decorateChatGptTurn, type ChatGptTurnNotes } from './chatgpt/parity'
 import { BURN_SPARSE_WINDOW_MS, creditBurn } from './chatgpt/creditRates'
-import { chatGptFeatureCapabilities, effectiveCreditsPolicy, forcedReasoningSummary, getChatGptFeatures, resetChatGptFeatures, updateChatGptFeatures, validateChatGptFeatureUpdate } from './chatgpt/features'
+import { chatGptFeatureCapabilities, effectiveCreditsPolicy, forcedReasoningSummary, getChatGptFeatures, resetAutoRedeemSettings, resetChatGptFeatures, updateChatGptFeatures, validateChatGptFeatureUpdate } from './chatgpt/features'
 import { resolveModelPricing } from '../telemetry/pricing'
 import { getPricingOverrides } from '../telemetry/pricingStore'
 import { computeSummary } from '../telemetry/percentiles'
@@ -27,7 +28,8 @@ import { CHATGPT_WARM_MODELS, chatGptRefusalDiagnosis, chatGptWarmBody, createCh
 import { chatGptNameProblem, seatWindows, type ChatGptProfile } from './chatgpt/profiles'
 import { applyChatGptRemoval, applyChatGptRename } from './chatgpt/seatOps'
 import { chatGptResetLedgerPath, chatGptStorePath } from './chatgpt/paths'
-import { createResetRedeemer, type ResetRedeemResult } from './chatgpt/resetRedeem'
+import { createResetRedeemer, resetCreditKey, type ResetRedeemResult } from './chatgpt/resetRedeem'
+import { createResetScheduler, type ResetEvent } from './chatgpt/resetScheduler'
 import { currentCodexUsageEvidence, forgetCodexUsage, getCodexUsage } from './codex/service'
 import type { CodexUsageResponse } from './codex/types'
 import { createUpstreamRegistry, isImageEndpoint, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
@@ -10725,6 +10727,30 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     forgetCodexUsage(seat)
     await refreshChatGptUsage(true)
   }
+  // Plans every seat's banked resets from its latest usage reading and, with
+  // auto-redeem on, spends the due ones (chatgpt/resetScheduler.ts). Ticked by
+  // startProxyServer; its events go on /profiles/events.
+  const appendResetEvent = (event: ResetEvent): void => {
+    const profile = chatGptProfiles?.profileIdFor(event.seat) ?? event.seat
+    failoverEvents.append({
+      kind: event.kind, profile, servedBy: null, reason: event.outcome ?? event.trigger, routing: "active",
+      sessionKey: null, internalHop: false, until: null, limit: null, provider: "chatgpt",
+      reset: { creditKey: event.creditKey, expiresAt: event.expiresAt, trigger: event.trigger, earliestRedeemAt: event.earliestRedeemAt, outcome: event.outcome, error: event.error },
+    })
+    claudeLog(`profile.${event.kind}`, { profile, provider: "chatgpt", trigger: event.trigger, outcome: event.outcome, expiresAt: event.expiresAt })
+  }
+  const chatGptResetScheduler = chatGptResetRedeemer ? createResetScheduler({
+    redeemer: chatGptResetRedeemer,
+    readings: () => (chatGptUsage?.entries ?? []).filter(entry => entry.fetchedAt !== null && !entry.error).map(entry => ({
+      seat: entry.id, windows: entry.windows, credits: entry.resetCredits?.credits ?? null,
+      applicable: entry.resetCredits?.applicableAvailableCount ?? null,
+    })),
+    refresh: () => refreshChatGptUsage(),
+    settings: () => resetAutoRedeemSettings(getChatGptFeatures()),
+    emit: appendResetEvent,
+    redeemed: seat => afterChatGptReset(chatGptProfiles?.profileIdFor(seat) ?? seat, seat),
+    log: plog,
+  }) : undefined
   const claudeProfileIds = (): string[] => listProfiles(finalConfig.profiles, finalConfig.defaultProfile).map(p => p.id)
   /**
    * Per model, the profiles whose CVP map shows active access, in `order`, and
@@ -12884,6 +12910,29 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         return c.json({ profile: profileId, code: "not_owned", error: "This instance does not hold the seats' ChatGPT login right now" }, 409)
     }
   }
+  // What auto-redeem plans for each owned seat's banked resets, and the
+  // operator's say on one (chatgpt/resetPolicy.ts). Read-only on any other instance.
+  app.get("/profiles/chatgpt-resets/plan", (c) => {
+    if (!chatGptResetScheduler) return c.json({ code: "not_owned", error: "Only the instance that owns the seats' ChatGPT login plans their resets" }, 409)
+    const settings = resetAutoRedeemSettings(getChatGptFeatures())
+    const seats = chatGptResetScheduler.plans().map(plan => ({ profile: chatGptProfiles?.profileIdFor(plan.seat) ?? plan.seat, ...plan }))
+    return c.json({ settings, seats, asOf: Date.now() })
+  })
+  app.put("/profiles/chatgpt-resets/decisions", async (c) => {
+    if (!isSameOriginRequest(c.req.raw)) {
+      return c.json({ code: "forbidden_origin", error: "Cross-origin reset decisions are not allowed" }, 403)
+    }
+    if (!chatGptResetScheduler || !chatGptResetRedeemer) return c.json({ code: "not_owned", error: "Only the instance that owns the seats' ChatGPT login takes reset decisions" }, 409)
+    const body = await c.req.json().catch(() => null) as { creditKey?: unknown; decision?: unknown } | null
+    const decision = body?.decision === "approve" || body?.decision === "prevent" ? body.decision : null
+    const creditKey = typeof body?.creditKey === "string" && /^[0-9a-f]{16}$/.test(body.creditKey) ? body.creditKey : null
+    if (!decision || !creditKey) return c.json({ code: "invalid_request", error: 'Expected {creditKey, decision: "approve" | "prevent"}' }, 400)
+    const credit = (chatGptUsage?.entries ?? []).flatMap(entry => (entry.resetCredits?.credits ?? [])
+      .flatMap(listed => listed.id && resetCreditKey(entry.id, listed.id) === creditKey ? [{ seat: entry.id, expiresAt: listed.expiresAt }] : []))[0]
+    if (!credit) return c.json({ code: "reset_not_found", error: "No banked reset of an owned seat has that key" }, 404)
+    chatGptResetRedeemer.decide(creditKey, decision, credit.expiresAt)
+    return c.json({ creditKey, decision, profile: chatGptProfiles?.profileIdFor(credit.seat) ?? credit.seat, expiresAt: credit.expiresAt })
+  })
   function usageRefreshTooSoon(profile: string, retryAfterMs: number): Response {
     const seconds = Math.max(1, Math.ceil(retryAfterMs / 1000))
     return new Response(JSON.stringify({
@@ -14852,6 +14901,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         chatGptUsageAt = 0
         return true
       },
+      ...(chatGptResetScheduler ? { resetTick: () => chatGptResetScheduler.tick() } : {}),
       settle: async () => {
         await Promise.allSettled([chatGptLoginClosed, chatGptSource.settle?.()])
       },
@@ -15160,6 +15210,11 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
   const chatGptRenewal = !credentialsReadOnly && chatGpt?.mode === "owned"
     ? startRenewalSchedule(() => chatGpt.renewDue())
     : undefined
+  // Plans each seat's banked resets every minute and redeems the due ones
+  // when auto-redeem is on (chatgpt/resetScheduler.ts).
+  const chatGptResets = !credentialsReadOnly && chatGpt?.resetTick
+    ? startResetSchedule(() => chatGpt.resetTick!(), message => console.error(message))
+    : undefined
 
   // Background auth keepalive: periodically refresh auth status for all
   // configured profiles so switching is instant (no stale token delay).
@@ -15194,6 +15249,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
         // Refuse new work before potentially waiting for a deletion child.
         beginDrain?.()
         const chatGptRenewalStopped = chatGptRenewal?.stop()
+        const chatGptResetsStopped = chatGptResets?.stop()
         stopFollowPolling()
         stopFollowUsagePolling()
         stopBackgroundRefresh()
@@ -15238,6 +15294,8 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
             chatGpt: async () => {
               // Not before a renewal still out has recorded its seat's new refresh token.
               await chatGptRenewalStopped
+              // Nor before a redemption under way has recorded how it ended.
+              await chatGptResetsStopped
               await chatGpt?.settle()
               chatGpt?.release()
             },

@@ -395,6 +395,8 @@ adapter lets the subprocess run the built-in WebFetch at all.
 | `GET /v1/usage/quota` | Usage windows for the active profile (JSON) |
 | `GET /v1/usage/quota/all` | Usage windows and Claude banked-reset grants with expiration dates for every profile (JSON) |
 | `POST /v1/usage/quota/reset` | Explicitly redeem a Claude banked reset with `profile`, `grantId` and caller-owned `requestId`; [request and outcome contract](../MONITORING.md#redeeming-a-banked-reset) |
+| `GET /profiles/chatgpt-resets/plan` | What auto-redeem plans for each owned seat's banked resets; [contract](../MONITORING.md#auto-redeeming-chatgpt-banked-resets) |
+| `PUT /profiles/chatgpt-resets/decisions` | Approve or prevent one planned reset by `creditKey` |
 | `POST /profiles/:id/chatgpt-resets/redeem` | Redeem an owned ChatGPT seat's soonest-expiring banked reset; [contract](../MONITORING.md#redeeming-a-chatgpt-seats-banked-reset) |
 | `GET /settings` | Routing, SDK feature toggles, model pricing, telemetry storage, update-check, site-header and page layout UI |
 | `GET/PUT /settings/api/updates` | Read or set `checkForUpdates` (JSON `{"checkForUpdates": true}`); takes effect on the running proxy. Also reports each loaded plugin's installed and latest version in `plugins`; turning it on also sends loaded plugins' npm package names to the registry |
@@ -1663,8 +1665,13 @@ its credentials.
 
 **Settings → ChatGPT** holds the gateway's own options: forwarding reasoning
 summaries, a per-request cost cap, a fallback model, when a seat with its plan
-spent may serve on purchased Codex credits (`never` by default), and where
-free-plan seats rank.
+spent may serve on purchased Codex credits (`never` by default), where
+free-plan seats rank, and banked reset auto-redeem: `resetAutoRedeem` (on by
+default) spends a seat's soonest-expiring reset once its weekly usage has
+`resetNearEmptyPoints` (0.5) points left and the week does not renew before
+the reset's deadline, or `resetSafetyMarginHours` (2) before the reset expires;
+`resetAskAheadHours` (6) is how far ahead a supervisor asks. See [auto-redeeming
+banked resets](../MONITORING.md#auto-redeeming-chatgpt-banked-resets).
 
 **Telemetry and health.** Each turn is recorded with `adapter: "chatgpt"`,
 valued at OpenAI list prices for the model that served it. `/health` carries a

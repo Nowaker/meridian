@@ -137,6 +137,8 @@ export interface ChatGptUpstreamControl {
   release(): void
   /** Renew the seat most overdue for renewal (owned); true when one was renewed. Always false for follow-external. */
   renewDue(): Promise<boolean>
+  /** Plan every seat's banked resets and auto-redeem the due ones (owned only; chatgpt/resetScheduler.ts). */
+  resetTick?(): Promise<void>
   /**
    * Resolves once every credential exchange already under way (renewals,
    * sign-ins) has recorded its result. Await it before `release`.

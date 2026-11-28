@@ -167,6 +167,50 @@ re-read the seat before trying again), 404 `no_reset` (none banked, or every
 banked one already tried), 503 `unavailable` (the seat's token cannot be used
 or the credit list could not be read; nothing was sent).
 
+### Auto-redeeming ChatGPT banked resets
+
+On an `owned` instance Meridian plans every seat's banked resets once a
+minute and, with the `resetAutoRedeem` ChatGPT setting on (the default),
+redeems the due one by itself. A redeemed reset keeps the seat's renewal date,
+so it is spent as late as possible. For the seat's soonest-expiring reset that
+may still be tried (expiry E, the binding window's renewal R, margin
+`resetSafetyMarginHours`, 2 by default):
+
+- **usage**: once the binding window (the widest one at least a week wide;
+  5-hour windows never count) has at most `resetNearEmptyPoints` (0.5)
+  percentage points left, and only when R is at or after E - margin;
+- **deadline**: at E - margin, whatever the usage.
+
+ChatGPT counts a reset as applicable only once a seat is limited, so a due
+reset is tried even when it is not: a refusal leaves it banked and it is tried
+again every 30 minutes, each time with an idempotency key of its own. A reset
+that went through but left the binding window as used as before is
+`spent_without_reset` and is reported as a failure.
+
+`GET /profiles/chatgpt-resets/plan` answers `{settings, seats, asOf}`.
+`settings` holds `enabled`, `nearEmptyPoints`, `safetyMarginHours` and
+`askAheadHours` (how far ahead a supervisor such as Vibeterm asks; Meridian
+only reports it). Each seat is `{profile, seat, available, next: {creditKey,
+expiresAt} | null, binding: {type, utilization, resetsAt} | null, applicable,
+trigger: "usage" | "deadline" | "none", due, earliestRedeemAt, deadlineAt,
+decision: "pending" | "approved" | "prevented", reason, lastAttempt}`.
+`earliestRedeemAt` is exact for the deadline and projected from the window's
+pace so far for usage; `reason` is a sentence for a person. The plan is
+computed while auto-redeem is off too.
+
+`PUT /profiles/chatgpt-resets/decisions` with `{creditKey, decision:
+"approve" | "prevent"}` records the operator's say on one reset (same-origin
+only; 400 `invalid_request`, 404 `reset_not_found`). A prevented reset is never
+auto-redeemed and the plan moves to the next one; an approval is recorded and
+shown only, since an unanswered plan proceeds as well.
+
+`GET /profiles/events` carries `reset_planned` (a seat's next redemption
+changed: another reset, trigger, or a time that moved an hour or more),
+`reset_redeemed` and `reset_redeem_failed`, each with `provider: "chatgpt"`
+and `reset: {creditKey, expiresAt, trigger, earliestRedeemAt, outcome,
+error}`. A refusal ChatGPT counted no reset applicable for is reported only
+when no later try fits before the reset expires.
+
 
 ## Reading Token and Cache Metrics
 

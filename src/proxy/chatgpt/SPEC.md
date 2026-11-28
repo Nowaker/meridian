@@ -67,6 +67,13 @@ Code: `src/proxy/chatgpt/` (incl. `migrate/`), `src/proxy/codex/`,
   derivation from the credit id, so the two tools cannot spend one credit
   twice. After a confirmed redemption the seat's cached usage is dropped, its
   quota bench lifted and its usage read again.
+- **Auto-redeem spends a reset as late as it can** (`resetPolicy.ts`, pure;
+  `resetScheduler.ts`, a one-minute tick started by `startProxyServer` on an
+  owned instance). Only the binding window triggers, a seat that renews before
+  a reset's deadline waits for the deadline, a prevented reset is skipped, and
+  a refused one is retried every 30 minutes with a fresh idempotency key. The
+  plan is computed while auto-redeem is off, so a supervisor can ask ahead of
+  it; Meridian never asks anyone itself.
 - Seats are profiles with `type: "chatgpt"` and their own active pointer; they
   never live in Claude's profile config. All additions are absent unless
   ChatGPT is enabled, and existing fields keep their meaning

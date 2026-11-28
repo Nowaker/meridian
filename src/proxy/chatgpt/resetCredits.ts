@@ -30,6 +30,11 @@ export interface ResetCreditOptions {
   now?: number
 }
 
+export interface ResetConsumeOptions extends ResetCreditOptions {
+  /** How many times this credit was tried before; each try after a refusal sends a key of its own. */
+  attempt?: number
+}
+
 export type ResetCreditList =
   | { ok: true; credits: CodexResetCredit[] }
   | { ok: false; error: CodexUsageError }
@@ -78,7 +83,7 @@ export type ResetConsumeOutcome =
 export async function consumeResetCredit(
   credentials: CodexCredentials,
   creditId: string,
-  options: ResetCreditOptions = {},
+  options: ResetConsumeOptions = {},
 ): Promise<ResetConsumeOutcome> {
   const usable = usableToken(credentials, options.now ?? Date.now())
   if ("error" in usable) return { kind: "not_sent", error: usable.error }
@@ -87,7 +92,7 @@ export async function consumeResetCredit(
     response = await (options.fetchImpl ?? fetch)(CONSUME_URL, {
       method: "POST",
       headers: { ...codexHeaders(usable.token, credentials.accountId), "Content-Type": "application/json" },
-      body: JSON.stringify({ credit_id: creditId, redeem_request_id: redeemRequestId(creditId) }),
+      body: JSON.stringify({ credit_id: creditId, redeem_request_id: redeemRequestId(options.attempt ? `${creditId}#${options.attempt}` : creditId) }),
       // A bearer credential must never be replayed to a redirect target.
       redirect: "error",
       signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS),

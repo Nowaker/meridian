@@ -8,29 +8,47 @@
  *
  * Every redemption lists the seat's credits afresh, picks one, writes it to a
  * ledger on disk BEFORE the consume leaves the process, and records how it
- * ended. The ledger is what keeps a credit from being tried twice: a crash
+ * ended. The ledger is what keeps a credit from being spent twice: a crash
  * between the write and the answer leaves the credit marked as tried, never
- * as free to try again. Automatic redemptions skip any credit the ledger
- * names; a person's redeem skips only those that may have been spent (a
- * refusal left the credit intact, so a person may try it again). One
- * redemption runs per seat at a time.
+ * as free to try again. A credit that may have been spent is never tried
+ * again. One ChatGPT refused is intact: a person may try it again at once, a
+ * scheduled redemption half an hour later (resetPolicy.ts). Each retry sends
+ * an idempotency key of its own, so a refusal ChatGPT stored under the first
+ * key cannot be replayed to it. One redemption runs per seat at a time.
+ *
+ * The ledger also keeps the operator's decision per credit: `prevent` keeps a
+ * scheduled redemption off it until it expires; `approve` is recorded only.
+ *
+ * A refusal is `not_applicable` when ChatGPT counted no reset as applicable
+ * just before (it does so only once a seat is limited, measured 2026-11-28),
+ * else `refused`. Both leave the credit intact.
  *
  * After a consume answers success the credits are listed once more: a reset
  * the backend still lists as available was not redeemed, whatever the answer
- * said, and is reported as unconfirmed.
+ * said, and is reported as unconfirmed. Then the seat's usage is read again:
+ * a reset that went but left the binding window as used as before is
+ * `spent_without_reset` - the one way trying early could cost a credit, so it
+ * is reported as a failure.
  */
 
 import { createHash } from "node:crypto"
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import { dirname } from "node:path"
 import { consumeResetCredit, listResetCredits } from "./resetCredits"
-import type { CodexCredentials } from "../codex/usage"
+import { fetchCodexAccountUsage, type CodexCredentials } from "../codex/usage"
+import { codexBindingWindow } from "../codex/windows"
 import type { ChatGptCredentialSource } from "./source"
 
 export type ResetRedeemTrigger = "manual" | "deadline" | "usage"
+export type ResetDecision = "approve" | "prevent"
 
 /** How an attempt ended; `dispatching` means the consume was sent and no answer was recorded. */
-export type ResetAttemptOutcome = "dispatching" | "redeemed" | "refused" | "indeterminate" | "unconfirmed"
+export type ResetAttemptOutcome = "dispatching" | "redeemed" | "refused" | "not_applicable" | "indeterminate" | "unconfirmed" | "spent_without_reset"
+
+/** An outcome after which the credit is certainly still banked: ChatGPT said no. */
+export function isIntactRefusal(outcome: ResetAttemptOutcome): boolean {
+  return outcome === "refused" || outcome === "not_applicable"
+}
 
 export interface ResetAttempt {
   /** Stable, non-reversible name of the credit: what the plan and decisions use. */
@@ -46,7 +64,7 @@ export interface ResetAttempt {
 
 export type ResetRedeemResult =
   | { kind: "redeemed"; creditKey: string; expiresAt: number | null; windowsReset: string[]; redeemedAt: number | null; remaining: number | null }
-  | { kind: "failed"; creditKey: string; expiresAt: number | null; error: string; indeterminate: boolean }
+  | { kind: "failed"; creditKey: string; expiresAt: number | null; error: string; indeterminate: boolean; outcome: ResetAttemptOutcome }
   | { kind: "no_credit"; available: number }
   | { kind: "unavailable"; error: string }
   | { kind: "in_progress" }
@@ -60,6 +78,9 @@ export interface ResetRedeemer {
   redeem(seat: string, trigger: ResetRedeemTrigger, options?: { creditKey?: string }): Promise<ResetRedeemResult>
   /** Every recorded attempt, oldest first. */
   attempts(): ResetAttempt[]
+  /** The operator's decision per credit key. */
+  decisions(): Record<string, ResetDecision>
+  decide(creditKey: string, decision: ResetDecision, expiresAt: number | null): void
   /** Whether a redemption is running for the seat. */
   running(seat: string): boolean
 }
@@ -75,14 +96,29 @@ export interface ResetRedeemerDeps {
 
 /** Attempts are kept a week past their credit's expiry; after that no credit they name can come back. */
 const ATTEMPT_RETENTION_MS = 7 * 24 * 3_600_000
+export const RESET_RETRY_AFTER_REFUSAL_MS = 30 * 60_000
+
+/** Whether a scheduled redemption may try a credit with these attempts: never tried, or only refused and not lately. */
+export function mayTryAutomatically(attempts: readonly ResetAttempt[], now: number): boolean {
+  if (attempts.length === 0) return true
+  if (attempts.some(a => !isIntactRefusal(a.outcome))) return false
+  return now - Math.max(...attempts.map(a => a.attemptedAt)) >= RESET_RETRY_AFTER_REFUSAL_MS
+}
 
 export function resetCreditKey(seat: string, creditId: string): string {
   return createHash("sha256").update(`${seat}\u0000${creditId}`).digest("hex").slice(0, 16)
 }
 
+interface DecisionRecord {
+  decision: ResetDecision
+  decidedAt: number
+  expiresAt: number | null
+}
+
 interface LedgerDoc {
   version: 1
   attempts: ResetAttempt[]
+  decisions: Record<string, DecisionRecord>
 }
 
 function readLedger(path: string): LedgerDoc {
@@ -90,12 +126,13 @@ function readLedger(path: string): LedgerDoc {
   try {
     raw = readFileSync(path, "utf8")
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, attempts: [] }
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, attempts: [], decisions: {} }
     throw error
   }
   const parsed = JSON.parse(raw) as Partial<LedgerDoc>
   if (parsed.version !== 1 || !Array.isArray(parsed.attempts)) throw new Error(`unreadable reset ledger ${path}`)
-  return { version: 1, attempts: parsed.attempts }
+  const decisions = typeof parsed.decisions === "object" && parsed.decisions !== null && !Array.isArray(parsed.decisions) ? parsed.decisions : {}
+  return { version: 1, attempts: parsed.attempts, decisions }
 }
 
 function writeLedger(path: string, doc: LedgerDoc): void {
@@ -105,10 +142,8 @@ function writeLedger(path: string, doc: LedgerDoc): void {
   renameSync(temp, path)
 }
 
-/** A credit an automatic redemption may not try: any attempt at all. */
-const triedForAutomatic = (attempt: ResetAttempt | undefined): boolean => attempt !== undefined
-/** A credit a person's redeem may not try: one that may have been spent. */
-const triedForManual = (attempt: ResetAttempt | undefined): boolean => attempt !== undefined && attempt.outcome !== "refused"
+/** A person's redeem may try any credit that cannot have been spent. */
+const mayTryByHand = (attempts: readonly ResetAttempt[]): boolean => attempts.every(a => isIntactRefusal(a.outcome))
 
 export function createResetRedeemer(deps: ResetRedeemerDeps): ResetRedeemer {
   const now = deps.now ?? Date.now
@@ -119,6 +154,9 @@ export function createResetRedeemer(deps: ResetRedeemerDeps): ResetRedeemer {
     mutate(doc)
     const at = now()
     doc.attempts = doc.attempts.filter(a => a.expiresAt === null || a.expiresAt + ATTEMPT_RETENTION_MS > at)
+    for (const [key, record] of Object.entries(doc.decisions)) {
+      if (record.expiresAt !== null && record.expiresAt + ATTEMPT_RETENTION_MS <= at) delete doc.decisions[key]
+    }
     writeLedger(deps.ledgerPath, doc)
   }
   const settle = (creditKey: string, outcome: ResetAttemptOutcome, error: string | null): void => {
@@ -141,13 +179,21 @@ export function createResetRedeemer(deps: ResetRedeemerDeps): ResetRedeemer {
     const listed = await listResetCredits(credentials, options)
     if (!listed.ok) return { kind: "unavailable", error: `ChatGPT did not list the seat's resets (${listed.error})` }
 
-    const attempts = new Map(readLedger(deps.ledgerPath).attempts.map(a => [a.creditKey, a]))
-    const tried = trigger === "manual" ? triedForManual : triedForAutomatic
+    const ledger = readLedger(deps.ledgerPath)
+    const attemptsOf = (key: string) => ledger.attempts.filter(a => a.creditKey === key)
+    const mayTry = (key: string) => trigger === "manual"
+      ? mayTryByHand(attemptsOf(key))
+      : mayTryAutomatically(attemptsOf(key), now()) && ledger.decisions[key]?.decision !== "prevent"
     const candidates = listed.credits
       .flatMap(credit => credit.id ? [{ id: credit.id, key: resetCreditKey(seat, credit.id), expiresAt: credit.expiresAt }] : [])
-      .filter(credit => (wanted === undefined || credit.key === wanted) && !tried(attempts.get(credit.key)))
+      .filter(credit => (wanted === undefined || credit.key === wanted) && mayTry(credit.key))
     const credit = candidates[0]
     if (!credit) return { kind: "no_credit", available: listed.credits.length }
+
+    const binding = (usage: Awaited<ReturnType<typeof fetchCodexAccountUsage>>) => usage.usage ? codexBindingWindow(usage.usage.windows)?.utilization ?? null : null
+    const before = await fetchCodexAccountUsage(credentials, { ...options, now: now() })
+    const applicable = before.usage?.resetCredits?.applicableAvailableCount ?? null
+    const usedBefore = binding(before)
 
     update(doc => {
       doc.attempts.push({
@@ -157,17 +203,20 @@ export function createResetRedeemer(deps: ResetRedeemerDeps): ResetRedeemer {
     })
     const fail = (outcome: ResetAttemptOutcome, error: string, indeterminate: boolean): ResetRedeemResult => {
       settle(credit.key, outcome, error)
-      return { kind: "failed", creditKey: credit.key, expiresAt: credit.expiresAt, error, indeterminate }
+      return { kind: "failed", creditKey: credit.key, expiresAt: credit.expiresAt, error, indeterminate, outcome }
     }
 
-    const consumed = await consumeResetCredit(credentials, credit.id, options)
+    const consumed = await consumeResetCredit(credentials, credit.id, { ...options, attempt: attemptsOf(credit.key).length })
     if (consumed.kind === "not_sent") {
       // Nothing left the process, so the credit is untouched and free to try again.
       update(doc => { doc.attempts = doc.attempts.filter(a => !(a.creditKey === credit.key && a.outcome === "dispatching")) })
       return { kind: "unavailable", error: `the seat's access token cannot be sent (${consumed.error})` }
     }
     if (consumed.kind === "refused") {
-      return fail("refused", `ChatGPT refused the redemption: HTTP ${consumed.status}${consumed.code ? ` ${consumed.code}` : ""}`, false)
+      const refusal = `ChatGPT refused the redemption: HTTP ${consumed.status}${consumed.code ? ` ${consumed.code}` : ""}`
+      return applicable === 0
+        ? fail("not_applicable", `${refusal}; it counted no reset as applicable, which it does only once the seat is limited`, false)
+        : fail("refused", refusal, false)
     }
     if (consumed.kind === "indeterminate") {
       return fail("indeterminate", `ChatGPT gave no usable answer${consumed.status ? ` (HTTP ${consumed.status})` : ""}; the reset may or may not be spent`, true)
@@ -176,6 +225,14 @@ export function createResetRedeemer(deps: ResetRedeemerDeps): ResetRedeemer {
     const after = await listResetCredits(credentials, { ...options, now: now() })
     if (after.ok && after.credits.some(c => c.id === credit.id)) {
       return fail("unconfirmed", "ChatGPT answered success but still lists the reset as available", true)
+    }
+    const usedAfter = binding(await fetchCodexAccountUsage(credentials, { ...options, now: now() }))
+    const unchanged = usedBefore !== null && usedAfter !== null
+      ? usedBefore > 0 && usedAfter >= usedBefore
+      : consumed.windowsReset.length === 0
+    if (unchanged) {
+      const pct = (u: number | null) => u === null ? "unknown" : `${Math.round(u * 100)}%`
+      return fail("spent_without_reset", `ChatGPT took the reset but cleared nothing: the seat's weekly usage was ${pct(usedBefore)} before and ${pct(usedAfter)} after, windows reset: ${consumed.windowsReset.join(", ") || "none"}`, false)
     }
     settle(credit.key, "redeemed", null)
     return {
@@ -194,6 +251,10 @@ export function createResetRedeemer(deps: ResetRedeemerDeps): ResetRedeemer {
       return pending
     },
     attempts: () => readLedger(deps.ledgerPath).attempts,
+    decisions: () => Object.fromEntries(Object.entries(readLedger(deps.ledgerPath).decisions).map(([key, record]) => [key, record.decision])),
+    decide(creditKey, decision, expiresAt) {
+      update(doc => { doc.decisions[creditKey] = { decision, decidedAt: now(), expiresAt } })
+    },
     running: seat => running.has(seat),
   }
 }

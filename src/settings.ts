@@ -216,6 +216,11 @@ export type ChatGptFeatureSettings = {
   freeSeatOrder?: string
   /** Seat id (accountUserId) -> hours between renewals, overriding the default for that seat. */
   seatRenewalHours?: Record<string, number>
+  /** Banked reset auto-redeem; see ResetAutoRedeemSettings in proxy/chatgpt/resetPolicy.ts. */
+  resetAutoRedeem?: boolean
+  resetNearEmptyPoints?: number
+  resetSafetyMarginHours?: number
+  resetAskAheadHours?: number
 }
 
 /**

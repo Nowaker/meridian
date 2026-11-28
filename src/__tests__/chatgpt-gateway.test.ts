@@ -1975,6 +1975,86 @@ describe("owned mode signs its own seats in", () => {
     }
   })
 
+  it("plans an owned seat's banked resets, takes a decision, and auto-redeems only once turned on", async () => {
+    mkdirSync(storeDir, { recursive: true, mode: 0o700 })
+    const token = `${part({ alg: "none" })}.${part({
+      exp: Math.floor(NOW / 1000) + 3600,
+      "https://api.openai.com/auth": { chatgpt_account_id: "workspace-6", chatgpt_account_user_id: "user-6__workspace-6", chatgpt_user_id: "user-6", chatgpt_plan_type: "pro" },
+    })}.sig`
+    writeFileSync(storePath, JSON.stringify({ version: 1, accounts: [{
+      accountUserId: "user-6__workspace-6", accountId: "workspace-6", email: "out@example.test",
+      refreshToken: "rt-6", accessToken: token, expiresAt: NOW + 3_600_000, tokenRotatedAt: NOW, exchangeStartedAt: null,
+    }] }), { mode: 0o600 })
+    const soon = Date.now() + 2 * 86_400_000
+    const later = Date.now() + 3 * 86_400_000
+    let credits = [
+      { id: "c-soon", status: "available", expires_at: new Date(soon).toISOString() },
+      { id: "c-later", status: "available", expires_at: new Date(later).toISOString() },
+    ]
+    let used = 100
+    const consumed: string[] = []
+    const serve = globalThis.fetch
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url === `${WHAM_PREFIX}rate-limit-reset-credits/consume`) {
+        const body = JSON.parse(String(init?.body)) as { credit_id: string }
+        consumed.push(body.credit_id)
+        credits = credits.filter(c => c.id !== body.credit_id)
+        used = 0
+        return Response.json({ code: "ok", windows_reset: ["primary"] })
+      }
+      if (url === `${WHAM_PREFIX}rate-limit-reset-credits`) return Response.json({ available_count: credits.length, credits })
+      if (url === `${WHAM_PREFIX}usage`) {
+        return Response.json({
+          user_id: "user-6", account_id: "workspace-6", plan_type: "pro",
+          rate_limit: { limit_reached: used >= 100, primary_window: { used_percent: used, limit_window_seconds: 604_800, reset_at: Math.floor(Date.now() / 1000) + 4 * 86_400 } },
+          rate_limit_reset_credits: { available_count: credits.length, applicable_available_count: used >= 100 ? credits.length : 0 },
+        })
+      }
+      return serve(input, init)
+    }) as typeof fetch
+    saveSettings({ chatgpt: { resetAutoRedeem: false } })
+    const proxy = await server("owned")
+    await proxy.chatGpt!.acquire()
+    try {
+      type Plan = { settings: { enabled: boolean }; seats: Array<{ profile: string; trigger: string; due: boolean; decision: string; next: { creditKey: string; expiresAt: number } | null }> }
+      await proxy.app.fetch(new Request("http://localhost/v1/usage/quota/all"))
+      const plan = async () => (await (await proxy.app.fetch(new Request("http://localhost/profiles/chatgpt-resets/plan"))).json()) as Plan
+      const first = await plan()
+      expect(first.settings.enabled).toBe(false)
+      expect(first.seats).toHaveLength(1)
+      expect(first.seats[0]).toMatchObject({ trigger: "usage", due: true, decision: "pending", next: { expiresAt: soon } })
+
+      const decide = (body: unknown, origin?: string) => proxy.app.fetch(new Request("http://localhost/profiles/chatgpt-resets/decisions", {
+        method: "PUT", headers: { "content-type": "application/json", ...(origin ? { origin } : {}) }, body: JSON.stringify(body),
+      }))
+      const soonKey = first.seats[0]!.next!.creditKey
+      expect((await decide({ creditKey: soonKey, decision: "prevent" }, "https://evil.example")).status).toBe(403)
+      expect((await decide({ creditKey: soonKey, decision: "maybe" })).status).toBe(400)
+      expect((await decide({ creditKey: "0123456789abcdef", decision: "prevent" })).status).toBe(404) // gitleaks:allow - an unknown credit key, not a credential
+      expect((await decide({ creditKey: soonKey, decision: "prevent" })).status).toBe(200)
+      const prevented = await plan()
+      expect(prevented.seats[0]!.next).toMatchObject({ expiresAt: later })
+
+      // Off: the tick plans and announces, and spends nothing.
+      await proxy.chatGpt!.resetTick!()
+      expect(consumed).toEqual([])
+      type Events = { events: Array<{ kind: string; profile: string; provider?: string; reset?: { trigger: string; outcome: string | null; creditKey: string } }> }
+      const events = async () => ((await (await proxy.app.fetch(new Request("http://localhost/profiles/events"))).json()) as Events).events.filter(e => e.kind.startsWith("reset_"))
+      expect((await events()).map(e => [e.kind, e.reset?.trigger])).toEqual([["reset_planned", "usage"]])
+
+      saveSettings({ chatgpt: { resetAutoRedeem: true } })
+      await proxy.chatGpt!.resetTick!()
+      expect(consumed).toEqual(["c-later"])
+      const after = await events()
+      expect(after.at(-1)).toMatchObject({ kind: "reset_redeemed", provider: "chatgpt", profile: first.seats[0]!.profile, reset: { trigger: "usage", outcome: "redeemed" } })
+      expect(JSON.stringify(after)).not.toContain("c-later")
+      expect(tokenCalls).toBe(0)
+    } finally {
+      proxy.chatGpt!.release()
+    }
+  })
+
   it("refuses to redeem a reset where it follows another tool's store", async () => {
     writePool([account(0)])
     const proxy = await server("follow-external")

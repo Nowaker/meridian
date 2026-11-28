@@ -58,3 +58,19 @@ export function pickHeadlineWindow(windows: readonly CodexUsageWindow[]): CodexU
   }
   return headline
 }
+
+const WEEK_SECONDS = 7 * DAY_SECONDS
+
+/**
+ * The window that can shut a seat out for days: the widest one at least a
+ * week wide (a paid plan's 7 days, a free plan's 30). A 5-hour window refills
+ * by itself and is never binding. Null when the reading has none.
+ */
+export function codexBindingWindow(windows: readonly CodexUsageWindow[]): CodexUsageWindow | null {
+  let best: CodexUsageWindow | null = null
+  for (const window of windows) {
+    if ((window.limitWindowSeconds ?? 0) < WEEK_SECONDS) continue
+    if (!best || (window.limitWindowSeconds ?? 0) > (best.limitWindowSeconds ?? 0)) best = window
+  }
+  return best
+}

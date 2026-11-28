@@ -15,6 +15,7 @@
 import { getSetting, setSetting } from "../../settings"
 import { REASONING_SUMMARY_LEVELS, type ReasoningSummaryLevel } from "./body"
 import { CHATGPT_MODELS, providerForModel } from "../upstream/provider"
+import type { ResetAutoRedeemSettings } from "./resetPolicy"
 
 export interface ChatGptFeatures {
   /** Forward ChatGPT's reasoning summaries to the client. */
@@ -37,6 +38,37 @@ export interface ChatGptFeatures {
    * instead of 80% into the token's life (owned.ts `renewalDueAt`).
    */
   seatRenewalHours: Record<string, number>
+  /** Spend a seat's banked resets by itself when they are due (resetPolicy.ts). */
+  resetAutoRedeem: boolean
+  /** Percentage points of the binding window left at which a due reset is redeemed. */
+  resetNearEmptyPoints: number
+  /** Hours before a reset expires at which it is redeemed whatever the usage. */
+  resetSafetyMarginHours: number
+  /** Hours before a redemption at which a supervisor (Vibeterm) asks about it; Meridian only reports it. */
+  resetAskAheadHours: number
+}
+
+/** The range each reset auto-redeem number may take. */
+export const CHATGPT_RESET_LIMITS = {
+  resetNearEmptyPoints: { min: 0, max: 50 },
+  resetSafetyMarginHours: { min: 0, max: 72 },
+  resetAskAheadHours: { min: 0, max: 72 },
+} as const
+type ResetNumberKey = keyof typeof CHATGPT_RESET_LIMITS
+
+function isResetNumber(key: ResetNumberKey, value: unknown): value is number {
+  const { min, max } = CHATGPT_RESET_LIMITS[key]
+  return typeof value === "number" && Number.isFinite(value) && value >= min && value <= max
+}
+
+/** The reset auto-redeem policy as resetPolicy.ts reads it. */
+export function resetAutoRedeemSettings(features: ChatGptFeatures): ResetAutoRedeemSettings {
+  return {
+    enabled: features.resetAutoRedeem,
+    nearEmptyPoints: features.resetNearEmptyPoints,
+    safetyMarginHours: features.resetSafetyMarginHours,
+    askAheadHours: features.resetAskAheadHours,
+  }
 }
 
 /**
@@ -137,6 +169,11 @@ export const CHATGPT_FEATURE_DEFAULTS: Readonly<ChatGptFeatures> = {
   seatCreditsPolicy: {},
   freeSeatOrder: "before-credits",
   seatRenewalHours: {},
+  // Spending a reset late keeps the renewal date and wastes none; see resetPolicy.ts.
+  resetAutoRedeem: true,
+  resetNearEmptyPoints: 0.5,
+  resetSafetyMarginHours: 2,
+  resetAskAheadHours: 6,
 }
 
 /**
@@ -163,6 +200,10 @@ export function getChatGptFeatures(): ChatGptFeatures {
     seatCreditsPolicy: savedSeatPolicies(saved.seatCreditsPolicy),
     freeSeatOrder: isChatGptFreeSeatOrder(saved.freeSeatOrder) ? saved.freeSeatOrder : CHATGPT_FEATURE_DEFAULTS.freeSeatOrder,
     seatRenewalHours: savedRenewalHours(saved.seatRenewalHours),
+    resetAutoRedeem: typeof saved.resetAutoRedeem === "boolean" ? saved.resetAutoRedeem : CHATGPT_FEATURE_DEFAULTS.resetAutoRedeem,
+    resetNearEmptyPoints: isResetNumber("resetNearEmptyPoints", saved.resetNearEmptyPoints) ? saved.resetNearEmptyPoints : CHATGPT_FEATURE_DEFAULTS.resetNearEmptyPoints,
+    resetSafetyMarginHours: isResetNumber("resetSafetyMarginHours", saved.resetSafetyMarginHours) ? saved.resetSafetyMarginHours : CHATGPT_FEATURE_DEFAULTS.resetSafetyMarginHours,
+    resetAskAheadHours: isResetNumber("resetAskAheadHours", saved.resetAskAheadHours) ? saved.resetAskAheadHours : CHATGPT_FEATURE_DEFAULTS.resetAskAheadHours,
   }
 }
 
@@ -248,6 +289,12 @@ export function validateChatGptFeatureUpdate(
         seats[seat] = hours
       }
       result.seatRenewalHours = seats
+    } else if (key === "resetAutoRedeem") {
+      if (typeof value !== "boolean") throw new Error("resetAutoRedeem must be a boolean")
+      result.resetAutoRedeem = value
+    } else if (key === "resetNearEmptyPoints" || key === "resetSafetyMarginHours" || key === "resetAskAheadHours") {
+      if (!isResetNumber(key, value)) throw new Error(`${key} must be a number from ${CHATGPT_RESET_LIMITS[key].min} to ${CHATGPT_RESET_LIMITS[key].max}`)
+      result[key] = value
     } else if (key === "freeSeatOrder") {
       if (!isChatGptFreeSeatOrder(value)) throw new Error(`freeSeatOrder must be one of: ${CHATGPT_FREE_SEAT_ORDERS.join(", ")}`)
       result.freeSeatOrder = value
@@ -288,6 +335,13 @@ export function chatGptFeatureCapabilities(features: ChatGptFeatures): Array<{ n
       name: "Codex Credits",
       status: features.creditsPolicy + (Object.keys(features.seatCreditsPolicy).length > 0 ? ` (+${Object.keys(features.seatCreditsPolicy).length} seat overrides)` : ""),
       detail: CREDITS_POLICY_DETAIL[features.creditsPolicy],
+    },
+    {
+      name: "Reset Auto-Redeem",
+      status: features.resetAutoRedeem ? "on" : "off",
+      detail: features.resetAutoRedeem
+        ? `A seat's soonest-expiring banked reset is redeemed once its weekly window has ${features.resetNearEmptyPoints} points left and renews after the reset's deadline, or ${features.resetSafetyMarginHours}h before the reset expires.`
+        : "Banked resets are redeemed only from a seat's card.",
     },
     {
       name: "Free Seats",

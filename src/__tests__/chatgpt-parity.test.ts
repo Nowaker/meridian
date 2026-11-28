@@ -308,13 +308,13 @@ describe("Fallback Model", () => {
 describe("ChatGPT feature settings", () => {
   it("defaults to thinking passthrough on, the client's reasoning summary, no budget, no fallback, and never spending credits", () => {
     resetChatGptFeatures()
-    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: true, reasoningSummary: "client", maxBudgetUsd: 0, fallbackModel: "", creditsPolicy: "never", seatCreditsPolicy: {}, freeSeatOrder: "before-credits", seatRenewalHours: {} })
+    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: true, reasoningSummary: "client", maxBudgetUsd: 0, fallbackModel: "", creditsPolicy: "never", seatCreditsPolicy: {}, freeSeatOrder: "before-credits", seatRenewalHours: {}, resetAutoRedeem: true, resetNearEmptyPoints: 0.5, resetSafetyMarginHours: 2, resetAskAheadHours: 6 })
   })
 
   it("round-trips through settings.json", () => {
     updateChatGptFeatures({ thinkingPassthrough: false, maxBudgetUsd: 0.5 })
     updateChatGptFeatures({ fallbackModel: "gpt-5.4", creditsPolicy: "reserve" })
-    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: false, reasoningSummary: "client", maxBudgetUsd: 0.5, fallbackModel: "gpt-5.4", creditsPolicy: "reserve", seatCreditsPolicy: {}, freeSeatOrder: "before-credits", seatRenewalHours: {} })
+    expect(getChatGptFeatures()).toEqual({ thinkingPassthrough: false, reasoningSummary: "client", maxBudgetUsd: 0.5, fallbackModel: "gpt-5.4", creditsPolicy: "reserve", seatCreditsPolicy: {}, freeSeatOrder: "before-credits", seatRenewalHours: {}, resetAutoRedeem: true, resetNearEmptyPoints: 0.5, resetSafetyMarginHours: 2, resetAskAheadHours: 6 })
     resetChatGptFeatures()
   })
 

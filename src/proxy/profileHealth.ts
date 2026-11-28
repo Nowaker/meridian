@@ -125,8 +125,24 @@ export class SpentStore {
  *                    the error. Opens or carries the pool incident.
  * `pool_recovered` - a Claude account served a request again; closes the
  *                    incident the last `pool_exhausted` carried.
+ * `reset_planned`, `reset_redeemed`, `reset_redeem_failed` - a ChatGPT seat's
+ *                    banked reset was scheduled, spent, or could not be spent
+ *                    by auto-redeem (chatgpt/resetScheduler.ts); `reset` says which.
  */
 export type FailoverEventKind = "refused" | "failover" | "pool_exhausted" | "pool_recovered"
+  | "reset_planned" | "reset_redeemed" | "reset_redeem_failed"
+
+/** The banked reset a `reset_*` event is about. */
+export interface ResetEventDetail {
+  /** Short hash naming the credit (chatgpt/resetRedeem.ts `resetCreditKey`), never its id. */
+  creditKey: string
+  expiresAt: number | null
+  trigger: "manual" | "deadline" | "usage" | "none"
+  /** When the redemption is planned for, on `reset_planned`. */
+  earliestRedeemAt: number | null
+  outcome: string | null
+  error: string | null
+}
 
 /** Why a profile could not take a request nobody could take. */
 export type NoRoutableReason =
@@ -186,6 +202,8 @@ export interface FailoverEvent {
   profiles?: PoolEventProfile[]
   /** ISO time of the pool's earliest opening, on `pool_exhausted`; null when none is known. */
   resetAt?: string | null
+  /** On `reset_*` events. */
+  reset?: ResetEventDetail
 }
 
 export type PoolExhaustedEvent = FailoverEvent & { kind: "pool_exhausted"; incidentId: string }
