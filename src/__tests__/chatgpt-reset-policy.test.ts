@@ -227,3 +227,113 @@ describe("the reset scheduler", () => {
     expect(events.at(-1)).toMatchObject({ kind: "reset_redeem_failed", outcome: "spent_without_reset" })
   })
 })
+
+/**
+ * Two instances owning the same accounts (desktop's and m4max's Meridian,
+ * 2026-11-28), each with its own ledger, against one chatgpt.com that spends a
+ * credit once per idempotency key, as the backend does.
+ */
+function sharedChatGpt(ids: Array<{ id: string; expiresIn: number }>) {
+  let credits = ids.map(c => ({ id: c.id, status: "available", expires_at: new Date(NOW + c.expiresIn).toISOString() }))
+  let used = 100
+  let resetAt = NOW + 4 * DAY
+  let clock = NOW
+  const answered = new Map<string, unknown>()
+  const spent: string[] = []
+  const keys: string[] = []
+  const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input)
+    if (url === LIST_URL) return Response.json({ available_count: credits.length, credits })
+    if (url === USAGE_URL) {
+      return Response.json({
+        user_id: "user-1", account_id: "workspace-1",
+        rate_limit: { limit_reached: used >= 100, primary_window: { used_percent: used, limit_window_seconds: 604_800, reset_at: Math.floor(resetAt / 1000) } },
+        rate_limit_reset_credits: { available_count: credits.length, applicable_available_count: used >= 100 ? credits.length : 0 },
+      })
+    }
+    if (url === CONSUME_URL) {
+      const body = JSON.parse(String(init?.body)) as { credit_id: string; redeem_request_id: string }
+      keys.push(body.redeem_request_id)
+      const seen = answered.get(body.redeem_request_id)
+      if (seen) return Response.json(seen)
+      if (used < 100) return Response.json({ code: "not_applicable" }, { status: 409 })
+      credits = credits.filter(c => c.id !== body.credit_id)
+      spent.push(body.credit_id)
+      used = 0
+      resetAt = clock + 7 * DAY
+      const answer = { code: "ok", windows_reset: ["primary"] }
+      answered.set(body.redeem_request_id, answer)
+      return Response.json(answer)
+    }
+    return new Response("{}", { status: 404 })
+  }) as typeof fetch
+  return { fetchImpl, spent, keys, tick: (ms: number) => { clock += ms } }
+}
+
+describe("two instances owning one seat", () => {
+  it("a stale-plan instance does not redeem after the other did", async () => {
+    const provider = sharedChatGpt([{ id: "c-a", expiresIn: 2 * DAY }, { id: "c-b", expiresIn: 3 * DAY }])
+    const desktop = redeemer(provider.fetchImpl, () => NOW)
+    const m4max = redeemer(provider.fetchImpl, () => NOW + 60_000)
+    expect(await desktop.redeem(SEAT, "usage", { nearEmptyPoints: 0.5 })).toMatchObject({ kind: "redeemed" })
+    // m4max's plan still says the seat is at 100%; the fresh read says it was just reset.
+    const stale = await m4max.redeem(SEAT, "usage", { nearEmptyPoints: 0.5 })
+    expect(stale).toMatchObject({ kind: "superseded" })
+    expect((stale as { reason: string }).reason).toContain("just reset")
+    expect(m4max.attempts().map(a => a.outcome)).toEqual(["superseded"])
+    // At the deadline too: a window started minutes ago is not redeemed again.
+    expect(await redeemer(provider.fetchImpl, () => NOW + 120_000).redeem(SEAT, "deadline")).toMatchObject({ kind: "superseded" })
+    expect(provider.spent).toEqual(["c-a"])
+    expect(provider.keys).toHaveLength(1)
+  })
+
+  it("two instances redeeming at once name the same credit and key, so one credit is spent", async () => {
+    const provider = sharedChatGpt([{ id: "c-z", expiresIn: 2 * DAY }, { id: "c-y", expiresIn: 2 * DAY }, { id: "c-late", expiresIn: 5 * DAY }])
+    const desktop = redeemer(provider.fetchImpl, () => NOW)
+    const m4max = redeemer(provider.fetchImpl, () => NOW)
+    const results = await Promise.all([desktop.redeem(SEAT, "usage", { nearEmptyPoints: 0.5 }), m4max.redeem(SEAT, "usage", { nearEmptyPoints: 0.5 })])
+    expect(results.map(r => r.kind)).toEqual(["redeemed", "redeemed"])
+    // Soonest expiry first, ties by id: both chose c-y.
+    expect(provider.spent).toEqual(["c-y"])
+    expect(new Set(provider.keys)).toEqual(new Set([redeemRequestId("c-y")]))
+  })
+
+  it("a usage redemption whose seat is no longer near empty is skipped, and a manual one is not", async () => {
+    const provider = sharedChatGpt([{ id: "c-a", expiresIn: 2 * DAY }, { id: "c-b", expiresIn: 3 * DAY }])
+    await redeemer(provider.fetchImpl, () => NOW).redeem(SEAT, "manual")
+    // Half an hour later the window is no longer \"just reset\", only no longer near empty.
+    const later = redeemer(provider.fetchImpl, () => NOW + HOUR / 2)
+    const skipped = await later.redeem(SEAT, "usage", { nearEmptyPoints: 0.5 })
+    expect(skipped).toMatchObject({ kind: "superseded" })
+    expect((skipped as { reason: string }).reason).toContain("0% used now, no longer near empty")
+    expect(provider.keys).toHaveLength(1)
+    // A person's redeem is sent regardless; ChatGPT decides.
+    expect(await redeemer(provider.fetchImpl, () => NOW + HOUR / 2).redeem(SEAT, "manual")).toMatchObject({ kind: "failed", outcome: "not_applicable" })
+    expect(provider.keys).toHaveLength(2)
+    expect(provider.spent).toEqual(["c-a"])
+  })
+})
+
+describe("\"don't redeem\" holds the seat", () => {
+  it("plans nothing on a held seat until the hold ends, then plans its soonest reset", () => {
+    const held = planSeatReset(input({ windows: [weekly(1, 4 * DAY)], credits: [credit("c-1", 2 * DAY), credit("c-2", 3 * DAY)],
+      decisions: { [resetCreditKey(SEAT, "c-1")]: "prevent" }, holds: { [SEAT]: NOW + 4 * DAY } }))
+    expect(held).toMatchObject({ trigger: "none", due: false, heldUntil: NOW + 4 * DAY, next: { creditKey: resetCreditKey(SEAT, "c-2") } })
+    expect(held.reason).toContain("You said not to redeem")
+    expect(planSeatReset(input({ windows: [weekly(1, 4 * DAY)], credits: [credit("c-2", 3 * DAY)], holds: { [SEAT]: NOW - 1 } }))).toMatchObject({ trigger: "usage", due: true, heldUntil: null })
+  })
+
+  it("the redeemer skips every credit of a held seat by itself, and a person's redeem still goes", async () => {
+    const provider = sharedChatGpt([{ id: "c-1", expiresIn: 2 * DAY }, { id: "c-2", expiresIn: 3 * DAY }])
+    const target = redeemer(provider.fetchImpl, () => NOW)
+    target.decide(resetCreditKey(SEAT, "c-1"), "prevent", NOW + 2 * DAY, { seat: SEAT, until: NOW + 4 * DAY })
+    expect(target.holds()).toEqual({ [SEAT]: NOW + 4 * DAY })
+    expect(await target.redeem(SEAT, "usage", { nearEmptyPoints: 0.5 })).toMatchObject({ kind: "superseded" })
+    expect(provider.keys).toEqual([])
+    expect(await target.redeem(SEAT, "manual")).toMatchObject({ kind: "redeemed" })
+    expect(provider.spent).toEqual(["c-1"])
+    // Approving lifts the hold.
+    target.decide(resetCreditKey(SEAT, "c-1"), "approve", NOW + 2 * DAY)
+    expect(target.holds()).toEqual({})
+  })
+})

@@ -1666,8 +1666,8 @@ its credentials.
 **Settings → ChatGPT** holds the gateway's own options: forwarding reasoning
 summaries, a per-request cost cap, a fallback model, when a seat with its plan
 spent may serve on purchased Codex credits (`never` by default), where
-free-plan seats rank, and banked reset auto-redeem: `resetAutoRedeem` (on by
-default) spends a seat's soonest-expiring reset once its weekly usage has
+free-plan seats rank, and banked reset auto-redeem: `resetAutoRedeem` (off by
+default; Vibeterm turns it on for one instance per fleet) spends a seat's soonest-expiring reset once its weekly usage has
 `resetNearEmptyPoints` (0.5) points left and the week does not renew before
 the reset's deadline, or `resetSafetyMarginHours` (2) before the reset expires;
 `resetAskAheadHours` (6) is how far ahead a supervisor asks. See [auto-redeeming

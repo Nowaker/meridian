@@ -71,7 +71,14 @@ Code: `src/proxy/chatgpt/` (incl. `migrate/`), `src/proxy/codex/`,
   `resetScheduler.ts`, a one-minute tick started by `startProxyServer` on an
   owned instance). Only the binding window triggers, a seat that renews before
   a reset's deadline waits for the deadline, a prevented reset is skipped, and
-  a refused one is retried every 30 minutes with a fresh idempotency key. The
+  a refused one is retried every 30 minutes with a fresh idempotency key.
+  It is off by default (`resetAutoRedeem`), so of several instances owning
+  the same accounts only the one a supervisor turns on redeems. Before the
+  consume a scheduled redemption reads the seat afresh and stops, as
+  `superseded`, when another instance already reset it; credits are picked
+  soonest expiry first, ties by id, so a race spends one credit under one
+  idempotency key. A "don't redeem" decision holds its seat until the binding
+  window renews. The
   plan is computed while auto-redeem is off, so a supervisor can ask ahead of
   it; Meridian never asks anyone itself.
 - Seats are profiles with `type: "chatgpt"` and their own active pointer; they

@@ -30,6 +30,7 @@ import { applyChatGptRemoval, applyChatGptRename } from './chatgpt/seatOps'
 import { chatGptResetLedgerPath, chatGptStorePath } from './chatgpt/paths'
 import { createResetRedeemer, resetCreditKey, type ResetRedeemResult } from './chatgpt/resetRedeem'
 import { createResetScheduler, type ResetEvent } from './chatgpt/resetScheduler'
+import { codexBindingWindow } from './codex/windows'
 import { currentCodexUsageEvidence, forgetCodexUsage, getCodexUsage } from './codex/service'
 import type { CodexUsageResponse } from './codex/types'
 import { createUpstreamRegistry, isImageEndpoint, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
@@ -12975,6 +12976,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           await refreshChatGptUsage(true)
         }
         return c.json({ profile: profileId, code: "redeem_failed", error: result.error, creditKey: result.creditKey, expiresAt: result.expiresAt, indeterminate: result.indeterminate }, 502)
+      case "superseded":
+        return c.json({ profile: profileId, code: "superseded", error: result.reason }, 409)
       case "no_credit":
         return c.json({ profile: profileId, code: "no_reset", error: result.available > 0 ? "Every banked reset of this seat was already tried; check its figures" : "This seat has no banked reset to redeem" }, 404)
       case "unavailable":
@@ -13003,10 +13006,14 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     const creditKey = typeof body?.creditKey === "string" && /^[0-9a-f]{16}$/.test(body.creditKey) ? body.creditKey : null
     if (!decision || !creditKey) return c.json({ code: "invalid_request", error: 'Expected {creditKey, decision: "approve" | "prevent"}' }, 400)
     const credit = (chatGptUsage?.entries ?? []).flatMap(entry => (entry.resetCredits?.credits ?? [])
-      .flatMap(listed => listed.id && resetCreditKey(entry.id, listed.id) === creditKey ? [{ seat: entry.id, expiresAt: listed.expiresAt }] : []))[0]
+      .flatMap(listed => listed.id && resetCreditKey(entry.id, listed.id) === creditKey
+        ? [{ seat: entry.id, expiresAt: listed.expiresAt, renewsAt: codexBindingWindow(entry.windows)?.resetsAt ?? null }] : []))[0]
     if (!credit) return c.json({ code: "reset_not_found", error: "No banked reset of an owned seat has that key" }, 404)
-    chatGptResetRedeemer.decide(creditKey, decision, credit.expiresAt)
-    return c.json({ creditKey, decision, profile: chatGptProfiles?.profileIdFor(credit.seat) ?? credit.seat, expiresAt: credit.expiresAt })
+    // "Don't redeem" holds the whole seat until its binding window renews, so
+    // the plan does not move on to the seat's next reset (resetRedeem.ts).
+    const holdUntil = decision === "prevent" ? credit.renewsAt ?? credit.expiresAt : null
+    chatGptResetRedeemer.decide(creditKey, decision, credit.expiresAt, holdUntil !== null && holdUntil > Date.now() ? { seat: credit.seat, until: holdUntil } : undefined)
+    return c.json({ creditKey, decision, profile: chatGptProfiles?.profileIdFor(credit.seat) ?? credit.seat, expiresAt: credit.expiresAt, heldUntil: holdUntil })
   })
   function usageRefreshTooSoon(profile: string, retryAfterMs: number): Response {
     const seconds = Math.max(1, Math.ceil(retryAfterMs / 1000))

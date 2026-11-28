@@ -67,8 +67,9 @@ export function createResetScheduler(deps: ResetSchedulerDeps): ResetScheduler {
     const settings = deps.settings()
     const attempts = deps.redeemer.attempts()
     const decisions = deps.redeemer.decisions()
+    const holds = deps.redeemer.holds()
     const at = now()
-    return deps.readings().map(reading => planSeatReset({ ...reading, attempts, decisions, settings, now: at }))
+    return deps.readings().map(reading => planSeatReset({ ...reading, attempts, decisions, holds, settings, now: at }))
   }
 
   const event = (plan: SeatResetPlan, kind: ResetEvent["kind"], extra: Partial<ResetEvent> = {}): ResetEvent => ({
@@ -90,7 +91,11 @@ export function createResetScheduler(deps: ResetSchedulerDeps): ResetScheduler {
   async function redeem(plan: SeatResetPlan): Promise<void> {
     const next = plan.next!
     const trigger = plan.trigger as ResetRedeemTrigger
-    const result = await deps.redeemer.redeem(plan.seat, trigger, { creditKey: next.creditKey })
+    const result = await deps.redeemer.redeem(plan.seat, trigger, { creditKey: next.creditKey, nearEmptyPoints: deps.settings().nearEmptyPoints })
+    if (result.kind === "superseded") {
+      deps.log?.(`[PROXY] ChatGPT reset on ${plan.seat} not redeemed: ${result.reason}`)
+      return
+    }
     if (result.kind === "redeemed") {
       deps.emit(event(plan, "reset_redeemed", { outcome: "redeemed" }))
       await deps.redeemed?.(plan.seat)

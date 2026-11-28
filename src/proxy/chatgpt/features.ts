@@ -169,8 +169,9 @@ export const CHATGPT_FEATURE_DEFAULTS: Readonly<ChatGptFeatures> = {
   seatCreditsPolicy: {},
   freeSeatOrder: "before-credits",
   seatRenewalHours: {},
-  // Spending a reset late keeps the renewal date and wastes none; see resetPolicy.ts.
-  resetAutoRedeem: true,
+  // Off until told: two instances owning the same accounts must never both
+  // redeem them, so the supervisor (Vibeterm) turns it on for exactly one.
+  resetAutoRedeem: false,
   resetNearEmptyPoints: 0.5,
   resetSafetyMarginHours: 2,
   resetAskAheadHours: 6,

@@ -22,12 +22,14 @@ const TOKEN = `${part({ alg: "none" })}.${part({
 const CREDENTIALS = { accountId: "workspace-1", accountUserId: SEAT, accessToken: TOKEN, email: null }
 const LIST_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 const CONSUME_URL = `${LIST_URL}/consume`
+const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
 interface Call { url: string; method: string; body: unknown; authorization: string | null; accountId: string | null; redirect: RequestInit["redirect"] }
 
 /** A chatgpt.com that lists `credits` and removes a credit once it is consumed. */
 function fakeChatGpt(initial: Array<{ id?: string; status?: string; expires_at?: string }>, consume: (body: { credit_id: string }) => Response = () => Response.json({ code: "ok", windows_reset: ["primary", "secondary"], credit: { redeemed_at: new Date(NOW).toISOString() } })) {
   let credits = [...initial]
+  let used = 100
   const calls: Call[] = []
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input)
@@ -35,9 +37,21 @@ function fakeChatGpt(initial: Array<{ id?: string; status?: string; expires_at?:
     const body = init?.body ? JSON.parse(String(init.body)) as { credit_id: string } : null
     calls.push({ url, method: init?.method ?? "GET", body, authorization: headers.get("authorization"), accountId: headers.get("chatgpt-account-id"), redirect: init?.redirect })
     if (url === LIST_URL) return Response.json({ available_count: credits.filter(c => c.status === "available").length, credits })
+    if (url === USAGE_URL) {
+      // A limited seat: its weekly window is spent until a reset clears it.
+      const available = credits.filter(c => c.status === "available").length
+      return Response.json({
+        user_id: "user-1", account_id: "workspace-1",
+        rate_limit: { limit_reached: used >= 100, primary_window: { used_percent: used, limit_window_seconds: 604_800, reset_at: Math.floor((NOW + 4 * 24 * HOUR) / 1000) } },
+        rate_limit_reset_credits: { available_count: available, applicable_available_count: used >= 100 ? available : 0 },
+      })
+    }
     if (url === CONSUME_URL && body) {
       const answer = consume(body)
-      if (answer.ok) credits = credits.filter(c => c.id !== body.credit_id)
+      if (answer.ok) {
+        credits = credits.filter(c => c.id !== body.credit_id)
+        used = 0
+      }
       return answer
     }
     return new Response("{}", { status: 404 })
@@ -167,7 +181,7 @@ describe("redeeming a seat's banked reset", () => {
     const chatgpt = fakeChatGpt([{ id: "c-1", status: "available", expires_at: at(5) }], () => new Response(JSON.stringify({ code: "ok" }), { status: 202, headers: { "content-type": "application/json" } }))
     const stubborn = (async (input: string | URL | Request, init?: RequestInit) => {
       const answer = await chatgpt.fetchImpl(input, init)
-      return String(input) === CONSUME_URL ? answer : Response.json({ credits: [{ id: "c-1", status: "available", expires_at: at(5) }] })
+      return String(input) !== LIST_URL ? answer : Response.json({ credits: [{ id: "c-1", status: "available", expires_at: at(5) }] })
     }) as typeof fetch
     expect(await redeemer(stubborn).redeem(SEAT, "usage")).toMatchObject({ kind: "failed", indeterminate: true, error: "ChatGPT answered success but still lists the reset as available" })
     expect(JSON.parse(readFileSync(ledgerPath, "utf8")).attempts[0].outcome).toBe("unconfirmed")

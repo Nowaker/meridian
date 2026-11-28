@@ -1975,7 +1975,7 @@ describe("owned mode signs its own seats in", () => {
     }
   })
 
-  it("plans an owned seat's banked resets, takes a decision, and auto-redeems only once turned on", async () => {
+  it("plans an owned seat's banked resets, holds the seat on \"don't redeem\", and auto-redeems only once turned on", async () => {
     mkdirSync(storeDir, { recursive: true, mode: 0o700 })
     const token = `${part({ alg: "none" })}.${part({
       exp: Math.floor(NOW / 1000) + 3600,
@@ -2033,22 +2033,30 @@ describe("owned mode signs its own seats in", () => {
       expect((await decide({ creditKey: soonKey, decision: "maybe" })).status).toBe(400)
       expect((await decide({ creditKey: "0123456789abcdef", decision: "prevent" })).status).toBe(404) // gitleaks:allow - an unknown credit key, not a credential
       expect((await decide({ creditKey: soonKey, decision: "prevent" })).status).toBe(200)
-      const prevented = await plan()
-      expect(prevented.seats[0]!.next).toMatchObject({ expiresAt: later })
-
-      // Off: the tick plans and announces, and spends nothing.
-      await proxy.chatGpt!.resetTick!()
-      expect(consumed).toEqual([])
+      // "Don't redeem" holds the seat, so the plan does not move on to its next reset.
+      const prevented = (await plan()).seats[0] as unknown as { trigger: string; heldUntil: number | null; next: { expiresAt: number } }
+      expect(prevented).toMatchObject({ trigger: "none", next: { expiresAt: later } })
+      expect(prevented.heldUntil).toBeGreaterThan(Date.now())
       type Events = { events: Array<{ kind: string; profile: string; provider?: string; reset?: { trigger: string; outcome: string | null; creditKey: string } }> }
       const events = async () => ((await (await proxy.app.fetch(new Request("http://localhost/profiles/events"))).json()) as Events).events.filter(e => e.kind.startsWith("reset_"))
+      saveSettings({ chatgpt: { resetAutoRedeem: true } })
+      await proxy.chatGpt!.resetTick!()
+      expect(consumed).toEqual([])
+      expect(await events()).toEqual([])
+
+      // Approving lifts the hold. Off: the tick plans and announces, and spends nothing.
+      expect((await decide({ creditKey: soonKey, decision: "approve" })).status).toBe(200)
+      saveSettings({ chatgpt: { resetAutoRedeem: false } })
+      await proxy.chatGpt!.resetTick!()
+      expect(consumed).toEqual([])
       expect((await events()).map(e => [e.kind, e.reset?.trigger])).toEqual([["reset_planned", "usage"]])
 
       saveSettings({ chatgpt: { resetAutoRedeem: true } })
       await proxy.chatGpt!.resetTick!()
-      expect(consumed).toEqual(["c-later"])
+      expect(consumed).toEqual(["c-soon"])
       const after = await events()
       expect(after.at(-1)).toMatchObject({ kind: "reset_redeemed", provider: "chatgpt", profile: first.seats[0]!.profile, reset: { trigger: "usage", outcome: "redeemed" } })
-      expect(JSON.stringify(after)).not.toContain("c-later")
+      expect(JSON.stringify(after)).not.toContain("c-soon")
       expect(tokenCalls).toBe(0)
     } finally {
       proxy.chatGpt!.release()

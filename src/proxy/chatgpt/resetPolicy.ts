@@ -70,6 +70,8 @@ export interface SeatResetPlan {
   /** The deadline of the next reset (E - M), or null when its expiry is unknown. */
   deadlineAt: number | null
   decision: ResetPlanDecision
+  /** Until when a "don't redeem" decision holds this seat, or null. */
+  heldUntil: number | null
   /** Why, in a sentence for a person. */
   reason: string
   lastAttempt: ResetPlanAttempt | null
@@ -82,6 +84,8 @@ export interface SeatResetInput {
   applicable: number | null
   attempts: readonly ResetAttempt[]
   decisions: Readonly<Record<string, ResetDecision>>
+  /** Per seat, until when a "don't redeem" decision holds it. */
+  holds?: Readonly<Record<string, number>>
   settings: ResetAutoRedeemSettings
   now: number
 }
@@ -123,8 +127,9 @@ export function planSeatReset(input: SeatResetInput): SeatResetPlan {
   const next = candidates.find(c => mayTryAutomatically(attemptsOf(c.creditKey), now))
     ?? candidates.find(c => attemptsOf(c.creditKey).every(a => isIntactRefusal(a.outcome))) ?? null
   const last = next ? attemptsOf(next.creditKey).at(-1) : bySeat.at(-1)
+  const heldUntil = (input.holds?.[seat] ?? 0) > now ? input.holds![seat]! : null
   const base = {
-    seat, available: input.credits?.length ?? 0, binding, applicable: input.applicable,
+    seat, available: input.credits?.length ?? 0, binding, applicable: input.applicable, heldUntil,
     lastAttempt: last ? { trigger: last.trigger, attemptedAt: last.attemptedAt, outcome: last.outcome, error: last.error } : null,
   }
   const none = (reason: string, nextCredit: SeatResetPlan["next"] = null): SeatResetPlan => ({
@@ -136,6 +141,9 @@ export function planSeatReset(input: SeatResetInput): SeatResetPlan {
   if (credits.length === 0) return none("This seat has no banked reset.")
   if (!next) return none("Every banked reset of this seat was prevented or already tried.")
   const nextCredit = { creditKey: next.creditKey, expiresAt: next.expiresAt }
+  if (heldUntil !== null) {
+    return none(`You said not to redeem a reset on this seat, so none of its resets is redeemed by itself until ${when(heldUntil)}, when its weekly window renews; one that expires before then is not used.`, nextCredit)
+  }
   if (next.expiresAt === null) return none("The reset's expiry is unknown, so no deadline applies.", nextCredit)
   const expiresAt = next.expiresAt
 
@@ -144,12 +152,13 @@ export function planSeatReset(input: SeatResetInput): SeatResetPlan {
   const refusedAt = last !== undefined && isIntactRefusal(last.outcome) ? last.attemptedAt : null
   const retryAt = refusedAt === null ? now : refusedAt + RESET_RETRY_AFTER_REFUSAL_MS
   if (retryAt >= expiresAt) return none(`ChatGPT refused the last try, and the reset expires ${when(expiresAt)}, before another.`, nextCredit)
-  const retrying = refusedAt === null ? "" : ` ChatGPT refused the last try; trying again from ${when(retryAt)}.`
+  const retrying = refusedAt === null ? "" : ` The last try was refused or skipped; trying again from ${when(retryAt)}.`
   const plan = (trigger: ResetTrigger, at: number, reason: string): SeatResetPlan => {
     const earliest = Math.max(at, retryAt)
     return {
       ...base, next: nextCredit, trigger, due: earliest <= now, earliestRedeemAt: earliest, deadlineAt,
-      decision: decisionOf(next.creditKey), reason,
+      decision: decisionOf(next.creditKey),
+      reason: reason + (settings.enabled ? "" : " Auto-redeem is off on this instance, so it does not redeem this by itself."),
     }
   }
 

@@ -359,7 +359,9 @@ export function availableCredits(value: unknown): CodexResetCredit[] {
     const id = typeof credit.id === "string" ? credit.id.trim() : ""
     credits.push({ ...(id ? { id } : {}), status: "available", expiresAt: Number.isFinite(parsed) ? parsed : null })
   }
-  return credits.sort((a, b) => (a.expiresAt ?? Number.POSITIVE_INFINITY) - (b.expiresAt ?? Number.POSITIVE_INFINITY))
+  // Ties broken by id, so two instances reading one seat pick the same credit.
+  return credits.sort((a, b) => (a.expiresAt ?? Number.POSITIVE_INFINITY) - (b.expiresAt ?? Number.POSITIVE_INFINITY)
+    || (a.id ?? "").localeCompare(b.id ?? ""))
 }
 
 function countOrNull(value: unknown): number | null {

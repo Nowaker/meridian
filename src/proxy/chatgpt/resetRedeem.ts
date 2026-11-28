@@ -17,7 +17,18 @@
  * key cannot be replayed to it. One redemption runs per seat at a time.
  *
  * The ledger also keeps the operator's decision per credit: `prevent` keeps a
- * scheduled redemption off it until it expires; `approve` is recorded only.
+ * scheduled redemption off that credit until it expires, and off every credit
+ * of its seat until the seat's binding window renews (`holds`), so "don't"
+ * does not become "spend the next one"; `approve` is recorded only.
+ *
+ * FRESH-READ GATE. Another instance owning the same accounts may have
+ * redeemed since this one planned. Right before the irreversible POST a
+ * scheduled redemption lists the credits and reads the seat's usage afresh
+ * and stops, recorded `superseded`, when its credit is gone, the binding
+ * window no longer meets the usage trigger, or the window started within
+ * RECENT_RESET_MS (someone just reset it). Credits are taken soonest expiry
+ * first, ties by id, so two instances redeeming at once name the same credit
+ * and the provider spends it once.
  *
  * A refusal is `not_applicable` when ChatGPT counted no reset as applicable
  * just before (it does so only once a seat is limited, measured 2026-11-28),
@@ -43,12 +54,15 @@ export type ResetRedeemTrigger = "manual" | "deadline" | "usage"
 export type ResetDecision = "approve" | "prevent"
 
 /** How an attempt ended; `dispatching` means the consume was sent and no answer was recorded. */
-export type ResetAttemptOutcome = "dispatching" | "redeemed" | "refused" | "not_applicable" | "indeterminate" | "unconfirmed" | "spent_without_reset"
+export type ResetAttemptOutcome = "dispatching" | "redeemed" | "refused" | "not_applicable" | "superseded" | "indeterminate" | "unconfirmed" | "spent_without_reset"
 
-/** An outcome after which the credit is certainly still banked: ChatGPT said no. */
+/** An outcome after which the credit is certainly still banked: ChatGPT said no, or nothing was sent. */
 export function isIntactRefusal(outcome: ResetAttemptOutcome): boolean {
-  return outcome === "refused" || outcome === "not_applicable"
+  return outcome === "refused" || outcome === "not_applicable" || outcome === "superseded"
 }
+
+/** A binding window that started this recently was just reset, by a renewal or another instance. */
+export const RECENT_RESET_MS = 15 * 60_000
 
 export interface ResetAttempt {
   /** Stable, non-reversible name of the credit: what the plan and decisions use. */
@@ -66,6 +80,7 @@ export type ResetRedeemResult =
   | { kind: "redeemed"; creditKey: string; expiresAt: number | null; windowsReset: string[]; redeemedAt: number | null; remaining: number | null }
   | { kind: "failed"; creditKey: string; expiresAt: number | null; error: string; indeterminate: boolean; outcome: ResetAttemptOutcome }
   | { kind: "no_credit"; available: number }
+  | { kind: "superseded"; creditKey: string; reason: string }
   | { kind: "unavailable"; error: string }
   | { kind: "in_progress" }
   | { kind: "not_owned" }
@@ -75,14 +90,24 @@ export interface ResetRedeemer {
    * Redeem the seat's soonest-expiring credit that may be tried, or, with
    * `creditKey`, that credit only.
    */
-  redeem(seat: string, trigger: ResetRedeemTrigger, options?: { creditKey?: string }): Promise<ResetRedeemResult>
+  redeem(seat: string, trigger: ResetRedeemTrigger, options?: ResetRedeemOptions): Promise<ResetRedeemResult>
   /** Every recorded attempt, oldest first. */
   attempts(): ResetAttempt[]
   /** The operator's decision per credit key. */
   decisions(): Record<string, ResetDecision>
-  decide(creditKey: string, decision: ResetDecision, expiresAt: number | null): void
+  /** `hold`: on a prevent, the seat and until when no credit of it is redeemed by itself. */
+  decide(creditKey: string, decision: ResetDecision, expiresAt: number | null, hold?: { seat: string; until: number }): void
+  /** Per seat, until when a prevent holds it. */
+  holds(): Record<string, number>
   /** Whether a redemption is running for the seat. */
   running(seat: string): boolean
+}
+
+export interface ResetRedeemOptions {
+  /** That credit only. */
+  creditKey?: string
+  /** A usage-triggered redemption goes ahead only while the binding window has at most this many points left. */
+  nearEmptyPoints?: number
 }
 
 export interface ResetRedeemerDeps {
@@ -113,6 +138,8 @@ interface DecisionRecord {
   decision: ResetDecision
   decidedAt: number
   expiresAt: number | null
+  seat?: string
+  holdUntil?: number
 }
 
 interface LedgerDoc {
@@ -166,7 +193,18 @@ export function createResetRedeemer(deps: ResetRedeemerDeps): ResetRedeemer {
     })
   }
 
-  async function run(seat: string, trigger: ResetRedeemTrigger, wanted: string | undefined): Promise<ResetRedeemResult> {
+  const holds = (): Record<string, number> => {
+    const at = now()
+    const out: Record<string, number> = {}
+    for (const record of Object.values(readLedger(deps.ledgerPath).decisions)) {
+      if (record.decision !== "prevent" || !record.seat || record.holdUntil === undefined || record.holdUntil <= at) continue
+      out[record.seat] = Math.max(out[record.seat] ?? 0, record.holdUntil)
+    }
+    return out
+  }
+
+  async function run(seat: string, trigger: ResetRedeemTrigger, options: ResetRedeemOptions): Promise<ResetRedeemResult> {
+    const wanted = options.creditKey
     const credential = await deps.source.credentials(seat)
     if (!credential.ok) return { kind: "unavailable", error: `the seat's credentials cannot be used (${credential.reason})` }
     const credentials: CodexCredentials = {
@@ -175,8 +213,8 @@ export function createResetRedeemer(deps: ResetRedeemerDeps): ResetRedeemer {
       accessToken: credential.account.accessToken,
       email: null,
     }
-    const options = { fetchImpl: deps.fetchImpl, now: now() }
-    const listed = await listResetCredits(credentials, options)
+    const fetchOptions = { fetchImpl: deps.fetchImpl, now: now() }
+    const listed = await listResetCredits(credentials, fetchOptions)
     if (!listed.ok) return { kind: "unavailable", error: `ChatGPT did not list the seat's resets (${listed.error})` }
 
     const ledger = readLedger(deps.ledgerPath)
@@ -191,9 +229,31 @@ export function createResetRedeemer(deps: ResetRedeemerDeps): ResetRedeemer {
     if (!credit) return { kind: "no_credit", available: listed.credits.length }
 
     const binding = (usage: Awaited<ReturnType<typeof fetchCodexAccountUsage>>) => usage.usage ? codexBindingWindow(usage.usage.windows)?.utilization ?? null : null
-    const before = await fetchCodexAccountUsage(credentials, { ...options, now: now() })
+    const before = await fetchCodexAccountUsage(credentials, { ...fetchOptions, now: now() })
     const applicable = before.usage?.resetCredits?.applicableAvailableCount ?? null
     const usedBefore = binding(before)
+
+    if (trigger !== "manual") {
+      const supersede = (reason: string): ResetRedeemResult => {
+        update(doc => {
+          doc.attempts.push({ creditKey: credit.key, seat, expiresAt: credit.expiresAt, trigger, attemptedAt: now(), outcome: "superseded", error: reason, settledAt: now() })
+        })
+        return { kind: "superseded", creditKey: credit.key, reason }
+      }
+      const heldUntil = holds()[seat]
+      if (heldUntil !== undefined) return { kind: "superseded", creditKey: credit.key, reason: `the seat is held until ${new Date(heldUntil).toISOString()} by a \"don't redeem\" decision` }
+      if (!before.usage) return { kind: "unavailable", error: `ChatGPT did not answer the seat's usage (${before.error ?? "no reading"}), so nothing was sent` }
+      const window = codexBindingWindow(before.usage.windows)
+      const threshold = 1 - (options.nearEmptyPoints ?? 0.5) / 100
+      const started = window?.resetsAt != null && window.limitWindowSeconds != null ? window.resetsAt - window.limitWindowSeconds * 1000 : null
+      const pct = Math.round((usedBefore ?? 0) * 100)
+      if (started !== null && now() - started < RECENT_RESET_MS && (usedBefore ?? 0) < threshold) {
+        return supersede(`the seat's ${window!.type} window started ${Math.round((now() - started) / 60_000)} min ago (${pct}% used): it was just reset, here or by another instance`)
+      }
+      if (trigger === "usage" && (usedBefore === null || usedBefore < threshold)) {
+        return supersede(`the seat's weekly window is ${usedBefore === null ? "unknown" : `${pct}% used`} now, no longer near empty`)
+      }
+    }
 
     update(doc => {
       doc.attempts.push({
@@ -206,7 +266,7 @@ export function createResetRedeemer(deps: ResetRedeemerDeps): ResetRedeemer {
       return { kind: "failed", creditKey: credit.key, expiresAt: credit.expiresAt, error, indeterminate, outcome }
     }
 
-    const consumed = await consumeResetCredit(credentials, credit.id, { ...options, attempt: attemptsOf(credit.key).length })
+    const consumed = await consumeResetCredit(credentials, credit.id, { ...fetchOptions, attempt: attemptsOf(credit.key).filter(a => a.outcome !== "superseded").length })
     if (consumed.kind === "not_sent") {
       // Nothing left the process, so the credit is untouched and free to try again.
       update(doc => { doc.attempts = doc.attempts.filter(a => !(a.creditKey === credit.key && a.outcome === "dispatching")) })
@@ -222,11 +282,11 @@ export function createResetRedeemer(deps: ResetRedeemerDeps): ResetRedeemer {
       return fail("indeterminate", `ChatGPT gave no usable answer${consumed.status ? ` (HTTP ${consumed.status})` : ""}; the reset may or may not be spent`, true)
     }
 
-    const after = await listResetCredits(credentials, { ...options, now: now() })
+    const after = await listResetCredits(credentials, { ...fetchOptions, now: now() })
     if (after.ok && after.credits.some(c => c.id === credit.id)) {
       return fail("unconfirmed", "ChatGPT answered success but still lists the reset as available", true)
     }
-    const usedAfter = binding(await fetchCodexAccountUsage(credentials, { ...options, now: now() }))
+    const usedAfter = binding(await fetchCodexAccountUsage(credentials, { ...fetchOptions, now: now() }))
     const unchanged = usedBefore !== null && usedAfter !== null
       ? usedBefore > 0 && usedAfter >= usedBefore
       : consumed.windowsReset.length === 0
@@ -246,15 +306,18 @@ export function createResetRedeemer(deps: ResetRedeemerDeps): ResetRedeemer {
     redeem(seat, trigger, options) {
       if (!deps.canRedeem()) return Promise.resolve({ kind: "not_owned" })
       if (running.has(seat)) return Promise.resolve({ kind: "in_progress" })
-      const pending = run(seat, trigger, options?.creditKey).finally(() => running.delete(seat))
+      const pending = run(seat, trigger, options ?? {}).finally(() => running.delete(seat))
       running.set(seat, pending)
       return pending
     },
     attempts: () => readLedger(deps.ledgerPath).attempts,
     decisions: () => Object.fromEntries(Object.entries(readLedger(deps.ledgerPath).decisions).map(([key, record]) => [key, record.decision])),
-    decide(creditKey, decision, expiresAt) {
-      update(doc => { doc.decisions[creditKey] = { decision, decidedAt: now(), expiresAt } })
+    decide(creditKey, decision, expiresAt, hold) {
+      update(doc => {
+        doc.decisions[creditKey] = { decision, decidedAt: now(), expiresAt, ...(hold ? { seat: hold.seat, holdUntil: hold.until } : {}) }
+      })
     },
+    holds,
     running: seat => running.has(seat),
   }
 }
