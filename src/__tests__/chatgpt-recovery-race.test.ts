@@ -1,5 +1,5 @@
 import { afterEach, expect, it } from "bun:test"
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, watch, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -13,13 +13,33 @@ function spawn(mode: string, root: string, name: string) {
   return child
 }
 
-async function waitFile(root: string, file: string): Promise<string> {
+/**
+ * The file `worker` publishes (the fixture renames it into place), once it
+ * appears: on the directory's own change event, never on a timer, and failing
+ * at once if the worker exits without it. The test's timeout is the only
+ * bound, since a worker can take tens of seconds just to start on a loaded host.
+ */
+async function waitFile(root: string, file: string, worker: ReturnType<typeof Bun.spawn>): Promise<string> {
   const path = join(root, file)
-  const deadline = Date.now() + 20_000
-  while (!existsSync(path)) {
-    if (Date.now() > deadline) throw new Error(`Worker did not publish ${file}`)
-    await Bun.sleep(10)
-  }
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+    const watcher = watch(root)
+    const finish = (error?: Error) => {
+      if (settled) return
+      settled = true
+      watcher.close()
+      if (error) reject(error)
+      else resolve()
+    }
+    const check = () => { if (existsSync(path)) finish() }
+    watcher.on("change", check)
+    watcher.on("error", error => finish(error))
+    void worker.exited.then(code => {
+      if (!existsSync(path)) finish(new Error(`Worker exited ${code} without publishing ${file}`))
+      else finish()
+    })
+    check()
+  })
   return readFileSync(path, "utf8")
 }
 
@@ -42,54 +62,54 @@ afterEach(async () => {
 it("excludes a second reclaimer while the first pauses before canonical retirement", async () => {
   const root = await deadOwner()
   const first = spawn("pause-writer", root, "first")
-  await waitFile(root, "first.paused")
+  await waitFile(root, "first.paused", first)
   const second = spawn("attempt", root, "second")
-  expect(await waitFile(root, "second.result")).toBe("denied")
+  expect(await waitFile(root, "second.result", second)).toBe("denied")
   expect(await second.exited).toBe(0)
   writeFileSync(join(root, "first.resume"), "resume")
-  expect(await waitFile(root, "first.result")).toBe("admitted")
+  expect(await waitFile(root, "first.result", first)).toBe("admitted")
   expect(first.exitCode).toBeNull()
-}, 60_000)
+}, 180_000)
 
 it("cannot retire a live successor when two processes recover a crashed claimant", async () => {
   const root = await deadOwner()
   expect(await spawn("crash-claim", root, "crashed").exited).toBe(0)
-  spawn("pause-claim", root, "first")
-  await waitFile(root, "first.paused")
+  const first = spawn("pause-claim", root, "first")
+  await waitFile(root, "first.paused", first)
   const winner = spawn("attempt", root, "winner")
-  expect(await waitFile(root, "winner.result")).toBe("admitted")
+  expect(await waitFile(root, "winner.result", winner)).toBe("admitted")
   writeFileSync(join(root, "first.resume"), "resume")
-  expect(await waitFile(root, "first.result")).toBe("denied")
+  expect(await waitFile(root, "first.result", first)).toBe("denied")
   expect(winner.exitCode).toBeNull()
   writeFileSync(join(root, "winner.validate"), "validate")
-  expect(await waitFile(root, "winner.validated")).toBe("still-valid")
-  spawn("attempt", root, "third")
-  expect(await waitFile(root, "third.result")).toBe("denied")
-}, 60_000)
+  expect(await waitFile(root, "winner.validated", winner)).toBe("still-valid")
+  const third = spawn("attempt", root, "third")
+  expect(await waitFile(root, "third.result", third)).toBe("denied")
+}, 180_000)
 
 it("recovers after killing a paused reclaimer and can reacquire after release", async () => {
   const root = await deadOwner()
   const first = spawn("pause-writer", root, "first")
-  await waitFile(root, "first.paused")
+  await waitFile(root, "first.paused", first)
   first.kill("SIGKILL")
   await first.exited
   const second = spawn("attempt", root, "second")
-  expect(await waitFile(root, "second.result")).toBe("admitted")
+  expect(await waitFile(root, "second.result", second)).toBe("admitted")
   writeFileSync(join(root, "second.release"), "release")
   expect(await second.exited).toBe(0)
-  spawn("attempt", root, "third")
-  expect(await waitFile(root, "third.result")).toBe("admitted")
-}, 60_000)
+  const third = spawn("attempt", root, "third")
+  expect(await waitFile(root, "third.result", third)).toBe("admitted")
+}, 180_000)
 
 it.skipIf(process.platform !== "linux")("never steals from a SIGSTOPed admitted writer with an expired heartbeat", async () => {
   const root = await deadOwner()
   const writer = spawn("attempt", root, "writer")
-  expect(await waitFile(root, "writer.result")).toBe("admitted")
+  expect(await waitFile(root, "writer.result", writer)).toBe("admitted")
   process.kill(writer.pid, "SIGSTOP")
   utimesSync(join(root, "writer.lock"), new Date(0), new Date(0))
-  spawn("attempt", root, "contender")
-  expect(await waitFile(root, "contender.result")).toBe("denied")
+  const contender = spawn("attempt", root, "contender")
+  expect(await waitFile(root, "contender.result", contender)).toBe("denied")
   process.kill(writer.pid, "SIGCONT")
   writeFileSync(join(root, "writer.validate"), "validate")
-  expect(await waitFile(root, "writer.validated")).toBe("still-valid")
-}, 60_000)
+  expect(await waitFile(root, "writer.validated", writer)).toBe("still-valid")
+}, 180_000)

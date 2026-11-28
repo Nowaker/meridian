@@ -46,12 +46,12 @@ describe("the telemetry startup banner", () => {
   it("prints by default, so an operator still gets the confirmation", async () => {
     const out = await bannerWith({})
     expect(out).toContain("SQLite persistence enabled")
-  }, 30_000)
+  }, 120_000)
 
   it("is suppressed by MERIDIAN_QUIET=1", async () => {
     const out = await bannerWith({ MERIDIAN_QUIET: "1" })
     expect(out).not.toContain("SQLite persistence enabled")
-  }, 30_000)
+  }, 120_000)
 
   it("accepts the other truthy spellings envBool allows", async () => {
     for (const v of ["true", "yes"]) {
@@ -67,10 +67,10 @@ describe("the telemetry startup banner", () => {
     // A failed SQLite load falls back to memory and would surface differently;
     // absence of any error is what confirms the store was created.
     expect(out).not.toMatch(/error|failed/i)
-  }, 30_000)
+  }, 120_000)
 
   it("prints when the flag is explicitly off", async () => {
     const out = await bannerWith({ MERIDIAN_QUIET: "0" })
     expect(out).toContain("SQLite persistence enabled")
-  }, 30_000)
+  }, 120_000)
 })
