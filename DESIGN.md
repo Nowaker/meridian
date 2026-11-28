@@ -177,6 +177,12 @@ at its provider, so card CSS never names one.
     with 0% Fable used: "Full reset 1 · all usable now · expires in 24d
     [Redeem full reset]", then a muted "Fable reset 3 · no Fable usage to
     give back right now · next expires in 12d" with no button.
+- **ChatGPT banked resets:** on `/profiles` a seat with banked resets shows a
+  "Banked resets" block below its usage: the count in green when the seat can
+  redeem here (muted otherwise), "soonest expires <time>", and a small blue
+  "Redeem closest-expiring reset" button, disabled with a tooltip where the
+  instance does not own the seat's login. The confirmation names the expiry of
+  the reset it spends and says the renewal date stays.
 - **Refresh:** a small icon button with circular arrows, on every profile
   card. On `/profiles` it is the first of the card's action icons, before
   Rename and Remove; on `/` it sits at the end of the name row, after the

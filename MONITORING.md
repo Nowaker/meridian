@@ -135,6 +135,38 @@ uncertain outcomes, but server-side deduplication is not guaranteed.
 Every Claude OAuth usage, identity and reset request identifies itself as the
 Claude Code version installed with Meridian.
 
+### Redeeming a ChatGPT seat's banked reset
+
+`POST /profiles/:id/chatgpt-resets/redeem` spends one of a ChatGPT seat's
+banked rate-limit resets: the one that expires soonest. `:id` is the seat's
+profile id, seat id or an alias. There is no body. ChatGPT clears the seat's
+usage windows and keeps its renewal date.
+
+Only an instance in `owned` mode that holds the writer lease (and is not
+`MERIDIAN_CREDENTIALS_READONLY`) redeems; any other answers HTTP 409
+`not_owned`. The route inherits API-key authentication, rejects cross-origin
+browser requests (403 `forbidden_origin`), and answers 404 `profile_not_found`
+for an id that names no seat.
+
+Meridian lists the seat's credits again, writes the chosen credit to
+`chatgpt-reset-ledger.json` beside the seat store before the consume is sent,
+and records how it ended. The consume carries an idempotency key derived from
+the credit id alone, the same key oc-codex-multi-auth's `codex-reset` sends.
+A credit whose consume may have gone through (no answer, a 5xx, an unreadable
+answer, or a success while ChatGPT still lists the credit) is never tried
+again; one ChatGPT refused may be redeemed again by hand. One redemption runs
+per seat at a time (409 `redeem_in_progress`).
+
+HTTP 200 returns `{profile, result: "redeemed", creditKey, expiresAt,
+windowsReset, redeemedAt, remaining, usage}`: `creditKey` is a short hash
+naming the credit, never its id; `usage` is the seat's reading taken after the
+reset, and the seat's quota bench is lifted. Failures return `{profile, code,
+error}`: 502 `redeem_failed` (with `creditKey`, `expiresAt` and
+`indeterminate`; `indeterminate: true` means the reset may have been spent, so
+re-read the seat before trying again), 404 `no_reset` (none banked, or every
+banked one already tried), 503 `unavailable` (the seat's token cannot be used
+or the credit list could not be read; nothing was sent).
+
 
 ## Reading Token and Cache Metrics
 

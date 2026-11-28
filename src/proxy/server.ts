@@ -26,7 +26,9 @@ import { createCodexClientVersion } from './chatgpt/clientVersion'
 import { CHATGPT_WARM_MODELS, chatGptRefusalDiagnosis, chatGptWarmBody, createChatGptProfileSurface } from './chatgpt/profileSurface'
 import { chatGptNameProblem, seatWindows, type ChatGptProfile } from './chatgpt/profiles'
 import { applyChatGptRemoval, applyChatGptRename } from './chatgpt/seatOps'
-import { currentCodexUsageEvidence, getCodexUsage } from './codex/service'
+import { chatGptResetLedgerPath, chatGptStorePath } from './chatgpt/paths'
+import { createResetRedeemer, type ResetRedeemResult } from './chatgpt/resetRedeem'
+import { currentCodexUsageEvidence, forgetCodexUsage, getCodexUsage } from './codex/service'
 import type { CodexUsageResponse } from './codex/types'
 import { createUpstreamRegistry, isImageEndpoint, UnknownProviderError, type UpstreamEndpoint } from './upstream/backend'
 import { createClaudeBackend } from './upstream/claude'
@@ -10708,6 +10710,21 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     freeSeatOrder: () => getChatGptFeatures().freeSeatOrder,
     renewalHours: (seat) => getChatGptFeatures().seatRenewalHours[seat] ?? null,
   }) : undefined
+  // Banked resets are spent only by the instance that owns the seats'
+  // credentials (chatgpt/resetRedeem.ts); every other instance answers not_owned.
+  const chatGptResetRedeemer = chatGptSource?.mode === "owned" ? createResetRedeemer({
+    source: chatGptSource,
+    ledgerPath: chatGptResetLedgerPath(chatGptStorePath()),
+    canRedeem: () => !isCredentialsReadOnly() && chatGptSource.isServing(),
+  }) : undefined
+  // A redeemed reset clears the seat's windows: drop what benched it for its
+  // quota, and read its usage again so routing and the pages see it serve.
+  const afterChatGptReset = async (profileId: string, seat: string): Promise<void> => {
+    spentProfiles.forget(profileId)
+    if (chatGptExhaustion.snapshot().some(mark => mark.id === seat && isQuotaRefusal(mark.reason))) chatGptExhaustion.forget(seat)
+    forgetCodexUsage(seat)
+    await refreshChatGptUsage(true)
+  }
   const claudeProfileIds = (): string[] => listProfiles(finalConfig.profiles, finalConfig.defaultProfile).map(p => p.id)
   /**
    * Per model, the profiles whose CVP map shows active access, in `order`, and
@@ -12823,6 +12840,50 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     const read = await readClaudeUsageNow(target)
     return c.json({ profile: requested, refreshed: read.refreshed, note: read.note, usage: read.usage })
   })
+  // Redeem a ChatGPT seat's soonest-expiring banked reset now
+  // (chatgpt/resetRedeem.ts). Same-origin only, like every other spend.
+  app.post("/profiles/:id/chatgpt-resets/redeem", async (c) => {
+    if (!isSameOriginRequest(c.req.raw)) {
+      return c.json({ code: "forbidden_origin", error: "Cross-origin reset redemptions are not allowed" }, 403)
+    }
+    const requested = c.req.param("id")
+    const profile = chatGptProfiles?.resolve(requested)
+    if (!profile) return c.json({ code: "profile_not_found", error: `No ChatGPT seat "${requested}"` }, 404)
+    if (!chatGptResetRedeemer) {
+      return c.json({ code: "not_owned", error: "Only the instance that owns the seat's ChatGPT login redeems its resets" }, 409)
+    }
+    let result: ResetRedeemResult
+    try {
+      result = await chatGptResetRedeemer.redeem(profile.seat, "manual")
+    } catch (error) {
+      plog(`[PROXY] ChatGPT reset redemption on ${profile.id} failed: ${error instanceof Error ? error.message : String(error)}`)
+      return c.json({ code: "redeem_failed", error: "Meridian could not record the redemption; check the seat's resets before trying again", indeterminate: true }, 500)
+    }
+    return chatGptRedeemResponse(c, profile.id, profile.seat, result)
+  })
+  async function chatGptRedeemResponse(c: Context, profileId: string, seat: string, result: ResetRedeemResult): Promise<Response> {
+    switch (result.kind) {
+      case "redeemed": {
+        await afterChatGptReset(profileId, seat)
+        const usage = chatGptProfiles?.quotaEntries().find(e => e.id === profileId) ?? null
+        return c.json({ profile: profileId, result: "redeemed", creditKey: result.creditKey, expiresAt: result.expiresAt, windowsReset: result.windowsReset, redeemedAt: result.redeemedAt, remaining: result.remaining, usage })
+      }
+      case "failed":
+        if (result.indeterminate) {
+          forgetCodexUsage(seat)
+          await refreshChatGptUsage(true)
+        }
+        return c.json({ profile: profileId, code: "redeem_failed", error: result.error, creditKey: result.creditKey, expiresAt: result.expiresAt, indeterminate: result.indeterminate }, 502)
+      case "no_credit":
+        return c.json({ profile: profileId, code: "no_reset", error: result.available > 0 ? "Every banked reset of this seat was already tried; check its figures" : "This seat has no banked reset to redeem" }, 404)
+      case "unavailable":
+        return c.json({ profile: profileId, code: "unavailable", error: result.error, indeterminate: false }, 503)
+      case "in_progress":
+        return c.json({ profile: profileId, code: "redeem_in_progress", error: "A redemption on this seat is still running" }, 409)
+      case "not_owned":
+        return c.json({ profile: profileId, code: "not_owned", error: "This instance does not hold the seats' ChatGPT login right now" }, 409)
+    }
+  }
   function usageRefreshTooSoon(profile: string, retryAfterMs: number): Response {
     const seconds = Math.max(1, Math.ceil(retryAfterMs / 1000))
     return new Response(JSON.stringify({

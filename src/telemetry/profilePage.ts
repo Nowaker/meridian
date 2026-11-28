@@ -10,6 +10,7 @@ import { reorderClientJs, reorderCss, reorderLiveRegionHtml } from "./profileOrd
 import { PROVIDERS_NONE_SHOWN_HTML, profileProvidersCss, profileProvidersJs } from "./profileProviders"
 import { LOGIN_STATES_NONE_SHOWN_HTML, profileLoginStatesCss, profileLoginStatesJs } from "./profileLoginStates"
 import { freeResetOutcomeText, freeResetView } from "./freeResets"
+import { chatGptRedeemOutcomeText, chatGptResetCardView } from "./chatGptResets"
 import { isUnusableJs } from "./profileSpent"
 import { WINDOW_LABELS } from "./profileUsage"
 import { domPatchJs } from "./domPatch"
@@ -566,6 +567,9 @@ ${isUnusableJs}
 // Shared with / (freeResets.ts), so both pages count an account's resets alike.
 var freeResetView = ${freeResetView.toString()};
 var freeResetOutcomeText = ${freeResetOutcomeText.toString()};
+// A ChatGPT seat's banked resets on its card (chatGptResets.ts).
+var chatGptResetCardView = ${chatGptResetCardView.toString()};
+var chatGptRedeemOutcomeText = ${chatGptRedeemOutcomeText.toString()};
 
 ${reorderClientJs}
 ${profileProvidersJs}
@@ -1217,6 +1221,36 @@ function renderUsageSection(profileQuota, p) {
     + (cards ? '<div class="usage-grid">' + cards + '</div>' : '')
     + extraBlock
     + renderFreeResets(resets, p)
+    + (chatgpt ? renderChatGptResets(p) : '')
+    + '</div>';
+}
+
+// A seat's banked resets with its redeem, which spends the soonest-expiring
+// one after an in-page confirmation naming that expiry. Its outcome stays in
+// the block for two minutes, as a Claude reset's does.
+function renderChatGptResets(p) {
+  var view = chatGptResetCardView(p.resets, chatGptOwnerInfo && chatGptOwnerInfo.mode);
+  if (!view) return '';
+  var outcome = resetOutcomes[p.id];
+  if (outcome && (Date.now() - outcome.at > 120000 || outcome.kind !== 'chatgpt')) outcome = null;
+  var expiry = view.nextExpiresAt === null ? null : new Date(view.nextExpiresAt).toLocaleString();
+  var note = view.available === 0 ? 'none banked'
+    : expiry ? 'soonest expires ' + expiry : 'expiry unknown';
+  var button = view.available > 0
+    ? '<button type="button" class="switch-btn reset-btn" data-profile="' + attr(p.id) + '" data-name="' + attr(p.label || p.id)
+      + '" data-expiry="' + attr(expiry || '') + '" data-available="' + view.available + '" onclick="redeemChatGptReset(this)"'
+      + (view.redeemable && !redeemingReset ? '' : ' disabled') + (view.reason ? ' title="' + attr(view.reason) + '"' : '')
+      + '>Redeem closest-expiring reset</button>'
+    : '';
+  return '<div class="usage-extra free-resets' + (view.redeemable ? '' : ' held') + '" title="' + attr(view.available + ' banked reset' + (view.available === 1 ? '' : 's') + (view.reason ? '. ' + view.reason : '')) + '">'
+    +   '<div class="usage-extra-row">'
+    +     '<span class="usage-label">Banked resets</span>'
+    +     '<span class="usage-pct">' + esc(String(view.available)) + '</span>'
+    +   '</div>'
+    +   '<div class="usage-extra-row" style="margin-top:4px">'
+    +     '<span class="usage-note">' + esc(note) + '</span>' + button
+    +   '</div>'
+    +   (outcome ? '<div class="usage-note reset-outcome' + (outcome.ok ? '' : ' err') + '" role="status">' + esc(outcome.text) + '</div>' : '')
     + '</div>';
 }
 
@@ -1226,7 +1260,7 @@ function renderUsageSection(profileQuota, p) {
 // A redeem's outcome stays in the block of the kind it was for.
 function renderFreeResets(resets, p) {
   var outcome = resetOutcomes[p.id];
-  if (outcome && Date.now() - outcome.at > 120000) outcome = null;
+  if (outcome && (Date.now() - outcome.at > 120000 || outcome.kind === 'chatgpt')) outcome = null;
   function said(label) {
     return '<div class="usage-note reset-outcome' + (outcome.ok ? '' : ' err') + '" role="status">' + esc(label + ': ' + outcome.text) + '</div>';
   }
@@ -2726,6 +2760,37 @@ async function redeemFreeReset(button) {
   redeemingReset = null;
   var outcome = freeResetOutcomeText(status, data, labelForWindow);
   resetOutcomes[id] = { ok: outcome.ok, text: outcome.text, at: Date.now(), kind: kind, label: button.getAttribute('data-label') };
+  await refresh();
+}
+
+async function redeemChatGptReset(button) {
+  if (redeemingReset) return;
+  var id = button.getAttribute('data-profile');
+  var expiry = button.getAttribute('data-expiry');
+  var after = Math.max(0, (Number(button.getAttribute('data-available')) || 0) - 1);
+  var go = await meridianDialog.ask({
+    title: 'Redeem a banked reset on ' + button.getAttribute('data-name') + ' now?',
+    message: 'This spends the reset that expires soonest' + (expiry ? ' (' + expiry + ')' : '')
+      + '. ChatGPT clears this seat\u2019s usage windows right away; its renewal date stays as it is. It cannot be undone.',
+    note: after + ' banked reset' + (after === 1 ? '' : 's') + ' would be left.',
+    confirmText: 'Redeem reset',
+    danger: true
+  });
+  if (!go) return;
+  redeemingReset = id;
+  button.disabled = true;
+  button.textContent = 'Redeeming\u2026';
+  var status = 0, data = null;
+  try {
+    var res = await fetch('/profiles/' + encodeURIComponent(id) + '/chatgpt-resets/redeem', { method: 'POST' });
+    status = res.status;
+    try { data = await res.json(); } catch (_) { data = null; }
+  } catch (_) {
+    status = 0;
+  }
+  redeemingReset = null;
+  var outcome = chatGptRedeemOutcomeText(status, data);
+  resetOutcomes[id] = { ok: outcome.ok, text: outcome.text, at: Date.now(), kind: 'chatgpt' };
   await refresh();
 }
 

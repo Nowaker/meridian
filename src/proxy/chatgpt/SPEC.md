@@ -58,6 +58,15 @@ Code: `src/proxy/chatgpt/` (incl. `migrate/`), `src/proxy/codex/`,
     failure leaves; an attempt that never reached the provider records
     nothing. The history is never a credential, so a malformed entry is
     dropped on read rather than failing the store. Owner approval pending.
+- **Banked resets are spent only by the owner, once each.** Only `owned` mode
+  holding the writer lease redeems (`resetRedeem.ts`); the consume lives in
+  `chatgpt/resetCredits.ts` because `codex/` only ever reads. A credit is
+  written to `chatgpt-reset-ledger.json` before its consume is sent, so a
+  crash leaves it marked as tried, never free to try again; one whose outcome
+  is unknown is never retried, and the idempotency key is oc-codex-multi-auth's
+  derivation from the credit id, so the two tools cannot spend one credit
+  twice. After a confirmed redemption the seat's cached usage is dropped, its
+  quota bench lifted and its usage read again.
 - Seats are profiles with `type: "chatgpt"` and their own active pointer; they
   never live in Claude's profile config. All additions are absent unless
   ChatGPT is enabled, and existing fields keep their meaning

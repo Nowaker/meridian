@@ -66,6 +66,17 @@ export function resetCodexUsageCache(): void {
 }
 
 /**
+ * Drop one seat's cached reading, so the next read asks chatgpt.com again
+ * even inside the success TTL: after a reset is redeemed the cached windows
+ * describe a quota that no longer exists.
+ */
+export function forgetCodexUsage(accountUserId: string): void {
+  for (const key of [...lastGood.keys()]) {
+    if (key.startsWith(`${accountUserId}|`)) lastGood.delete(key)
+  }
+}
+
+/**
  * Bound concurrent upstream work process-wide.
  *
  * A finishing task hands its slot straight to the next waiter rather than

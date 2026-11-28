@@ -1909,6 +1909,82 @@ describe("owned mode signs its own seats in", () => {
     }
   })
 
+  it("redeems an owned seat's soonest-expiring banked reset from its card, once, and lifts its quota bench", async () => {
+    mkdirSync(storeDir, { recursive: true, mode: 0o700 })
+    const token = `${part({ alg: "none" })}.${part({
+      exp: Math.floor(NOW / 1000) + 3600,
+      "https://api.openai.com/auth": { chatgpt_account_id: "workspace-5", chatgpt_account_user_id: "user-5__workspace-5", chatgpt_user_id: "user-5", chatgpt_plan_type: "pro" },
+    })}.sig`
+    writeFileSync(storePath, JSON.stringify({ version: 1, accounts: [{
+      accountUserId: "user-5__workspace-5", accountId: "workspace-5", email: "spent@example.test",
+      refreshToken: "rt-5", accessToken: token, expiresAt: NOW + 3_600_000, tokenRotatedAt: NOW, exchangeStartedAt: null,
+    }] }), { mode: 0o600 })
+    const soon = NOW + 2 * 86_400_000
+    const later = NOW + 5 * 86_400_000
+    let credits = [
+      { id: "c-later", status: "available", expires_at: new Date(later).toISOString() },
+      { id: "c-soon", status: "available", expires_at: new Date(soon).toISOString() },
+    ]
+    let used = 100
+    const consumed: unknown[] = []
+    const serve = globalThis.fetch
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (url === `${WHAM_PREFIX}rate-limit-reset-credits/consume`) {
+        const body = JSON.parse(String(init?.body)) as { credit_id: string }
+        consumed.push(body)
+        credits = credits.filter(c => c.id !== body.credit_id)
+        used = 0
+        return Response.json({ code: "ok", windows_reset: ["secondary"] })
+      }
+      if (url === `${WHAM_PREFIX}rate-limit-reset-credits`) return Response.json({ available_count: credits.length, credits })
+      if (url === `${WHAM_PREFIX}usage`) {
+        return Response.json({
+          user_id: "user-5", account_id: "workspace-5", plan_type: "pro",
+          rate_limit: { primary_window: { used_percent: used, limit_window_seconds: 604_800, reset_at: Math.floor(NOW / 1000) + 4 * 86_400 } },
+          rate_limit_reset_credits: { available_count: credits.length, applicable_available_count: used >= 100 ? 1 : 0 },
+        })
+      }
+      return serve(input, init)
+    }) as typeof fetch
+    const proxy = await server("owned")
+    await proxy.chatGpt!.acquire()
+    try {
+      await proxy.app.fetch(new Request("http://localhost/v1/usage/quota/all"))
+      const list = await (await proxy.app.fetch(new Request("http://localhost/profiles/list"))).json() as { profiles: Array<{ id: string; seat?: string; resets?: unknown }> }
+      const seat = list.profiles.find(p => p.seat === "user-5__workspace-5")!
+      expect(seat.resets).toEqual({ available: 2, expiresAt: [soon, later] })
+
+      const redeem = (id: string, origin?: string) => proxy.app.fetch(new Request(`http://localhost/profiles/${id}/chatgpt-resets/redeem`, { method: "POST", headers: origin ? { origin } : {} }))
+      expect((await redeem(seat.id, "https://evil.example")).status).toBe(403)
+      expect((await redeem("nobody")).status).toBe(404)
+      expect(consumed).toHaveLength(0)
+
+      const res = await redeem(seat.id)
+      expect(res.status).toBe(200)
+      const body = await res.json() as Record<string, unknown>
+      expect(body).toMatchObject({ profile: seat.id, result: "redeemed", expiresAt: soon, windowsReset: ["secondary"], remaining: 1 })
+      expect(JSON.stringify(body)).not.toContain(token)
+      expect(consumed).toEqual([{ credit_id: "c-soon", redeem_request_id: expect.stringMatching(/^[0-9a-f-]{36}$/) }])
+      expect((body.usage as { windows: Array<{ utilization: number }> }).windows[0]!.utilization).toBe(0)
+      const ledger = JSON.parse(readFileSync(join(storeDir, "chatgpt-reset-ledger.json"), "utf8")) as { attempts: Array<{ outcome: string; trigger: string }> }
+      expect(ledger.attempts.map(a => [a.trigger, a.outcome])).toEqual([["manual", "redeemed"]])
+      expect(tokenCalls).toBe(0)
+    } finally {
+      proxy.chatGpt!.release()
+    }
+  })
+
+  it("refuses to redeem a reset where it follows another tool's store", async () => {
+    writePool([account(0)])
+    const proxy = await server("follow-external")
+    const list = await (await proxy.app.fetch(new Request("http://localhost/profiles/list"))).json() as { profiles: Array<{ id: string }> }
+    const res = await proxy.app.fetch(new Request(`http://localhost/profiles/${list.profiles[0]!.id}/chatgpt-resets/redeem`, { method: "POST" }))
+    expect(res.status).toBe(409)
+    expect(await res.json()).toMatchObject({ code: "not_owned" })
+    expect(whamCalls.filter(c => c.method === "POST")).toHaveLength(0)
+  })
+
   it("refuses to sign a seat in where it follows another tool's store", async () => {
     writePool([account(0)])
     const proxy = await server("follow-external")

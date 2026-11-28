@@ -32,7 +32,7 @@ import type {
 /** Fixed by construction: an operator-supplied base URL would be a way to aim a bearer token at an arbitrary host. */
 const CHATGPT_ORIGIN = "https://chatgpt.com"
 const USAGE_URL = `${CHATGPT_ORIGIN}/backend-api/wham/usage`
-const RESET_CREDITS_URL = `${CHATGPT_ORIGIN}/backend-api/wham/rate-limit-reset-credits`
+export const RESET_CREDITS_URL = `${CHATGPT_ORIGIN}/backend-api/wham/rate-limit-reset-credits`
 const WORKSPACES_URL = `${CHATGPT_ORIGIN}/backend-api/wham/accounts/check`
 const DEFAULT_TIMEOUT_MS = 10_000
 const WORKSPACE_NAME_MAX_CHARS = 64
@@ -198,7 +198,7 @@ function workspaceDisplayName(value: unknown): string | null {
   return chars.length > WORKSPACE_NAME_MAX_CHARS ? `${chars.slice(0, WORKSPACE_NAME_MAX_CHARS - 1).join("")}\u2026` : cleaned
 }
 
-type UsableToken = { token: string; claims: CodexTokenClaims } | { error: CodexUsageError }
+export type UsableToken = { token: string; claims: CodexTokenClaims } | { error: CodexUsageError }
 
 /**
  * The access token, when it may be sent at all: present, decodable, not
@@ -206,7 +206,7 @@ type UsableToken = { token: string; claims: CodexTokenClaims } | { error: CodexU
  * credential leaves the process - if the token belongs to a different account
  * than the pool record says, no request is made.
  */
-function usableToken(credentials: CodexCredentials, now: number): UsableToken {
+export function usableToken(credentials: CodexCredentials, now: number): UsableToken {
   const token = credentials.accessToken
   if (!token) return { error: "no_token" }
   const claims = decodeCodexToken(token)
@@ -222,18 +222,8 @@ function disagrees(expected: string | null, actual: string | null): boolean {
   return expected !== null && actual !== null && expected !== actual
 }
 
-interface JsonResult {
-  body: unknown
-  error: CodexRemoteError | null
-}
-
-async function getJson(
-  doFetch: typeof fetch,
-  url: string,
-  token: string,
-  accountId: string | null,
-  timeoutMs: number | undefined,
-): Promise<JsonResult> {
+/** What every `wham/*` request sends: the seat's bearer token and the Codex client identity. */
+export function codexHeaders(token: string, accountId: string | null): Record<string, string> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
     Accept: "application/json",
@@ -241,15 +231,29 @@ async function getJson(
     originator: "codex_cli_rs",
     "User-Agent": codexUserAgent(),
   }
-  // Without this header the endpoint answers with an empty account_id, which
-  // would fail validation below.
+  // Without this header the usage endpoint answers with an empty account_id,
+  // which fails the identity check in fetchCodexAccountUsage.
   if (accountId) headers["ChatGPT-Account-ID"] = accountId
+  return headers
+}
 
+interface JsonResult {
+  body: unknown
+  error: CodexRemoteError | null
+}
+
+export async function getJson(
+  doFetch: typeof fetch,
+  url: string,
+  token: string,
+  accountId: string | null,
+  timeoutMs: number | undefined,
+): Promise<JsonResult> {
   let response: Response
   try {
     response = await doFetch(url, {
       method: "GET",
-      headers,
+      headers: codexHeaders(token, accountId),
       // A bearer credential must never be replayed to a redirect target.
       redirect: "error",
       signal: AbortSignal.timeout(timeoutMs ?? DEFAULT_TIMEOUT_MS),
@@ -269,7 +273,7 @@ async function getJson(
   }
 }
 
-function classifyStatus(status: number): CodexRemoteError {
+export function classifyStatus(status: number): CodexRemoteError {
   if (status === 401 || status === 403) return "unauthorized"
   if (status === 429) return "rate_limited"
   return "upstream_error"
@@ -342,7 +346,7 @@ async function collectResetCredits(
  * expiry cannot be read is kept, last, with a null expiry: it is still a
  * banked reset, and dropping it would understate what the seat holds.
  */
-function availableCredits(value: unknown): CodexResetCredit[] {
+export function availableCredits(value: unknown): CodexResetCredit[] {
   const raw = asRecord(value)
   if (!Array.isArray(raw?.credits)) return []
 
@@ -352,7 +356,8 @@ function availableCredits(value: unknown): CodexResetCredit[] {
     if (credit?.status !== "available") continue
     const expiresAtRaw = stringOrNull(credit.expires_at)
     const parsed = expiresAtRaw ? Date.parse(expiresAtRaw) : Number.NaN
-    credits.push({ status: "available", expiresAt: Number.isFinite(parsed) ? parsed : null })
+    const id = typeof credit.id === "string" ? credit.id.trim() : ""
+    credits.push({ ...(id ? { id } : {}), status: "available", expiresAt: Number.isFinite(parsed) ? parsed : null })
   }
   return credits.sort((a, b) => (a.expiresAt ?? Number.POSITIVE_INFINITY) - (b.expiresAt ?? Number.POSITIVE_INFINITY))
 }

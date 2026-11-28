@@ -85,6 +85,8 @@ export interface CodexPlan {
 }
 
 export interface CodexResetCredit {
+  /** The vendor's credit id, which a redemption names; absent when the list named none. */
+  id?: string
   /** Vendor status; only "available" credits are listed. */
   status: string
   /** Epoch milliseconds, or null when unparseable. */

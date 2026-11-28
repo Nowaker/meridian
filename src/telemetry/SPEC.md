@@ -138,6 +138,14 @@ Record what Meridian did and show it to the operator:
   `/v1/usage/quota/all` (the page's refresh, or Vibeterm's re-check) shows
   the new state.
 
+- **A ChatGPT seat's banked resets on `/profiles`** (`chatGptResets.ts`): a
+  "Banked resets" block under the seat's usage, with the count and the
+  soonest expiry, and a "Redeem closest-expiring reset" button. It acts only
+  after an in-page confirmation naming that expiry, and posts
+  `POST /profiles/:id/chatgpt-resets/redeem`. The button is disabled with a
+  tooltip on an instance that does not own the seat's login and absent on a
+  seat with none banked. The outcome stays in the block for two minutes.
+
 - **Refresh is one click per card.** Every profile card and ChatGPT seat on
   `/` and `/profiles` carries a refresh icon that posts
   `POST /profiles/:id/refresh` (`profileActions.ts`): login, usage, model

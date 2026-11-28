@@ -10,6 +10,7 @@
  * `~/.opencode/oc-codex-multi-auth-accounts.json`.
  */
 
+import { dirname, join } from "node:path"
 import { configPath } from "../../configDir"
 
 /**
@@ -26,4 +27,9 @@ export function chatGptStorePath(): string {
 
 export function chatGptLockPath(storePath: string): string {
   return `${storePath}.lock`
+}
+
+/** The record of banked resets Meridian tried to redeem, beside the store whose seats they belong to. */
+export function chatGptResetLedgerPath(storePath: string): string {
+  return join(dirname(storePath), "chatgpt-reset-ledger.json")
 }
