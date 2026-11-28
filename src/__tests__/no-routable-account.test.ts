@@ -319,8 +319,12 @@ it.each([
   { name: "manual exclusion", model: "claude-opus-5-5", effort: "high", excluded: true, expected: 0 },
   { name: "CVP requirement", model: "claude-opus-5-5", effort: "high", header: ["x-meridian-require", "cvp"], expected: 0 },
   { name: "manual pin", model: "claude-opus-5-5", effort: "high", header: ["x-meridian-profile", "return-work"], expected: 0 },
+  { name: "cybersec-preserved by default", model: "claude-opus-5-5", effort: "high", window: "seven_day_opus", preserved: true, expected: 0 },
+  { name: "cybersec-preserved with preservation on", model: "claude-opus-5-5", effort: "high", window: "seven_day_opus", preserved: true, header: ["x-meridian-cybersec-preservation", "on"], expected: 0 },
+  { name: "cybersec-preserved with preservation off", model: "claude-opus-5-5", effort: "high", window: "seven_day_opus", preserved: true, header: ["x-meridian-cybersec-preservation", "Off"], expected: 0.25 },
+  { name: "unknown preservation value", model: "claude-opus-5-5", effort: "high", window: "seven_day_opus", header: ["x-meridian-cybersec-preservation", "maybe"], expected: 0 },
   { name: "cold catalog shared with pinned model list", model: "claude-sonnet-4-6", effort: "medium", cold: true, expected: 1 - 0.7 },
-])("attests only exact available Claude routes over loopback: $name", async ({ model, effort, window, scope, offered, offeredEffort, noEffort, used = 75, expired, replaced, header, sdkBucket, paid, unknownPaid, immediatePaid, excluded, cold, expected }) => {
+])("attests only exact available Claude routes over loopback: $name", async ({ model, effort, window, scope, offered, offeredEffort, noEffort, used = 75, expired, replaced, header, sdkBucket, paid, unknownPaid, immediatePaid, excluded, preserved, cold, expected }) => {
   const root = await mkdtemp(join(tmpdir(), "meridian-return-"))
   const dir = join(root, "work")
   const profileId = "return-work"
@@ -350,6 +354,7 @@ it.each([
       }),
     })
     if (excluded) setSetting("routingExcludedProfiles", [profileId])
+    if (preserved) expect((await setFleetEvidence(app, { [profileId]: "cybersec-preserved" })).status).toBe(200)
     if (sdkBucket || paid) rateLimitStore.record(profileId, {
       status: sdkBucket ? "rejected" : "allowed", rateLimitType: sdkBucket ?? "five_hour",
       utilization: sdkBucket ? 1 : 0.3, resetsAt: Date.parse(resetsAt), isUsingOverage: paid,

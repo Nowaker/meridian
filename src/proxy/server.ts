@@ -21,7 +21,7 @@ import { CATALOG_CLIENT_VERSION, chatGptModelList, createChatGptModelCatalog, ty
 import { createHash } from 'node:crypto'
 import { claudeReturnUsage, isExactClaudeWireModel, routeAvailability } from './routeAvailability'
 import { freshPlanExhaustion } from './freshPlanExhaustion'
-import { capacityObservationIsFresh, parseManagedExclusionEvidence, POLICY_PRESERVED_REASON, type ManagedExclusionEvidence } from './managedExclusionEvidence'
+import { capacityObservationIsFresh, CYBERSEC_PRESERVATION_HEADER, parseManagedExclusionEvidence, POLICY_PRESERVED_REASON, resolveCybersecPreservation, type ManagedExclusionEvidence } from './managedExclusionEvidence'
 import { CHATGPT_MANAGED_PROTECTION_REASONS, chatGptRefusalPoolKey, proveChatGptRouteRefusal } from './chatgpt/routeRefusal'
 import { createCodexClientVersion } from './chatgpt/clientVersion'
 import { CHATGPT_WARM_MODELS, chatGptRefusalDiagnosis, chatGptWarmBody, createChatGptProfileSurface } from './chatgpt/profileSurface'
@@ -1334,7 +1334,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   const routingUnavailableProfileIdsFor = (profiles: readonly ProfileConfig[]) => [
     ...new Set([...routingExcludedProfileIdsFor(profiles), ...routingHeldProfileIdsFor(profiles)]),
   ]
-  const routingUnavailableProfileIds = () => routingUnavailableProfileIdsFor(getEffectiveProfiles(finalConfig.profiles))
   /**
    * Whether some profile is out of work routing only because the supervisor's
    * managed list names it. Such a pool has no account the supervisor will let
@@ -1342,14 +1341,43 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
    * configuration error.
    */
   /**
-   * Profiles the supervisor's fresh evidence keeps out by policy rather than
-   * capacity: their own resets never name a pool's wait, since none of them
-   * reopens it.
+   * Profiles the supervisor's last evidence keeps out of general work by
+   * policy (`cybersec-preserved`) rather than capacity, whatever the
+   * evidence's age: a policy describes the list as written, and the evidence
+   * goes with any write of the lists that does not replace it. Their own
+   * resets never name a pool's wait, since none of them reopens it.
    */
-  const policyPreservedProfileIds = (): ReadonlySet<string> => {
+  const cybersecPreservedProfileIds = (): ReadonlySet<string> => {
     const evidence = managedExclusionEvidence
-    if (!evidence || !capacityObservationIsFresh(evidence.observedAt, Date.now())) return new Set()
+    if (!evidence) return new Set()
     return new Set([...evidence.reasons].flatMap(([id, reason]) => reason === POLICY_PRESERVED_REASON ? [id] : []))
+  }
+  /** `cybersecPreservationDefault`; unset is on, as before the setting existed. */
+  const cybersecPreservationDefault = (): boolean => getSetting("cybersecPreservationDefault") !== false
+  /** The supervisor's managed list as plain work meets it: without the preserved profiles when preservation is off. */
+  const managedRoutingExcludedProfileIdsFor = (preserve: boolean): string[] => {
+    const managed = managedRoutingExcludedProfileIds()
+    if (preserve) return managed
+    const preserved = cybersecPreservedProfileIds()
+    return canonicalRoutingExcludedProfileIds(getEffectiveProfiles(finalConfig.profiles), managed).filter(id => !preserved.has(id))
+  }
+  /** What the active pointer must not rest on: preserved profiles only while the machine default keeps work off them. */
+  const pointerUnavailableProfileIdsFor = (profiles: readonly ProfileConfig[]): string[] => {
+    return [...new Set([
+      ...canonicalRoutingExcludedProfileIds(profiles, mergeRoutingExcludedProfiles(
+        userRoutingExcludedProfileIds(), managedRoutingExcludedProfileIdsFor(cybersecPreservationDefault()))),
+      ...routingHeldProfileIdsFor(profiles),
+    ])]
+  }
+  /**
+   * What a Claude row records of the request's preservation: present only on
+   * the work the header applies to, unpinned and without `x-meridian-require`.
+   */
+  const cybersecPreservationTelemetry = (headers: Headers): Pick<RequestMetric, "cybersecPreservation" | "cybersecPreservationSource"> => {
+    if (headers.get("x-meridian-profile") || isMeridianWarm(headers) ||
+      parseRoutingRequirements(headers.get(ROUTING_REQUIRE_HEADER) ?? undefined).known.length > 0) return {}
+    const resolved = resolveCybersecPreservation(headers.get(CYBERSEC_PRESERVATION_HEADER) ?? undefined, cybersecPreservationDefault())
+    return resolved.error === null ? { cybersecPreservation: resolved.value, cybersecPreservationSource: resolved.source } : {}
   }
   const someOutOnlyByManagedExclusion = (
     managed: readonly string[] = managedRoutingExcludedProfileIds(),
@@ -1391,7 +1419,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       profiles,
       defaultProfile: finalConfig.defaultProfile,
       activeProfile: getActiveProfileId(),
-      excludedProfileIds: routingUnavailableProfileIds(),
+      excludedProfileIds: pointerUnavailableProfileIdsFor(profiles),
     })
     if (!replacement.change) return
     applyActiveProfile(replacement.profileId, { source: "routing-exclusions" })
@@ -2237,7 +2265,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   }): NoRoutableProfile[] {
     const excluded = new Set(input.excluded ?? routingExcludedProfileIds())
     const held = new Set(routingHeldProfileIds())
-    const preserved = policyPreservedProfileIds()
+    const preserved = cybersecPreservedProfileIds()
     const now = Date.now()
     const benchedUntil = new Map(priorityExhaustion.snapshot().map(e => [e.id, e.until]))
     const modelBenchedUntil = new Map(priorityExhaustion.modelSnapshot()
@@ -2942,6 +2970,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   ) => {
     const requestStartAt = requestMeta.queueEnteredAt
     const routingRequire = routingRequireOf(c.req.header(ROUTING_REQUIRE_HEADER))
+    const cybersecPreservation = cybersecPreservationTelemetry(c.req.raw.headers)
     const attribution = isMeridianWarm(c.req.raw.headers) ? meridianWarmAttribution : readClientAttribution(c.req.raw.headers)
     const requestSignal = options.turnWatchdogSignal
       ? AbortSignal.any([c.req.raw.signal, options.turnWatchdogSignal])
@@ -3393,10 +3422,21 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         if (requirements.error !== null) {
           return c.json({ type: "error", error: { type: "invalid_request_error", message: requirements.error } }, 400)
         }
+        const preservation = resolveCybersecPreservation(c.req.header(CYBERSEC_PRESERVATION_HEADER), cybersecPreservationDefault())
+        if (preservation.error !== null) {
+          return c.json({ type: "error", error: { type: "invalid_request_error", message: preservation.error } }, 400)
+        }
         const cvpModel = typeof body.model === "string" ? body.model : ""
         const unpinnedWork = !warmProfileId && !options.forcedProfileId && !c.req.header("x-meridian-profile")
         const requireCvp = requirements.cvp && unpinnedWork
         const requireRestricted = requirements.restricted && unpinnedWork
+        // Unpinned work with no requirement meets the supervisor's
+        // cybersec-preserved exclusions only while its preservation (the
+        // header, else the instance default) is on. cvp and restricted work,
+        // pins, warms and hops meet the lists as written.
+        const plainWork = unpinnedWork && requirements.known.length === 0
+        const preserveHolders = !plainWork || preservation.value === "on"
+        const generalManaged = managedRoutingExcludedProfileIdsFor(preserveHolders)
         const attestedModel = isPoolRouting(routingMode) && !requirements.cvp && !requestedProfileId && !forcedProfileId() &&
           c.req.header("x-meridian-route-refusal") === "1" &&
           c.req.header("x-request-id") === requestMeta.requestId &&
@@ -3427,6 +3467,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         const restrictedIds = requireRestricted ? new Set(poolIds.filter(id => !holdsCvpAccess(id))) : undefined
         const outsideRestricted = restrictedIds ? (id: string) => !restrictedIds.has(id) : undefined
         const routingPool = restrictedIds ? claudePool.filter(p => restrictedIds.has(p.id)) : claudePool
+        // The exclusions a refusal names when they are not the general lists
+        // as written: cvp work's own, or those plain work met with
+        // preservation off.
+        const requestExcluded = cvpExcluded ?? (preserveHolders ? undefined
+          : canonicalRoutingExcludedProfileIds(claudePool, mergeRoutingExcludedProfiles(userRoutingExcludedProfileIds(), generalManaged)))
         const refuseNoRestricted = (sessionKey: string | null, lead: string, profiles: NoRoutableProfile[]): Response => {
           claudeLog("routing.no_restricted", { routing: routingMode })
           return noRoutableAccountResponse(noRoutableAccount({
@@ -3449,7 +3494,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           purpose: warmProfileId ? "warm" : "work",
           explicitProfileId: requestedProfileId,
           excludedProfileIds: userRoutingExcludedProfileIds(),
-          managedExcludedProfileIds: requireCvp ? cvpManagedExcludedProfileIds() : managedRoutingExcludedProfileIds(),
+          managedExcludedProfileIds: requireCvp ? cvpManagedExcludedProfileIds() : generalManaged,
           heldProfileIds: routingHeldProfileIds(),
         })
         switch (routingAccess.access.kind) {
@@ -3458,7 +3503,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           case "explicit_held":
             return profileHeldResponse(routingAccess.access.profileId)
           case "no_eligible_profiles": {
-            if (!someOutOnlyByManagedExclusion(requireCvp ? cvpManagedExcludedProfileIds() : undefined, routingPool)) return noEligibleProfilesResponse()
+            if (!someOutOnlyByManagedExclusion(requireCvp ? cvpManagedExcludedProfileIds() : generalManaged, routingPool)) return noEligibleProfilesResponse()
             claudeLog("routing.managed_exclusion_refused", { routing: routingMode })
             const reserves = usageReserves()
             const refusal = noRoutableAccount({
@@ -3471,14 +3516,14 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               profiles: unroutableProfiles({
                 modelFamily: claudeModelFamily(typeof body.model === "string" ? body.model : "sonnet"),
                 reserveHold: id => claudeReserveHold(id, reserves),
-                excluded: cvpExcluded,
+                excluded: requestExcluded,
                 outside: outsideRestricted,
               }),
             })
             const fleetEvidence = freshFleetEvidence()
             if (attestedModel && fleetEvidence) {
               const pool = routingPool
-              const managed = new Set(canonicalRoutingExcludedProfileIds(pool, managedRoutingExcludedProfileIds()))
+              const managed = new Set(canonicalRoutingExcludedProfileIds(pool, generalManaged))
               const manual = new Set(canonicalRoutingExcludedProfileIds(pool, userRoutingExcludedProfileIds()))
               const held = new Set(routingHeldProfileIds())
               // A policy reason covers an account but proves nothing spent:
@@ -3515,6 +3560,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           claudeLog("routing.pin_has_cvp", { profile: restrictedPin })
           return profileHasCvpResponse(restrictedPin)
         }
+        // A pointer this request keeps off as cybersec-preserved is passed for
+        // the first eligible in the general order, as restricted work passes
+        // one on a holder.
+        const preservedIds = cybersecPreservedProfileIds()
+        const preservedOut = (id: string) => plainWork && preserveHolders && preservedIds.has(id) && routingAccess.excludedProfileIds.includes(id)
         // Priority mode (opt-in): unpinned requests are dispatched across the
         if (isPoolRouting(routingMode) && !options.forcedProfileId && !c.req.header("x-meridian-profile")) {
           const effectivePool = routingPool
@@ -3536,7 +3586,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 modelFamily: poolModelFamily,
                 reserveHold: id => claudeReserveHold(id, reserves),
                 noCvp: lacksCvp,
-                excluded: cvpExcluded,
+                excluded: requestExcluded,
               }))
             }
             // Upstream's opt-in weekly reserve (#1484) passes a holding profile
@@ -3561,7 +3611,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             const unavailable = (id: string) => benched(id) || weeklyHolds.has(id) || heldBy(id) !== null
             const extraUsagePolicy = getClaudeExtraUsagePolicy(process.env.MERIDIAN_CLAUDE_EXTRA_USAGE ?? getSetting("claudeExtraUsage"))
             const extraUsageOff = (id: string) => extraUsagePolicy === "never" && profileDrawsExtraUsage(id)
-            const describeUnroutable = () => unroutableProfiles({ modelFamily, reserveHold: heldBy, weeklyHolds, extraUsageOff, noCvp: lacksCvp, excluded: cvpExcluded, outside: outsideRestricted })
+            const describeUnroutable = () => unroutableProfiles({ modelFamily, reserveHold: heldBy, weeklyHolds, extraUsageOff, noCvp: lacksCvp, excluded: requestExcluded, outside: outsideRestricted })
             const extraUsage = orderForExtraUsage(
               allReserveHeld ? eligibleOrder : routable,
               extraUsagePolicy,
@@ -3767,7 +3817,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               }
               if (attestPool) {
                 const fleetEvidence = freshFleetEvidence()
-                const managed = new Set(canonicalRoutingExcludedProfileIds(effectivePool, managedRoutingExcludedProfileIds()))
+                const managed = new Set(canonicalRoutingExcludedProfileIds(effectivePool, generalManaged))
                 const manual = new Set(canonicalRoutingExcludedProfileIds(effectivePool, userRoutingExcludedProfileIds()))
                 const held = new Set(routingHeldProfileIds())
                 const eligible = new Set(eligibleOrder)
@@ -3795,13 +3845,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 // cvp work is led by the cvp pointer, never the general one, and
                 // only while it qualifies: chooseActivePriorityCandidates would
                 // put any head first, eligible or not.
-                // Restricted work keeps the general pointer while it is in the
-                // set, else the first in the general order.
+                // Restricted and preserving work keep the general pointer while
+                // it is in their set, else take the first in the general order.
                 const cvpPointer = getSetting("cvpActiveProfile")
                 const generalActive = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile).id
                 const activeId = requireCvp
                   ? (cvpPointer !== undefined && order.includes(cvpPointer) ? cvpPointer : order[0]!)
-                  : outsideRestricted?.(generalActive) ? order[0]! : generalActive
+                  : outsideRestricted?.(generalActive) || preservedOut(generalActive) ? order[0]! : generalActive
                 candidates = retainOnlyProfile
                   ? [retainOnlyProfile]
                   : [
@@ -3885,12 +3935,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // excluded account was already refused above and never gets this far.
         const eligibleProfileIds = new Set(routingAccess.profiles.map(p => p.id))
         if (eligibleProfileIds.size > 0 && !eligibleProfileIds.has(profile.id)) {
-          // Restricted work replaces a pointer outside its set the way the
-          // general switcher orders accounts.
+          // Restricted and preserving work replace a pointer outside their set
+          // the way the general switcher orders accounts.
           profile = resolveProfile(
             finalConfig.profiles,
             finalConfig.defaultProfile,
-            requireRestricted
+            requireRestricted || preservedOut(profile.id)
               ? resolvePriorityOrder([...eligibleProfileIds], priorityProfileOrderSetting()).order[0]!
               : routingAccess.profiles[0]!.id,
             stickyOptions
@@ -3929,7 +3979,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 lead: "every eligible profile is held back by its usage reserve",
                 reason: "reserve_held",
                 lastTried: null,
-                profiles: unroutableProfiles({ modelFamily, reserveHold: id => holds.get(id) ?? null, outside: outsideRestricted }),
+                profiles: unroutableProfiles({ modelFamily, reserveHold: id => holds.get(id) ?? null, excluded: requestExcluded, outside: outsideRestricted }),
               }))
             }
             claudeLog("routing.usage_reserve", { from: profile.id, to: next })
@@ -3958,7 +4008,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               modelFamily: claudeModelFamily(cvpModel || "sonnet"),
               reserveHold: id => claudeReserveHold(id, reserves, now),
               noCvp: lacksCvp,
-              excluded: cvpExcluded,
+              excluded: requestExcluded,
             }))
           }
           if (next !== profile.id) {
@@ -4811,6 +4861,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             requestId: requestMeta.requestId,
             clientSessionId: requestMeta.clientSessionId,
             routingRequire,
+            ...cybersecPreservation,
             timestamp: Date.now(),
             adapter: adapter.name,
             model,
@@ -6926,6 +6977,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             requestId: requestMeta.requestId,
             clientSessionId: requestMeta.clientSessionId,
             routingRequire,
+            ...cybersecPreservation,
             timestamp: Date.now(),
             adapter: adapter.name,
             profileId: profile.id,
@@ -7553,7 +7605,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               const queueWaitMs = totalQueueWaitMs(requestMeta)
               observeStreamFailure(() => telemetryStore.record({
                 ...attribution,
-                requestId: requestMeta.requestId, timestamp: Date.now(), adapter: adapter.name, routingRequire,
+                requestId: requestMeta.requestId, timestamp: Date.now(), adapter: adapter.name, routingRequire, ...cybersecPreservation,
                 clientSessionId: requestMeta.clientSessionId,
                 profileId: profile.id, routeKind, routeGroupId, routeAttempt, requestSource, model,
                 requestModel: body.model || undefined, resolvedModel: resolvedHaikuModel(), mode: "stream", isResume,
@@ -9144,6 +9196,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   requestId: requestMeta.requestId,
                   clientSessionId: requestMeta.clientSessionId,
                   routingRequire,
+                  ...cybersecPreservation,
                   timestamp: Date.now(),
                   adapter: adapter.name,
             profileId: profile.id,
@@ -9696,6 +9749,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   requestId: requestMeta.requestId,
                   clientSessionId: requestMeta.clientSessionId,
                   routingRequire,
+                  ...cybersecPreservation,
                   timestamp: Date.now(),
                   adapter: adapter.name,
                   profileId: profile.id,
@@ -9851,6 +9905,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   requestId: requestMeta.requestId,
                   clientSessionId: requestMeta.clientSessionId,
                   routingRequire,
+                  ...cybersecPreservation,
                   timestamp: Date.now(),
                   adapter: adapter.name,
                   profileId: profile.id,
@@ -9931,6 +9986,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                 requestId: requestMeta.requestId,
                 clientSessionId: requestMeta.clientSessionId,
                 routingRequire,
+                ...cybersecPreservation,
                 timestamp: Date.now(),
                 adapter: adapter.name,
                 profileId: profile.id,
@@ -10176,6 +10232,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           requestId: requestMeta.requestId,
           clientSessionId: requestMeta.clientSessionId,
           routingRequire,
+          ...cybersecPreservation,
           timestamp: Date.now(),
           adapter: adapter.name,
           profileId: attributedProfileId ?? resolvedProfileId,
@@ -10526,6 +10583,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
               timestamp: Date.now(),
               adapter: adapter.name,
               routingRequire: routingRequireOf(c.req.header(ROUTING_REQUIRE_HEADER)),
+              ...cybersecPreservationTelemetry(c.req.raw.headers),
               model: "unknown",
               requestModel: undefined,
               mode: "non-stream",
@@ -10994,8 +11052,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const unpinnedPool = () => isPoolRouting(getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing"))) &&
         !forcedProfileId() && getClaudeExtraUsagePolicy(process.env.MERIDIAN_CLAUDE_EXTRA_USAGE ?? getSetting("claudeExtraUsage")) !== "immediately"
       const requirements = parseRoutingRequirements(c.req.header(ROUTING_REQUIRE_HEADER))
+      const preservation = resolveCybersecPreservation(c.req.header(CYBERSEC_PRESERVATION_HEADER), cybersecPreservationDefault())
       if (!isExactClaudeWireModel(model) || !normalizeEffort(variant) || !unpinnedPool() ||
-        c.req.header("x-meridian-profile") !== undefined || requirements.cvp || requirements.error !== null) {
+        c.req.header("x-meridian-profile") !== undefined || requirements.cvp || requirements.error !== null || preservation.error !== null) {
         return c.json(routeAvailability(query, [], now))
       }
       const family = claudeModelFamily(model)
@@ -11003,9 +11062,12 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const returnPool = () => requirements.restricted
         ? getEffectiveProfiles(finalConfig.profiles).filter(p => !holdsCvpAccess(p.id))
         : getEffectiveProfiles(finalConfig.profiles)
+      // A plain return is judged under the request's preservation; restricted
+      // work keeps off every holder whatever it says.
       const pool = () => evaluateRoutingProfileAccess({
         profiles: returnPool(), defaultProfile: finalConfig.defaultProfile, purpose: "work",
-        excludedProfileIds: userRoutingExcludedProfileIds(), managedExcludedProfileIds: managedRoutingExcludedProfileIds(),
+        excludedProfileIds: userRoutingExcludedProfileIds(),
+        managedExcludedProfileIds: managedRoutingExcludedProfileIdsFor(requirements.restricted || preservation.value === "on"),
         heldProfileIds: routingHeldProfileIds(),
       })
       const observed = await Promise.all(pool().profiles.flatMap(profile => {
@@ -11402,9 +11464,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // What `x-meridian-require: restricted` work may reach: the profiles
       // whose map shows CVP access on no model, in the general order.
       restrictedProfiles,
+      // Whether plain work without `x-meridian-cybersec-preservation` keeps
+      // off the profiles the supervisor's evidence names cybersec-preserved.
+      cybersecPreservationDefault: cybersecPreservationDefault(),
+      cybersecPreservedProfiles: [...cybersecPreservedProfileIds()],
       // What a supervisor may rely on this build doing; read rather than
       // guessed from a version, which forks share.
-      capabilities: ["managed-exclusion-no-routable", "managed-exclusion-evidence-v1", "managed-exclusion-cybersec-preserved", "managed-chatgpt-exclusion-evidence-v1", "profile-model-list", "pin-bypasses-managed-exclusion", "cvp-routing", "cvp-order", "cvp-organization-inference", "restricted-routing", "forced-active-profile", "managed-exclusion-reasons", "usage-refresh", "profile-refresh"],
+      capabilities: ["managed-exclusion-no-routable", "managed-exclusion-evidence-v1", "managed-exclusion-cybersec-preserved", "cybersec-preservation-per-request", "managed-chatgpt-exclusion-evidence-v1", "profile-model-list", "pin-bypasses-managed-exclusion", "cvp-routing", "cvp-order", "cvp-organization-inference", "restricted-routing", "forced-active-profile", "managed-exclusion-reasons", "usage-refresh", "profile-refresh"],
       profiles: profileIds,
       saved: {
         routing: getSetting("routing") ?? null,
@@ -11437,6 +11503,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       cvpProfileOrder?: unknown
       cvpActiveProfile?: unknown
       cvpManagedExcludedProfiles?: unknown
+      cybersecPreservationDefault?: unknown
     }
     try { body = await c.req.json() } catch { return c.json({ error: "Invalid JSON" }, 400) }
     // One form submits routing, order and exclusions together, so a later
@@ -11526,6 +11593,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       }
       updates.cvpManagedExcludedProfiles = parseRoutingExcludedProfiles(body.cvpManagedExcludedProfiles)
     }
+    // `null` clears it, which reads as on.
+    if (body.cybersecPreservationDefault !== undefined) {
+      if (body.cybersecPreservationDefault !== null && typeof body.cybersecPreservationDefault !== "boolean") {
+        return c.json({ error: "cybersecPreservationDefault must be a boolean or null" }, 400)
+      }
+      updates.cybersecPreservationDefault = body.cybersecPreservationDefault ?? undefined
+    }
     let evidence: ManagedExclusionEvidence | undefined
     if (body.routingManagedExclusionEvidence !== undefined) {
       if (!isSameOriginRequest(c.req.raw)) return c.json({ error: "Managed exclusion evidence requires a same-origin request" }, 403)
@@ -11568,7 +11642,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     // is forced past a supervisor any more.
     if (updates.allowForcingForbiddenProfile === false && getSetting("forcedActiveProfile") !== undefined) {
       releaseForcedProfile("setting_off")
-    } else if (body.routingExcludedProfiles !== undefined || body.routingManagedExcludedProfiles !== undefined || body.routingHeldProfiles !== undefined) {
+    } else if (body.routingExcludedProfiles !== undefined || body.routingManagedExcludedProfiles !== undefined || body.routingHeldProfiles !== undefined ||
+      body.routingManagedExclusionEvidence !== undefined || body.cybersecPreservationDefault !== undefined) {
       reconcileActiveProfileWithExclusions()
     }
     plog(`[PROXY] Routing settings updated: routing=${getSetting("routing") ?? "active"} order=${(getSetting("profileOrder") ?? []).join(",") || "(config order)"}`)
@@ -12286,7 +12361,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     const availableProfileIds = listedProfiles.length > 0
       ? listedProfiles.map(profile => profile.id)
       : ["default"]
-    const excludedProfileIds = routingUnavailableProfileIdsFor(
+    const excludedProfileIds = pointerUnavailableProfileIdsFor(
       listedProfiles.length > 0 ? getEffectiveProfiles(finalConfig.profiles) : [],
     )
     const eligibleProfileIds = filterEligibleProfileIds(
@@ -12648,7 +12723,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       const checkSupervisor = !excluded && (!releaseRequired || getSetting("allowForcingForbiddenProfile") === true)
       const blocker: { readonly refusal: ActivationRefusal; readonly respond: (refusal: ActivationRefusal) => Response } | null =
         !checkSupervisor ? null
-          : canonicalRoutingExcludedProfileIds(effectiveProfiles, managedRoutingExcludedProfileIds()).includes(requested)
+          : canonicalRoutingExcludedProfileIds(effectiveProfiles, managedRoutingExcludedProfileIdsFor(cybersecPreservationDefault())).includes(requested)
             ? { refusal: activationRefusal("managed_excluded", requested, { forced }), respond: refusal => profileExcludedResponse(requested, { refusal }) }
             : routingHeldProfileIdsFor(effectiveProfiles).includes(requested)
               ? { refusal: activationRefusal("held", requested, { forced }), respond: refusal => profileHeldResponse(requested, { refusal }) }
@@ -14256,8 +14331,11 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
   // `cyber_verification` and the `cvp_profiles` that hold it.
   app.get("/v1/models", async (c) => {
     const requirements = parseRoutingRequirements(c.req.header(ROUTING_REQUIRE_HEADER))
-    if (requirements.error !== null) {
-      return c.json({ type: "error", error: { type: "invalid_request_error", message: requirements.error } }, 400)
+    // The plain unpinned list never depends on exclusions, so the
+    // preservation header changes nothing here but is refused when malformed.
+    const invalid = requirements.error ?? resolveCybersecPreservation(c.req.header(CYBERSEC_PRESERVATION_HEADER), cybersecPreservationDefault()).error
+    if (invalid !== null) {
+      return c.json({ type: "error", error: { type: "invalid_request_error", message: invalid } }, 400)
     }
     const pin = c.req.header("x-meridian-profile")?.trim() || undefined
     const claudePin = pin !== undefined && !chatGptProfiles?.resolve(pin) ? pin : undefined

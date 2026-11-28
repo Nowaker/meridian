@@ -65,6 +65,11 @@ export interface MeridianSettings {
    */
   cvpManagedExcludedProfiles?: string[]
   /**
+   * Whether unpinned plain Claude work without `x-meridian-cybersec-preservation`
+   * keeps off the profiles managed-excluded as `cybersec-preserved`. Unset is on.
+   */
+  cybersecPreservationDefault?: boolean
+  /**
    * Profiles held out of rotation by a supervisor, for a measured run: no
    * unpinned work, failover or warm reaches them, but a request pinned with
    * `x-meridian-profile` is served there. Written through

@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS metrics (
   fallback_from_model  TEXT,
   resolved_model       TEXT,
   routing_require      TEXT,
+  cybersec_preservation TEXT,
+  cybersec_preservation_source TEXT,
   client_name          TEXT,
   client_version       TEXT,
   client_installation  TEXT,
@@ -82,6 +84,8 @@ const METRICS_MIGRATIONS = [
   "ALTER TABLE metrics ADD COLUMN fallback_from_model TEXT",
   "ALTER TABLE metrics ADD COLUMN resolved_model TEXT",
   "ALTER TABLE metrics ADD COLUMN routing_require TEXT",
+  "ALTER TABLE metrics ADD COLUMN cybersec_preservation TEXT",
+  "ALTER TABLE metrics ADD COLUMN cybersec_preservation_source TEXT",
   "ALTER TABLE metrics ADD COLUMN client_session_id TEXT",
   "ALTER TABLE metrics ADD COLUMN client_name TEXT",
   "ALTER TABLE metrics ADD COLUMN client_version TEXT",
@@ -158,6 +162,7 @@ class SqliteTelemetryStore implements ITelemetryStore {
         cache_creation_input_tokens, cache_hit_rate, profile_id, envelope_violations,
         route_kind, route_group_id, route_attempt, route_refused_bucket,
         reasoning_output_tokens, fallback_from_model, routing_require,
+        cybersec_preservation, cybersec_preservation_source,
         client_name, client_version, client_installation, client_device, purpose
       ) VALUES (
         @requestId, @timestamp, @adapter, @requestSource, @model, @requestModel, @resolvedModel, @mode,
@@ -170,6 +175,7 @@ class SqliteTelemetryStore implements ITelemetryStore {
         @cacheCreationInputTokens, @cacheHitRate, @profileId, @envelopeViolations,
         @routeKind, @routeGroupId, @routeAttempt, @routeRefusedBucket,
         @reasoningOutputTokens, @fallbackFromModel, @routingRequire,
+        @cybersecPreservation, @cybersecPreservationSource,
         @clientName, @clientVersion, @clientInstallation, @clientDevice, @purpose
       )
     `)
@@ -230,6 +236,8 @@ class SqliteTelemetryStore implements ITelemetryStore {
         reasoningOutputTokens: metric.reasoningOutputTokens ?? null,
         fallbackFromModel: metric.fallbackFromModel ?? null,
         routingRequire: metric.routingRequire && metric.routingRequire.length > 0 ? JSON.stringify(metric.routingRequire) : null,
+        cybersecPreservation: metric.cybersecPreservation ?? null,
+        cybersecPreservationSource: metric.cybersecPreservationSource ?? null,
         clientName: metric.client?.name ?? null,
         clientVersion: metric.client?.version ?? null,
         clientInstallation: metric.client?.installation ?? null,
@@ -434,6 +442,7 @@ function parseStringList(raw: unknown): string[] | undefined {
 
 function rowToMetric(r: Record<string, unknown>): RequestMetric {
   const { client_name: name, client_version: version, client_installation: installation, client_device: device, purpose } = r
+  const { cybersec_preservation: preservation, cybersec_preservation_source: preservationSource } = r
   return {
     requestId: r.request_id as string,
     timestamp: r.timestamp as number,
@@ -479,6 +488,8 @@ function rowToMetric(r: Record<string, unknown>): RequestMetric {
     reasoningOutputTokens: (r.reasoning_output_tokens as number) ?? undefined,
     fallbackFromModel: (r.fallback_from_model as string) ?? undefined,
     routingRequire: parseStringList(r.routing_require),
+    ...(preservation === "on" || preservation === "off" ? { cybersecPreservation: preservation } : {}),
+    ...(preservationSource === "header" || preservationSource === "default" ? { cybersecPreservationSource: preservationSource } : {}),
     ...(typeof name === "string" ? {
       client: {
         name,

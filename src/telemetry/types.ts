@@ -104,6 +104,13 @@ export interface RequestMetric extends RequestAttribution {
    *  (e.g. `["cvp"]`). Absent when it carried none. */
   routingRequire?: string[]
 
+  /** Whether unpinned plain Claude work kept off the supervisor's
+   *  `cybersec-preserved` exclusions, and whether its
+   *  `x-meridian-cybersec-preservation` header or the instance default
+   *  decided. Absent on pinned, warm and `x-meridian-require` work. */
+  cybersecPreservation?: "on" | "off"
+  cybersecPreservationSource?: "header" | "default"
+
   /** Correlates the internal hops of ONE client request. Priority routing
    *  re-enters the proxy once per candidate account, so a failover writes
    *  several rows; they share this id (the outer request's id). Absent on

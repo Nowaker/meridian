@@ -6,6 +6,25 @@ export const CAPACITY_OBSERVATION_MAX_AGE_MS = 120_000
  */
 export const POLICY_PRESERVED_REASON = "cybersec-preserved"
 
+/**
+ * Header saying whether an unpinned plain Claude request keeps off the
+ * accounts managed-excluded as `POLICY_PRESERVED_REASON`; without it the
+ * instance's `cybersecPreservationDefault` decides.
+ */
+export const CYBERSEC_PRESERVATION_HEADER = "x-meridian-cybersec-preservation"
+
+export type CybersecPreservationResolution =
+  | { readonly value: "on" | "off"; readonly source: "header" | "default"; readonly error: null }
+  | { readonly value: null; readonly source: null; readonly error: string }
+
+/** The header's `on`/`off` (case-insensitive), else the default; any other value is an error to refuse. */
+export function resolveCybersecPreservation(header: string | undefined, defaultOn: boolean): CybersecPreservationResolution {
+  if (header === undefined) return { value: defaultOn ? "on" : "off", source: "default", error: null }
+  const value = header.trim().toLowerCase()
+  if (value === "on" || value === "off") return { value, source: "header", error: null }
+  return { value: null, source: null, error: `${CYBERSEC_PRESERVATION_HEADER}: expected on or off` }
+}
+
 const PROTECTION_REASONS = new Set([
   "spent", "usage-reserve", "weekly-reserve", "extra-usage",
   "loaner-gate", "unmeasured-loaner", "unmeasured-loaner-cap",
